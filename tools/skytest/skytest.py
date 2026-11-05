@@ -728,7 +728,8 @@ def folder_state(root: Path, skip: tuple[str, ...] = ()) -> tuple[int, float]:
 def guarded_folders(cfg: Config) -> dict[str, tuple[Path, tuple[str, ...]]]:
     """What a run must leave alone: the owner's data folders and the disc (whose cachenonce.txt the
     game itself rewrites at every start)."""
-    out = {f"owner data {r}": (r, ()) for r in owner_data_roots() if r.exists()}
+    # Every place the owner's data can be, also one that does not exist yet: a game creating it fails too.
+    out = {f"owner data {r}": (r, ()) for r in owner_data_roots()}
     out[f"disc {cfg.rom}"] = (cfg.rom.resolve(), ("cachenonce.txt",))
     return out
 
@@ -771,7 +772,7 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     # Required cases of the stages run here that have no spec yet: named, never skipped silently.
     unwritten = [c["id"] for c in manifest.get("case", [])
                  if c.get("kind") == "required" and not c.get("spec")
-                 and (stages is None or str(c.get("stage")) in stages)] if not a.cases else []
+                 and (stages is None or str(c.get("stage")) in stages)] if a.cases in ([], ["all"]) else []
     before = previous_statuses(cfg, out)
     payload = {"snapshot": str(snap), "max_games": max_games, "stages": stages, "thresholds": thresholds,
                "guarded_folders": guard, "required_without_spec": unwritten, "cases": [asdict(r) for r in results]}

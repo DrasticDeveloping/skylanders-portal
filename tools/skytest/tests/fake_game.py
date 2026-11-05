@@ -43,6 +43,12 @@ def main() -> int:
             elif cmd == "scribble":  # a game that writes where it must not: into its disc folder
                 with open(arg("game_data_root") + "/scribble.txt", "w", encoding="utf-8") as f:
                     f.write("x")
+            elif cmd == "ownerwrite":  # a game that writes into the owner's data folder
+                import os
+                target = os.path.join(os.environ["USERPROFILE"], "Documents", "Skylanders")
+                os.makedirs(target, exist_ok=True)
+                with open(os.path.join(target, "oops.txt"), "w", encoding="utf-8") as f:
+                    f.write("x")
             elif cmd == "hang":
                 time.sleep(3600)
             elif cmd == "crash":

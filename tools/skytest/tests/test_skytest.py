@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -265,6 +266,34 @@ quit
         folder = Path(out.getvalue().strip().splitlines()[-1].split("report: ", 1)[1]).parent
         results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
         self.assertEqual([c["case"] for c in results["cases"]], ["zero"])
+
+    def test_all_with_a_stage_still_names_unwritten_cases(self) -> None:
+        self.spec("zero", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
+        self.manifest('[[case]]\nid = "zero"\nstage = "0"\nlayout = "solo"\nkind = "required"\nspec = true\n'
+                      '[[case]]\nid = "later"\nstage = "0"\nlayout = "server+1"\nkind = "required"\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_test(self.cfg, argparse.Namespace(cases=["all"], stage="0", max_games=5))
+        folder = Path(out.getvalue().strip().splitlines()[-1].split("report: ", 1)[1]).parent
+        results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(results["required_without_spec"], ["later"])
+
+    def test_an_owner_folder_created_during_the_run_fails_it(self) -> None:
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        saved = os.environ.get("USERPROFILE")
+        os.environ["USERPROFILE"] = str(home)  # the runner and the fake game both read it
+        try:
+            self.spec("owner", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "ownerwrite\\nquit\\n"\n')
+            r = self.run_cases("owner")
+        finally:
+            if saved is None:
+                del os.environ["USERPROFILE"]
+            else:
+                os.environ["USERPROFILE"] = saved
+        self.assertEqual(r["exit"], 1)
+        touched = [g for g in r["guarded_folders"] if not g["unchanged"]]
+        self.assertEqual(len(touched), 1)
+        self.assertIn(str(home), touched[0]["folder"])
 
     def test_a_game_writing_into_the_disc_fails_the_run(self) -> None:
         self.spec("scribble", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "scribble\\nquit\\n"\n')
