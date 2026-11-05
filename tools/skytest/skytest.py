@@ -67,7 +67,7 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
                     r"private (-?\d+) working (-?\d+) video (-?\d+)")
 # Where a hosted server (`server = "host"`) writes its log: the owner's session folder.
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
-GRADES = ("server_frame_time", "client_fps")
+GRADES = ("server_frame_time", "client_fps", "level_load")
 ALWAYS_FORBIDDEN = [r"\] Crash: ", r"\[FATAL\]", r"Input script: cannot (parse|use)"]
 
 # The lifecycle script of the stand-in server peer until stage 1A: boots, stays up, quits.
@@ -297,6 +297,8 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             raise SpecError(f"{path.name}: grade {gname} is not one of {', '.join(GRADES)}")
         if not isinstance(g, dict) or g.get("peer", "S" if gname == "server_frame_time" else "H") not in names:
             raise SpecError(f"{path.name}: grade {gname} names a peer not in {names}")
+        if gname == "level_load" and (g.get("measure") not in d.get("measure", {}) or not g.get("baseline")):
+            raise SpecError(f"{path.name}: grade level_load needs `measure` (one of the spec's) and `baseline`")
     measures = d.get("measure", {})
     for mname, m in measures.items():
         if not isinstance(m, dict) or "to" not in m:
@@ -512,7 +514,18 @@ def lines_after(lines: list[tuple[float | None, str]], after: str | None) -> lis
     return []
 
 
-def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, settings_limit: float) -> list[str]:
+def baseline_value(baseline: dict, dotted: str) -> float | None:
+    """`solo.hub.hub_load_seconds` in tests/baseline.toml."""
+    node = baseline
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return float(node) if isinstance(node, (int, float)) else None
+
+
+def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, settings_limit: float,
+                     baseline: dict | None = None) -> list[str]:
     """Plan 5.5 against tests/thresholds.toml, for the grades the spec names for this peer."""
     reasons = []
     for gname, g in spec.grades.items():
@@ -538,6 +551,18 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
                 reasons.append(f"grade {gname}: no fps window after /{g.get('after', '')}/")
             elif worst < floor:
                 reasons.append(f"grade {gname}: {worst:.1f} FPS under the floor {floor:.1f}")
+        elif gname == "level_load":
+            ratio_max = float(thresholds.get("level_load", {}).get("max_ratio_to_solo", 1.5))
+            solo = baseline_value(baseline or {}, g["baseline"])
+            value = r.measures.get(g["measure"])
+            ratio = round(value / solo, 2) if value is not None and solo else None
+            r.graded[gname] = {"value_s": value, "solo_s": solo, "ratio": ratio, "max_ratio": ratio_max}
+            if solo is None:
+                reasons.append(f"grade {gname}: no {g['baseline']} in the baseline")
+            elif ratio is None:
+                reasons.append(f"grade {gname}: measure {g['measure']} has no value")
+            elif ratio > ratio_max:
+                reasons.append(f"grade {gname}: {value:.1f} s is {ratio:.2f}x solo ({solo:.1f} s), over {ratio_max}x")
     return reasons
 
 
@@ -597,7 +622,7 @@ def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
 
 
 def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
-             thresholds: dict | None = None) -> CaseResult:
+             thresholds: dict | None = None, baseline: dict | None = None) -> CaseResult:
     names = list(spec.peers)
     hosted = spec.server == "host"
     # A hosted server is started by its owner H, not by the runner (it is still one of the games).
@@ -688,7 +713,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         r.frame_p95_ms, r.peak_video_mb = parsed["frame_p95"], parsed["video"]
         grade_peer(spec, r, text, parsed)
         if spec.grades:
-            extra = grade_thresholds(spec, r, parsed, thresholds or {}, 60.0)
+            extra = grade_thresholds(spec, r, parsed, thresholds or {}, 60.0, baseline)
             if extra:
                 r.reasons += extra
                 r.status = "fail"
@@ -911,10 +936,11 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     check_output_path(cfg, out)
     out.mkdir(parents=True)
     thresholds = tomllib.loads(cfg.thresholds.read_text(encoding="utf-8")) if cfg.thresholds.is_file() else {}
+    baseline = tomllib.loads(cfg.baseline.read_text(encoding="utf-8")) if cfg.baseline.is_file() else {}
     results = []
     for spec in specs:
         print(f"{spec.name} ({spec.layout}) ...", flush=True)
-        r = run_case(cfg, spec, snap, max_games, time.strftime("%Y%m%d-%H%M%S"), thresholds)
+        r = run_case(cfg, spec, snap, max_games, time.strftime("%Y%m%d-%H%M%S"), thresholds, baseline)
         print(f"  {r.status.upper()}" + (f": {'; '.join(r.reasons)}" if r.reasons else ""), flush=True)
         results.append(r)
     after_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}

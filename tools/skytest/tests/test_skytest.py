@@ -472,6 +472,22 @@ expect = ["Online: starting as the server"]
             with self.assertRaises(skytest.SpecError, msg=name):
                 skytest.load_spec(self.repo / "tests" / "runtime" / f"{name}.toml", 20)
 
+    def test_a_level_load_is_graded_against_the_baseline(self) -> None:
+        (self.repo / "tests" / "baseline.toml").write_text("[solo.hub]\nhub_load_seconds = 0.001\n", encoding="utf-8")
+        self.cfg = skytest.load_config(self.repo)
+        self.cfg.start_gap = 0.0
+        self.spec("load", self.HOSTED.replace("online_host 0", "online_host 0\nwait 20") +
+                  '\n[measure.hub_load]\nfrom = "Online: hosting"\nto = "Input script: placed in slot 0"\n'
+                  '[grade.level_load]\npeer = "H"\nmeasure = "hub_load"\nbaseline = "solo.hub.hub_load_seconds"\n')
+        case = self.run_cases("load")["cases"][0]
+        h = next(p for p in case["peers"] if p["peer"] == "H")
+        self.assertIsNotNone(h["graded"]["level_load"]["ratio"])
+        self.assertGreater(h["graded"]["level_load"]["ratio"], 1.5)
+        self.assertTrue(any("grade level_load" in why for why in h["reasons"]), h["reasons"])
+        self.spec("load2", self.HOSTED + '\n[grade.level_load]\npeer = "H"\nmeasure = "nope"\nbaseline = "x"\n')
+        with self.assertRaises(skytest.SpecError):
+            skytest.load_spec(self.repo / "tests" / "runtime" / "load2.toml", 20)
+
 class JobTest(unittest.TestCase):
     @unittest.skipUnless(winjob.WINDOWS, "job objects are Windows only")
     def test_closing_the_job_ends_its_processes(self) -> None:
