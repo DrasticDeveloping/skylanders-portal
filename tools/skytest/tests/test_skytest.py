@@ -505,6 +505,29 @@ expect = ["Online: starting as the server"]
         self.assertEqual(h["graded"]["client_fps"]["floor_fps"], 21.0)
         self.assertNotIn("client_fps", " ".join(h["reasons"]))
 
+    def test_an_accepted_grade_is_named_and_a_regression_is_open(self) -> None:
+        graded = self.HOSTED.replace('stage = "1A"', 'stage = "0"').replace(
+            "online_host 0", "serverframes 50\nonline_host 0") + '\n[grade.server_frame_time]\n'
+        self.spec("slowsrv", graded)
+        entry = ('[[case]]\nid = "slowsrv"\nstage = "0"\nlayout = "server+2"\nkind = "required"\nspec = true\n')
+
+        def checkpoint(manifest_body: str) -> dict:
+            self.manifest(manifest_body)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                skytest.cmd_test(self.cfg, argparse.Namespace(cases=[], stage="0", max_games=3))
+            folder = Path(out.getvalue().strip().splitlines()[-1].split("report: ", 1)[1]).parent
+            return json.loads((folder / "results.json").read_text(encoding="utf-8"))["checkpoint"]
+
+        self.assertFalse(checkpoint(entry)["met"])  # the server's p95 of 50 ms fails
+        cp = checkpoint(entry + 'accepted_grades = ["server_frame_time"]\nreason = "one PC"\n')
+        self.assertTrue(cp["met"], cp)
+        self.assertIn("accepted: slowsrv: grade server_frame_time: p95 50.0 ms over 33 ms", cp["line"])
+        # It passed in the run before; now its flow breaks (the owner never hosts): open as a regression.
+        self.spec("slowsrv", graded.replace("online_host 0", "crash"))
+        cp = checkpoint(entry + 'accepted_grades = ["server_frame_time"]\nreason = "one PC"\n')
+        self.assertFalse(cp["met"])
+        self.assertIn("slowsrv (passed before, fails now)", cp["open"])
+
 class JobTest(unittest.TestCase):
     @unittest.skipUnless(winjob.WINDOWS, "job objects are Windows only")
     def test_closing_the_job_ends_its_processes(self) -> None:

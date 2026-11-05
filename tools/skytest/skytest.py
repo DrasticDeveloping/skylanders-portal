@@ -416,6 +416,7 @@ class PeerResult:
     frame_p95_ms: list[float] = field(default_factory=list)  # the frame-time event's windows
     peak_video_mb: int = 0
     graded: dict[str, dict] = field(default_factory=dict)
+    accepted: list[str] = field(default_factory=list)  # grade failures the manifest accepts
 
 
 @dataclass
@@ -643,7 +644,8 @@ def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
 
 
 def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
-             thresholds: dict | None = None, baseline: dict | None = None) -> CaseResult:
+             thresholds: dict | None = None, baseline: dict | None = None,
+             accepted_grades: tuple[str, ...] = ()) -> CaseResult:
     names = list(spec.peers)
     hosted = spec.server == "host"
     # A hosted server is started by its owner H, not by the runner (it is still one of the games).
@@ -736,6 +738,10 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         if spec.grades:
             limit = frame_rate_limit(r.command, run / n / "settings.toml")
             extra = grade_thresholds(spec, r, parsed, thresholds or {}, limit, baseline)
+            # A grade the manifest accepts for this case (plan 5.4: accepted failures with a reason)
+            # is recorded, not failed on; everything else still has to pass.
+            r.accepted = [why for why in extra if why.split(":", 1)[0].removeprefix("grade ") in accepted_grades]
+            extra = [why for why in extra if why not in r.accepted]
             if extra:
                 r.reasons += extra
                 r.status = "fail"
@@ -753,13 +759,19 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
 
 
 def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: list[CaseResult],
-                       touched: list[str] | None = None) -> dict:
+                       touched: list[str] | None = None, before: dict[str, str] | None = None) -> dict:
     """Plan 5.4: a checkpoint is met when every required case of its stage and the earlier ones ran
     and passed, and the run left the owner's data and the disc alone. A capacity result counts only
-    where the manifest says so (capacity_ok). (Not yet: "nothing that passed before fails" and
-    accepted failures; neither exists before stage 1A, which adds them.)"""
+    where the manifest says so (capacity_ok). A grade the manifest accepts for a case
+    (accepted_grades, with a reason) does not fail it; the line names it. A case of any kind that
+    passed in the run before and fails now is open ("nothing that passed before fails")."""
     ran = {r.case: r for r in results}
     open_cases = [f"guard: {folder} changed" for folder in (touched or [])]
+    for case_id, status in (before or {}).items():
+        r = ran.get(case_id)
+        if status == "pass" and r is not None and r.status == "fail":
+            open_cases.append(f"{case_id} (passed before, fails now)")
+    accepted = sorted({f"{r.case}: {why}" for r in results for p in r.peers for why in p.accepted})
     for c in manifest.get("case", []):
         if c.get("kind") != "required" or str(c.get("stage")) not in stages:
             continue
@@ -772,8 +784,11 @@ def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: l
             continue
         elif r.status != "pass":
             open_cases.append(f"{c['id']} ({r.status})")
+    open_cases = list(dict.fromkeys(open_cases))
     line = f"checkpoint {stage}: met" if not open_cases else f"checkpoint {stage}: NOT met: {', '.join(open_cases)}"
-    return {"stage": stage, "met": not open_cases, "open": open_cases, "line": line}
+    if accepted:
+        line += f" (accepted: {'; '.join(accepted)})"
+    return {"stage": stage, "met": not open_cases, "open": open_cases, "accepted": accepted, "line": line}
 
 
 def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: dict, thresholds: dict,
@@ -962,7 +977,9 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     results = []
     for spec in specs:
         print(f"{spec.name} ({spec.layout}) ...", flush=True)
-        r = run_case(cfg, spec, snap, max_games, time.strftime("%Y%m%d-%H%M%S"), thresholds, baseline)
+        entry = next((c for c in manifest.get("case", []) if c.get("id") == spec.name), {})
+        r = run_case(cfg, spec, snap, max_games, time.strftime("%Y%m%d-%H%M%S"), thresholds, baseline,
+                     tuple(entry.get("accepted_grades", [])))
         print(f"  {r.status.upper()}" + (f": {'; '.join(r.reasons)}" if r.reasons else ""), flush=True)
         results.append(r)
     after_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
@@ -974,8 +991,8 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                  and (stages is None or str(c.get("stage")) in stages)] if a.cases in ([], ["all"]) else []
     touched = [g["folder"] for g in guard if not g["unchanged"]]
     full_run = a.cases in ([], ["all"])
-    checkpoint = checkpoint_verdict(manifest, a.stage, stages, results, touched) if a.stage and full_run else None
     before = previous_statuses(cfg, out)
+    checkpoint = checkpoint_verdict(manifest, a.stage, stages, results, touched, before) if a.stage and full_run else None
     payload = {"snapshot": str(snap), "max_games": max_games, "stages": stages, "thresholds": thresholds,
                "guarded_folders": guard, "required_without_spec": unwritten, "checkpoint": checkpoint,
                "cases": [asdict(r) for r in results]}
@@ -1029,6 +1046,11 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
         for key in ("id", "stage", "layout", "kind"):
             if key not in c:
                 problems.append(f"manifest: a case lacks `{key}`: {c}")
+        bad = [g for g in c.get("accepted_grades", []) if g not in GRADES]
+        if bad:
+            problems.append(f"manifest: {c.get('id')}: accepted_grades {bad} are not grades ({', '.join(GRADES)})")
+        if c.get("accepted_grades") and not c.get("reason"):
+            problems.append(f"manifest: {c.get('id')}: accepted_grades need a `reason`")
         if c.get("id") in ids:
             problems.append(f"manifest: {c.get('id')} twice")
         if order and str(c.get("stage")) not in order + ["v1"]:
