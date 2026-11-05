@@ -408,6 +408,70 @@ quit
         self.assertIn("named wrong-file but the case right-name", out.getvalue())
 
 
+    HOSTED = '''layout = "server+2"
+stage = "1A"
+server = "host"
+[peer.H]
+script = """
+online_host 0
+place 0 {figures}/Roller Brawl.dump
+fps 8
+quit
+"""
+[peer.D]
+script = """
+wait 1
+online_join {join}
+fps 8
+quit
+"""
+[peer.S]
+expect = ["Online: starting as the server"]
+'''
+
+    def test_a_hosted_server_is_graded_from_the_owners_session_folder(self) -> None:
+        self.spec("hosted", self.HOSTED)
+        r = self.run_cases("hosted")
+        case = r["cases"][0]
+        self.assertEqual(case["status"], "pass", case)
+        peers = {p["peer"]: p for p in case["peers"]}
+        self.assertEqual(sorted(peers), ["D", "H", "S"])
+        self.assertIsNone(peers["S"]["exit_code"], "the runner did not start the hosted server")
+        self.assertEqual(peers["S"]["command"], [])
+        self.assertEqual(peers["S"]["frame_p95_ms"], [12.0])
+        self.assertEqual(peers["S"]["peak_video_mb"], 410)
+        port = next(a.split("=", 1)[1] for a in peers["H"]["command"] if a.startswith("--online_port="))
+        self.assertTrue(port.isdigit() and int(port) > 0)
+        d_script = (Path(case["folder"]) / "D" / "script.txt").read_text(encoding="utf-8")
+        self.assertIn(f"online_join 127.0.0.1:{port}", d_script)
+        self.assertFalse((Path(case["folder"]) / "S").exists(), "no folder of its own for a hosted server")
+
+    def test_the_server_frame_time_and_client_fps_are_graded(self) -> None:
+        grades = ('\n[grade.server_frame_time]\nafter = "Level watch: tutorial_b: ready"\n'
+                  '[grade.client_fps]\npeer = "H"\n')
+        self.spec("graded", self.HOSTED + grades)
+        case = self.run_cases("graded")["cases"][0]
+        self.assertEqual(case["status"], "pass", case)
+        peers = {p["peer"]: p for p in case["peers"]}
+        self.assertEqual(peers["S"]["graded"]["server_frame_time"]["value_ms"], 12.0)
+        self.assertEqual(peers["S"]["graded"]["server_frame_time"]["windows"], 1, "the empty window does not count")
+        self.assertEqual(peers["H"]["graded"]["client_fps"]["value_fps"], 44.7)
+        # A slow server fails its grade; so does a client under the floor (44.7 < 0.8 x 60).
+        self.spec("slow", self.HOSTED.replace("online_host 0", "serverframes 50\nonline_host 0") + grades)
+        slow = self.run_cases("slow")["cases"][0]
+        self.assertEqual(slow["status"], "fail")
+        s = next(p for p in slow["peers"] if p["peer"] == "S")
+        self.assertTrue(any("p95 50.0 ms over 33 ms" in why for why in s["reasons"]), s["reasons"])
+
+    def test_a_hosted_server_spec_is_checked(self) -> None:
+        self.spec("bad1", 'layout = "solo"\nstage = "1A"\nserver = "host"\n[peer.H]\nscript = "quit\\n"\n')
+        self.spec("bad2", self.HOSTED.replace('expect = ["Online: starting as the server"]',
+                                              'args = ["--x=1"]'))
+        self.spec("bad3", self.HOSTED + '\n[grade.speed]\n')
+        for name in ("bad1", "bad2", "bad3"):
+            with self.assertRaises(skytest.SpecError, msg=name):
+                skytest.load_spec(self.repo / "tests" / "runtime" / f"{name}.toml", 20)
+
 class JobTest(unittest.TestCase):
     @unittest.skipUnless(winjob.WINDOWS, "job objects are Windows only")
     def test_closing_the_job_ends_its_processes(self) -> None:

@@ -2,7 +2,11 @@
 input script's commands fast, and writes the log lines the real game writes.
 
 Extra commands only this fake knows: `hang` (never quits), `crash` (logs a crash and exits 3),
-`exit <code>`. `place` logs the hub as the level, as a figure placed after a save is loaded does."""
+`exit <code>`. `place` logs the hub as the level, as a figure placed after a save is loaded does.
+`online_host` writes a hosted server's log into the session folder as the real owner's game does
+(its frame-time windows with the p95 of `serverframes <ms>`, 12 by default); `online_join <addr>`
+logs the connection when the address has the owner's port."""
+import os
 import sys
 import time
 
@@ -25,6 +29,7 @@ def main() -> int:
 
         line("Skylanders: Swap Force test (build fake123); Windows")
         line(f"Input script: playing '{script_path}'")
+        server_p95 = 12.0
         for raw in open(script_path, encoding="utf-8").read().splitlines():
             cmd, _, rest = raw.strip().partition(" ")
             if not cmd or cmd.startswith("#"):
@@ -46,11 +51,29 @@ def main() -> int:
                 with open(arg("game_data_root") + "/scribble.txt", "w", encoding="utf-8") as f:
                     f.write("x")
             elif cmd == "ownerwrite":  # a game that writes into the owner's data folder
-                import os
                 target = os.path.join(os.environ["USERPROFILE"], "Documents", "Skylanders")
                 os.makedirs(target, exist_ok=True)
                 with open(os.path.join(target, "oops.txt"), "w", encoding="utf-8") as f:
                     f.write("x")
+            elif cmd == "serverframes":
+                server_p95 = float(rest)
+            elif cmd == "online_host":
+                session = os.path.join(arg("user_data_root"), "Online", "session")
+                os.makedirs(session, exist_ok=True)
+                with open(os.path.join(session, "game.log"), "w", encoding="utf-8") as s:
+                    now = time.time()
+                    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)) + ".000"
+                    s.write(f"[{stamp}] [info] [core] [t2] Online: starting as the server\n")
+                    s.write(f"[{stamp}] [info] [core] [t2] Online: frames 0 in 10.0 s (no frame presented)\n")
+                    s.write(f"[{stamp}] [info] [core] [t2] Level watch: tutorial_b: ready (request 1, a player is in it)\n")
+                    s.write(f"[{stamp}] [info] [core] [t2] Online: frames 600 fps 60.0 p50 16.7 p95 {server_p95} "
+                            "max 40.0 private 1500 working 900 video 410\n")
+                line(f"Online: hosting: the server is on port {arg('online_port')}, join code ABCDEFGH")
+            elif cmd == "online_join":
+                if rest.endswith(":" + rest.rsplit(":", 1)[-1]) and rest.rsplit(":", 1)[-1].isdigit():
+                    line(f"Online: online_join: connected to {rest}")
+                else:
+                    line(f"Online: online_join {rest}: no server", "error")
             elif cmd == "hang":
                 time.sleep(3600)
             elif cmd == "crash":
