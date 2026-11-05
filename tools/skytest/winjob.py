@@ -72,6 +72,22 @@ if WINDOWS:
     _k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
     _k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
     _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _ntdll = ctypes.WinDLL("ntdll")
+    _ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    _ntdll.NtResumeProcess.restype = ctypes.c_long
+
+# Popen creationflags: start the process suspended (and in its own process group), so it can join the
+# job before it runs a single instruction; resume() starts it.
+SUSPENDED_START = (0x00000004 | 0x00000200) if WINDOWS else 0  # CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP
+
+
+def resume(proc: subprocess.Popen) -> None:
+    """Let a process started with SUSPENDED_START run."""
+    if not WINDOWS:
+        return
+    status = _ntdll.NtResumeProcess(int(proc._handle))  # noqa: SLF001
+    if status != 0:
+        raise OSError(f"NtResumeProcess failed (NTSTATUS {status & 0xFFFFFFFF:#010x})")
 
 
 class Job:

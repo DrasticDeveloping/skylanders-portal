@@ -155,15 +155,52 @@ quit
         self.assertTrue((a / "game.exe").is_file() and (a / "runtime.dll").is_file())
         self.assertTrue(skytest.inside(a, self.cfg.store))
 
+    def owned(self) -> list[str]:
+        return [f"--{k}=x" for k in skytest.RUNNER_OWNED] + ["--portal_mode=software"]
+
     def test_refusals(self) -> None:
-        with self.assertRaises(SystemExit):
-            skytest.check_args(["--user_data_root=", "--config_file=x", "--portal_mode=software"])
-        with self.assertRaises(SystemExit):
-            skytest.check_args(["--config_file=x", "--portal_mode=software"])  # no data folder
+        skytest.check_args(self.owned())
+        with self.assertRaises(skytest.SpecError):
+            skytest.check_args(self.owned() + ["--audio_mute="])  # an empty setting
+        with self.assertRaises(skytest.SpecError):
+            skytest.check_args(self.owned()[1:])  # no data folder
+        with self.assertRaises(skytest.SpecError):
+            skytest.check_args(self.owned() + ["--user_data_root=C:/owner"])  # a second data folder
+        with self.assertRaises(skytest.SpecError):
+            skytest.check_args(self.owned() + ["--portal_mode=usb"])  # the real portal
         with self.assertRaises(SystemExit):
             skytest.check_output_path(self.cfg, Path(self.tmp.name) / "elsewhere")
         with self.assertRaises(SystemExit):
             skytest.check_output_path(self.cfg, self.cfg.rom / "x")
+
+    def test_a_case_cannot_override_the_runner_settings(self) -> None:
+        self.spec("override", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n'
+                  'args = ["--portal_mode=usb"]\n')
+        case = self.run_cases("override")["cases"][0]
+        self.assertEqual(case["status"], "error")
+        self.assertIn("portal_mode", case["reasons"][0])
+
+    def test_a_game_that_cannot_join_the_job_is_ended(self) -> None:
+        self.spec("nojob", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "hang\\nquit\\n"\n')
+        started = []
+        real_popen, real_add = skytest.subprocess.Popen, winjob.Job.add
+
+        def recording_popen(*args, **kw):
+            p = real_popen(*args, **kw)
+            started.append(p)
+            return p
+
+        def failing_add(self, proc):
+            raise OSError("AssignProcessToJobObject failed")
+
+        skytest.subprocess.Popen, winjob.Job.add = recording_popen, failing_add
+        try:
+            case = self.run_cases("nojob")["cases"][0]
+        finally:
+            skytest.subprocess.Popen, winjob.Job.add = real_popen, real_add
+        self.assertEqual(case["status"], "error")
+        self.assertEqual(len(started), 1)
+        self.assertIsNotNone(started[0].poll(), "the game must not keep running outside the job")
 
     def test_spec_errors(self) -> None:
         bad = {

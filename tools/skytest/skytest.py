@@ -170,15 +170,30 @@ def check_output_path(cfg: Config, path: Path) -> None:
         raise SystemExit(f"refusing to write {path}: inside the disc")
 
 
+# Settings the runner sets for each peer itself. A case or the defaults may not set them again: the
+# game takes the last of two, so a second --user_data_root would point a test at any folder.
+RUNNER_OWNED = ("user_data_root", "cache_root", "config_file", "log_file", "portal_figures_dir",
+                "game_data_root", "input_script")
+
+
 def check_args(args: list[str]) -> None:
     """A setting with an empty value makes the game drop its whole command line (and run on the
-    owner's real data): refuse it, and require the data folder settings."""
+    owner's real data): refuse it. Each runner-owned setting appears exactly once, and the portal is
+    the software one (a real portal would get the test's writes)."""
+    counts: dict[str, int] = {}
     for a in args:
         if a.startswith("--") and a.endswith("="):
-            raise SystemExit(f"refusing an empty setting {a!r}: the game would ignore its whole command line")
-    for need in ("--user_data_root=", "--config_file=", "--portal_mode=software"):
-        if not any(a.startswith(need) for a in args):
-            raise SystemExit(f"refusing to start a game without {need}")
+            raise SpecError(f"refusing an empty setting {a!r}: the game would ignore its whole command line")
+        if a.startswith("--"):
+            key = a[2:].split("=", 1)[0]
+            key = key[3:] if key.startswith("no-") else key
+            counts[key] = counts.get(key, 0) + 1
+    for key in RUNNER_OWNED:
+        if counts.get(key, 0) != 1:
+            raise SpecError(f"refusing to start a game with --{key} set {counts.get(key, 0)} times (the runner"
+                             " sets it once, for the peer's own copy)")
+    if counts.get("portal_mode", 0) != 1 or "--portal_mode=software" not in args:
+        raise SpecError("refusing to start a game without exactly one --portal_mode=software")
 
 
 # --- specs ----------------------------------------------------------------------------------------
@@ -498,12 +513,19 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
                 d, args = prepare_peer(cfg, spec, n, run)
                 cmd = [*cfg.launcher, *args] if cfg.launcher else [str(exe), *args]
                 results[n].command = cmd
-                err = open(d / "stderr.txt", "wb")
-                flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                procs[n] = subprocess.Popen(cmd, cwd=str(d), stdout=subprocess.DEVNULL, stderr=err,
-                                            stdin=subprocess.DEVNULL, creationflags=flags)
-                job.add(procs[n])
-                err.close()
+                # The game starts suspended, joins the job, and only then runs: it never runs outside
+                # the job. If any step fails it is ended before the error goes on.
+                with open(d / "stderr.txt", "wb") as err:
+                    p = subprocess.Popen(cmd, cwd=str(d), stdout=subprocess.DEVNULL, stderr=err,
+                                         stdin=subprocess.DEVNULL, creationflags=winjob.SUSPENDED_START)
+                try:
+                    job.add(p)
+                    winjob.resume(p)
+                except BaseException:
+                    p.kill()
+                    p.wait(timeout=30)
+                    raise
+                procs[n] = p
             started = {n: time.monotonic() for n in names}
             deadline = time.monotonic() + spec.timeout
             while any(p.poll() is None for p in procs.values()) and time.monotonic() < deadline:
@@ -521,7 +543,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
             res.leftover_processes = job.active()
             if res.leftover_processes:
                 job.terminate()
-    except SpecError as e:
+    except (SpecError, OSError) as e:
+        # Every game started so far went with the job when it closed.
         res.status, res.reasons = "error", [str(e)]
         return res
     res.seconds = round(time.monotonic() - t_start, 1)
