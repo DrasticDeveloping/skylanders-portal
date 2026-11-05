@@ -40,6 +40,9 @@ def main() -> int:
             elif cmd == "fps":
                 line("Input script: 44.7 guest FPS (358 frames in 8.00 s), longest frame 27 ms, 0 over 50 ms")
                 line("Input script: memory 3113 MB private, 918 MB working set, 1456 handles")
+            elif cmd == "scribble":  # a game that writes where it must not: into its disc folder
+                with open(arg("game_data_root") + "/scribble.txt", "w", encoding="utf-8") as f:
+                    f.write("x")
             elif cmd == "hang":
                 time.sleep(3600)
             elif cmd == "crash":

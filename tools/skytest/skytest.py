@@ -299,6 +299,21 @@ def load_manifest(cfg: Config) -> dict:
 # --- snapshot and fixtures ------------------------------------------------------------------------
 
 
+def fresh_dir(path: Path) -> Path:
+    """path, or path-2, path-3 ... if a run in the same second already took it."""
+    candidate, n = path, 1
+    while candidate.exists():
+        n += 1
+        candidate = path.with_name(f"{path.name}-{n}")
+    return candidate
+
+
+def check_disc(cfg: Config) -> None:
+    if not (cfg.rom / "default.xex").is_file():
+        raise SystemExit(f"no disc at {cfg.rom} (rom/default.xex): a worktree links the main checkout's disc with"
+                         " `just worktree-setup`")
+
+
 def snapshot_build(cfg: Config) -> Path:
     """Copy the exe and DLLs into the store once per build, so a rebuild during a run changes
     nothing. Runs never start the build folder's exe."""
@@ -499,7 +514,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
         res.status = "capacity"
         res.reasons = [f"needs {len(names)} games at once, this run allows {max_games} (--max-games)"]
         return res
-    run = cfg.store / "runs" / f"{stamp}-{spec.name}"
+    run = fresh_dir(cfg.store / "runs" / f"{stamp}-{spec.name}")
     check_output_path(cfg, run)
     run.mkdir(parents=True)
     res.folder = str(run)
@@ -508,9 +523,12 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
     procs: dict[str, subprocess.Popen] = {}
     results = {n: PeerResult(peer=n) for n in names}
     try:
+        # Every peer's folder first (copies take a moment), then all games start close together, and
+        # a spec error in a later peer starts no game at all.
+        prepared = {n: prepare_peer(cfg, spec, n, run) for n in names}
         with winjob.Job() as job:
             for n in names:
-                d, args = prepare_peer(cfg, spec, n, run)
+                d, args = prepared[n]
                 cmd = [*cfg.launcher, *args] if cfg.launcher else [str(exe), *args]
                 results[n].command = cmd
                 # The game starts suspended, joins the job, and only then runs: it never runs outside
@@ -570,7 +588,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
 
 
 def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: dict, thresholds: dict,
-                 max_games: int) -> None:
+                 max_games: int, guard: list[dict], unwritten: list[str]) -> None:
     lines = [f"# skytest run {out.name}", "", f"At most {max_games} game(s) at once.", ""]
     lines += ["| Case | Layout | Stage | Status | Time | Why |", "|---|---|---|---|---|---|"]
     for r in results:
@@ -596,7 +614,12 @@ def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: di
     ran = {r.case for r in results}
     missing = sorted(c["id"] for c in manifest.get("case", []) if c.get("spec") and c["id"] not in ran)
     if missing:
-        lines += ["", "## Manifest cases not run in this run", "", ", ".join(missing)]
+        lines += ["", "## Manifest cases with a spec, not run in this run", "", ", ".join(missing)]
+    if unwritten:
+        lines += ["", "## Required cases of these stages with no spec yet", "", ", ".join(unwritten)]
+    lines += ["", "## Left alone", "", "| Folder | Files before | Files after | Unchanged |", "|---|---|---|---|"]
+    for g in guard:
+        lines.append(f"| {g['folder']} | {g['before'][0]} | {g['after'][0]} | {'yes' if g['unchanged'] else 'NO'} |")
     lines += ["", f"Thresholds: {cfg.thresholds.name} (version {thresholds.get('version', '?')}); manifest cases: "
               f"{len(written)}."]
     (out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -659,16 +682,55 @@ def default_max_games() -> int:
     return max(1, min(5, cores // 3, int(free_gb // 1.5)))
 
 
-def select(specs: list[Spec], patterns: list[str], stage: str | None) -> list[Spec]:
+def stage_order(manifest: dict) -> list[str]:
+    return [str(x) for x in manifest.get("stages", [])]
+
+
+def stages_up_to(manifest: dict, stage: str) -> list[str]:
+    """A checkpoint grades its stage and every earlier one (plan 5.4): `--stage 1A` means 0, 1-pre, 1A."""
+    order = stage_order(manifest)
+    if stage not in order:
+        raise SystemExit(f"unknown stage {stage!r}; the manifest's order is {order}")
+    return order[: order.index(stage) + 1]
+
+
+def select(specs: list[Spec], patterns: list[str], stages: list[str] | None) -> list[Spec]:
     if not patterns or patterns == ["all"]:
         chosen = list(specs)
     else:
         chosen = [s for s in specs if any(fnmatch.fnmatch(s.name, p) or s.path.stem == p for p in patterns)]
         if not chosen:
             raise SystemExit(f"no case matches {patterns}; `skytest.py list` names them")
-    if stage:
-        chosen = [s for s in chosen if s.stage == stage]
+    if stages is not None:
+        chosen = [s for s in chosen if s.stage in stages]
     return chosen
+
+
+def folder_state(root: Path, skip: tuple[str, ...] = ()) -> tuple[int, float]:
+    """How many files a folder holds and the newest change time, never following a link."""
+    count, newest = 0, 0.0
+    if not root.exists():
+        return 0, 0.0
+    for d, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = [x for x in dirs if not os.path.islink(os.path.join(d, x))]
+        for f in files:
+            if f in skip:
+                continue
+            try:
+                st = os.lstat(os.path.join(d, f))
+            except OSError:
+                continue
+            count += 1
+            newest = max(newest, st.st_mtime)
+    return count, newest
+
+
+def guarded_folders(cfg: Config) -> dict[str, tuple[Path, tuple[str, ...]]]:
+    """What a run must leave alone: the owner's data folders and the disc (whose cachenonce.txt the
+    game itself rewrites at every start)."""
+    out = {f"owner data {r}": (r, ()) for r in owner_data_roots() if r.exists()}
+    out[f"disc {cfg.rom}"] = (cfg.rom.resolve(), ("cachenonce.txt",))
+    return out
 
 
 def janitor_line(cfg: Config) -> None:
@@ -682,16 +744,20 @@ def janitor_line(cfg: Config) -> None:
 
 def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     janitor_line(cfg)
-    specs = select(all_specs(cfg), a.cases, a.stage)
+    manifest = load_manifest(cfg)
+    stages = stages_up_to(manifest, a.stage) if a.stage else None
+    specs = select(all_specs(cfg), a.cases, stages)
     if not specs:
         raise SystemExit("no case to run")
+    check_disc(cfg)
     max_games = a.max_games or default_max_games()
     snap = snapshot_build(cfg)
+    guarded = guarded_folders(cfg)
+    before_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    out = cfg.store / "runs" / f"{stamp}-session"
+    out = fresh_dir(cfg.store / "runs" / f"{stamp}-session")
     check_output_path(cfg, out)
     out.mkdir(parents=True)
-    manifest = load_manifest(cfg)
     thresholds = tomllib.loads(cfg.thresholds.read_text(encoding="utf-8")) if cfg.thresholds.is_file() else {}
     results = []
     for spec in specs:
@@ -699,15 +765,29 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         r = run_case(cfg, spec, snap, max_games, time.strftime("%Y%m%d-%H%M%S"))
         print(f"  {r.status.upper()}" + (f": {'; '.join(r.reasons)}" if r.reasons else ""), flush=True)
         results.append(r)
+    after_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
+    guard = [{"folder": k, "before": before_state[k], "after": after_state[k],
+              "unchanged": before_state[k] == after_state[k]} for k in guarded]
+    # Required cases of the stages run here that have no spec yet: named, never skipped silently.
+    unwritten = [c["id"] for c in manifest.get("case", [])
+                 if c.get("kind") == "required" and not c.get("spec")
+                 and (stages is None or str(c.get("stage")) in stages)] if not a.cases else []
     before = previous_statuses(cfg, out)
-    payload = {"snapshot": str(snap), "max_games": max_games, "thresholds": thresholds,
-               "cases": [asdict(r) for r in results]}
+    payload = {"snapshot": str(snap), "max_games": max_games, "stages": stages, "thresholds": thresholds,
+               "guarded_folders": guard, "required_without_spec": unwritten, "cases": [asdict(r) for r in results]}
     (out / "results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    write_report(cfg, out, results, manifest, thresholds, max_games)
+    write_report(cfg, out, results, manifest, thresholds, max_games, guard, unwritten)
     write_findings(out, results, before)
+    failed = [r for r in results if r.status not in ("pass", "capacity")]
+    capacity = [r for r in results if r.status == "capacity"]
+    touched = [g["folder"] for g in guard if not g["unchanged"]]
+    if touched:
+        print(f"WARNING: changed during the run: {', '.join(touched)}")
+    if capacity:
+        print(f"{len(capacity)} case(s) not run for capacity (a capacity result is reported, not failed):"
+              f" {', '.join(r.case for r in capacity)}")
     print(f"report: {out / 'report.md'}")
-    bad = [r for r in results if r.status not in ("pass",)]
-    return 1 if bad else 0
+    return 1 if failed or touched else 0
 
 
 def cmd_list(cfg: Config, a: argparse.Namespace) -> int:
@@ -727,12 +807,18 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
     for p in sorted(cfg.cases_dir.glob("*.toml")) if cfg.cases_dir.is_dir() else []:
         try:
             s = load_spec(p, cfg.timeout)
+            if s.name != p.stem:
+                problems.append(f"{p.name}: the file is named {p.stem} but the case {s.name}")
             if s.name in specs:
                 problems.append(f"{p.name}: case name {s.name} also in {specs[s.name].path.name}")
             specs[s.name] = s
         except SpecError as e:
             problems.append(str(e))
-    man = load_manifest(cfg).get("case", [])
+    manifest = load_manifest(cfg)
+    man = manifest.get("case", [])
+    order = stage_order(manifest)
+    if man and not order:
+        problems.append("manifest: `stages` (the stage order) is missing")
     ids = set()
     for c in man:
         for key in ("id", "stage", "layout", "kind"):
@@ -740,6 +826,8 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
                 problems.append(f"manifest: a case lacks `{key}`: {c}")
         if c.get("id") in ids:
             problems.append(f"manifest: {c.get('id')} twice")
+        if order and str(c.get("stage")) not in order + ["v1"]:
+            problems.append(f"manifest: {c.get('id')}: stage {c.get('stage')} is not in `stages`")
         ids.add(c.get("id"))
         if c.get("kind") not in ("required", "unsupported", "accepted-failure"):
             problems.append(f"manifest: {c.get('id')}: kind must be required, unsupported or accepted-failure")
@@ -753,6 +841,8 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
             problems.append(f"manifest: {c.get('id')}: has a spec; mark it spec = true")
         if c.get("id") in specs and specs[c["id"]].layout != c.get("layout"):
             problems.append(f"manifest: {c.get('id')}: layout {c.get('layout')} but its spec says {specs[c['id']].layout}")
+        if c.get("id") in specs and specs[c["id"]].stage != str(c.get("stage")):
+            problems.append(f"manifest: {c.get('id')}: stage {c.get('stage')} but its spec says {specs[c['id']].stage}")
     for name in specs:
         if man and name not in ids:
             problems.append(f"{name}: a spec with no manifest entry")

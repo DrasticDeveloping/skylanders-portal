@@ -226,6 +226,89 @@ quit
         self.assertEqual(code, 1)
         self.assertIn("accepted-failure case needs a reason", out.getvalue())
 
+    def test_lint_catches_a_stage_that_drifted(self) -> None:
+        self.spec("ok", 'layout = "solo"\nstage = "1A"\n[peer.H]\nscript = "quit\\n"\n')
+        (self.repo / "tests" / "manifest.toml").write_text(
+            '[[case]]\nid = "ok"\nstage = "0"\nlayout = "solo"\nkind = "required"\nspec = true\n', encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_lint(self.cfg, argparse.Namespace())
+        self.assertEqual(code, 1)
+        self.assertIn("stage 0 but its spec says 1A", out.getvalue())
+
+
+    def test_capacity_alone_does_not_fail_the_run(self) -> None:
+        self.spec("five", 'layout = "server+4"\nstage = "0"\n[peer.all]\n' + self.HUB)
+        r = self.run_cases("five", max_games=2)
+        self.assertEqual(r["cases"][0]["status"], "capacity")
+        self.assertEqual(r["exit"], 0)
+
+    def manifest(self, body: str) -> None:
+        (self.repo / "tests" / "manifest.toml").write_text('stages = ["0", "1-pre", "1A"]\n' + body, encoding="utf-8")
+
+    def test_stage_is_cumulative_and_unwritten_cases_are_named(self) -> None:
+        self.spec("zero", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
+        self.spec("one", 'layout = "solo"\nstage = "1A"\n[peer.H]\nscript = "quit\\n"\n')
+        self.manifest('[[case]]\nid = "zero"\nstage = "0"\nlayout = "solo"\nkind = "required"\nspec = true\n'
+                      '[[case]]\nid = "one"\nstage = "1A"\nlayout = "solo"\nkind = "required"\nspec = true\n'
+                      '[[case]]\nid = "later"\nstage = "1A"\nlayout = "server+1"\nkind = "required"\n')
+        a = argparse.Namespace(cases=[], stage="1A", max_games=5)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_test(self.cfg, a)
+        folder = Path(out.getvalue().strip().splitlines()[-1].split("report: ", 1)[1]).parent
+        results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(c["case"] for c in results["cases"]), ["one", "zero"])
+        self.assertEqual(results["required_without_spec"], ["later"])
+        self.assertIn("later", (folder / "report.md").read_text(encoding="utf-8"))
+        a0 = argparse.Namespace(cases=[], stage="0", max_games=5)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_test(self.cfg, a0)
+        folder = Path(out.getvalue().strip().splitlines()[-1].split("report: ", 1)[1]).parent
+        results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual([c["case"] for c in results["cases"]], ["zero"])
+
+    def test_a_game_writing_into_the_disc_fails_the_run(self) -> None:
+        self.spec("scribble", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "scribble\\nquit\\n"\n')
+        r = self.run_cases("scribble")
+        self.assertEqual(r["exit"], 1)
+        disc = [g for g in r["guarded_folders"] if g["folder"].startswith("disc")]
+        self.assertEqual(len(disc), 1)
+        self.assertFalse(disc[0]["unchanged"])
+
+    def test_a_spec_error_in_a_later_peer_starts_no_game(self) -> None:
+        self.spec("late", 'layout = "server+2"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB +
+                  '[peer.D]\nargs = ["--portal_mode=usb"]\n')
+        started = []
+        real_popen = skytest.subprocess.Popen
+
+        def recording_popen(*args, **kw):
+            p = real_popen(*args, **kw)
+            started.append(p)
+            return p
+
+        skytest.subprocess.Popen = recording_popen
+        try:
+            case = self.run_cases("late")["cases"][0]
+        finally:
+            skytest.subprocess.Popen = real_popen
+        self.assertEqual(case["status"], "error")
+        self.assertEqual(started, [])
+
+    def test_no_disc_is_refused(self) -> None:
+        self.spec("solo", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
+        (self.repo / "rom" / "default.xex").unlink()
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stdout(io.StringIO()):
+                skytest.cmd_test(self.cfg, argparse.Namespace(cases=["solo"], stage=None, max_games=5))
+
+    def test_lint_wants_the_file_named_like_the_case(self) -> None:
+        p = self.repo / "tests" / "runtime" / "wrong-file.toml"
+        p.write_text('name = "right-name"\nlayout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n',
+                     encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_lint(self.cfg, argparse.Namespace())
+        self.assertEqual(code, 1)
+        self.assertIn("named wrong-file but the case right-name", out.getvalue())
+
 
 class JobTest(unittest.TestCase):
     @unittest.skipUnless(winjob.WINDOWS, "job objects are Windows only")
