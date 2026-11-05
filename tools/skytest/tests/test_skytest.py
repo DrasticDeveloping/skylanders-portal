@@ -488,6 +488,23 @@ expect = ["Online: starting as the server"]
         with self.assertRaises(skytest.SpecError):
             skytest.load_spec(self.repo / "tests" / "runtime" / "load2.toml", 20)
 
+    def test_the_fps_floor_follows_the_peers_frame_limit(self) -> None:
+        settings = self.repo / "s.toml"
+        settings.write_text('["Graphics"]\nframe_rate_limit = 30\n', encoding="utf-8")
+        self.assertEqual(skytest.frame_rate_limit([], settings), 30.0)
+        self.assertEqual(skytest.frame_rate_limit(["--frame_rate_limit=120"], settings), 120.0)
+        self.assertEqual(skytest.frame_rate_limit([], self.repo / "missing.toml"), 60.0)
+        settings.write_text('["Graphics"]\nframe_rate_limit = 0\n', encoding="utf-8")
+        self.assertEqual(skytest.frame_rate_limit([], settings), 60.0)
+        # A 30 FPS peer at 25 FPS is over its floor of 21; at 60 it would be under 42.
+        (self.repo / "settings.example").write_text('["Graphics"]\nframe_rate_limit = 30\n', encoding="utf-8")
+        self.cfg = skytest.load_config(self.repo)
+        self.cfg.start_gap = 0.0
+        self.spec("slow30", self.HOSTED + '\n[grade.client_fps]\npeer = "H"\n')
+        h = next(p for p in self.run_cases("slow30")["cases"][0]["peers"] if p["peer"] == "H")
+        self.assertEqual(h["graded"]["client_fps"]["floor_fps"], 21.0)
+        self.assertNotIn("client_fps", " ".join(h["reasons"]))
+
 class JobTest(unittest.TestCase):
     @unittest.skipUnless(winjob.WINDOWS, "job objects are Windows only")
     def test_closing_the_job_ends_its_processes(self) -> None:

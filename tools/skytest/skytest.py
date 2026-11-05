@@ -514,6 +514,27 @@ def lines_after(lines: list[tuple[float | None, str]], after: str | None) -> lis
     return []
 
 
+def frame_rate_limit(args: list[str], settings: Path) -> float:
+    """A peer's own frame limit: its --frame_rate_limit, else its settings file's, else the game's
+    default (60). 0 (no cap) counts as 60, the game's pace at present_interval 1."""
+    value = None
+    for a in args:
+        if a.startswith("--frame_rate_limit="):
+            value = a.split("=", 1)[1]
+    if value is None and settings.is_file():
+        try:
+            for table in tomllib.loads(settings.read_text(encoding="utf-8")).values():
+                if isinstance(table, dict) and "frame_rate_limit" in table:
+                    value = table["frame_rate_limit"]
+        except tomllib.TOMLDecodeError:
+            pass
+    try:
+        limit = float(value) if value is not None else 60.0
+    except (TypeError, ValueError):
+        limit = 60.0
+    return limit if limit > 0 else 60.0
+
+
 def baseline_value(baseline: dict, dotted: str) -> float | None:
     """`solo.hub.hub_load_seconds` in tests/baseline.toml."""
     node = baseline
@@ -713,7 +734,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         r.frame_p95_ms, r.peak_video_mb = parsed["frame_p95"], parsed["video"]
         grade_peer(spec, r, text, parsed)
         if spec.grades:
-            extra = grade_thresholds(spec, r, parsed, thresholds or {}, 60.0, baseline)
+            limit = frame_rate_limit(r.command, run / n / "settings.toml")
+            extra = grade_thresholds(spec, r, parsed, thresholds or {}, limit, baseline)
             if extra:
                 r.reasons += extra
                 r.status = "fail"
