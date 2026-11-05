@@ -84,6 +84,7 @@ class Config:
     settings_template: Path
     default_args: list[str]
     timeout: float
+    start_gap: float
     cases_dir: Path
     manifest: Path
     thresholds: Path
@@ -120,6 +121,7 @@ def load_config(repo: Path) -> Config:
         settings_template=repo / g["settings_template"],
         default_args=list(d.get("args", [])),
         timeout=float(d.get("timeout", 300)),
+        start_gap=float(d.get("start_gap_seconds", 3)),
         cases_dir=repo / c.get("cases", "tests/runtime"),
         manifest=repo / c.get("manifest", "tests/manifest.toml"),
         thresholds=repo / c.get("thresholds", "tests/thresholds.toml"),
@@ -383,6 +385,7 @@ class PeerResult:
     errors: int = 0
     measures: dict[str, float | None] = field(default_factory=dict)
     command: list[str] = field(default_factory=list)
+    started_after_s: float = 0.0
 
 
 @dataclass
@@ -495,6 +498,8 @@ def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
     for rx in expect:
         if not re.search(rx, text, re.M):
             reasons.append(f"log lacks /{rx}/")
+    if any(f == 0.0 for f in parsed["fps"]):
+        reasons.append("presented no frame during an fps window (frozen, or not booted yet)")
     for rx in forbid:
         if m := re.search(rx, text, re.M):
             reasons.append(f"log has forbidden /{rx}/: {m.group(0)[:80]}")
@@ -526,8 +531,13 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
         # Every peer's folder first (copies take a moment), then all games start close together, and
         # a spec error in a later peer starts no game at all.
         prepared = {n: prepare_peer(cfg, spec, n, run) for n in names}
+        started: dict[str, float] = {}
         with winjob.Job() as job:
-            for n in names:
+            for i, n in enumerate(names):
+                if i and cfg.start_gap > 0:
+                    # Games booting in the same instant crashed and froze each other in a test
+                    # (stage 0, five at once); real sessions never start them together either.
+                    time.sleep(cfg.start_gap)
                 d, args = prepared[n]
                 cmd = [*cfg.launcher, *args] if cfg.launcher else [str(exe), *args]
                 results[n].command = cmd
@@ -544,7 +554,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
                     p.wait(timeout=30)
                     raise
                 procs[n] = p
-            started = {n: time.monotonic() for n in names}
+                started[n] = time.monotonic()
+                results[n].started_after_s = round(started[n] - t_start, 1)
             deadline = time.monotonic() + spec.timeout
             while any(p.poll() is None for p in procs.values()) and time.monotonic() < deadline:
                 time.sleep(0.5)

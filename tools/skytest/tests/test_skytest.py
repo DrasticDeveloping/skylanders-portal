@@ -63,6 +63,7 @@ args = ["--portal_mode=software", "--audio_mute=true", "--fullscreen=false"]
 timeout = 20
 """, encoding="utf-8")
         self.cfg = skytest.load_config(self.repo)
+        self.cfg.start_gap = 0.0
         with contextlib.redirect_stdout(io.StringIO()):
             skytest.cmd_fixtures(self.cfg, argparse.Namespace(from_owner=True))
 
@@ -136,6 +137,20 @@ quit
         self.assertTrue(case["peers"][0]["ended_by_runner"])
         self.assertEqual(case["leftover_processes"], 0)
         self.assertEqual(r["exit"], 1)
+
+    def test_a_frozen_game_fails_even_with_its_fps_line(self) -> None:
+        self.spec("frozen", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "fps0\\nquit\\n"\nexpect = ["guest FPS"]\n')
+        p = self.run_cases("frozen")["cases"][0]["peers"][0]
+        self.assertEqual(p["status"], "fail")
+        self.assertTrue(any("no frame" in w for w in p["reasons"]), p["reasons"])
+
+    def test_games_start_a_gap_apart(self) -> None:
+        self.cfg.start_gap = 0.4
+        self.spec("gap", 'layout = "server+2"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB)
+        peers = self.run_cases("gap")["cases"][0]["peers"]
+        offsets = [p["started_after_s"] for p in peers]
+        self.assertEqual(offsets, sorted(offsets))
+        self.assertGreaterEqual(offsets[2] - offsets[0], 0.7)
 
     def test_a_crash_fails_the_case(self) -> None:
         self.spec("crash", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "crash\\nquit\\n"\n')
