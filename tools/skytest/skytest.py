@@ -535,12 +535,23 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
         # a spec error in a later peer starts no game at all.
         prepared = {n: prepare_peer(cfg, spec, n, run) for n in names}
         started: dict[str, float] = {}
+        ended: dict[str, float] = {}  # each game's own end, for its time
+
+        def note_ends() -> None:
+            for name, proc in procs.items():
+                if name not in ended and proc.poll() is not None:
+                    ended[name] = time.monotonic()
+
         with winjob.Job() as job:
             for i, n in enumerate(names):
                 if i and cfg.start_gap > 0:
                     # Games booting in the same instant crashed and froze each other in a test
                     # (stage 0, five at once); real sessions never start them together either.
-                    time.sleep(cfg.start_gap)
+                    # The games already started are watched meanwhile.
+                    gap_end = time.monotonic() + cfg.start_gap
+                    while time.monotonic() < gap_end:
+                        note_ends()
+                        time.sleep(min(0.2, max(0.0, gap_end - time.monotonic())))
                 d, args = prepared[n]
                 cmd = [*cfg.launcher, *args] if cfg.launcher else [str(exe), *args]
                 results[n].command = cmd
@@ -560,11 +571,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
                 started[n] = time.monotonic()
                 results[n].started_after_s = round(started[n] - t_start, 1)
             deadline = time.monotonic() + spec.timeout
-            ended: dict[str, float] = {}
             while len(ended) < len(procs) and time.monotonic() < deadline:
-                for n, p in procs.items():
-                    if n not in ended and p.poll() is not None:
-                        ended[n] = time.monotonic()  # this game's own end, for its time
+                note_ends()
                 time.sleep(0.5)
             for n, p in procs.items():
                 if p.poll() is None:
@@ -605,11 +613,14 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
 # --- reports --------------------------------------------------------------------------------------
 
 
-def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: list[CaseResult]) -> dict:
+def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: list[CaseResult],
+                       touched: list[str] | None = None) -> dict:
     """Plan 5.4: a checkpoint is met when every required case of its stage and the earlier ones ran
-    and passed. A capacity result counts only where the manifest says so (capacity_ok)."""
+    and passed, and the run left the owner's data and the disc alone. A capacity result counts only
+    where the manifest says so (capacity_ok). (Not yet: "nothing that passed before fails" and
+    accepted failures; neither exists before stage 1A, which adds them.)"""
     ran = {r.case: r for r in results}
-    open_cases = []
+    open_cases = [f"guard: {folder} changed" for folder in (touched or [])]
     for c in manifest.get("case", []):
         if c.get("kind") != "required" or str(c.get("stage")) not in stages:
             continue
@@ -821,7 +832,9 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     unwritten = [c["id"] for c in manifest.get("case", [])
                  if c.get("kind") == "required" and not c.get("spec")
                  and (stages is None or str(c.get("stage")) in stages)] if a.cases in ([], ["all"]) else []
-    checkpoint = checkpoint_verdict(manifest, a.stage, stages, results) if a.stage and not a.cases else None
+    touched = [g["folder"] for g in guard if not g["unchanged"]]
+    full_run = a.cases in ([], ["all"])
+    checkpoint = checkpoint_verdict(manifest, a.stage, stages, results, touched) if a.stage and full_run else None
     before = previous_statuses(cfg, out)
     payload = {"snapshot": str(snap), "max_games": max_games, "stages": stages, "thresholds": thresholds,
                "guarded_folders": guard, "required_without_spec": unwritten, "checkpoint": checkpoint,
@@ -831,7 +844,6 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     write_findings(out, results, before)
     failed = [r for r in results if r.status not in ("pass", "capacity")]
     capacity = [r for r in results if r.status == "capacity"]
-    touched = [g["folder"] for g in guard if not g["unchanged"]]
     if touched:
         print(f"WARNING: changed during the run: {', '.join(touched)}")
     if capacity:

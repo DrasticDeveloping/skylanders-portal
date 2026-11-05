@@ -328,6 +328,17 @@ quit
         self.assertIn("(no spec)", " ".join(checkpoint(
             base + 'capacity_ok = true\n[[case]]\nid = "x"\nstage = "0"\nlayout = "solo"\nkind = "required"\n')["open"]))
 
+    def test_a_touched_disc_means_the_checkpoint_is_not_met(self) -> None:
+        self.spec("scribble", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "scribble\\nquit\\n"\n')
+        self.manifest('[[case]]\nid = "scribble"\nstage = "0"\nlayout = "solo"\nkind = "required"\nspec = true\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_test(self.cfg, argparse.Namespace(cases=["all"], stage="0", max_games=5))
+        folder = Path(out.getvalue().strip().splitlines()[-1].split("report: ", 1)[1]).parent
+        cp = json.loads((folder / "results.json").read_text(encoding="utf-8"))["checkpoint"]
+        self.assertEqual(code, 1)
+        self.assertFalse(cp["met"])
+        self.assertTrue(any(o.startswith("guard: disc") for o in cp["open"]), cp["open"])
+
     def test_a_crashed_peer_keeps_its_own_time(self) -> None:
         self.spec("mixed", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 3000\ntimeout = 6\n'
                   '[peer.H]\nscript = "crash\\nquit\\n"\n')
@@ -335,6 +346,13 @@ quit
         self.assertTrue(peers["S"]["ended_by_runner"])
         self.assertLess(peers["H"]["seconds"], peers["S"]["seconds"])
         self.assertLess(peers["H"]["seconds"], 3.0)
+
+    def test_a_peer_that_ends_during_the_start_gaps_keeps_its_own_time(self) -> None:
+        self.cfg.start_gap = 1.0
+        self.spec("early", 'layout = "server+2"\nstage = "0"\nstandin_seconds = 100\n'
+                  '[peer.H]\nscript = "crash\\nquit\\n"\n[peer.D]\nscript = "wait 50\\nquit\\n"\n')
+        peers = {p["peer"]: p for p in self.run_cases("early")["cases"][0]["peers"]}
+        self.assertLess(peers["H"]["seconds"], 0.9)  # it crashed while D was still waiting to start
 
     def test_the_guard_sees_a_rename(self) -> None:
         d = Path(self.tmp.name) / "guarded"
