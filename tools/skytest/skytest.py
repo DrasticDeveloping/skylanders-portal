@@ -563,6 +563,7 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
                 reasons.append(f"grade {gname}: no frame-time window after /{g.get('after', '')}/")
             elif worst > limit:
                 reasons.append(f"grade {gname}: p95 {worst:.1f} ms over {limit:.0f} ms")
+                r.graded[gname]["violation"] = True
         elif gname == "client_fps":
             fraction = float(thresholds.get("client_fps", {}).get("floor_fraction_of_limit", 0.7))
             floor = fraction * settings_limit
@@ -573,6 +574,7 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
                 reasons.append(f"grade {gname}: no fps window after /{g.get('after', '')}/")
             elif worst < floor:
                 reasons.append(f"grade {gname}: {worst:.1f} FPS under the floor {floor:.1f}")
+                r.graded[gname]["violation"] = True
         elif gname == "level_load":
             ratio_max = float(thresholds.get("level_load", {}).get("max_ratio_to_solo", 1.5))
             solo = baseline_value(baseline or {}, g["baseline"])
@@ -585,6 +587,7 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
                 reasons.append(f"grade {gname}: measure {g['measure']} has no value")
             elif ratio > ratio_max:
                 reasons.append(f"grade {gname}: {value:.1f} s is {ratio:.2f}x solo ({solo:.1f} s), over {ratio_max}x")
+                r.graded[gname]["violation"] = True
     return reasons
 
 
@@ -740,7 +743,12 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             extra = grade_thresholds(spec, r, parsed, thresholds or {}, limit, baseline)
             # A grade the manifest accepts for this case (plan 5.4: accepted failures with a reason)
             # is recorded, not failed on; everything else still has to pass.
-            r.accepted = [why for why in extra if why.split(":", 1)[0].removeprefix("grade ") in accepted_grades]
+            # Only a measured violation is accepted: a missing measurement or baseline still fails.
+            def acceptable(why: str) -> bool:
+                gname = why.split(":", 1)[0].removeprefix("grade ")
+                return gname in accepted_grades and bool(r.graded.get(gname, {}).get("violation"))
+
+            r.accepted = [why for why in extra if acceptable(why)]
             extra = [why for why in extra if why not in r.accepted]
             if extra:
                 r.reasons += extra
@@ -769,7 +777,7 @@ def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: l
     open_cases = [f"guard: {folder} changed" for folder in (touched or [])]
     for case_id, status in (before or {}).items():
         r = ran.get(case_id)
-        if status == "pass" and r is not None and r.status == "fail":
+        if status == "pass" and r is not None and r.status in ("fail", "error"):
             open_cases.append(f"{case_id} (passed before, fails now)")
     accepted = sorted({f"{r.case}: {why}" for r in results for p in r.peers for why in p.accepted})
     for c in manifest.get("case", []):

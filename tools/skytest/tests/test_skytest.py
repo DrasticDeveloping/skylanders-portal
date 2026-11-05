@@ -528,6 +528,27 @@ expect = ["Online: starting as the server"]
         self.assertFalse(cp["met"])
         self.assertIn("slowsrv (passed before, fails now)", cp["open"])
 
+    def test_an_accepted_grade_still_needs_its_measurement(self) -> None:
+        # client_fps accepted, but H measures no fps window: that is missing evidence, not accepted.
+        no_fps = self.HOSTED.replace('stage = "1A"', 'stage = "0"').replace("fps 8\nquit", "quit", 1) + \
+            '\n[grade.client_fps]\npeer = "H"\n'
+        self.spec("nofps", no_fps)
+        self.manifest('[[case]]\nid = "nofps"\nstage = "0"\nlayout = "server+2"\nkind = "required"\nspec = true\n'
+                      'accepted_grades = ["client_fps"]\nreason = "one PC"\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_test(self.cfg, argparse.Namespace(cases=[], stage="0", max_games=3))
+        folder = Path(out.getvalue().strip().splitlines()[-1].split("report: ", 1)[1]).parent
+        results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+        self.assertFalse(results["checkpoint"]["met"])
+        h = next(p for p in results["cases"][0]["peers"] if p["peer"] == "H")
+        self.assertEqual(h["accepted"], [])
+        self.assertTrue(any("no fps window" in why for why in h["reasons"]), h["reasons"])
+
+    def test_a_case_that_errors_after_passing_is_a_regression(self) -> None:
+        r = skytest.CaseResult(case="x", layout="solo", stage="0", status="error")
+        cp = skytest.checkpoint_verdict({"case": []}, "0", ["0"], [r], [], {"x": "pass"})
+        self.assertIn("x (passed before, fails now)", cp["open"])
+
 class JobTest(unittest.TestCase):
     @unittest.skipUnless(winjob.WINDOWS, "job objects are Windows only")
     def test_closing_the_job_ends_its_processes(self) -> None:
