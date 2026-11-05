@@ -61,7 +61,7 @@ FPS = re.compile(r"Input script: ([\d.]+) guest FPS \((\d+) frames in ([\d.]+) s
 WHERE = re.compile(r"Where: (\w+) at (-?[\d.]+) (-?[\d.]+) (-?[\d.]+)")
 MEMORY = re.compile(r"Input script: memory (\d+) MB private, (\d+) MB working set")
 BUILD = re.compile(r"\(build (\w+)\)")
-ALWAYS_FORBIDDEN = [r"\] Crash: exception", r"Input script: cannot (parse|use)"]
+ALWAYS_FORBIDDEN = [r"\] Crash: ", r"\[FATAL\]", r"Input script: cannot (parse|use)"]
 
 # The lifecycle script of the stand-in server peer until stage 1A: boots, stays up, quits.
 STANDIN_SERVER_SCRIPT = "wait {seconds}\nfps 5\nquit\n"
@@ -502,7 +502,10 @@ def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
         reasons.append("presented no frame during an fps window (frozen, or not booted yet)")
     for rx in forbid:
         if m := re.search(rx, text, re.M):
-            reasons.append(f"log has forbidden /{rx}/: {m.group(0)[:80]}")
+            start = text.rfind("\n", 0, m.start()) + 1
+            end = text.find("\n", m.end())
+            whole = text[start:end if end != -1 else len(text)].strip()
+            reasons.append(f"log has forbidden /{rx}/: {whole[:160]}")
     for name, m in spec.measures.items():
         if m.get("peer", "H") == r.peer:
             r.measures[name] = measure(parsed["lines"], m.get("from"), m["to"])
@@ -557,7 +560,11 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
                 started[n] = time.monotonic()
                 results[n].started_after_s = round(started[n] - t_start, 1)
             deadline = time.monotonic() + spec.timeout
-            while any(p.poll() is None for p in procs.values()) and time.monotonic() < deadline:
+            ended: dict[str, float] = {}
+            while len(ended) < len(procs) and time.monotonic() < deadline:
+                for n, p in procs.items():
+                    if n not in ended and p.poll() is not None:
+                        ended[n] = time.monotonic()  # this game's own end, for its time
                 time.sleep(0.5)
             for n, p in procs.items():
                 if p.poll() is None:
@@ -568,7 +575,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
                 except subprocess.TimeoutExpired:
                     pass
                 results[n].exit_code = p.returncode
-                results[n].seconds = round(time.monotonic() - started[n], 1)
+                results[n].seconds = round(ended.get(n, time.monotonic()) - started[n], 1)
             res.leftover_processes = job.active()
             if res.leftover_processes:
                 job.terminate()
@@ -598,8 +605,29 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
 # --- reports --------------------------------------------------------------------------------------
 
 
+def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: list[CaseResult]) -> dict:
+    """Plan 5.4: a checkpoint is met when every required case of its stage and the earlier ones ran
+    and passed. A capacity result counts only where the manifest says so (capacity_ok)."""
+    ran = {r.case: r for r in results}
+    open_cases = []
+    for c in manifest.get("case", []):
+        if c.get("kind") != "required" or str(c.get("stage")) not in stages:
+            continue
+        r = ran.get(c["id"])
+        if not c.get("spec"):
+            open_cases.append(f"{c['id']} (no spec)")
+        elif r is None:
+            open_cases.append(f"{c['id']} (not run)")
+        elif r.status == "capacity" and c.get("capacity_ok"):
+            continue
+        elif r.status != "pass":
+            open_cases.append(f"{c['id']} ({r.status})")
+    line = f"checkpoint {stage}: met" if not open_cases else f"checkpoint {stage}: NOT met: {', '.join(open_cases)}"
+    return {"stage": stage, "met": not open_cases, "open": open_cases, "line": line}
+
+
 def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: dict, thresholds: dict,
-                 max_games: int, guard: list[dict], unwritten: list[str]) -> None:
+                 max_games: int, guard: list[dict], unwritten: list[str], checkpoint: dict | None = None) -> None:
     lines = [f"# skytest run {out.name}", "", f"At most {max_games} game(s) at once.", ""]
     lines += ["| Case | Layout | Stage | Status | Time | Why |", "|---|---|---|---|---|---|"]
     for r in results:
@@ -633,6 +661,8 @@ def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: di
         lines.append(f"| {g['folder']} | {g['before'][0]} | {g['after'][0]} | {'yes' if g['unchanged'] else 'NO'} |")
     lines += ["", f"Thresholds: {cfg.thresholds.name} (version {thresholds.get('version', '?')}); manifest cases: "
               f"{len(written)}."]
+    if checkpoint:
+        lines += ["", f"**{checkpoint['line']}**"]
     (out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -717,23 +747,30 @@ def select(specs: list[Spec], patterns: list[str], stages: list[str] | None) -> 
     return chosen
 
 
-def folder_state(root: Path, skip: tuple[str, ...] = ()) -> tuple[int, float]:
-    """How many files a folder holds and the newest change time, never following a link."""
+def folder_state(root: Path, skip: tuple[str, ...] = ()) -> tuple[int, float, str]:
+    """How many files a folder holds, the newest change time, and a hash over every file's relative
+    path, size and change time (a rename or a same-time overwrite shows too); links never followed."""
     count, newest = 0, 0.0
+    h = hashlib.sha256()
     if not root.exists():
-        return 0, 0.0
+        return 0, 0.0, h.hexdigest()
+    entries = []
     for d, dirs, files in os.walk(root, followlinks=False):
         dirs[:] = [x for x in dirs if not os.path.islink(os.path.join(d, x))]
         for f in files:
             if f in skip:
                 continue
+            full = os.path.join(d, f)
             try:
-                st = os.lstat(os.path.join(d, f))
+                st = os.lstat(full)
             except OSError:
                 continue
             count += 1
             newest = max(newest, st.st_mtime)
-    return count, newest
+            entries.append(f"{os.path.relpath(full, root)}|{st.st_size}|{st.st_mtime_ns}")
+    for e in sorted(entries):
+        h.update(e.encode("utf-8", "surrogateescape") + b"\n")
+    return count, newest, h.hexdigest()
 
 
 def guarded_folders(cfg: Config) -> dict[str, tuple[Path, tuple[str, ...]]]:
@@ -784,11 +821,13 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     unwritten = [c["id"] for c in manifest.get("case", [])
                  if c.get("kind") == "required" and not c.get("spec")
                  and (stages is None or str(c.get("stage")) in stages)] if a.cases in ([], ["all"]) else []
+    checkpoint = checkpoint_verdict(manifest, a.stage, stages, results) if a.stage and not a.cases else None
     before = previous_statuses(cfg, out)
     payload = {"snapshot": str(snap), "max_games": max_games, "stages": stages, "thresholds": thresholds,
-               "guarded_folders": guard, "required_without_spec": unwritten, "cases": [asdict(r) for r in results]}
+               "guarded_folders": guard, "required_without_spec": unwritten, "checkpoint": checkpoint,
+               "cases": [asdict(r) for r in results]}
     (out / "results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    write_report(cfg, out, results, manifest, thresholds, max_games, guard, unwritten)
+    write_report(cfg, out, results, manifest, thresholds, max_games, guard, unwritten, checkpoint)
     write_findings(out, results, before)
     failed = [r for r in results if r.status not in ("pass", "capacity")]
     capacity = [r for r in results if r.status == "capacity"]
@@ -798,6 +837,8 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     if capacity:
         print(f"{len(capacity)} case(s) not run for capacity (a capacity result is reported, not failed):"
               f" {', '.join(r.case for r in capacity)}")
+    if checkpoint:
+        print(checkpoint["line"])
     print(f"report: {out / 'report.md'}")
     return 1 if failed or touched else 0
 
@@ -870,7 +911,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("test")
     t.add_argument("cases", nargs="*", help="case names or globs; none or `all` runs every case")
-    t.add_argument("--stage", default=None, help="only the cases of this stage")
+    t.add_argument("--stage", default=None, help="this stage's cases and every earlier stage's (a checkpoint's set)")
     t.add_argument("--max-games", type=int, default=0, help="most games at once (default: from cores and memory)")
     t.set_defaults(fn=cmd_test)
     sub.add_parser("list").set_defaults(fn=cmd_list)

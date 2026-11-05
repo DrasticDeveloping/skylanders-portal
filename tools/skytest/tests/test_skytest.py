@@ -310,6 +310,42 @@ quit
         self.assertEqual(len(touched), 1)
         self.assertIn(str(home), touched[0]["folder"])
 
+    def test_the_checkpoint_line(self) -> None:
+        self.spec("zero", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
+        self.spec("five", 'layout = "server+4"\nstage = "0"\n[peer.all]\n' + self.HUB)
+        base = ('[[case]]\nid = "zero"\nstage = "0"\nlayout = "solo"\nkind = "required"\nspec = true\n'
+                '[[case]]\nid = "five"\nstage = "0"\nlayout = "server+4"\nkind = "required"\nspec = true\n')
+
+        def checkpoint(manifest_body: str) -> dict:
+            self.manifest(manifest_body)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                skytest.cmd_test(self.cfg, argparse.Namespace(cases=[], stage="0", max_games=2))
+            folder = Path(out.getvalue().strip().splitlines()[-1].split("report: ", 1)[1]).parent
+            return json.loads((folder / "results.json").read_text(encoding="utf-8"))["checkpoint"]
+
+        self.assertFalse(checkpoint(base)["met"])  # five only reported capacity
+        self.assertTrue(checkpoint(base + 'capacity_ok = true\n')["met"])
+        self.assertIn("(no spec)", " ".join(checkpoint(
+            base + 'capacity_ok = true\n[[case]]\nid = "x"\nstage = "0"\nlayout = "solo"\nkind = "required"\n')["open"]))
+
+    def test_a_crashed_peer_keeps_its_own_time(self) -> None:
+        self.spec("mixed", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 3000\ntimeout = 6\n'
+                  '[peer.H]\nscript = "crash\\nquit\\n"\n')
+        peers = {p["peer"]: p for p in self.run_cases("mixed")["cases"][0]["peers"]}
+        self.assertTrue(peers["S"]["ended_by_runner"])
+        self.assertLess(peers["H"]["seconds"], peers["S"]["seconds"])
+        self.assertLess(peers["H"]["seconds"], 3.0)
+
+    def test_the_guard_sees_a_rename(self) -> None:
+        d = Path(self.tmp.name) / "guarded"
+        d.mkdir()
+        (d / "a.txt").write_text("1", encoding="utf-8")
+        before = skytest.folder_state(d)
+        (d / "a.txt").rename(d / "b.txt")
+        after = skytest.folder_state(d)
+        self.assertEqual(before[0], after[0])
+        self.assertNotEqual(before, after)
+
     def test_a_game_writing_into_the_disc_fails_the_run(self) -> None:
         self.spec("scribble", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "scribble\\nquit\\n"\n')
         r = self.run_cases("scribble")
