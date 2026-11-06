@@ -609,6 +609,62 @@ int main() {
     CHECK(GenerateGapLinks(mesh, limits).empty());
   }
 
+  // A drop of 25 across a gap of 70: walking off falls 25 long before it is across (the walk-off
+  // reach is 300 / 4 * sqrt(25 / 100) = 37.5), so it is a jump, not a drop. A jump back up too.
+  {
+    const NavMesh mesh(Join(Squares(Row(0, 2)), Shift(Squares(Row(3, 5)), 70, -25)));
+    const std::vector<Link> links = GenerateGapLinks(mesh, limits);
+    CHECK(links.size() == 2);
+    const Link* across = Find(links, 2, 3);
+    const Link* back = Find(links, 3, 2);
+    REQUIRE_OR_RETURN(across && back);
+    CHECK(across->kind == LinkKind::kJump);
+    CHECK(Near(across->takeoff, 3 * S, 0.5f * S, 0.0f));
+    CHECK(Near(across->landing, 3 * S + 70 + limits.min_gap, 0.5f * S, -25.0f));
+    CHECK(back->kind == LinkKind::kJump);
+  }
+
+  // The same gap of 70 with a drop of 300: the fall is long enough to carry the walker across
+  // (the walk-off reach is 129.9, capped at reach / 3 = 100), so a drop; nothing back up.
+  {
+    const NavMesh mesh(Join(Squares(Row(0, 2)), Shift(Squares(Row(3, 5)), 70, -300)));
+    const std::vector<Link> links = GenerateGapLinks(mesh, limits);
+    CHECK(links.size() == 1);
+    const Link* down = Find(links, 2, 3);
+    REQUIRE_OR_RETURN(down);
+    CHECK(down->kind == LinkKind::kDrop);
+  }
+
+  // A drop of 25 across a gap of 30 (at most 2 * min_gap): a drop whatever its height; the way
+  // back up is a jump.
+  {
+    const NavMesh mesh(Join(Squares(Row(0, 2)), Shift(Squares(Row(3, 5)), 30, -25)));
+    const std::vector<Link> links = GenerateGapLinks(mesh, limits);
+    const Link* down = Find(links, 2, 3);
+    const Link* up = Find(links, 3, 2);
+    REQUIRE_OR_RETURN(down && up);
+    CHECK(down->kind == LinkKind::kDrop);
+    CHECK(up->kind == LinkKind::kJump);
+  }
+
+  // Walking lengths: through the midpoints of the shared edges, bounded, and none across a gap.
+  {
+    const NavMesh corridor(Squares(Row(0, 4)));
+    const float along = corridor.WalkLength(0, Center(0, 0), 4, Center(4, 0), 1000.0f);
+    CHECK(std::fabs(along - 4 * S) < 0.01f);
+    CHECK(std::isinf(corridor.WalkLength(0, Center(0, 0), 4, Center(4, 0), 3 * S)));
+    CHECK(std::fabs(corridor.WalkLength(1, {120, 50, 0}, 1, {150, 50, 0}, 100.0f) - 30.0f) < 0.01f);
+    CHECK(std::isinf(corridor.WalkLength(1, {120, 50, 0}, 1, {150, 50, 0}, 20.0f)));
+    CHECK(std::isinf(corridor.WalkLength(0, Center(0, 0), 9, Center(4, 0), 1000.0f)));
+    CHECK(std::isinf(corridor.WalkLength(-1, Center(0, 0), 4, Center(4, 0), 1000.0f)));
+    NavMesh apart(Join(Squares(Row(0, 2)), Squares(Row(5, 7))));
+    CHECK(std::isinf(apart.WalkLength(2, Center(2, 0), 3, Center(5, 0), 1e6f)));
+    // Links do not count: a jump across the gap leaves the walk as it was.
+    apart.AddLinks(GenerateGapLinks(apart, limits));
+    CHECK(apart.IslandCount() == 1);
+    CHECK(std::isinf(apart.WalkLength(2, Center(2, 0), 3, Center(5, 0), 1e6f)));
+  }
+
   // A drop onto the floor under a bridge: a narrow bridge (one square wide, along y) 200 over a
   // wide floor whose edges are nowhere near the bridge's. Walking off its side lands on the floor.
   {

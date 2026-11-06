@@ -592,6 +592,14 @@ int NavMesh::FindArea(const Vec3& p, float max_dz) const {
   return best;
 }
 
+float NavMesh::WalkLength(int from_area, const Vec3& from, int to_area, const Vec3& to,
+                          float bound) const {
+  if (!InRange(from_area, areas_.size()) || !InRange(to_area, areas_.size())) return kInf;
+  if (!Finite(from) || !Finite(to) || !(bound >= 0.0f)) return kInf;
+  WalkSearch walk(areas_);
+  return walk.Length(from_area, from, to_area, to, bound);
+}
+
 bool NavMesh::Symmetric() const {
   for (size_t i = 0; i < areas_.size(); ++i) {
     for (const Edge& e : areas_[i].edges) {
@@ -851,8 +859,13 @@ std::vector<Link> GenerateGapLinks(const NavMesh& mesh, const JumpLimits& limits
       }
       const Vec3 landing =
           mesh.ClosestPointXY(e2.area, q.x - e2.ox * min_gap, q.y - e2.oy * min_gap);
-      const LinkKind kind =
-          dz <= -min_gap && gap <= reach / 3.0f ? LinkKind::kDrop : LinkKind::kJump;
+      // A walk-off only when the fall carries the walker across the gap (the header comment):
+      // reach / 4 * sqrt(drop / up), at most reach / 3; a gap of 2 * min_gap always.
+      const float walk_off =
+          up > 0.0f && dz < 0.0f ? std::min(reach / 3.0f, 0.25f * reach * std::sqrt(-dz / up))
+                                 : 0.0f;
+      const bool walks_off = gap <= 2.0f * min_gap || gap <= walk_off;
+      const LinkKind kind = dz <= -min_gap && walks_off ? LinkKind::kDrop : LinkKind::kJump;
       consider(e1.area, e2.area, takeoff, landing, kind);
     }
   }

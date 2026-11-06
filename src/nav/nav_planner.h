@@ -82,6 +82,14 @@ class NavMesh {
   // True when every neighbor link has its reverse (area i names j across an edge, and j names i
   // across one of its own). A link to an index out of range has no reverse.
   bool Symmetric() const;
+  // The walking length from `from` (a point of from_area) to `to` (a point of to_area) over the
+  // neighbor links only (no Links), searched up to bound: the path runs through the midpoints of
+  // the shared edges (the measure GenerateGapLinks' walk check uses), so it is never shorter than
+  // the straight line. Infinity when it is longer than bound, when walking does not join the two
+  // areas, or when an area is out of range or a point not finite. For a caller that asks whether
+  // a point is a short walk from another, such as a walker that came down near a link's landing
+  // but in the area next to the landing's.
+  float WalkLength(int from_area, const Vec3& from, int to_area, const Vec3& to, float bound) const;
 
   // Adds one-way links to the graph and works out the islands again. A link whose areas are out of
   // range or the same area, or whose points are not finite, is left out. A link keeps its id when
@@ -168,8 +176,12 @@ Plan PlanPath(const NavMesh& mesh, const Vec3& start, const Vec3& goal);
 //   (closer edges touch), and the edges face each other: the jump leaves the first area across its
 //   edge and enters the second across its edge (for edges stacked in xy, the two edges' outward
 //   normals point against each other). The landing is pushed min_gap inside the second area. A
-//   link that goes down by at least min_gap with an xy gap of at most reach / 3 is a kDrop (walk
-//   off), every other one a kJump.
+//   link that goes down by at least min_gap is a kDrop (walk off) when its xy gap is at most
+//   2 * min_gap, or at most the walk-off reach of its drop d, reach / 4 * sqrt(d / up), and never
+//   more than reach / 3; every other link is a kJump. (On one gravity, running off a ledge at the
+//   jump's speed carries the walker reach / 2 * sqrt(d / apex) before it has fallen d; up stands
+//   in for the apex, which is higher, and the jump's held button lowers its gravity, so half of
+//   that is kept. A short drop across a wide gap needs the jump.)
 // - Floors below. From three points of every boundary edge (a quarter, half and three quarters
 //   along), 2 * min_gap straight out, the first floor below (the highest area under that point
 //   lower than the edge by at least min_gap, with no floor within min_gap of the edge's height
