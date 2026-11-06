@@ -9,11 +9,13 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "netplay/lanes.h"
 #include "netplay/transport.h"
 #include "online/protocol.h"
+#include "online/requests.h"
 #include "online/tick.h"
 
 namespace skylanders::online {
@@ -36,10 +38,12 @@ constexpr size_t kMaxUnadmitted = 16;
 // empty), so the bound holds for long datagrams and error reports too.
 constexpr int kMaxReceivePerPump = 4096;
 
-// Both sessions are driven by their owner: Pump(now) every frame receives, answers, resends and
-// times out; nothing runs on a thread of its own. `now` defaults to std::chrono::steady_clock;
-// tests pass the fake network's time. Not thread-safe: all calls from one thread (the game's).
-// Events queue up until the owner takes them with PollEvent.
+// Both sessions are driven by their owner: Pump(now) often (every frame, or every couple of
+// milliseconds on a pump thread) receives, answers, resends and times out; nothing runs on a thread
+// of its own. `now` defaults to std::chrono::steady_clock; tests pass the fake network's time. Not
+// thread-safe: all calls from one thread, the one that pumps it (in the game, session_host's pump
+// thread; the game thread reaches it only through that thread's queue). Events queue up until the
+// owner takes them with PollEvent.
 
 struct ServerSettings {
   uint32_t hz = 60;             // the session tick rate
@@ -53,6 +57,7 @@ enum class LeaveReason : uint8_t {
   kBye,       // it said Bye
   kTimeout,   // nothing from it for kPeerTimeout
   kReplaced,  // the owner connected again from another address
+  kClosed,    // End session's drain is done for it: its finals went out, then S's Bye (version 2)
 };
 
 struct ServerEvent {
@@ -62,6 +67,25 @@ struct ServerEvent {
     kLevelRequest,     // the owner asked for `zone`; `generation` is the barrier it opened
     kBarrierReleased,  // generation, tick (the start tick sent in BarrierGo)
     kRefusalSent,      // refuse_reason, text, name (from the Hello, if any), endpoint, peer_id
+    // Version 2 (stage 1B).
+    kPlayerPose,       // peer_id, pose: only a pose newer than the last from that peer this generation
+    kPlayerAction,     // peer_id, action
+    kRequestReceived,  // peer_id, request (its key's peer set to the sender), before it is decided
+    kEvaluateRequest,  // peer_id, request, generation (the key's): evaluate it on the game thread
+                       // (the authority checks in order, then, if they pass, the replay with
+                       // g_applying set and SendAppliedStep), then hand the result back with
+                       // SubmitEvaluation through the pump thread's queue. The game must drop it
+                       // unrun (no SubmitEvaluation needed) when, as it takes it, its generation is
+                       // not Generation() or Closing() is true: the table has given that key S's
+                       // final already, and a late SubmitEvaluation is dropped anyway. The game
+                       // reads both under the same lock the pump thread holds when it changes them.
+    kDecisionSent,     // peer_id, decision, sent: an answer for the requester. sent false: it did
+                       // not go out (the peer is no longer connected, or its lane's window is
+                       // full); for a final the host logs a warning, since that key's client never
+                       // gets its final decision
+    kPeerClosed,       // peer_id, gone: End session's drain is done for it (finals, then its Bye;
+                       // a kPeerLeft with kClosed follows); gone: its SessionClosed did not come
+                       // within kCloseWait
   };
   Type type = Type::kPeerJoined;
   uint16_t peer_id = 0;
@@ -76,6 +100,12 @@ struct ServerEvent {
   RefuseReason refuse_reason = RefuseReason::kOther;
   std::string text;
   netplay::Endpoint endpoint;
+  PlayerPose pose;
+  PlayerAction action;
+  WorldRequest request;
+  WorldDecision decision;
+  bool gone = false;
+  bool sent = false;  // kDecisionSent
 };
 
 struct PeerInfo {
@@ -87,6 +117,7 @@ struct PeerInfo {
   netplay::Endpoint endpoint;
   std::chrono::microseconds rtt{0};
   TimePoint last_receive{};  // the last datagram from it; kPeerTimeout after this it is dropped
+  netplay::ConnectionStats stats;  // its connection's counters (per-lane bytes included)
 };
 
 // The server side: accepts up to max_clients clients, keeps the peer list, answers pings with the
@@ -99,6 +130,16 @@ struct PeerInfo {
 // while it is open learns the level from its Welcome and is not waited for; a client that leaves
 // is no longer waited for. A new request while one is open replaces it (the old one never
 // releases).
+//
+// Requests (version 2): a client's WorldRequest goes through the request table (requests.h); its
+// answers go back to the requester on the gameplay lane. A key ready to be evaluated comes out as
+// kEvaluateRequest for the game thread, whose result comes back through SubmitEvaluation; only then
+// is the key decided. The table is serviced once per Pump. A new generation first sends the finals
+// the table owes, then LevelLoad, on the same ordered lane. EndSession sends SessionClosing; each
+// client's SessionClosed (or kCloseWait without it) sends that client's finals, then its Bye, and
+// the client leaves (kPeerClosed, then kPeerLeft with kClosed). While closing no Hello is welcomed
+// and no new generation opens. Offline play never starts a ServerSession, so none of this runs
+// there.
 class ServerSession {
  public:
   ServerSession() = default;
@@ -121,7 +162,8 @@ class ServerSession {
   bool PollEvent(ServerEvent& out);
 
   // Opens the next generation for `zone`; returns it (0 if the zone is longer than kMaxZoneBytes
-  // or not UTF-8, or the session is not running).
+  // or not UTF-8, the session is not running, or End session's drain is on: the owner's
+  // LevelRequest is ignored then too).
   uint32_t RequestLevel(std::string_view zone, TimePoint now = Clock::now());
   // The server's own game has the level of `generation` up.
   void MarkServerLoaded(uint32_t generation, TimePoint now = Clock::now());
@@ -139,6 +181,23 @@ class ServerSession {
   // The join code for the bound address and port; bound to every address (0.0.0.0), the machine's
   // primary address (loopback without a network).
   std::string JoinCode() const;
+  // Version 2. The game thread's result for a kEvaluateRequest of `key` (on the pump thread, from
+  // its queue): the decision and what follows go out now. false if it is dropped (the key is no
+  // longer evaluating: its generation ended, End session began, its peer left).
+  bool SubmitEvaluation(const RequestKey& key, const EvaluationResult& result,
+                        TimePoint now = Clock::now());
+  const RequestTable& Requests() const { return requests_; }
+  // To every client: the steps S applied for one request. false if it cannot be encoded.
+  bool SendAppliedStep(const AppliedStep& step, TimePoint now = Clock::now());
+  // To one client: a level end, a reaction. false if `peer` is not connected or it cannot be encoded.
+  bool SendLevelEnd(uint16_t peer, const LevelEnd& end, TimePoint now = Clock::now());
+  bool SendReaction(uint16_t peer, const Reaction& reaction, TimePoint now = Clock::now());
+  // End session's drain: SessionClosing to every client; from now on nothing is applied.
+  void EndSession(TimePoint now = Clock::now());
+  bool Closing() const { return requests_.Closing(); }
+  // Every client that was awaited has closed, been taken as gone, or left: Stop() may follow.
+  bool CloseComplete() const { return requests_.AllClosed(); }
+
   // The connected clients, by peer id.
   std::vector<PeerInfo> Peers() const;
   size_t PeerCount() const;
@@ -167,8 +226,10 @@ class ServerSession {
   void DropPeer(Peer& peer, LeaveReason reason, TimePoint now);
   void CheckBarrier(TimePoint now);
   void BroadcastPlayerList(TimePoint now);
-  void Post(Peer& peer, netplay::Lane lane, const Message& message, TimePoint now);
+  bool Post(Peer& peer, netplay::Lane lane, const Message& message, TimePoint now);
   Peer* FindById(uint16_t id);
+  // Sends what the request table decided, in its order.
+  void FlushRequests(TimePoint now);
 
   std::unique_ptr<netplay::Transport> transport_;
   ServerSettings settings_;
@@ -180,6 +241,7 @@ class ServerSession {
   bool barrier_open_ = false;
   bool server_loaded_ = false;
   std::set<uint16_t> waiting_;
+  RequestTable requests_;
   std::string error_;
 };
 
@@ -208,6 +270,12 @@ struct ClientEvent {
     kLevelLoad,       // generation, zone: load it, then SendLevelLoaded(generation)
     kBarrierGo,       // generation, tick: everyone has the level; it started at that server tick
     kDisconnected,    // disconnect_reason
+    // Version 2 (stage 1B).
+    kWorldDecision,   // decision: S's answer to one of this client's requests
+    kAppliedStep,     // applied: the steps S applied for a request (any requester's)
+    kLevelEnd,        // level_end
+    kReaction,        // reaction
+    kSessionClosing,  // End session: requests stop; SessionClosed went back already
   };
   Type type = Type::kConnected;
   uint16_t peer_id = 0;
@@ -218,6 +286,10 @@ struct ClientEvent {
   std::string text;
   std::vector<PlayerEntry> players;
   DisconnectReason disconnect_reason = DisconnectReason::kTimeout;
+  WorldDecision decision;
+  AppliedStep applied;
+  LevelEnd level_end;
+  Reaction reaction;
 };
 
 // The client side: one server, a ping every kPingInterval for the tick estimate and liveness.
@@ -247,6 +319,17 @@ class ClientSession {
   bool SendLevelRequest(std::string_view zone, TimePoint now = Clock::now());
   // While connected; false otherwise.
   bool SendLevelLoaded(uint32_t generation, TimePoint now = Clock::now());
+  // Version 2, while connected and End session has not begun; false otherwise. The pose goes on
+  // the fast lane, the rest on the gameplay lane. A request's key gets this client's peer id.
+  bool SendPlayerPose(const PlayerPose& pose, TimePoint now = Clock::now());
+  bool SendPlayerAction(const PlayerAction& action, TimePoint now = Clock::now());
+  bool SendWorldRequest(const WorldRequest& request, TimePoint now = Clock::now());
+  // End session began (SessionClosing came): no request leaves this client any more.
+  bool Closing() const { return closing_; }
+  // The connection's counters (per-lane bytes included); all zero with no connection.
+  netplay::ConnectionStats Stats() const {
+    return conn_ ? conn_->Stats() : netplay::ConnectionStats{};
+  }
 
   ClientState State() const { return state_; }
   bool Connected() const { return state_ == ClientState::kConnected; }
@@ -280,6 +363,7 @@ class ClientSession {
   std::string zone_;
   std::vector<PlayerEntry> players_;
   ClientTickEstimator ticks_;
+  bool closing_ = false;
   TimePoint next_ping_{};
   TimePoint closing_since_{};
   std::deque<ClientEvent> events_;

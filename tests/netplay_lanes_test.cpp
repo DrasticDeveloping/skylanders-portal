@@ -254,5 +254,40 @@ int main() {
     CHECK(delivered == 201);
   }
 
+  // The per-lane byte counters: whole datagrams (header included), first sends, resends and acks
+  // apart, on the lane they went on.
+  {
+    Pair p(6);
+    const std::vector<uint8_t> ten(10, 0xAB);
+    const uint64_t datagram = kDatagramHeaderSize + ten.size();
+    CHECK(p.a->Send(Lane::kFast, ten, p.net.Now()) == SendResult::kSent);
+    CHECK(p.a->Stats().Bytes(Lane::kFast).sent == datagram);
+    LinkConditions down;
+    down.loss_percent = 100;
+    p.net.SetLink(kA, kB, down);
+    p.Step();  // the fast datagram went before the link went down
+    CHECK(p.a->Send(Lane::kGameplay, ten, p.net.Now()) == SendResult::kSent);  // lost
+    CHECK(p.a->Stats().Bytes(Lane::kGameplay).sent == datagram);
+    CHECK(p.a->Stats().Bytes(Lane::kGameplay).resent == 0);
+    p.net.ClearLink(kA, kB);
+    for (int i = 0; i < 2000 && p.a->UnackedTotal() > 0; ++i) p.Step();
+    for (int i = 0; i < 10; ++i) p.Step();  // the last acks land
+    CHECK(p.a->UnackedTotal() == 0);
+    const ConnectionStats& sa = p.a->Stats();
+    const ConnectionStats& sb = p.b->Stats();
+    CHECK(sa.Bytes(Lane::kGameplay).sent == datagram);  // one first send
+    CHECK(sa.resent > 0 && sa.Bytes(Lane::kGameplay).resent == sa.resent * datagram);
+    CHECK(sa.Bytes(Lane::kState).sent == 0 && sa.Bytes(Lane::kState).resent == 0);
+    CHECK(sb.Bytes(Lane::kFast).received == datagram);
+    CHECK(sb.Bytes(Lane::kGameplay).received >= datagram);  // at least the resend that landed
+    CHECK(sb.Bytes(Lane::kGameplay).received % datagram == 0);
+    // B acked on the gameplay lane: ack-only datagrams are a header alone.
+    CHECK(sb.acks_sent > 0 && sb.Bytes(Lane::kGameplay).acks == sb.acks_sent * kDatagramHeaderSize);
+    CHECK(sb.Bytes(Lane::kGameplay).sent == 0);
+    CHECK(sa.Bytes(Lane::kGameplay).received == sb.Bytes(Lane::kGameplay).acks);  // no loss back
+    CHECK(sa.BytesSent() == datagram * (2 + sa.resent));
+    CHECK(sb.BytesReceived() == sb.Bytes(Lane::kFast).received + sb.Bytes(Lane::kGameplay).received);
+  }
+
   return Finish("netplay_lanes");
 }

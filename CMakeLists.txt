@@ -40,7 +40,7 @@ if(SKYLANDERS_ALCHEMY_STB)
 endif()
 
 # skylanders_online: Swap Force Online's session (UDP sockets and lanes, the session messages, join
-# codes, the shared tick, the level barrier). Game-independent and without the SDK, so every build
+# codes, the shared tick, the level barrier, the request state machine). Game-independent and without the SDK, so every build
 # mode has it (it stays above the figures-only return below).
 add_library(skylanders_online STATIC
     src/netplay/datagram.cpp
@@ -48,6 +48,7 @@ add_library(skylanders_online STATIC
     src/netplay/udp_socket.cpp
     src/online/join_code.cpp
     src/online/protocol.cpp
+    src/online/requests.cpp
     src/online/session.cpp
     src/online/tick.cpp
 )
@@ -122,7 +123,7 @@ if(SKYLANDERS_PORTAL_TESTS)
     endforeach()
     # The online session (skylanders_online), on the fake network and on loopback UDP.
     foreach(t netplay_datagram_test netplay_lanes_test netplay_udp_socket_test online_protocol_test
-              online_join_code_test online_tick_test online_session_test)
+              online_join_code_test online_tick_test online_session_test online_requests_test)
         add_executable(skylanders_${t} tests/${t}.cpp)
         target_include_directories(skylanders_${t} PRIVATE tests)
         target_link_libraries(skylanders_${t} PRIVATE skylanders_online)
