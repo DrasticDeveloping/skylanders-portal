@@ -753,6 +753,80 @@ void FakeNetworkCloseGone() {
   CHECK(final_sent);
 }
 
+// The scene barrier (item 12): S's open, release and end reach every client in order over a lossy
+// network; each client's ack comes back as kSceneAck with its peer id; a client cannot send S's
+// phases and S cannot send the clients'; after End session no ack is sent or reported.
+void FakeNetworkScenes() {
+  World w(77);
+  LinkConditions c;
+  c.loss_percent = 10;
+  c.duplicate_percent = 5;
+  c.reorder_percent = 10;
+  c.reorder_ms = 15;
+  c.delay_ms = 10;
+  w.net.SetDefault(c);
+  REQUIRE_OR_RETURN_VOID(w.StartServer(Settings()));
+  Client& owner = w.Connect(MakeHello("Owner", true));
+  Client& b = w.Connect(MakeHello("Bee"));
+  CHECK(w.RunUntil([&] { return owner.session->Connected() && b.session->Connected(); }));
+  const uint32_t g1 = w.server.RequestLevel("levels/zone_a", w.net.Now());
+  CHECK(w.RunUntil([&] { return b.session->Generation() == g1 && owner.session->Generation() == g1; }));
+
+  const SceneKey key{1, EntityRef{RefKind::kNone, g1}, NameHash("Tutorial_B_Intro")};
+  const SceneBarrier open{ScenePhase::kOpen, g1, key, SceneKind::kCutscene};
+  SceneBarrier release = open;
+  release.phase = ScenePhase::kRelease;
+  SceneBarrier end = open;
+  end.phase = ScenePhase::kEnd;
+  end.end = SceneEndReason::kNatural;
+  CHECK(w.server.SendSceneBarrier(open, w.net.Now()));
+  CHECK(w.server.SendSceneBarrier(release, w.net.Now()));
+  SceneBarrier ack_phase = open;
+  ack_phase.phase = ScenePhase::kAck;
+  CHECK(!w.server.SendSceneBarrier(ack_phase, w.net.Now()));  // the clients' phase
+  SceneBarrier bad = open;
+  bad.kind = SceneKind(9);
+  CHECK(!w.server.SendSceneBarrier(bad, w.net.Now()));  // not encoded
+  CHECK(w.RunUntil([&] { return owner.Count(CE::kSceneBarrier) == 2 && b.Count(CE::kSceneBarrier) == 2; }));
+  for (Client* cl : {&owner, &b}) {
+    std::vector<SceneBarrier> got;
+    for (const ClientEvent& e : cl->events) {
+      if (e.type == CE::kSceneBarrier) got.push_back(e.scene);
+    }
+    REQUIRE_OR_RETURN_VOID(got.size() == 2);
+    CHECK(got[0] == open && got[1] == release);  // in order: the gameplay lane is ordered
+  }
+
+  // Each client acks with S's key; whatever phase it passes, kAck goes out.
+  CHECK(b.session->SendSceneAck(release, w.net.Now()));
+  CHECK(owner.session->SendSceneAck(open, w.net.Now()));
+  CHECK(w.RunUntil([&] { return w.Count(SE::kSceneAck) == 2; }));
+  w.Run(100ms);
+  CHECK(w.Count(SE::kSceneAck) == 2);  // duplicated datagrams are not reported twice
+  std::vector<uint16_t> ackers;
+  for (const ServerEvent& e : w.server_events) {
+    if (e.type != SE::kSceneAck) continue;
+    ackers.push_back(e.peer_id);
+    CHECK(e.scene.phase == ScenePhase::kAck && e.scene.scene == key && e.scene.generation == g1 &&
+          e.scene.kind == SceneKind::kCutscene);
+  }
+  std::sort(ackers.begin(), ackers.end());
+  CHECK((ackers == std::vector<uint16_t>{kOwnerPeerId, b.session->PeerId()}));
+
+  CHECK(w.server.SendSceneBarrier(end, w.net.Now()));
+  CHECK(w.RunUntil([&] { return owner.Count(CE::kSceneBarrier) == 3 && b.Count(CE::kSceneBarrier) == 3; }));
+  CHECK(b.Last(CE::kSceneBarrier)->scene == end);
+
+  // End session: a client stops acking (SessionClosed was its last message).
+  w.server.EndSession(w.net.Now());
+  CHECK(w.RunUntil([&] { return b.session->Closing(); }));
+  CHECK(!b.session->SendSceneAck(open, w.net.Now()));
+  CHECK(w.RunUntil([&] { return b.session->State() == ClientState::kDisconnected &&
+                                owner.session->State() == ClientState::kDisconnected; }));
+  CHECK(w.Count(SE::kSceneAck) == 2);
+  CHECK(!b.session->SendSceneAck(open, w.net.Now()));  // not connected
+}
+
 // Real UDP sockets on 127.0.0.1 (port 0: any free one), real time.
 void LoopbackSession() {
   ServerSession server;
@@ -830,6 +904,7 @@ int main() {
   FakeNetworkHelloFlood();
   FakeNetworkRequests();
   FakeNetworkCloseGone();
+  FakeNetworkScenes();
   LoopbackSession();
   return Finish("online_session");
 }

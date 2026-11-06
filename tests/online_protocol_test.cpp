@@ -52,7 +52,9 @@ TelegramKey Telegram() {
   return t;
 }
 
-SceneKey Scene() { return SceneKey{1, WorldRef(3, 77, NameHash("Cutscene_01"), NameHash("CEntity"))}; }
+SceneKey Scene() {
+  return SceneKey{1, WorldRef(3, 77, NameHash("Cutscene_01"), NameHash("CEntity")), NameHash("Tutorial_B_Intro")};
+}
 
 std::vector<WorldRequest> SampleRequests() {
   std::vector<WorldRequest> out;
@@ -160,10 +162,11 @@ void Version2RoundTrips() {
     WorldRequest r;
     r.key = TriggerRequestKey(0x0102, 3, WorldRef(3, 0x0A0B0C0D, 0, 0), TriggerEvent::kExit, 0x11);
     const auto b = EncodeMessage(r);
-    REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 2 + 4 + 1 + 17 + 1 + 4 + 17 + 4 + 4);
+    REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 2 + 4 + 1 + 17 + 1 + 4 + 17 + 4 + 4 + 1);
     CHECK(b[0] == 14 && b[4] == 0x02 && b[5] == 0x01 && b[10] == 1 && b[11] == 2);
     CHECK(b[16] == 0x0D && b[19] == 0x0A);       // the mid, little-endian
     CHECK(b[28] == 2 && b[29] == 0x11);          // the event kind, then the enter sequence
+    CHECK(b.back() == 0);                        // item 9: the client's verdict, kPassed
   }
 
   // The key builders fill only their kind's fields.
@@ -175,6 +178,83 @@ void Version2RoundTrips() {
   CHECK(NameHash("a") == 0xE40C292Cu);  // FNV-1a test vector
   CHECK(std::string(RefusalReasonName(RefusalReason::kTooFar)) == "too_far");
   CHECK(std::string(RefusalReasonName(RefusalReason::kExitBeforeEnter)) == "exit before enter");
+}
+
+// Stage 1B item 9: the client's verdict on a trigger request (amendment l 3.3), and the two refusals
+// amendment l adds.
+void Version2Item9() {
+  for (TriggerChecks c : {TriggerChecks::kPassed, TriggerChecks::kCooldown, TriggerChecks::kAccept,
+                          TriggerChecks::kAct, TriggerChecks::kTouchFlag, TriggerChecks::kNotRun}) {
+    WorldRequest r = SampleRequests()[0];
+    r.checks = c;
+    CHECK(RoundTrip(r));
+  }
+  CHECK(std::string(TriggerChecksName(TriggerChecks::kTouchFlag)) == "touch flag");
+  CHECK(std::string(TriggerChecksName(TriggerChecks::kNotRun)) == "not run");
+  // A request written before item 9 (no trailing byte) reads as kPassed.
+  {
+    WorldRequest r = SampleRequests()[1];
+    r.checks = TriggerChecks::kPassed;
+    std::vector<uint8_t> b = EncodeMessage(r);
+    REQUIRE_OR_RETURN_VOID(b.size() > kMessageHeaderSize);
+    b.pop_back();
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);  // the length (under 256 here)
+    b[3] = 0;
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<WorldRequest>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    CHECK(*got == r);
+  }
+  // A verdict past kNotRun is neither encoded nor decoded.
+  {
+    WorldRequest r = SampleRequests()[0];
+    r.checks = TriggerChecks(6);
+    CHECK(EncodeMessage(r).empty());
+    r.checks = TriggerChecks::kNotRun;
+    std::vector<uint8_t> b = EncodeMessage(r);
+    REQUIRE_OR_RETURN_VOID(!b.empty());
+    b.back() = 6;
+    CHECK(!DecodeMessages(b));
+  }
+  // A later field after the verdict is ignored, as for any message.
+  {
+    WorldRequest r = SampleRequests()[2];
+    r.checks = TriggerChecks::kAct;
+    std::vector<uint8_t> b = EncodeMessage(r);
+    b.push_back(0x5A);
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    CHECK((*back)[0] == Message{r});
+  }
+  CHECK(std::string(RefusalReasonName(RefusalReason::kAlreadyFired)) == "already fired");
+  CHECK(std::string(RefusalReasonName(RefusalReason::kNotActivated)) == "not activated");
+  for (RefusalReason reason : {RefusalReason::kAlreadyFired, RefusalReason::kNotActivated}) {
+    WorldDecision d;
+    d.key = SampleRequests()[0].key;
+    d.outcome = DecisionOutcome::kRefused;
+    d.reason = reason;
+    d.final = true;
+    CHECK(RoundTrip(d));
+  }
+  // A reason past the ones this version knows still reads as "other".
+  {
+    WorldDecision d;
+    d.key = SampleRequests()[0].key;
+    d.outcome = DecisionOutcome::kRefused;
+    d.reason = RefusalReason::kNotActivated;
+    d.final = true;
+    std::vector<uint8_t> b = EncodeMessage(d);
+    REQUIRE_OR_RETURN_VOID(b.size() > 8);
+    // outcome, reason, flags, then the applied sequence (u32) end the message.
+    b[b.size() - 6] = 17;
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<WorldDecision>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    CHECK(got->reason == RefusalReason::kOther);
+  }
 }
 
 void Version2Limits() {
@@ -333,6 +413,8 @@ void Version2Limits() {
     all.push_back(Reaction{1, 2, SelfRef(2), ReactionOutcome::kRefused});
     all.push_back(SessionClosing{});
     all.push_back(SessionClosed{});
+    all.push_back(SceneBarrier{ScenePhase::kOpen, 2, Scene(), SceneKind::kConversation});
+    all.push_back(SceneBarrier{ScenePhase::kEnd, 2, Scene(), SceneKind::kCutscene, SceneEndReason::kNatural, 3});
     std::vector<size_t> ends;
     for (const Message& m : all) {
       CHECK(EncodeMessage(m, b));
@@ -345,6 +427,90 @@ void Version2Limits() {
       const bool at_end = std::find(ends.begin(), ends.end(), n) != ends.end();
       CHECK(DecodeMessages(std::span<const uint8_t>(b.data(), n)).has_value() == at_end);
     }
+  }
+}
+
+// The scene barrier (item 12) and the skip key's check field (amendment g).
+void Version2Scenes() {
+  // Every phase and kind survives a round trip; a level-load scene has no recipient (kNone).
+  const SceneKey loaded{1, EntityRef{RefKind::kNone, 2}, NameHash("Tutorial_B_Intro")};
+  for (ScenePhase p : {ScenePhase::kOpen, ScenePhase::kAck, ScenePhase::kRelease}) {
+    CHECK(RoundTrip(SceneBarrier{p, 2, loaded, SceneKind::kCutscene}));
+    CHECK(RoundTrip(SceneBarrier{p, 2, Scene(), SceneKind::kConversation}));
+  }
+  for (SceneEndReason e : {SceneEndReason::kNatural, SceneEndReason::kStop, SceneEndReason::kLevelChange,
+                           SceneEndReason::kOther}) {
+    CHECK(RoundTrip(SceneBarrier{ScenePhase::kEnd, 2, loaded, SceneKind::kCutscene, e, 0}));
+  }
+  CHECK(RoundTrip(SceneBarrier{ScenePhase::kEnd, 2, Scene(), SceneKind::kConversation, SceneEndReason::kNatural, 255}));
+  CHECK((TypeOf(Message{SceneBarrier{}}) == MessageType::kSceneBarrier));
+  CHECK(std::string(SceneEndReasonName(SceneEndReason::kLevelChange)) == "level change");
+
+  // The wire layout: type 21, phase, generation, sequence, the ref (17), name hash, kind, end, skips.
+  {
+    const auto b = EncodeMessage(SceneBarrier{ScenePhase::kRelease, 0x0A0B0C0D, loaded, SceneKind::kConversation});
+    REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 1 + 4 + 4 + 17 + 4 + 1 + 1 + 1);
+    CHECK(b[0] == 21 && b[1] == 0 && b[2] == 33 && b[3] == 0);
+    CHECK(b[4] == uint8_t(ScenePhase::kRelease));
+    CHECK(b[5] == 0x0D && b[8] == 0x0A);              // the generation, little-endian
+    CHECK(b[9] == 1);                                  // the scene sequence
+    CHECK(b[13] == uint8_t(RefKind::kNone));           // the recipient's kind
+    const uint32_t hash = NameHash("Tutorial_B_Intro");
+    CHECK(b[30] == uint8_t(hash) && b[33] == uint8_t(hash >> 24));
+    CHECK(b[34] == uint8_t(SceneKind::kConversation) && b[35] == 0 && b[36] == 0);
+  }
+
+  // Not encoded: an unknown phase or kind, an end reason outside kEnd (or none in it), skips
+  // outside kEnd, a recipient ref with stray fields.
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase(0), 2, loaded, SceneKind::kCutscene}).empty());
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase(5), 2, loaded, SceneKind::kCutscene}).empty());
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase::kOpen, 2, loaded, SceneKind(3)}).empty());
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase::kOpen, 2, loaded, SceneKind::kCutscene, SceneEndReason::kStop}).empty());
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase::kEnd, 2, loaded, SceneKind::kCutscene, SceneEndReason::kNone}).empty());
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase::kAck, 2, loaded, SceneKind::kCutscene, SceneEndReason::kNone, 1}).empty());
+  SceneKey stray = loaded;
+  stray.recipient.mid = 9;
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase::kOpen, 2, stray, SceneKind::kCutscene}).empty());
+
+  // Decoded with the same checks: patch valid bytes into invalid ones.
+  {
+    auto b = EncodeMessage(SceneBarrier{ScenePhase::kEnd, 2, loaded, SceneKind::kCutscene, SceneEndReason::kStop, 1});
+    REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 33);
+    const size_t phase = kMessageHeaderSize, kind = kMessageHeaderSize + 30, end = kind + 1;
+    CHECK(DecodeMessages(b).has_value());
+    b[phase] = 6;
+    CHECK(!DecodeMessages(b).has_value());
+    b[phase] = uint8_t(ScenePhase::kEnd);
+    b[kind] = 0;
+    CHECK(!DecodeMessages(b).has_value());
+    b[kind] = uint8_t(SceneKind::kCutscene);
+    b[end] = 200;  // an unknown end reason reads as other
+    auto r = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(r && r->size() == 1);
+    CHECK(std::get<SceneBarrier>((*r)[0]).end == SceneEndReason::kOther);
+    b[phase] = uint8_t(ScenePhase::kOpen);  // an open with an end reason
+    CHECK(!DecodeMessages(b).has_value());
+  }
+
+  // The name hash is part of a skip's key: the same occurrence with another name is another key,
+  // and it survives the round trip in requests, decisions and applied steps.
+  SceneKey other = Scene();
+  other.name_hash = NameHash("conversation");
+  CHECK(SkipRequestKey(1, 3, Scene(), 2) != SkipRequestKey(1, 3, other, 2));
+  WorldRequest skip;
+  skip.key = SkipRequestKey(1, 3, other, 2);
+  CHECK(RoundTrip(skip));
+  {
+    auto b = EncodeMessage(skip);
+    // peer, generation, kind, then sequence, the ref, the name hash, the skip sequence; then the
+    // subject, the event bits, the pose and (item 9) the client's verdict byte.
+    const size_t hash = kMessageHeaderSize + 2 + 4 + 1 + 4 + 17;
+    REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 2 + 4 + 1 + 4 + 17 + 4 + 4 + 17 + 4 + 4 + 1);
+    CHECK(b[hash] == uint8_t(other.name_hash) && b[hash + 3] == uint8_t(other.name_hash >> 24));
+    b[hash] ^= 1;
+    auto r = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(r && r->size() == 1);
+    CHECK(std::get<WorldRequest>((*r)[0]).key != skip.key);
   }
 }
 
@@ -498,7 +664,9 @@ int main() {
   }
 
   Version2RoundTrips();
+  Version2Item9();
   Version2Limits();
+  Version2Scenes();
 
   return Finish("online_protocol");
 }

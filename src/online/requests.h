@@ -94,9 +94,15 @@ bool IsRetryable(const RequestKey& key, RefusalReason reason);
 // the AppliedStep it sent); anything else: refused for that reason (retryable or terminal by
 // IsRetryable). A refusal converts implicitly, so SubmitEvaluation(key, RefusalReason::kTooFar)
 // reads as one; EvaluationResult::Applied(sequence) is the pass.
+//
+// `server_final` (stage 1B item 9, amendment l 3.5): S made the refusal final itself, at the end of
+// its own wait (its 2 s retry bound on a single-fire trigger): the key is refused with S's final
+// (`final <key> refused (<reason>)`) even for a reason that is otherwise retryable, since the client
+// never resends a single-fire key. Ignored for a pass.
 struct EvaluationResult {
   RefusalReason reason = RefusalReason::kNone;
   uint32_t applied_sequence = 0;
+  bool server_final = false;
 
   EvaluationResult() = default;
   // NOLINTNEXTLINE(google-explicit-constructor): implicit on purpose
@@ -104,6 +110,11 @@ struct EvaluationResult {
   static EvaluationResult Applied(uint32_t sequence) {
     EvaluationResult r;
     r.applied_sequence = sequence;
+    return r;
+  }
+  static EvaluationResult ServerFinal(RefusalReason refused) {
+    EvaluationResult r(refused);
+    r.server_final = true;
     return r;
   }
 };

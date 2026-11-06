@@ -1777,6 +1777,13 @@ void SceneSkips() {
   const auto ds = h.Decisions(second.key);
   REQUIRE_OR_RETURN_VOID(ds.size() == 3);
   CHECK(Refused(ds[1], RR::kSceneEnded, true) && Refused(ds[2], RR::kSceneEnded, true, false, true));
+  // The scene's name hash is the key's check field (amendment g): the same sequence, recipient and
+  // skip sequence with another name is its own key, evaluated on its own.
+  WorldRequest renamed = skip;
+  renamed.key.scene.name_hash ^= 1;
+  CHECK(renamed.key != skip.key);
+  h.Send(renamed);
+  CHECK(h.Applies(renamed.key) == 1 && h.Applies(skip.key) == 1);
   EndAndCheck(h);
 }
 
@@ -1819,6 +1826,166 @@ void ForgetPeer() {
   g.Send(r);
   CHECK(g.Applies(r.key) == 1);
   EndAndCheck(g);
+}
+
+// Stage 1B item 9, amendment l (docs/online-1B-amendment-l.md 3.9): the two terminal refusals it
+// adds, and S's own waits. S's waits (the lock, a deferral, `not released` for an exit or a
+// single-fire key, S's own retry on a single-fire trigger) keep the key evaluating: the game thread
+// holds its kEvaluate and submits only the key's one decision, so the table sees one long
+// evaluation (server/requests.cpp in the game). These cells check what the table does around it.
+
+// already fired and not activated are terminal for every kind; an enter refused either way refuses
+// its exit `enter refused` (never `already fired`), and its touch the same.
+void AmendmentLTerminalRefusals() {
+  for (RR reason : {RR::kAlreadyFired, RR::kNotActivated}) {
+    for (K k : kAllKinds) CHECK(!IsRetryable(Make(k, 1, 1, 1).key, reason));
+    H h;
+    h.Pose(kSeen);
+    const WorldRequest enter = Make(K::kEnter, 1, 1, kSeen);
+    h.verdicts[enter.key] = reason;
+    size_t mark = h.Mark();
+    h.Send(enter);
+    WorldDecision d;
+    CHECK(Decided(h, enter, mark, &d) && Refused(d, reason, true));
+    CHECK(h.State(enter) == RS::kRefused);
+    const WorldRequest touch = Make(K::kTouch, 1, 1, kSeen);
+    mark = h.Mark();
+    h.Send(touch);
+    CHECK(One(h, touch, mark, &d) && Refused(d, RR::kEnterRefused, true));
+    const WorldRequest exit = Make(K::kExit, 1, 1, kSeen);
+    mark = h.Mark();
+    h.Send(exit);
+    CHECK(One(h, exit, mark, &d) && Refused(d, RR::kEnterRefused, true));
+    CHECK(h.Evaluations(exit.key) == 0 && h.Evaluations(touch.key) == 0);
+    // A duplicate gets the cached refusal, no second evaluation.
+    mark = h.Mark();
+    h.Send(enter);
+    CHECK(One(h, enter, mark, &d) && Refused(d, reason, true, false, true));
+    CHECK(h.Evaluations(enter.key) == 1);
+    EndAndCheck(h);
+  }
+  // Two peers against one single-fire trigger: the first applied, the second `already fired`.
+  H h;
+  h.Pose(kSeen);
+  h.Pose(kSeen, kOther);
+  const WorldRequest first = Make(K::kEnter, 1, 1, kSeen);
+  const WorldRequest second = Make(K::kEnter, 1, 1, kSeen, kOther);
+  h.verdicts[second.key] = RR::kAlreadyFired;
+  h.Send(first);
+  h.Send(second);
+  CHECK(h.State(first) == RS::kApplied && h.State(second) == RS::kRefused);
+  EndAndCheck(h);
+}
+
+// S holds an enter's evaluation (a lock wait, then the replay): the key stays pending with no pose
+// timeout, the client's resends are answered `pending` from the cache, the same peer's later key
+// waits its turn and is not refused too_far meanwhile, and the one decision comes when S submits.
+void SOwnWaitHoldsTheEvaluation() {
+  H h;
+  h.game = false;
+  h.Pose(kSeen);
+  const WorldRequest enter = Make(K::kEnter, 1, 1, kSeen);
+  h.Send(enter);
+  CHECK(h.Evaluating(enter));
+  const WorldRequest other = Make(K::kEnter, 1, 2, kSeen);  // another enter sequence of the same peer
+  h.Send(other);
+  CHECK(h.State(other) == RS::kPending && !h.Evaluating(other));
+  for (int i = 0; i < 30; ++i) h.Wait(100ms);  // 3 s: longer than the pose and held-exit waits
+  CHECK(h.Evaluating(enter) && h.State(other) == RS::kPending);
+  size_t mark = h.Mark();
+  h.Send(enter);  // the client's resend while S waits
+  WorldDecision d;
+  CHECK(One(h, enter, mark, &d) && Pending(d, true));
+  // Its exit arrives meanwhile: held behind the pending enter.
+  const WorldRequest exit = Make(K::kExit, 1, 1, kSeen);
+  h.Send(exit);
+  CHECK(h.State(exit) == RS::kHeld);
+  for (int i = 0; i < 10; ++i) h.Wait(100ms);
+  CHECK(h.State(exit) == RS::kHeld);  // not `exit before enter`: its enter exists
+  mark = h.Mark();
+  CHECK(h.Submit(enter.key));
+  CHECK(Decided(h, enter, mark, &d) && Applied(d));
+  // The exit goes to its own evaluation after the enter, then the other key.
+  CHECK(h.Evaluating(exit) || h.Evaluating(other));
+  while (!h.asked.empty()) h.Submit(h.asked.front());
+  CHECK(h.State(exit) == RS::kApplied && h.State(other) == RS::kApplied);
+  EndAndCheck(h);
+}
+
+// A held evaluation across a generation change, and across End session: S's final (generation
+// ended, session ended), and S's late submit is dropped (one final decision). For an enter and for
+// an exit (an exit is never lost to a wait, but the generation's end closes it).
+void SOwnWaitAcrossGenerationAndEndSession() {
+  for (K k : {K::kEnter, K::kExit}) {
+    H h;
+    h.game = false;
+    Prereq(h, k, 1);
+    while (!h.asked.empty()) h.Submit(h.asked.front());
+    const WorldRequest r = Make(k, 1, 1, kSeen);
+    h.Send(r);
+    REQUIRE_OR_RETURN_VOID(h.Evaluating(r));
+    for (int i = 0; i < 20; ++i) h.Wait(100ms);
+    const size_t mark = h.Mark();
+    h.NewGeneration();
+    WorldDecision d;
+    CHECK(One(h, r, mark, &d) && Refused(d, RR::kGenerationEnded, true, true));
+    CHECK(!h.Submit(r.key));  // the replay that came too late is dropped
+    CHECK(h.Applies(r.key) == 0);
+    EndAndCheck(h);
+  }
+  for (K k : {K::kEnter, K::kExit}) {
+    H h;
+    h.game = false;
+    Prereq(h, k, 1);
+    while (!h.asked.empty()) h.Submit(h.asked.front());
+    const WorldRequest r = Make(k, 1, 1, kSeen);
+    h.Send(r);
+    REQUIRE_OR_RETURN_VOID(h.Evaluating(r));
+    h.Close();
+    CHECK(!h.Submit(r.key));
+    h.Closed();
+    WorldDecision d;
+    const auto ds = h.Decisions(r.key);
+    REQUIRE_OR_RETURN_VOID(!ds.empty());
+    d = ds.back();
+    CHECK(Refused(d, RR::kSessionEnded, true, true));
+    CheckInvariants(h);
+  }
+}
+
+// S's 2 s retry bound on a single-fire key (amendment l 3.5): S submits the last retryable reason as
+// its own final; the key is refused for good (no retry state, no resend expected), its exit
+// `enter refused`.
+void SOwnRetryBoundIsFinal() {
+  H h;
+  h.game = false;
+  h.Pose(kSeen);
+  const WorldRequest enter = Make(K::kEnter, 1, 1, kSeen);
+  h.Send(enter);
+  REQUIRE_OR_RETURN_VOID(h.Evaluating(enter));
+  for (int i = 0; i < 20; ++i) h.Wait(100ms);
+  size_t mark = h.Mark();
+  h.asked.clear();
+  CHECK(h.table.SubmitEvaluation(enter.key, EvaluationResult::ServerFinal(RR::kTooFar), h.now));
+  h.Take();
+  WorldDecision d;
+  CHECK(One(h, enter, mark, &d) && Refused(d, RR::kTooFar, true, true));
+  CHECK(h.State(enter) == RS::kRefused);
+  const WorldRequest exit = Make(K::kExit, 1, 1, kSeen);
+  mark = h.Mark();
+  h.Send(exit);
+  CHECK(One(h, exit, mark, &d) && Refused(d, RR::kEnterRefused, true));
+  // A pass ignores the flag.
+  const WorldRequest other = Make(K::kEnter, 1, 2, kSeen);
+  h.Send(other);
+  EvaluationResult pass = EvaluationResult::Applied(7);
+  pass.server_final = true;
+  mark = h.Mark();
+  h.asked.clear();
+  CHECK(h.table.SubmitEvaluation(other.key, pass, h.now));
+  h.Take();
+  CHECK(One(h, other, mark, &d) && Applied(d));
+  EndAndCheck(h);
 }
 
 void Retryable() {
@@ -1913,5 +2080,10 @@ int main() {
   GenerationFinalsInOrder();
   ForgetPeer();
   Retryable();
+  // Item 9, amendment l.
+  AmendmentLTerminalRefusals();
+  SOwnWaitHoldsTheEvaluation();
+  SOwnWaitAcrossGenerationAndEndSession();
+  SOwnRetryBoundIsFinal();
   return Finish("online_requests");
 }

@@ -59,6 +59,7 @@ enum class MessageType : uint16_t {
   kReaction = 18,
   kSessionClosing = 19,
   kSessionClosed = 20,
+  kSceneBarrier = 21,
 };
 
 enum class RefuseReason : uint8_t {
@@ -200,10 +201,15 @@ struct TelegramKey {
 };
 
 // A scene occurrence (design: Scenes): the request key's generation, the scene's sequence number on
-// S in that generation, and the scene message's recipient.
+// S in that generation, and the scene message's recipient. `name_hash` is the check field
+// (docs/online-1B.md, amendment g): NameHash of the cutscene's name (the instance's +44), or of
+// "conversation" for a conversation. It is part of the key, so a skip that names another scene than
+// S's occurrence with that sequence and recipient is another key, and S finds no open occurrence
+// for it (`scene ended`).
 struct SceneKey {
   uint32_t scene_sequence = 0;
   EntityRef recipient;
+  uint32_t name_hash = 0;
   auto operator<=>(const SceneKey&) const = default;
 };
 
@@ -227,8 +233,8 @@ enum class TriggerEvent : uint8_t {
 //   trigger:   (peer, trigger, event kind, the client's enter sequence, generation); an exit and a
 //              touch carry the enter sequence of the enter they belong to
 //   telegram:  (peer, the peer's request sequence in the generation, telegram key, generation)
-//   skip:      (peer, scene occurrence (generation, scene sequence, recipient), the peer's skip
-//              sequence in the generation)
+//   skip:      (peer, scene occurrence (generation, scene sequence, recipient, name hash), the
+//              peer's skip sequence in the generation)
 // The server overwrites `peer` with the sender's peer id, so a client cannot speak for another.
 struct RequestKey {
   uint16_t peer = 0;
@@ -287,15 +293,36 @@ struct PlayerAction {
   bool operator==(const PlayerAction&) const = default;
 };
 
+// The client's own verdict on a trigger event (docs/online-1B-amendment-l.md 3.3): the trigger's
+// checks it ran read-only with its own hero, in the game's order per kind (enter: the +784
+// cooldown, the accept, the act check; exit: the accept, the act check; touch: flag 23, the
+// accept), only when the event's r6 has 0x20. kPassed: all passed; one of the four: the check that
+// refused (the key is made anyway because the volume's r7 has a list or delegate set for the
+// event); kNotRun: r6 has no 0x20, so no check runs natively. S answers each check under its
+// replay token as the client did. On the wire a trailing byte (stage 1B item 9): a request that
+// ends before it reads as kPassed; a value above kNotRun makes the message invalid.
+enum class TriggerChecks : uint8_t {
+  kPassed = 0,
+  kCooldown = 1,
+  kAccept = 2,
+  kAct = 3,
+  kTouchFlag = 4,
+  kNotRun = 5,
+};
+// "passed", "cooldown", "accept", "act", "touch flag", "not run".
+const char* TriggerChecksName(TriggerChecks checks);
+
 // Client to server, gameplay lane (reliable, ordered): one request per chain. `subject` is the
 // entity that acts (the entering entity or the activator; kSelf for the client's own hero).
 // `event_bits` is the whole r6 of the trigger event (the event kind is the key's), 0 otherwise.
+// `checks` is the client's verdict for a trigger request (kPassed for the other kinds).
 struct WorldRequest {
   RequestKey key;
   EntityRef subject;
   uint32_t event_bits = 0;
   uint32_t pose_sequence = 0;  // the pose the request was made at; 0 (needs none): a skip only,
                                // a trigger or telegram request with 0 is refused `unsupported`
+  TriggerChecks checks = TriggerChecks::kPassed;
   bool operator==(const WorldRequest&) const = default;
 };
 
@@ -308,7 +335,11 @@ enum class DecisionOutcome : uint8_t {
 // Why a request was refused (design section 5, the request lifecycle lines). Retryable for an
 // enter or a touch: too_far, rate, not released, not in play; for an exit: exit before enter.
 // Every other reason, and every refusal of a telegram or a skip, is terminal (requests.h
-// IsRetryable). An unknown value reads as kOther, which is terminal.
+// IsRetryable). An unknown value reads as kOther, which is terminal. kAlreadyFired and
+// kNotActivated are amendment l's (docs/online-1B-amendment-l.md 3.4, 3.5, 3.9; stage 1B item 9):
+// a single-fire trigger another enter sequence (or a native contact) consumed in the generation,
+// and a replay that ran neither the trigger's dispatch nor an r7 call. A version 2 game from before
+// item 9 reads them as kOther, also terminal.
 enum class RefusalReason : uint8_t {
   kNone = 0,
   kTooFar = 1,
@@ -325,6 +356,8 @@ enum class RefusalReason : uint8_t {
   kGenerationEnded = 12,
   kSessionEnded = 13,
   kOther = 14,
+  kAlreadyFired = 15,
+  kNotActivated = 16,
 };
 // The reason as the `Online:` lines write it ("too_far", "not released", ...).
 const char* RefusalReasonName(RefusalReason reason);
@@ -412,10 +445,48 @@ struct SessionClosed {
   bool operator==(const SessionClosed&) const = default;
 };
 
+// The scene barrier (stage 1B item 12; docs/online-1B.md section 1 point 6, section 2 Scenes, and
+// amendments f and g): the level barrier's pattern for one scene occurrence, without SceneRecord
+// (stage 6). S opens the occurrence when its own scene starts (kOpen to every client), acknowledges
+// it as ready itself at once and releases it (kRelease to every client); it never waits for the
+// clients and never holds its scene (the pause stack, the only native hold, freezes the scene
+// itself). Each client that plays a matching occurrence of its own (the same kind, name hash and
+// recipient in that generation) answers kAck. S's scene end goes to every client as kEnd.
+// Directions: kOpen, kRelease and kEnd server to client; kAck client to server. Gameplay lane.
+enum class ScenePhase : uint8_t {
+  kOpen = 1,
+  kAck = 2,
+  kRelease = 3,
+  kEnd = 4,
+};
+enum class SceneKind : uint8_t {
+  kCutscene = 1,      // a CCutsceneManager play
+  kConversation = 2,  // a CConversationSystem conversation
+};
+// How S's occurrence ended (kEnd only; kNone in the other phases). An unknown value reads as kOther.
+enum class SceneEndReason : uint8_t {
+  kNone = 0,
+  kNatural = 1,      // its timeline or its last line
+  kStop = 2,         // a stop: the script's, stop all, the stage, a restart
+  kLevelChange = 3,  // its generation ended while it was open
+  kOther = 4,
+};
+const char* SceneEndReasonName(SceneEndReason reason);
+
+struct SceneBarrier {
+  ScenePhase phase = ScenePhase::kOpen;
+  uint32_t generation = 0;
+  SceneKey scene;
+  SceneKind kind = SceneKind::kCutscene;
+  SceneEndReason end = SceneEndReason::kNone;
+  uint8_t skips = 0;  // kEnd: skips S applied to it (saturates at 255)
+  bool operator==(const SceneBarrier&) const = default;
+};
+
 using Message = std::variant<Hello, Welcome, Refuse, Bye, Ping, Pong, LevelRequest, LevelLoad,
                              LevelLoaded, BarrierGo, PlayerList, PlayerPose, PlayerAction,
                              WorldRequest, WorldDecision, AppliedStep, LevelEnd, Reaction,
-                             SessionClosing, SessionClosed>;
+                             SessionClosing, SessionClosed, SceneBarrier>;
 MessageType TypeOf(const Message& message);
 
 // Appends one message to `out`. false (nothing appended) if a string is over its limit or not

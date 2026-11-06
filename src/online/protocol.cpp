@@ -12,13 +12,14 @@ using netplay::ByteReader;
 using netplay::ByteWriter;
 
 // The variant's order is the type numbering (Hello = 1 ...), which TypeOf relies on.
-static_assert(std::variant_size_v<Message> == 20);
+static_assert(std::variant_size_v<Message> == 21);
 static_assert(std::is_same_v<std::variant_alternative_t<0, Message>, Hello>);
 static_assert(std::is_same_v<std::variant_alternative_t<10, Message>, PlayerList>);
 static_assert(std::is_same_v<std::variant_alternative_t<11, Message>, PlayerPose>);
 static_assert(std::is_same_v<std::variant_alternative_t<14, Message>, WorldDecision>);
 static_assert(std::is_same_v<std::variant_alternative_t<19, Message>, SessionClosed>);
-constexpr uint16_t kLastType = uint16_t(MessageType::kSessionClosed);
+static_assert(std::is_same_v<std::variant_alternative_t<20, Message>, SceneBarrier>);
+constexpr uint16_t kLastType = uint16_t(MessageType::kSceneBarrier);
 static_assert(kLastType == std::variant_size_v<Message>);
 
 bool IsNone(const OwnerToken& token) {
@@ -52,7 +53,32 @@ const char* RefusalReasonName(RefusalReason reason) {
     case RefusalReason::kSceneEnded: return "scene ended";
     case RefusalReason::kGenerationEnded: return "generation ended";
     case RefusalReason::kSessionEnded: return "session ended";
+    case RefusalReason::kAlreadyFired: return "already fired";
+    case RefusalReason::kNotActivated: return "not activated";
     case RefusalReason::kOther: break;
+  }
+  return "other";
+}
+
+const char* TriggerChecksName(TriggerChecks checks) {
+  switch (checks) {
+    case TriggerChecks::kPassed: return "passed";
+    case TriggerChecks::kCooldown: return "cooldown";
+    case TriggerChecks::kAccept: return "accept";
+    case TriggerChecks::kAct: return "act";
+    case TriggerChecks::kTouchFlag: return "touch flag";
+    case TriggerChecks::kNotRun: return "not run";
+  }
+  return "other";
+}
+
+const char* SceneEndReasonName(SceneEndReason reason) {
+  switch (reason) {
+    case SceneEndReason::kNone: return "none";
+    case SceneEndReason::kNatural: return "natural";
+    case SceneEndReason::kStop: return "stop";
+    case SceneEndReason::kLevelChange: return "level change";
+    case SceneEndReason::kOther: break;
   }
   return "other";
 }
@@ -237,7 +263,21 @@ bool GetTelegram(ByteReader& r, TelegramKey& t) {
   return ok;
 }
 
-// peer u16, generation u32, kind u8, then the kind's fields (at most 29 more bytes).
+// A scene occurrence: sequence u32, the recipient's ref, name hash u32: 25 bytes.
+bool PutScene(ByteWriter& w, const SceneKey& s) {
+  w.U32(s.scene_sequence);
+  if (!PutRef(w, s.recipient)) return false;
+  w.U32(s.name_hash);
+  return true;
+}
+bool GetScene(ByteReader& r, SceneKey& s) {
+  s.scene_sequence = r.U32();
+  const bool ok = GetRef(r, s.recipient);
+  s.name_hash = r.U32();
+  return ok;
+}
+
+// peer u16, generation u32, kind u8, then the kind's fields (at most 29 more bytes: a skip's).
 bool PutKey(ByteWriter& w, const RequestKey& k) {
   w.U16(k.peer);
   w.U32(k.generation);
@@ -252,8 +292,7 @@ bool PutKey(ByteWriter& w, const RequestKey& k) {
       w.U32(k.request_sequence);
       return PutTelegram(w, k.telegram);
     case RequestKind::kSceneSkip:
-      w.U32(k.scene.scene_sequence);
-      if (!PutRef(w, k.scene.recipient)) return false;
+      if (!PutScene(w, k.scene)) return false;
       w.U32(k.skip_sequence);
       return true;
   }
@@ -280,10 +319,9 @@ bool GetKey(ByteReader& r, RequestKey& k) {
       return GetTelegram(r, k.telegram);
     case uint8_t(RequestKind::kSceneSkip): {
       k.kind = RequestKind::kSceneSkip;
-      k.scene.scene_sequence = r.U32();
-      const bool ref_ok = GetRef(r, k.scene.recipient);
+      const bool scene_ok = GetScene(r, k.scene);
       k.skip_sequence = r.U32();
-      return ref_ok;
+      return scene_ok;
     }
     default:
       return false;
@@ -312,6 +350,18 @@ bool ValidStepKind(uint8_t kind) {
 }
 bool ValidReaction(uint8_t outcome) {
   return outcome >= uint8_t(ReactionOutcome::kLanded) && outcome <= uint8_t(ReactionOutcome::kMissed);
+}
+bool ValidScenePhase(uint8_t phase) {
+  return phase >= uint8_t(ScenePhase::kOpen) && phase <= uint8_t(ScenePhase::kEnd);
+}
+bool ValidSceneKind(uint8_t kind) {
+  return kind == uint8_t(SceneKind::kCutscene) || kind == uint8_t(SceneKind::kConversation);
+}
+// Only kEnd carries how it ended; every other phase has kNone and no skips, so two messages compare
+// equal exactly when they say the same.
+bool ConsistentScene(const SceneBarrier& m) {
+  if (m.phase == ScenePhase::kEnd) return m.end != SceneEndReason::kNone;
+  return m.end == SceneEndReason::kNone && m.skips == 0;
 }
 
 bool Fields(ByteWriter& w, const Hello& m) {
@@ -389,9 +439,11 @@ bool Fields(ByteWriter& w, const PlayerAction& m) {
   return true;
 }
 bool Fields(ByteWriter& w, const WorldRequest& m) {
+  if (uint8_t(m.checks) > uint8_t(TriggerChecks::kNotRun)) return false;
   if (!PutKey(w, m.key) || !PutRef(w, m.subject)) return false;
   w.U32(m.event_bits);
   w.U32(m.pose_sequence);
+  w.U8(uint8_t(m.checks));  // item 9: a trailing byte, so a request without it reads as kPassed
   return true;
 }
 bool Fields(ByteWriter& w, const WorldDecision& m) {
@@ -435,6 +487,20 @@ bool Fields(ByteWriter& w, const Reaction& m) {
 }
 bool Fields(ByteWriter&, const SessionClosing&) { return true; }
 bool Fields(ByteWriter&, const SessionClosed&) { return true; }
+// phase u8, generation u32, the scene (25 bytes), kind u8, end u8, skips u8: 33 bytes.
+bool Fields(ByteWriter& w, const SceneBarrier& m) {
+  if (!ValidScenePhase(uint8_t(m.phase)) || !ValidSceneKind(uint8_t(m.kind)) ||
+      uint8_t(m.end) > uint8_t(SceneEndReason::kOther) || !ConsistentScene(m)) {
+    return false;
+  }
+  w.U8(uint8_t(m.phase));
+  w.U32(m.generation);
+  if (!PutScene(w, m.scene)) return false;
+  w.U8(uint8_t(m.kind));
+  w.U8(uint8_t(m.end));
+  w.U8(m.skips);
+  return true;
+}
 
 template <size_t N>
 void GetArray(ByteReader& r, std::array<uint8_t, N>& out) {
@@ -554,6 +620,12 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
       ok = GetKey(r, m.key) && GetRef(r, m.subject);
       m.event_bits = r.U32();
       m.pose_sequence = r.U32();
+      if (ok && r.Ok() && r.Remaining() > 0) {
+        // Item 9's client verdict (absent in an earlier version 2 request: kPassed).
+        const uint8_t checks = r.U8();
+        if (checks > uint8_t(TriggerChecks::kNotRun)) return std::nullopt;
+        m.checks = TriggerChecks(checks);
+      }
       result = m;
       break;
     }
@@ -570,7 +642,7 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
       m.outcome = DecisionOutcome(outcome);
       // An unknown reason reads as "other" (terminal), as RefuseReason does; other flag bits are
       // a later version's.
-      m.reason = reason <= uint8_t(RefusalReason::kOther) ? RefusalReason(reason) : RefusalReason::kOther;
+      m.reason = reason <= uint8_t(RefusalReason::kNotActivated) ? RefusalReason(reason) : RefusalReason::kOther;
       m.cached = flags & kDecisionCached;
       m.final = flags & kDecisionFinal;
       m.server_final = flags & kDecisionServerFinal;
@@ -626,6 +698,23 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
     case MessageType::kSessionClosed:
       result = SessionClosed{};
       break;
+    case MessageType::kSceneBarrier: {
+      SceneBarrier m;
+      const uint8_t phase = r.U8();
+      m.generation = r.U32();
+      ok = GetScene(r, m.scene);
+      const uint8_t kind = r.U8();
+      const uint8_t end = r.U8();
+      m.skips = r.U8();
+      if (!ValidScenePhase(phase) || !ValidSceneKind(kind)) return std::nullopt;
+      m.phase = ScenePhase(phase);
+      m.kind = SceneKind(kind);
+      // An unknown end reason reads as "other", as an unknown refusal reason does.
+      m.end = end <= uint8_t(SceneEndReason::kOther) ? SceneEndReason(end) : SceneEndReason::kOther;
+      ok = ok && ConsistentScene(m);
+      result = m;
+      break;
+    }
     default:
       return std::nullopt;
   }

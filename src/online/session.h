@@ -86,6 +86,8 @@ struct ServerEvent {
     kPeerClosed,       // peer_id, gone: End session's drain is done for it (finals, then its Bye;
                        // a kPeerLeft with kClosed follows); gone: its SessionClosed did not come
                        // within kCloseWait
+    kSceneAck,         // peer_id, scene (phase kAck): the client plays a matching occurrence of
+                       // the scene S opened (item 12); not reported once End session began
   };
   Type type = Type::kPeerJoined;
   uint16_t peer_id = 0;
@@ -106,6 +108,7 @@ struct ServerEvent {
   WorldDecision decision;
   bool gone = false;
   bool sent = false;  // kDecisionSent
+  SceneBarrier scene;  // kSceneAck
 };
 
 struct PeerInfo {
@@ -140,6 +143,11 @@ struct PeerInfo {
 // the client leaves (kPeerClosed, then kPeerLeft with kClosed). While closing no Hello is welcomed
 // and no new generation opens. Offline play never starts a ServerSession, so none of this runs
 // there.
+//
+// The scene barrier (version 2, stage 1B item 12): the game opens, releases and ends a scene
+// occurrence with SendSceneBarrier (to every client); a client's kAck comes back as kSceneAck. The
+// session keeps no scene state: S auto-acks and releases at once (docs/online-1B.md section 1
+// point 6), so nothing here waits for an ack.
 class ServerSession {
  public:
   ServerSession() = default;
@@ -192,6 +200,9 @@ class ServerSession {
   // To one client: a level end, a reaction. false if `peer` is not connected or it cannot be encoded.
   bool SendLevelEnd(uint16_t peer, const LevelEnd& end, TimePoint now = Clock::now());
   bool SendReaction(uint16_t peer, const Reaction& reaction, TimePoint now = Clock::now());
+  // To every client: a scene occurrence's open, release or end (the scene barrier, item 12). false
+  // for a kAck (the clients' phase), or if it cannot be encoded, or the session is not running.
+  bool SendSceneBarrier(const SceneBarrier& scene, TimePoint now = Clock::now());
   // End session's drain: SessionClosing to every client; from now on nothing is applied.
   void EndSession(TimePoint now = Clock::now());
   bool Closing() const { return requests_.Closing(); }
@@ -276,6 +287,7 @@ struct ClientEvent {
     kLevelEnd,        // level_end
     kReaction,        // reaction
     kSessionClosing,  // End session: requests stop; SessionClosed went back already
+    kSceneBarrier,    // scene: S opened, released or ended a scene occurrence (never kAck)
   };
   Type type = Type::kConnected;
   uint16_t peer_id = 0;
@@ -290,6 +302,7 @@ struct ClientEvent {
   AppliedStep applied;
   LevelEnd level_end;
   Reaction reaction;
+  SceneBarrier scene;
 };
 
 // The client side: one server, a ping every kPingInterval for the tick estimate and liveness.
@@ -324,6 +337,10 @@ class ClientSession {
   bool SendPlayerPose(const PlayerPose& pose, TimePoint now = Clock::now());
   bool SendPlayerAction(const PlayerAction& action, TimePoint now = Clock::now());
   bool SendWorldRequest(const WorldRequest& request, TimePoint now = Clock::now());
+  // This client plays a matching occurrence of a scene S opened: `scene` goes back as kAck
+  // (whatever its phase says), with its generation, key and kind. While connected and End session
+  // has not begun (SessionClosed is the last thing a client sends); false otherwise.
+  bool SendSceneAck(const SceneBarrier& scene, TimePoint now = Clock::now());
   // End session began (SessionClosing came): no request leaves this client any more.
   bool Closing() const { return closing_; }
   // The connection's counters (per-lane bytes included); all zero with no connection.

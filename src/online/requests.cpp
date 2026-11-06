@@ -495,6 +495,8 @@ bool RequestTable::SubmitEvaluation(const RequestKey& key, const EvaluationResul
   e->evaluating = false;
   if (result.reason == RefusalReason::kNone) {
     Apply(*e, result.applied_sequence);
+  } else if (result.server_final) {
+    ServerFinal(*e, result.reason);  // S's own wait ended (amendment l 3.5): final whatever the reason
   } else if (IsRetryable(key, result.reason)) {
     Retry(*e, result.reason);
   } else {

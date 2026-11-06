@@ -231,6 +231,15 @@ void ServerSession::HandleMessage(Peer& peer, const Message& message, TimePoint 
   } else if (std::holds_alternative<SessionClosed>(message)) {
     requests_.OnClosed(peer.id);
     FlushRequests(now);
+  } else if (const auto* scene = std::get_if<SceneBarrier>(&message)) {
+    // A client only acknowledges; any other phase from it is dropped, and so is an ack that comes
+    // after End session began (the scene barrier has nothing left to wait for).
+    if (scene->phase != ScenePhase::kAck || requests_.Closing()) return;
+    ServerEvent e;
+    e.type = ServerEvent::Type::kSceneAck;
+    e.peer_id = peer.id;
+    e.scene = *scene;
+    events_.push_back(std::move(e));
   }
 }
 
@@ -454,6 +463,16 @@ bool ServerSession::SendLevelEnd(uint16_t peer, const LevelEnd& end, TimePoint n
 bool ServerSession::SendReaction(uint16_t peer, const Reaction& reaction, TimePoint now) {
   Peer* p = FindById(peer);
   return p && Post(*p, Lane::kGameplay, reaction, now);
+}
+
+bool ServerSession::SendSceneBarrier(const SceneBarrier& scene, TimePoint now) {
+  if (scene.phase == ScenePhase::kAck) return false;
+  const std::vector<uint8_t> bytes = Encoded(scene);
+  if (!transport_ || bytes.empty()) return false;
+  for (auto& [endpoint, peer] : peers_) {
+    if (peer->state == PeerState::kWelcomed) peer->conn->Send(Lane::kGameplay, bytes, now);
+  }
+  return true;
 }
 
 void ServerSession::EndSession(TimePoint now) {
@@ -717,6 +736,12 @@ void ClientSession::HandleMessage(const Message& message, TimePoint now) {
     e.type = ClientEvent::Type::kReaction;
     e.reaction = *reaction;
     events_.push_back(std::move(e));
+  } else if (const auto* scene = std::get_if<SceneBarrier>(&message)) {
+    if (scene->phase == ScenePhase::kAck) return;  // the clients' phase: not the server's to send
+    ClientEvent e;
+    e.type = ClientEvent::Type::kSceneBarrier;
+    e.scene = *scene;
+    events_.push_back(std::move(e));
   } else if (std::holds_alternative<SessionClosing>(message)) {
     if (closing_) return;
     // From here no request leaves this client (the Send calls refuse), so SessionClosed, sent now
@@ -763,6 +788,15 @@ bool ClientSession::SendWorldRequest(const WorldRequest& request, TimePoint now)
   WorldRequest r = request;
   r.key.peer = peer_id_;
   return Post(Lane::kGameplay, r, now);
+}
+
+bool ClientSession::SendSceneAck(const SceneBarrier& scene, TimePoint now) {
+  if (!Connected() || closing_) return false;
+  SceneBarrier ack = scene;
+  ack.phase = ScenePhase::kAck;
+  ack.end = SceneEndReason::kNone;
+  ack.skips = 0;
+  return Post(Lane::kGameplay, ack, now);
 }
 
 bool ClientSession::Post(Lane lane, const Message& message, TimePoint now) {
