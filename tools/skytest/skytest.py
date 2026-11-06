@@ -70,7 +70,17 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
                     r"private (-?\d+) working (-?\d+) video (-?\d+)")
 # Where a hosted server (`server = "host"`) writes its log: the owner's session folder.
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
-GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy")
+GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction")
+# The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
+# online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
+# for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
+# landed on S: a pair) or `reaction <peer>:<seq> missed|refused after <ms> ms (interim)` (counted
+# apart). The round trip comes from the client's barrier line (`(round trip <us> us)`).
+PRESS = re.compile(r"Online: press (\d+):(\d+) slot (\d+) at pose (\d+)(?: \(generation (\d+)\))?")
+REACTION = re.compile(r"Online: reaction (\d+):(\d+) after ([\d.]+) ms \(interim\) landed\b(?:.*\(generation (\d+)\))?")
+REACTION_OTHER = re.compile(r"Online: reaction (\d+):(\d+) (missed|refused) after ([\d.]+) ms \(interim\)"
+                            r"(?:.*\(generation (\d+)\))?")
+ROUND_TRIP = re.compile(r"\(round trip (\d+) us\)")
 # A title folder's name (the game's title id in hex), for the save_copy grade.
 TITLE_ID = re.compile(r"^[0-9A-F]{8}$")
 ALWAYS_FORBIDDEN = [r"\] Crash: ", r"\[FATAL\]", r"Input script: cannot (parse|use)"]
@@ -379,6 +389,8 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             raise SpecError(f"{path.name}: grade {gname} names a peer not in {names}")
         if gname == "level_load" and (g.get("measure") not in d.get("measure", {}) or not g.get("baseline")):
             raise SpecError(f"{path.name}: grade level_load needs `measure` (one of the spec's) and `baseline`")
+        if gname == "press_to_reaction":
+            check_press_to_reaction(path.name, g)
     measures = d.get("measure", {})
     for mname, m in measures.items():
         if not isinstance(m, dict) or "to" not in m:
@@ -394,6 +406,121 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         peers=peers, measures=measures, standin_seconds=float(d.get("standin_seconds", 45)),
         server=server, grades=grades, compare=compare,
     )
+
+
+def check_press_to_reaction(name: str, g: dict) -> None:
+    """A press_to_reaction grade's options: min_pairs (a whole number >= 1), statistic (p50, p95 or
+    max), send_interval_ms and rtt_ms (numbers >= 0, overriding the defaults)."""
+    pairs = g.get("min_pairs", 10)
+    if not isinstance(pairs, int) or isinstance(pairs, bool) or pairs < 1:
+        raise SpecError(f"{name}: grade press_to_reaction: min_pairs must be a whole number >= 1")
+    if g.get("statistic", "p95") not in ("p50", "p95", "max"):
+        raise SpecError(f"{name}: grade press_to_reaction: statistic is p50, p95 or max")
+    for key in ("send_interval_ms", "rtt_ms"):
+        v = g.get(key)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
+            raise SpecError(f"{name}: grade press_to_reaction: {key} must be a number >= 0")
+
+
+def percentile(values: list[float], q: float) -> float:
+    """The nearest-rank percentile of `values` (not empty): the smallest value with at least q% of
+    the values at or below it."""
+    ordered = sorted(values)
+    rank = max(1, -(-len(ordered) * q // 100))  # ceil(n * q / 100), at least 1
+    return ordered[int(rank) - 1]
+
+
+def press_to_reaction_limit(g: dict, thresholds: dict, rtt_ms: float | None) -> tuple[float, dict]:
+    """The threshold of plan 5.5 for press to reaction (tests/thresholds.toml [press_to_reaction]):
+    fixed_ms plus what its `plus` names. send_interval is one send interval of the requester, 1000 /
+    [send_rates] players_hz (the rate a press travels at in the player's records from stage 4; a spec
+    can set send_interval_ms); rtt is the round trip the requester measured (the median of its
+    `round trip` lines; a spec can set rtt_ms; none logged: 0, the strictest). Returns the limit and
+    its parts, for the report."""
+    t = thresholds.get("press_to_reaction", {})
+    fixed = float(t.get("fixed_ms", 250.0))
+    plus = list(t.get("plus", ["send_interval", "rtt"]))
+    parts: dict = {"fixed_ms": fixed}
+    limit = fixed
+    if "send_interval" in plus:
+        if g.get("send_interval_ms") is not None:
+            interval = float(g["send_interval_ms"])
+        else:
+            hz = float(thresholds.get("send_rates", {}).get("players_hz", 20.0))
+            interval = 1000.0 / hz if hz > 0 else 0.0
+        parts["send_interval_ms"] = round(interval, 3)
+        limit += interval
+    if "rtt" in plus:
+        rtt = float(g["rtt_ms"]) if g.get("rtt_ms") is not None else (rtt_ms or 0.0)
+        parts["rtt_ms"] = round(rtt, 3)
+        parts["rtt_source"] = "spec" if g.get("rtt_ms") is not None else ("log" if rtt_ms is not None else "none")
+        limit += rtt
+    return limit, parts
+
+
+def grade_press_to_reaction(lines: list[str], g: dict, thresholds: dict) -> tuple[dict, list[str]]:
+    """The press_to_reaction grade (stage 1B item 7; interim, the owner's decision 2): on the
+    requester's log, every press line and its reaction line, timed on the requester's clock (the
+    reaction line's own milliseconds). Only a press whose hit landed makes a pair; misses, refusals
+    and presses without any reaction are counted apart, and so is a reaction with no press before it.
+    The pairs' distribution (min, p50, p95, max) is graded at `statistic` (p95 by default) against
+    the threshold, once there are at least `min_pairs` (10) pairs. A reaction answers the press of
+    the same peer, sequence and generation; only its first reaction counts."""
+    presses: set[tuple] = set()
+    press_lines = 0
+    pairs: list[float] = []
+    missed = refused = unpaired = 0
+    answered: set[tuple] = set()
+    rtts: list[float] = []
+    for line in lines:
+        if m := ROUND_TRIP.search(line):
+            rtts.append(int(m.group(1)) / 1000.0)
+        if m := PRESS.search(line):
+            presses.add((m.group(1), m.group(2), m.group(5)))
+            press_lines += 1
+            continue
+        reaction = REACTION.search(line)
+        other = None if reaction else REACTION_OTHER.search(line)
+        if not reaction and not other:
+            continue
+        if reaction:
+            key = (reaction.group(1), reaction.group(2), reaction.group(4))
+        else:
+            key = (other.group(1), other.group(2), other.group(5))
+        if key not in presses or key in answered:
+            unpaired += 1
+            continue
+        answered.add(key)
+        if reaction:
+            pairs.append(float(reaction.group(3)))
+        elif other.group(3) == "missed":
+            missed += 1
+        else:
+            refused += 1
+    rtt = sorted(rtts)[len(rtts) // 2] if rtts else None
+    limit, parts = press_to_reaction_limit(g, thresholds, rtt)
+    statistic = g.get("statistic", "p95")
+    min_pairs = int(g.get("min_pairs", 10))
+    graded: dict = {"interim": True, "presses": press_lines, "pairs": len(pairs), "missed": missed,
+                    "refused": refused, "unanswered": len(presses - answered), "unpaired_reactions": unpaired,
+                    "statistic": statistic, "limit_ms": round(limit, 3), "min_pairs": min_pairs, **parts}
+    if pairs:
+        graded.update({"min_ms": min(pairs), "p50_ms": percentile(pairs, 50), "p95_ms": percentile(pairs, 95),
+                       "max_ms": max(pairs)})
+    reasons = []
+    if not presses:
+        reasons.append("grade press_to_reaction: (interim) no press line")
+    elif len(pairs) < min_pairs:
+        reasons.append(f"grade press_to_reaction: (interim) {len(pairs)} landed pairs, fewer than min_pairs "
+                       f"{min_pairs} ({press_lines} presses, {missed} missed, {refused} refused, "
+                       f"{graded['unanswered']} unanswered)")
+    else:
+        value = graded[f"{statistic}_ms"]
+        graded["value_ms"] = value
+        if value > limit:
+            reasons.append(f"grade press_to_reaction: (interim) {statistic} {value:.1f} ms over {limit:.1f} ms")
+            graded["violation"] = True
+    return graded, reasons
 
 
 def save_copy_peers(g: dict, names: list[str]) -> list[str]:
@@ -760,6 +887,9 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
             elif ratio > ratio_max:
                 reasons.append(f"grade {gname}: {value:.1f} s is {ratio:.2f}x solo ({solo:.1f} s), over {ratio_max}x")
                 r.graded[gname]["violation"] = True
+        elif gname == "press_to_reaction":
+            r.graded[gname], why = grade_press_to_reaction(after, g, thresholds)
+            reasons += why
     return reasons
 
 

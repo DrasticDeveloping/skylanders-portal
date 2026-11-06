@@ -1070,6 +1070,134 @@ class CompareTest(unittest.TestCase):
             r"log lacks /level 2 \S+: open/ after /barrier 2 released/ (expect_order)"])
 
 
+THRESHOLDS = {"press_to_reaction": {"fixed_ms": 250.0, "plus": ["send_interval", "rtt"]},
+              "send_rates": {"players_hz": 20.0}}
+
+
+def requester_log(pairs: list[tuple[int, float]], others: list[tuple[int, str]] = (), rtt_us: int = 1500,
+                  generation: int = 2, peer: int = 1) -> str:
+    """A client's log as the game writes it (online/client/attack_presses.cpp): a barrier line with
+    its round trip, then per press its press line and its reaction line."""
+    t = 0
+    lines = [f"[2026-11-06 10:00:00.000] [info] [core] [t1] Online: barrier {generation} released at tick 900",
+             f"[2026-11-06 10:00:00.001] [info] [core] [t1] Online: tick estimate off by 0.10 ticks "
+             f"(round trip {rtt_us} us)"]
+    for seq, ms in pairs:
+        t += 1
+        lines.append(f"[2026-11-06 10:00:{t:02d}.000] [info] [core] [t1] Online: press {peer}:{seq} slot 0 at pose "
+                     f"{seq * 14} (generation {generation})")
+        lines.append(f"[2026-11-06 10:00:{t:02d}.300] [info] [core] [t2] Online: reaction {peer}:{seq} after {ms:.1f} "
+                     f"ms (interim) landed victim w00000f2c.1a2b3c4d.5e6f7a8b (generation {generation})")
+    for seq, outcome in others:
+        t += 1
+        lines.append(f"[2026-11-06 10:00:{t:02d}.000] [info] [core] [t1] Online: press {peer}:{seq} slot 1 at pose "
+                     f"{seq * 14} (generation {generation})")
+        if outcome:
+            lines.append(f"[2026-11-06 10:00:{t:02d}.900] [info] [core] [t2] Online: reaction {peer}:{seq} {outcome} "
+                         f"after 2003.0 ms (interim) (generation {generation})")
+    return "\n".join(lines) + "\n"
+
+
+class PressToReactionTest(unittest.TestCase):
+    """The press_to_reaction grade (stage 1B item 7) on hand-written requester logs."""
+
+    def grade(self, text: str, g: dict | None = None) -> tuple[dict, list[str]]:
+        lines = [line for _, line in skytest.parse_log(text)["lines"]]
+        return skytest.grade_press_to_reaction(lines, g or {}, THRESHOLDS)
+
+    def test_landed_pairs_pass_under_the_limit(self) -> None:
+        pairs = [(i, 100.0 + i) for i in range(1, 13)]
+        graded, reasons = self.grade(requester_log(pairs, [(13, "missed"), (14, "refused"), (15, "")]))
+        self.assertEqual(reasons, [])
+        self.assertTrue(graded["interim"])
+        self.assertEqual((graded["presses"], graded["pairs"], graded["missed"], graded["refused"],
+                          graded["unanswered"]), (15, 12, 1, 1, 1))
+        # 250 + one send interval (1000 / 20 Hz) + the logged round trip (1.5 ms).
+        self.assertAlmostEqual(graded["limit_ms"], 301.5)
+        self.assertEqual((graded["send_interval_ms"], graded["rtt_ms"], graded["rtt_source"]), (50.0, 1.5, "log"))
+        self.assertEqual((graded["min_ms"], graded["p50_ms"], graded["p95_ms"], graded["max_ms"]),
+                         (101.0, 106.0, 112.0, 112.0))
+        self.assertEqual(graded["value_ms"], 112.0)
+        self.assertNotIn("violation", graded)
+
+    def test_the_p95_over_the_limit_fails_as_interim(self) -> None:
+        pairs = [(i, 120.0) for i in range(1, 19)] + [(19, 350.0), (20, 360.0)]
+        graded, reasons = self.grade(requester_log(pairs))
+        self.assertEqual(graded["p95_ms"], 350.0)
+        self.assertTrue(graded["violation"])
+        self.assertEqual(reasons, ["grade press_to_reaction: (interim) p95 350.0 ms over 301.5 ms"])
+        # The reason names the grade the way the runner's accepted-grade check reads it.
+        self.assertEqual(reasons[0].split(":", 1)[0].removeprefix("grade "), "press_to_reaction")
+        # The median passes the same log.
+        _, reasons = self.grade(requester_log(pairs), {"statistic": "p50"})
+        self.assertEqual(reasons, [])
+
+    def test_too_few_pairs_and_no_presses_fail(self) -> None:
+        graded, reasons = self.grade(requester_log([(1, 90.0), (2, 95.0)], [(3, "missed")]))
+        self.assertEqual(graded["pairs"], 2)
+        self.assertEqual(reasons, ["grade press_to_reaction: (interim) 2 landed pairs, fewer than min_pairs 10 "
+                                   "(3 presses, 1 missed, 0 refused, 0 unanswered)"])
+        _, reasons = self.grade(requester_log([(1, 90.0), (2, 95.0)]), {"min_pairs": 2})
+        self.assertEqual(reasons, [])
+        graded, reasons = self.grade(requester_log([]))
+        self.assertEqual(reasons, ["grade press_to_reaction: (interim) no press line"])
+        self.assertNotIn("p95_ms", graded)
+
+    def test_a_reaction_pairs_only_with_its_own_press(self) -> None:
+        text = requester_log([(1, 80.0), (2, 85.0)])
+        # A second reaction for press 2, one for a press never made, and the server's lines (S's
+        # `press <peer>:<seq> replayed ...`) are not pairs.
+        text += ("[2026-11-06 10:01:00.000] [info] [core] [t2] Online: reaction 1:2 after 99.0 ms (interim) landed "
+                 "victim w1.2.3 (generation 2)\n"
+                 "[2026-11-06 10:01:01.000] [info] [core] [t2] Online: reaction 1:7 after 99.0 ms (interim) landed "
+                 "victim w1.2.3 (generation 2)\n"
+                 "[2026-11-06 10:01:02.000] [info] [core] [t3] Online: press 1:8 replayed slot 0 on PeerPuppet_1 "
+                 "(facing pose 57)\n")
+        graded, _ = self.grade(text, {"min_pairs": 1})
+        self.assertEqual((graded["presses"], graded["pairs"], graded["unpaired_reactions"]), (2, 2, 2))
+        self.assertEqual(graded["max_ms"], 85.0)
+
+    def test_the_generation_keeps_equal_sequences_apart(self) -> None:
+        text = requester_log([(1, 80.0)], generation=2) + requester_log([(1, 90.0)], generation=3)
+        graded, _ = self.grade(text, {"min_pairs": 1})
+        self.assertEqual((graded["presses"], graded["pairs"]), (2, 2))
+        # A reaction of another generation does not answer the press.
+        text = requester_log([], [(1, "")], generation=2)
+        text += ("[2026-11-06 10:02:00.000] [info] [core] [t2] Online: reaction 1:1 after 70.0 ms (interim) landed "
+                 "victim w1.2.3 (generation 3)\n")
+        graded, _ = self.grade(text, {"min_pairs": 1})
+        self.assertEqual((graded["pairs"], graded["unanswered"], graded["unpaired_reactions"]), (0, 1, 1))
+
+    def test_the_limit_parts_can_be_set_by_the_spec(self) -> None:
+        graded, _ = self.grade(requester_log([(1, 80.0)], rtt_us=40000), {"min_pairs": 1})
+        self.assertAlmostEqual(graded["limit_ms"], 340.0)
+        graded, _ = self.grade(requester_log([(1, 80.0)]), {"min_pairs": 1, "send_interval_ms": 100, "rtt_ms": 0})
+        self.assertEqual((graded["limit_ms"], graded["rtt_source"]), (350.0, "spec"))
+        lines = ["Online: press 1:1 slot 0 at pose 3 (generation 2)",
+                 "Online: reaction 1:1 after 10.0 ms (interim) landed victim none (generation 2)"]
+        graded, _ = skytest.grade_press_to_reaction(lines, {"min_pairs": 1}, THRESHOLDS)
+        self.assertEqual((graded["rtt_ms"], graded["rtt_source"], graded["limit_ms"]), (0.0, "none", 300.0))
+
+    def test_the_grade_runs_from_the_spec_on_its_peer(self) -> None:
+        spec = argparse.Namespace(grades={"press_to_reaction": {"peer": "H", "min_pairs": 1,
+                                                                "after": "Online: barrier 2 released"}})
+        text = requester_log([(1, 80.0), (2, 500.0)])
+        r = skytest.PeerResult(peer="H")
+        reasons = skytest.grade_thresholds(spec, r, skytest.parse_log(text), THRESHOLDS, 60.0)
+        self.assertEqual(reasons, ["grade press_to_reaction: (interim) p95 500.0 ms over 301.5 ms"])
+        self.assertEqual(r.graded["press_to_reaction"]["pairs"], 2)
+        other = skytest.PeerResult(peer="S")
+        self.assertEqual(skytest.grade_thresholds(spec, other, skytest.parse_log(text), THRESHOLDS, 60.0), [])
+
+    def test_a_press_to_reaction_spec_is_checked(self) -> None:
+        skytest.check_press_to_reaction("x.toml", {"min_pairs": 10, "statistic": "max", "rtt_ms": 1.5})
+        for bad in ({"min_pairs": 0}, {"min_pairs": True}, {"statistic": "mean"}, {"send_interval_ms": -1},
+                    {"rtt_ms": "1"}):
+            with self.assertRaises(skytest.SpecError, msg=str(bad)):
+                skytest.check_press_to_reaction("x.toml", bad)
+        self.assertIn("press_to_reaction", skytest.GRADES)
+
+
 class JobTest(unittest.TestCase):
     @unittest.skipUnless(winjob.WINDOWS, "job objects are Windows only")
     def test_closing_the_job_ends_its_processes(self) -> None:
