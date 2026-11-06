@@ -106,6 +106,10 @@ std::atomic<double> g_code_stick_y{0.0};
 // SetScriptButtons: buttons held by code, added to the script's own presses while on.
 std::atomic<bool> g_code_buttons_on{false};
 std::atomic<uint16_t> g_code_buttons{0};
+// SetScriptTriggers: triggers pulled by code, added to the script's own presses while on.
+std::atomic<bool> g_code_triggers_on{false};
+std::atomic<bool> g_code_lt{false};
+std::atomic<bool> g_code_rt{false};
 
 // The script file's folder: where `shot` puts its pictures. Set before the timeline starts.
 std::filesystem::path g_script_dir;
@@ -415,10 +419,13 @@ void ScanGuestMemory(rex::memory::Memory* memory, const std::vector<uint32_t>& w
         address += 0x10000;
         continue;
       }
-      const uint64_t region_end = uint64_t(info.base_address) + info.region_size;
+      // region_size counts whole pages from the address's page (base_address is the asked
+      // address, BaseHeap::QueryRegionInfo): scan from the page, not past the region's end.
+      const uint32_t region_begin = uint32_t(address) & ~(heap->page_size() - 1);
+      const uint64_t region_end = uint64_t(region_begin) + info.region_size;
       if ((info.state & rex::memory::kMemoryAllocationCommit) &&
           (info.protect & rex::memory::kMemoryProtectRead)) {
-        const uint8_t* host = memory->TranslateVirtual<const uint8_t*>(info.base_address);
+        const uint8_t* host = memory->TranslateVirtual<const uint8_t*>(region_begin);
         const uint32_t count = info.region_size / 4;
         for (uint32_t i = 0; i + words.size() <= count && hits < kMaxScanHits; ++i) {
           bool match = true;
@@ -736,6 +743,10 @@ class ScriptInputDriver final : public rex::input::InputDriver {
     if (g_code_buttons_on.load(std::memory_order_relaxed)) {
       buttons |= g_code_buttons.load(std::memory_order_relaxed);
     }
+    if (g_code_triggers_on.load(std::memory_order_relaxed)) {
+      lt |= g_code_lt.load(std::memory_order_relaxed);
+      rt |= g_code_rt.load(std::memory_order_relaxed);
+    }
   }
 
   X_RESULT GetDeviceState(rex::input::DeviceId id, rex::input::X_INPUT_STATE* out_state) override {
@@ -885,6 +896,12 @@ void RegisterScriptCondition(const std::string& name, std::function<bool()> hold
 void SetScriptButtons(bool on, uint16_t buttons) {
   g_code_buttons.store(buttons, std::memory_order_relaxed);
   g_code_buttons_on.store(on, std::memory_order_relaxed);
+}
+
+void SetScriptTriggers(bool on, bool left, bool right) {
+  g_code_lt.store(left, std::memory_order_relaxed);
+  g_code_rt.store(right, std::memory_order_relaxed);
+  g_code_triggers_on.store(on, std::memory_order_relaxed);
 }
 
 void SetScriptStick(bool on, double x, double y) {

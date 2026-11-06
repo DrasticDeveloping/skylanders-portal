@@ -100,5 +100,9 @@ void SetScriptStick(bool on, double x, double y);
 // added to the script's own presses; XInput button bits (A is 0x1000). Any thread.
 #define SKYLANDERS_DEV_SCRIPT_BUTTONS 1
 void SetScriptButtons(bool on, uint16_t buttons);
+// Triggers the game's own developer code pulls (a route tool's RT interaction): while `on`, the
+// chosen ones are pulled all the way, added to the script's own `lt` / `rt` presses. Any thread.
+#define SKYLANDERS_DEV_SCRIPT_TRIGGERS 1
+void SetScriptTriggers(bool on, bool left, bool right);
 
 }  // namespace skylanders::dev
