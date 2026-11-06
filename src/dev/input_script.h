@@ -92,4 +92,9 @@ void InstallInputScript(rex::system::IInputSystem* input_system, rex::memory::Me
 void RegisterScriptCommand(const std::string& name, std::function<void(const std::string& args)> run);
 void RegisterScriptCondition(const std::string& name, std::function<bool()> holds);
 
+// A left stick the game's own developer code drives (a closed-loop walk that steers toward a
+// position each frame): while `on`, it replaces the script's `stick` events on the script's virtual
+// pad; x and y in -1..1. Any thread.
+void SetScriptStick(bool on, double x, double y);
+
 }  // namespace skylanders::dev

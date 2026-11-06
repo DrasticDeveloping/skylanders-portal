@@ -99,6 +99,10 @@ std::vector<uint32_t> g_scan_hits;
 // Seconds the timeline has moved from the times the script gives: down when a waitfor was met
 // early, up while a registered command ran. Every event and press is due at its time plus this.
 std::atomic<double> g_timeline_shift{0.0};
+// SetScriptStick: a stick driven by code, over the script's own stick events while on.
+std::atomic<bool> g_code_stick_on{false};
+std::atomic<double> g_code_stick_x{0.0};
+std::atomic<double> g_code_stick_y{0.0};
 
 // The script file's folder: where `shot` puts its pictures. Set before the timeline starts.
 std::filesystem::path g_script_dir;
@@ -722,6 +726,10 @@ class ScriptInputDriver final : public rex::input::InputDriver {
         y = e.y;
       }
     }
+    if (g_code_stick_on.load(std::memory_order_relaxed)) {
+      x = g_code_stick_x.load(std::memory_order_relaxed);
+      y = g_code_stick_y.load(std::memory_order_relaxed);
+    }
   }
 
   X_RESULT GetDeviceState(rex::input::DeviceId id, rex::input::X_INPUT_STATE* out_state) override {
@@ -866,6 +874,12 @@ void RegisterScriptCondition(const std::string& name, std::function<bool()> hold
   Registry& r = GetRegistry();
   std::lock_guard lock(r.mutex);
   r.conditions[name] = std::move(holds);
+}
+
+void SetScriptStick(bool on, double x, double y) {
+  g_code_stick_x.store(std::clamp(x, -1.0, 1.0), std::memory_order_relaxed);
+  g_code_stick_y.store(std::clamp(y, -1.0, 1.0), std::memory_order_relaxed);
+  g_code_stick_on.store(on, std::memory_order_relaxed);
 }
 
 }  // namespace skylanders::dev
