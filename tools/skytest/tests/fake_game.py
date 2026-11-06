@@ -7,7 +7,9 @@ Extra commands only this fake knows: `hang` (never quits), `crash` (logs a crash
 (its frame-time windows with the p95 of `serverframes <ms>`, 12 by default); `online_join <addr>`
 logs the connection when the address has the owner's port. `savewrite` rewrites the first save under
 the data folder's <profile>/415608E9 (as a save the game writes); `savewrite backup` writes only into
-the data folder's save-backup (as the SDK does), which is no save."""
+the data folder's save-backup (as the SDK does), which is no save. `serverlog <text>` appends a line
+to the hosted server's log (a [compare] case's workload); with `--render_hidden_draw=false` the
+hosted server's log says the draw skip is on, as the real server's does."""
 import os
 import sys
 import time
@@ -70,7 +72,16 @@ def main() -> int:
                     s.write(f"[{stamp}] [info] [core] [t2] Level watch: tutorial_b: ready (request 1, a player is in it)\n")
                     s.write(f"[{stamp}] [info] [core] [t2] Online: frames 600 fps 60.0 p50 16.7 p95 {server_p95} "
                             "max 40.0 private 1500 working 900 video 410\n")
+                    if arg("render_hidden_draw") == "false":
+                        s.write(f"[{stamp}] [info] [gpu] [t3] GPU: draw skip on (render_hidden_draw off, window "
+                                "hidden): draws without memexport, resolves and presents are skipped\n")
                 line(f"Online: hosting: the server is on port {arg('online_port')}, join code ABCDEFGH")
+            elif cmd == "serverlog":
+                now = time.time()
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)) + f".{int(now % 1 * 1000):03d}"
+                with open(os.path.join(arg("user_data_root"), "Online", "session", "game.log"), "a",
+                          encoding="utf-8") as s:
+                    s.write(f"[{stamp}] [info] [core] [t2] {rest}\n")
             elif cmd == "online_join":
                 if rest.endswith(":" + rest.rsplit(":", 1)[-1]) and rest.rsplit(":", 1)[-1].isdigit():
                     line(f"Online: online_join: connected to {rest}")

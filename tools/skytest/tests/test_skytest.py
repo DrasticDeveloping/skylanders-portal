@@ -611,6 +611,335 @@ expect = ["Online: starting as the server"]
         self.assertEqual(skytest.save_copy_peers(spec.grades["save_copy"], list(spec.peers)), ["S", "H"])
 
 
+    COMPARED = '''layout = "server+1"
+stage = "1B"
+server = "host"
+[peer.H]
+script = """
+online_host 0
+serverlog Online: the server is in its hub (town_state10)
+serverlog Online: level 2 tutorial_b: open
+serverlog Online: level 2: the server has it up
+serverlog Online: barrier 2 released at tick 1234 (1 client)
+serverlog Trace: message CTickMessage to Hero#5 from - (#1)
+serverlog GPU: draws 812 memexport 0 copies 121 swaps 60 zpd 0 viz 0 readbacks 0 skipped 0/0 in 10.0 s
+serverlog Online: End session: closing (1 client to drain)
+log the session ended
+quit
+"""
+[compare]
+noise = ["off1", "off2"]
+test = ["on"]
+window_end = "Online: End session: closing"
+load_floor_s = 1.0
+reached = { S = ['Online: barrier 2 released at tick \\d+ \\(1 client\\)'], H = ["the session ended"] }
+[[compare.run]]
+name = "off1"
+[compare.run.peer.S]
+forbid = ["GPU: draw skip on"]
+[[compare.run]]
+name = "off2"
+[compare.run.peer.S]
+forbid = ["GPU: draw skip on"]
+[[compare.run]]
+name = "on"
+[compare.run.peer.H]
+args = ["--render_hidden_draw=false"]
+[compare.run.peer.S]
+expect = ["GPU: draw skip on"]
+'''
+
+    def test_a_compared_case_runs_its_workload_per_run_and_compares(self) -> None:
+        self.spec("ab", self.COMPARED)
+        r = self.run_cases("ab")
+        case = r["cases"][0]
+        self.assertEqual(case["status"], "pass", case["reasons"])
+        self.assertEqual([p["peer"] for p in case["peers"]], ["off1:S", "off1:H", "off2:S", "off2:H", "on:S", "on:H"])
+        folder = Path(case["folder"])
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["compare.json", "compare.md", "off1", "off2", "on"])
+        on_h = next(p for p in case["peers"] if p["peer"] == "on:H")
+        self.assertIn("--render_hidden_draw=false", on_h["command"])
+        self.assertEqual(case["compare"]["status"], "pass")
+        self.assertEqual(case["compare"]["messages"]["mode"], "sampled")
+        report = (r["folder"] / "report.md").read_text(encoding="utf-8")
+        self.assertIn("### Comparison of S's logs: PASS", report)
+        # The same runs through `compare`: the first two are the A/A.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_compare(self.cfg, argparse.Namespace(
+                runs=[str(folder / n) for n in ("off1", "off2", "on")], spec="ab", noise=0))
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("compare ab: PASS", out.getvalue())
+        report = Path(out.getvalue().strip().splitlines()[-1].split("report: ", 1)[1])
+        self.assertTrue(report.is_file() and skytest.inside(report, self.cfg.store))
+        cmp = json.loads((report.parent / "compare.json").read_text(encoding="utf-8"))
+        self.assertEqual((cmp["noise"], cmp["test"]), (["off1", "off2"], ["on"]))
+
+    def test_a_compared_case_without_its_evidence_is_not_reached(self) -> None:
+        # The workload stops before tutorial_b's barrier: the first run is not reached, and the case
+        # stops there (no second or third run) and fails; the comparison is never a pass.
+        self.spec("stopped", self.COMPARED.replace("serverlog Online: barrier 2 released at tick 1234 (1 client)\n", ""))
+        case = self.run_cases("stopped")["cases"][0]
+        self.assertEqual(case["status"], "fail")
+        self.assertEqual(case["compare"]["status"], "not reached")
+        self.assertEqual([p["peer"] for p in case["peers"]], ["off1:S", "off1:H"])
+        self.assertIn("compare: not reached: run off1: S lacks /Online: barrier 2 released at tick \\d+ \\(1 client\\)/",
+                      case["reasons"])
+        self.assertIn("compare: not reached: run(s) off2, on not run", case["reasons"])
+
+    def test_a_run_of_a_compared_case_keeps_its_own_expectations(self) -> None:
+        # The skip-on run's server must say the skip is on: without the setting it fails its run.
+        self.spec("noskip", self.COMPARED.replace('args = ["--render_hidden_draw=false"]', 'args = ["--x=1"]'))
+        case = self.run_cases("noskip")["cases"][0]
+        self.assertEqual(case["status"], "fail")
+        self.assertEqual(case["compare"]["status"], "pass", "the logs agree; the run's own expect fails it")
+        self.assertIn("run on: peers failed: S", case["reasons"])
+
+    def test_a_compare_spec_is_checked(self) -> None:
+        one_run = self.COMPARED.split("[[compare.run]]")[0] + '[[compare.run]]\nname = "off1"\n'
+        self.spec("bad-one-run", one_run)
+        with self.assertRaisesRegex(skytest.SpecError, "two or more"):
+            skytest.load_spec(self.repo / "tests" / "runtime" / "bad-one-run.toml", 20)
+        bad = {
+            "noise1": ('noise = ["off1", "off2"]', 'noise = ["off1"]', 1),
+            "overlap": ('test = ["on"]', 'test = ["on", "off1"]', 1),
+            "orphan": ('test = ["on"]', "test = []", 1),
+            "noreach": ("reached = {", "x = 1\nreachedx = {", 1),
+            "srvargs": ('[compare.run.peer.S]\nexpect = ["GPU: draw skip on"]',
+                        '[compare.run.peer.S]\nargs = ["--y=1"]', 1),
+            "badname": ('name = "on"', 'name = "o n"', 1),
+            "floor": ("load_floor_s = 1.0", "load_floor_s = -1", 1),
+            "pattern": ('window_end = "Online: End session: closing"', 'window_end = "("', 1),
+        }
+        for name, (old, new, count) in bad.items():
+            body = self.COMPARED.replace(old, new, count)
+            self.assertNotEqual(body, self.COMPARED, name)
+            self.spec(f"bad-{name}", body)
+            with self.assertRaises(skytest.SpecError, msg=name):
+                skytest.load_spec(self.repo / "tests" / "runtime" / f"bad-{name}.toml", 20)
+
+
+def stamped(*lines: tuple[float, str]) -> str:
+    """A recorded-style log written by hand: (seconds after 10:00:00, text) per line."""
+    base = time.mktime(time.strptime("2026-11-06 10:00:00", "%Y-%m-%d %H:%M:%S"))
+    out = []
+    for sec, text in lines:
+        whole = int(sec)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(base + whole))
+        out.append(f"[{stamp}.{int(round((sec - whole) * 1000)):03d}] [info] [core] [t2] {text}")
+    return "\n".join(out) + "\n"
+
+
+def sampled(at: float, key_line: str, total: int) -> list[tuple[float, str]]:
+    """The trace lines of one key that came `total` times: the first 20 and every 500th (traces.cpp)."""
+    shown = [n for n in range(1, total + 1) if n <= 20 or n % 500 == 0]
+    return [(at + i * 0.01, key_line.format(n=n)) for i, n in enumerate(shown)]
+
+
+def server_log(skip: bool = False, level_load: float = 8.0, ticks: int = 7000, barriers: tuple[int, ...] = (2,),
+               stop_before_level: bool = False, readbacks: int = 0, memexport: int = 0, swap: bool = False,
+               interleave: bool = False, dumps: tuple[dict, dict] | None = None) -> str:
+    """S's log of the item-3 workload as the server writes it (the lines' forms from session_host.cpp,
+    level_watch.cpp, traces.cpp and the SDK's draw_skip.h): the hub, tutorial_b through barrier 2,
+    two minutes at the spawn, End session. `swap`: the barrier released before the server has the
+    level up (the session's own order changed); `interleave`: the level watch's load line after the
+    session's (only the two threads' interleaving changed)."""
+    skipped = "7900/1200" if skip else "0/0"
+    gpu = (f"GPU: draws 8123 memexport {memexport} copies 1210 swaps 600 zpd 0 viz 0 readbacks {readbacks} "
+           f"skipped {skipped} in 10.0 s")
+    lines: list[tuple[float, str]] = [
+        (0.0, "Skylanders: Swap Force test (build abc1234); Windows"),
+        (0.5, "Online: starting as the server"),
+        (18.0, "Online: peer 1 joined (Owner, owner) from 127.0.0.1:50123"),
+        (24.0, "Online: the server is in its hub (town_state10)"),
+        (30.0, gpu),
+    ]
+    if skip:
+        lines.insert(2, (1.0, "GPU: draw skip on (render_hidden_draw off, window hidden): draws without memexport, "
+                              "resolves and presents are skipped"))
+    if stop_before_level:
+        return stamped(*lines)
+    t = 40.0
+    level = [
+        (t, "Online: the owner asked for tutorial_b"),
+        (t, "Online: level 2 tutorial_b: open"),
+        (t + 0.2, "Level watch: tutorial_b: requested by the game (request 1, zone 0x8312ABCD)"),
+        (t + 0.4, "Level watch: tutorial_b: loading screen up (request 1)"),
+        (t + level_load, f"Level watch: tutorial_b: the game's load call returned after {int(level_load * 1000) - 300} "
+                         "ms (request 1)"),
+        (t + level_load + 0.1, "Online: level 2: the server has it up"),
+    ]
+    if interleave:
+        level[4], level[5] = (level[4][0], level[5][1]), (level[5][0], level[4][1])
+    lines += level
+    t += level_load + (0.05 if swap else 2.0)
+    for g in barriers:
+        lines.append((t, f"Online: barrier {g} released at tick {1234 + int(level_load * 60)} (1 client)"))
+    lines.append((t + 1.0, "Level watch: tutorial_b: ready (request 1, a player is in it)"))
+    if dumps:
+        lines.append((t + 1.1, f"Trace counts: {len(dumps[0])} keys"))
+        lines += [(t + 1.1, f"Trace count: {k} {n}") for k, n in dumps[0].items()]
+    lines += sampled(t + 2.0, "Trace: trigger SpawnVolume#12 enter by Hero#5 (bits 0x21, #{n})", 1)
+    lines += sampled(t + 3.0, "Trace: message CTickMessage to Hero#5 from - (#{n})", ticks)
+    lines += sampled(t + 4.0, "Trace: telegram CSpawnMessage sender Spawner#9 activator Hero#5 (#{n})", 3)
+    lines += [(t + 10.0 * k, gpu) for k in range(1, 13)]
+    if dumps:
+        lines.append((t + 120.0, f"Trace counts: {len(dumps[1])} keys"))
+        lines += [(t + 120.0, f"Trace count: {k} {n}") for k, n in dumps[1].items()]
+    lines.append((t + 120.5, "Online: End session: closing (1 client to drain)"))
+    lines += sampled(t + 121.0, "Trace: message CShutdownMessage to Hero#5 from - (#{n})", 4)
+    return stamped(*sorted(lines, key=lambda x: x[0]))
+
+
+COMPARE = {"peer": "S", "noise": ["off1", "off2"], "test": ["on"], "window_end": "Online: End session: closing",
+           "load_floor_s": 0.5, "reached": {"S": [r"Online: barrier 2 released at tick \d+ \(1 client\)"],
+                                            "H": ["Online: the session ended"]}}
+
+
+class CompareTest(unittest.TestCase):
+    """The [compare] grade on hand-written server logs (no game log from the disc)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def run_folder(self, name: str, s_log: str, ended: bool = True) -> Path:
+        """A hosted run's folder: H's log, and S's in H's session folder."""
+        d = skytest.fresh_dir(self.root / name)
+        (d / "H" / skytest.HOSTED_SERVER_LOG).parent.mkdir(parents=True)
+        (d / "H" / skytest.HOSTED_SERVER_LOG).write_text(s_log, encoding="utf-8")
+        (d / "H" / "game.log").write_text(stamped((1.0, "Online: hosting: the server is on port 5000, join code X"))
+                                          + (stamped((200.0, "Online: the session ended")) if ended else ""),
+                                          encoding="utf-8")
+        return d
+
+    def compare(self, logs: dict[str, str], c: dict | None = None, ended: dict[str, bool] | None = None) -> dict:
+        c = dict(c or COMPARE)
+        spec = skytest.Spec(name="draw-skip-ab", path=Path("draw-skip-ab.toml"), layout="server+1", stage="1B",
+                            description="", timeout=900, peers={}, measures={}, standin_seconds=0, server="host",
+                            compare=c)
+        runs = [skytest.gather_run(n, self.run_folder(n, text, (ended or {}).get(n, True)), spec)
+                for n, text in logs.items()]
+        return skytest.compare_runs(runs, c)
+
+    def test_the_keys_of_a_recorded_log(self) -> None:
+        k = skytest.compare_keys(server_log(skip=True), COMPARE)
+        self.assertEqual(k["sequences"]["session"], [
+            "the server is in its hub (town_state10)", "the owner asked for tutorial_b", "level 2 tutorial_b: open",
+            "level 2: the server has it up", "barrier 2 released (1 client(s))", "End session: closing (1 to drain)"])
+        self.assertEqual(k["sequences"]["level_watch"], [
+            "tutorial_b: requested by the game (request 1)", "tutorial_b: loading screen up (request 1)",
+            "tutorial_b: the game's load call returned (request 1)", "tutorial_b: ready (request 1)"])
+        self.assertEqual(k["loads"], {"start -> hub": 24.0, "level 2 tutorial_b: open -> server up": 8.1,
+                                      "level 2 tutorial_b: open -> barrier": 10.0,
+                                      "level watch tutorial_b: load call": 7.7})
+        # Sampled: the highest running number seen in the window (from barrier 2 to End session); the
+        # shutdown's messages after End session do not count.
+        self.assertEqual(k["messages"]["mode"], "sampled")
+        self.assertEqual(k["messages"]["keys"], {"message CTickMessage": 7000, "trigger enter SpawnVolume#12": 1,
+                                                 "telegram CSpawnMessage": 3})
+        self.assertEqual(k["messages"]["window_s"], 120.5)
+        self.assertEqual(k["gpu"]["windows"], 13)
+        self.assertEqual((k["gpu"]["draws"], k["gpu"]["readbacks"], k["gpu"]["skipped_draws"]), (13 * 8123, 0, 13 * 7900))
+
+    def test_exact_counts_come_from_two_dumps_in_the_window(self) -> None:
+        dumps = ({"message CTickMessage": 2000, "telegram send Spawner#3": 5, "ai pick X -> Y": 9},
+                 {"message CTickMessage": 9123, "trigger enter SpawnVolume#12": 1, "telegram send Spawner#3": 6,
+                  "ai pick X -> Y": 10})
+        k = skytest.compare_keys(server_log(dumps=dumps), COMPARE)
+        self.assertEqual(k["messages"]["mode"], "exact")
+        # The difference between the two dumps, world-message keys only (not trace_telegrams' or the AI's).
+        self.assertEqual(k["messages"]["keys"], {"message CTickMessage": 7123, "trigger enter SpawnVolume#12": 1})
+
+    def test_the_aa_pair_alone(self) -> None:
+        c = {**COMPARE, "test": []}
+        cmp = self.compare({"off1": server_log(level_load=8.0), "off2": server_log(level_load=8.4, ticks=7500)}, c)
+        self.assertEqual(cmp["status"], "pass", cmp["reasons"])
+        self.assertEqual(cmp["messages"]["noisy"], 1)
+        self.assertEqual(cmp["loads"]["level 2 tutorial_b: open -> server up"]["tolerance"], 0.5, "the floor")
+        md = "\n".join(skytest.compare_markdown(cmp))
+        self.assertIn("A/A: off1, off2.", md)
+        self.assertIn("| message CTickMessage | 7000 / 7500 |", md)
+
+    def test_the_ab_passes_with_equal_lines_and_loads_within_the_noise(self) -> None:
+        cmp = self.compare({"off1": server_log(level_load=8.0, ticks=7000),
+                            "off2": server_log(level_load=9.0, ticks=7500),
+                            # The skip on: a faster load passes; 8000 is within 7000-7500 widened by 500.
+                            "on": server_log(skip=True, level_load=6.0, ticks=8000)})
+        self.assertEqual(cmp["status"], "pass", cmp["reasons"])
+        self.assertEqual(cmp["loads"]["level 2 tutorial_b: open -> server up"]["tolerance"], 1.0, "the A/A spread")
+        md = "\n".join(skytest.compare_markdown(cmp))
+        self.assertIn("### Comparison of S's logs: PASS", md)
+        self.assertIn("| on | yes | 6 | 4 | 3 keys (sampled) | 120.5 s | 13 | 105599 | 0 | 0 | 102700/15600 |", md)
+
+    def test_the_ab_fails_on_counts_order_messages_loads_and_readbacks(self) -> None:
+        aa = {"off1": server_log(), "off2": server_log()}
+        cases = {
+            "an extra barrier line": (server_log(barriers=(2, 2)),
+                                      "compare: barrier and level lines: on and off1 differ from the A/A: counts "
+                                      "'barrier 2 released (1 client(s))' 1 vs 2"),
+            "the order": (server_log(swap=True),
+                          "compare: barrier and level lines: on and off1 differ from the A/A: order at line 4: "
+                          "'level 2: the server has it up' vs 'barrier 2 released (1 client(s))'"),
+            "a message count": (server_log(ticks=7500),
+                                "compare: world messages outside the A/A noise (sampled): message CTickMessage on "
+                                "7500 (A/A 7000/7000)"),
+            "a slower load": (server_log(level_load=9.0),
+                              "compare: load level 2 tutorial_b: open -> server up: on 9.100 s, over the A/A "
+                              "8.100-8.100 s by more than 0.500 s"),
+            "a readback": (server_log(readbacks=2), "compare: run on: 26 resolve readback(s), expected 0"),
+            "memexport": (server_log(memexport=1), "compare: run on: 13 memexport draw(s)"),
+        }
+        for what, (on, reason) in cases.items():
+            cmp = self.compare({**aa, "on": on})
+            self.assertEqual(cmp["status"], "fail", what)
+            self.assertTrue(any(why.startswith(reason) for why in cmp["reasons"]), (what, cmp["reasons"]))
+        # The level watch lines are their own family: a different interleaving with the session's
+        # lines is not graded; only the order inside a family is.
+        cmp = self.compare({**aa, "on": server_log(interleave=True)})
+        self.assertEqual(cmp["status"], "pass", cmp["reasons"])
+        # An A/A that disagrees on the lines gives no baseline: that fails too.
+        cmp = self.compare({"off1": server_log(), "off2": server_log(barriers=(2, 2)), "on": server_log()})
+        self.assertTrue(any("off2 and off1 the A/A runs disagree" in why for why in cmp["reasons"]), cmp["reasons"])
+        # memexport_zero = false reports memexport draws without failing on them.
+        self.assertEqual(self.compare({**aa, "on": server_log(memexport=1)}, {**COMPARE, "memexport_zero": False})
+                         ["status"], "pass")
+
+    def test_a_stopped_run_is_not_reached(self) -> None:
+        # The skip-on run stopped in the hub: no barrier 2, and its owner never ended the session.
+        cmp = self.compare({"off1": server_log(), "off2": server_log(), "on": server_log(stop_before_level=True)},
+                           ended={"on": False})
+        self.assertEqual(cmp["status"], "not reached")
+        self.assertEqual(cmp["reasons"], [
+            "compare: not reached: run on: S lacks /Online: barrier 2 released at tick \\d+ \\(1 client\\)/, "
+            "H lacks /Online: the session ended/"])
+        self.assertEqual(cmp["loads"], {}, "nothing is graded on a run without its evidence")
+        self.assertIn("### Comparison of S's logs: NOT REACHED", "\n".join(skytest.compare_markdown(cmp)))
+        # A run that reached its evidence but logs no counters or world messages fails (not reached is
+        # only for missing evidence).
+        bare = stamped((0.0, "Online: the server is in its hub (town_state10)"),
+                       (40.0, "Online: level 2 tutorial_b: open"), (48.0, "Online: level 2: the server has it up"),
+                       (50.0, "Online: barrier 2 released at tick 1714 (1 client)"))
+        cmp = self.compare({"off1": bare, "off2": bare, "on": bare})
+        self.assertEqual(cmp["status"], "fail")
+        self.assertIn("compare: world messages: no count in the window (trace_world_messages on the compared peer?)",
+                      cmp["reasons"])
+        self.assertIn("compare: run on: no `GPU: draws` line (gpu_draw_counters on the compared peer?)", cmp["reasons"])
+
+    def test_count_and_order_expectations(self) -> None:
+        text = server_log()
+        ps = skytest.PeerSpec(name="S", expect_count={r"Online: barrier \d+ released": 1, r"GPU: draws": 13},
+                              expect_order=[r"in its hub", r"level 2 \S+: open", r"barrier 2 released"])
+        self.assertEqual(skytest.check_count_and_order(text, ps), [])
+        ps = skytest.PeerSpec(name="S", expect_count={r"Online: barrier \d+ released": 2},
+                              expect_order=[r"barrier 2 released", r"level 2 \S+: open"])
+        self.assertEqual(skytest.check_count_and_order(text, ps), [
+            r"log has /Online: barrier \d+ released/ 1 time(s), expected 2",
+            r"log lacks /level 2 \S+: open/ after /barrier 2 released/ (expect_order)"])
+
+
 class JobTest(unittest.TestCase):
     @unittest.skipUnless(winjob.WINDOWS, "job objects are Windows only")
     def test_closing_the_job_ends_its_processes(self) -> None:
