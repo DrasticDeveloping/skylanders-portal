@@ -37,6 +37,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -61,6 +62,12 @@ FPS = re.compile(r"Input script: ([\d.]+) guest FPS \((\d+) frames in ([\d.]+) s
 WHERE = re.compile(r"Where: (\w+) at (-?[\d.]+) (-?[\d.]+) (-?[\d.]+)")
 MEMORY = re.compile(r"Input script: memory (\d+) MB private, (\d+) MB working set")
 BUILD = re.compile(r"\(build (\w+)\)")
+# The online code's frame-time event (stage 1A): every 10 s on the server and on a client in a session.
+FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+) max ([\d.]+) "
+                    r"private (-?\d+) working (-?\d+) video (-?\d+)")
+# Where a hosted server (`server = "host"`) writes its log: the owner's session folder.
+HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
+GRADES = ("server_frame_time", "client_fps", "level_load")
 ALWAYS_FORBIDDEN = [r"\] Crash: ", r"\[FATAL\]", r"Input script: cannot (parse|use)"]
 
 # The lifecycle script of the stand-in server peer until stage 1A: boots, stays up, quits.
@@ -221,6 +228,10 @@ class Spec:
     peers: dict[str, PeerSpec]
     measures: dict[str, dict]
     standin_seconds: float
+    # "standin": the runner starts S as a plain game (stage 0); "host": H hosts with --role=server
+    # as its child (stage 1A on), and S's log is read from H's session folder.
+    server: str = "standin"
+    grades: dict[str, dict] = field(default_factory=dict)
 
 
 def peers_of(layout: str) -> list[str]:
@@ -273,6 +284,21 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
                 re.compile(rx)
             except re.error as e:
                 raise SpecError(f"{path.name}: peer {n}: bad pattern {rx!r}: {e}") from e
+    server = d.get("server", "standin")
+    if server not in ("standin", "host"):
+        raise SpecError(f"{path.name}: server = {server!r} (standin or host)")
+    if server == "host" and d["layout"] == "solo":
+        raise SpecError(f"{path.name}: server = \"host\" needs a server+N layout")
+    if server == "host" and "S" in table and table["S"].get("args"):
+        raise SpecError(f"{path.name}: a hosted server gets its arguments from the owner's game, not the spec")
+    grades = d.get("grade", {})
+    for gname, g in grades.items():
+        if gname not in GRADES:
+            raise SpecError(f"{path.name}: grade {gname} is not one of {', '.join(GRADES)}")
+        if not isinstance(g, dict) or g.get("peer", "S" if gname == "server_frame_time" else "H") not in names:
+            raise SpecError(f"{path.name}: grade {gname} names a peer not in {names}")
+        if gname == "level_load" and (g.get("measure") not in d.get("measure", {}) or not g.get("baseline")):
+            raise SpecError(f"{path.name}: grade level_load needs `measure` (one of the spec's) and `baseline`")
     measures = d.get("measure", {})
     for mname, m in measures.items():
         if not isinstance(m, dict) or "to" not in m:
@@ -283,6 +309,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         name=d["name"], path=path, layout=d["layout"], stage=str(d["stage"]),
         description=d.get("description", ""), timeout=float(d.get("timeout", default_timeout)),
         peers=peers, measures=measures, standin_seconds=float(d.get("standin_seconds", 45)),
+        server=server, grades=grades,
     )
 
 
@@ -386,6 +413,10 @@ class PeerResult:
     measures: dict[str, float | None] = field(default_factory=dict)
     command: list[str] = field(default_factory=list)
     started_after_s: float = 0.0
+    frame_p95_ms: list[float] = field(default_factory=list)  # the frame-time event's windows
+    peak_video_mb: int = 0
+    graded: dict[str, dict] = field(default_factory=dict)
+    accepted: list[str] = field(default_factory=list)  # grade failures the manifest accepts
 
 
 @dataclass
@@ -402,13 +433,20 @@ class CaseResult:
     leftover_processes: int = 0
 
 
-def peer_script(spec: Spec, peer: str, figures: Path) -> str:
+def peer_script(spec: Spec, peer: str, figures: Path, join: str = "") -> str:
     if peer == "S":
         return STANDIN_SERVER_SCRIPT.format(seconds=int(spec.standin_seconds))
-    return spec.peers[peer].script.replace("{figures}", str(figures)).replace("{peer}", peer)
+    return spec.peers[peer].script.replace("{figures}", str(figures)).replace("{peer}", peer).replace("{join}", join)
 
 
-def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path) -> tuple[Path, list[str]]:
+def free_loopback_port() -> int:
+    """A port nothing listens on now, for a hosted server (its owner passes it on)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -> tuple[Path, list[str]]:
     d = run / peer
     check_output_path(cfg, d)
     saves, figures = fixture_dirs(cfg)
@@ -419,7 +457,7 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path) -> tuple[Path, l
     (d / "cache").mkdir()
     shutil.copy2(cfg.settings_template, d / "settings.toml")
     script = d / "script.txt"
-    script.write_text(peer_script(spec, peer, d / "figures"), encoding="utf-8")
+    script.write_text(peer_script(spec, peer, d / "figures", f"127.0.0.1:{port}" if port else ""), encoding="utf-8")
     args = [
         f"--user_data_root={d / 'data'}",
         f"--cache_root={d / 'cache'}",
@@ -430,6 +468,7 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path) -> tuple[Path, l
         f"--input_script={script}",
         *cfg.default_args,
         *(["--window_hidden=true"] if peer == "S" else []),
+        *([f"--online_port={port}"] if port and peer == "H" else []),
         *spec.peers[peer].args,
     ]
     check_args(args)
@@ -438,7 +477,7 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path) -> tuple[Path, l
 
 def parse_log(text: str) -> dict:
     out = {"levels": [], "fps": [], "longest": [], "private": 0, "working": 0, "errors": 0, "build": "",
-           "lines": []}
+           "lines": [], "frame_p95": [], "video": 0}
     for line in text.splitlines():
         m = TS.match(line)
         t = time.mktime(time.strptime(m.group(1)[:19], "%Y-%m-%d %H:%M:%S")) + float("0" + m.group(1)[19:]) \
@@ -457,7 +496,99 @@ def parse_log(text: str) -> dict:
         if mem := MEMORY.search(line):
             out["private"] = max(out["private"], int(mem.group(1)))
             out["working"] = max(out["working"], int(mem.group(2)))
+        if fr := FRAMES.search(line):
+            out["frame_p95"].append(float(fr.group(4)))
+            out["private"] = max(out["private"], int(fr.group(6)))
+            out["working"] = max(out["working"], int(fr.group(7)))
+            out["video"] = max(out["video"], int(fr.group(8)))
     return out
+
+
+def lines_after(lines: list[tuple[float | None, str]], after: str | None) -> list[str]:
+    """The log lines after the first one matching `after` (all of them without it)."""
+    if not after:
+        return [line for _, line in lines]
+    rx = re.compile(after)
+    for i, (_, line) in enumerate(lines):
+        if rx.search(line):
+            return [l for _, l in lines[i + 1:]]
+    return []
+
+
+def frame_rate_limit(args: list[str], settings: Path) -> float:
+    """A peer's own frame limit: its --frame_rate_limit, else its settings file's, else the game's
+    default (60). 0 (no cap) counts as 60, the game's pace at present_interval 1."""
+    value = None
+    for a in args:
+        if a.startswith("--frame_rate_limit="):
+            value = a.split("=", 1)[1]
+    if value is None and settings.is_file():
+        try:
+            for table in tomllib.loads(settings.read_text(encoding="utf-8")).values():
+                if isinstance(table, dict) and "frame_rate_limit" in table:
+                    value = table["frame_rate_limit"]
+        except tomllib.TOMLDecodeError:
+            pass
+    try:
+        limit = float(value) if value is not None else 60.0
+    except (TypeError, ValueError):
+        limit = 60.0
+    return limit if limit > 0 else 60.0
+
+
+def baseline_value(baseline: dict, dotted: str) -> float | None:
+    """`solo.hub.hub_load_seconds` in tests/baseline.toml."""
+    node = baseline
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return float(node) if isinstance(node, (int, float)) else None
+
+
+def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, settings_limit: float,
+                     baseline: dict | None = None) -> list[str]:
+    """Plan 5.5 against tests/thresholds.toml, for the grades the spec names for this peer."""
+    reasons = []
+    for gname, g in spec.grades.items():
+        if g.get("peer", "S" if gname == "server_frame_time" else "H") != r.peer:
+            continue
+        after = lines_after(parsed["lines"], g.get("after"))
+        if gname == "server_frame_time":
+            limit = float(thresholds.get("server_frame_time", {}).get("p95_ms", 33.0))
+            p95s = [float(m.group(4)) for line in after if (m := FRAMES.search(line)) and int(m.group(1)) > 0]
+            worst = max(p95s) if p95s else None
+            r.graded[gname] = {"value_ms": worst, "limit_ms": limit, "windows": len(p95s)}
+            if worst is None:
+                reasons.append(f"grade {gname}: no frame-time window after /{g.get('after', '')}/")
+            elif worst > limit:
+                reasons.append(f"grade {gname}: p95 {worst:.1f} ms over {limit:.0f} ms")
+                r.graded[gname]["violation"] = True
+        elif gname == "client_fps":
+            fraction = float(thresholds.get("client_fps", {}).get("floor_fraction_of_limit", 0.7))
+            floor = fraction * settings_limit
+            fpss = [float(m.group(1)) for line in after if (m := FPS.search(line))]
+            worst = min(fpss) if fpss else None
+            r.graded[gname] = {"value_fps": worst, "floor_fps": round(floor, 1), "windows": len(fpss)}
+            if worst is None:
+                reasons.append(f"grade {gname}: no fps window after /{g.get('after', '')}/")
+            elif worst < floor:
+                reasons.append(f"grade {gname}: {worst:.1f} FPS under the floor {floor:.1f}")
+                r.graded[gname]["violation"] = True
+        elif gname == "level_load":
+            ratio_max = float(thresholds.get("level_load", {}).get("max_ratio_to_solo", 1.5))
+            solo = baseline_value(baseline or {}, g["baseline"])
+            value = r.measures.get(g["measure"])
+            ratio = round(value / solo, 2) if value is not None and solo else None
+            r.graded[gname] = {"value_s": value, "solo_s": solo, "ratio": ratio, "max_ratio": ratio_max}
+            if solo is None:
+                reasons.append(f"grade {gname}: no {g['baseline']} in the baseline")
+            elif ratio is None:
+                reasons.append(f"grade {gname}: measure {g['measure']} has no value")
+            elif ratio > ratio_max:
+                reasons.append(f"grade {gname}: {value:.1f} s is {ratio:.2f}x solo ({solo:.1f} s), over {ratio_max}x")
+                r.graded[gname]["violation"] = True
+    return reasons
 
 
 def measure(lines: list[tuple[float | None, str]], start: str | None, end: str) -> float | None:
@@ -488,7 +619,7 @@ def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
     reasons = []
     if r.ended_by_runner:
         reasons.append(f"did not quit within {spec.timeout:.0f} s; ended by the runner")
-    elif r.exit_code != 0:
+    elif r.exit_code is not None and r.exit_code != 0:  # None: a hosted server, its owner's child
         reasons.append(f"exit code {r.exit_code}")
     if not text:
         reasons.append("no log written")
@@ -515,8 +646,13 @@ def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
     r.status = "pass" if not reasons else "fail"
 
 
-def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) -> CaseResult:
+def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
+             thresholds: dict | None = None, baseline: dict | None = None,
+             accepted_grades: tuple[str, ...] = ()) -> CaseResult:
     names = list(spec.peers)
+    hosted = spec.server == "host"
+    # A hosted server is started by its owner H, not by the runner (it is still one of the games).
+    starts = [n for n in names if not (hosted and n == "S")]
     res = CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage, started=stamp)
     if len(names) > max_games:
         res.status = "capacity"
@@ -533,7 +669,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
     try:
         # Every peer's folder first (copies take a moment), then all games start close together, and
         # a spec error in a later peer starts no game at all.
-        prepared = {n: prepare_peer(cfg, spec, n, run) for n in names}
+        port = free_loopback_port() if hosted else 0
+        prepared = {n: prepare_peer(cfg, spec, n, run, port) for n in starts}
         started: dict[str, float] = {}
         ended: dict[str, float] = {}  # each game's own end, for its time
 
@@ -543,7 +680,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
                     ended[name] = time.monotonic()
 
         with winjob.Job() as job:
-            for i, n in enumerate(names):
+            for i, n in enumerate(starts):
                 if i and cfg.start_gap > 0:
                     # Games booting in the same instant crashed and froze each other in a test
                     # (stage 0, five at once); real sessions never start them together either.
@@ -593,13 +730,29 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
         return res
     res.seconds = round(time.monotonic() - t_start, 1)
     for n in names:
-        log = run / n / "game.log"
+        log = run / "H" / HOSTED_SERVER_LOG if hosted and n == "S" else run / n / "game.log"
         text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
         parsed = parse_log(text)
         r = results[n]
         r.build, r.levels, r.fps, r.longest_frame_ms = parsed["build"], parsed["levels"], parsed["fps"], parsed["longest"]
         r.peak_private_mb, r.peak_working_set_mb, r.errors = parsed["private"], parsed["working"], parsed["errors"]
+        r.frame_p95_ms, r.peak_video_mb = parsed["frame_p95"], parsed["video"]
         grade_peer(spec, r, text, parsed)
+        if spec.grades:
+            limit = frame_rate_limit(r.command, run / n / "settings.toml")
+            extra = grade_thresholds(spec, r, parsed, thresholds or {}, limit, baseline)
+            # A grade the manifest accepts for this case (plan 5.4: accepted failures with a reason)
+            # is recorded, not failed on; everything else still has to pass.
+            # Only a measured violation is accepted: a missing measurement or baseline still fails.
+            def acceptable(why: str) -> bool:
+                gname = why.split(":", 1)[0].removeprefix("grade ")
+                return gname in accepted_grades and bool(r.graded.get(gname, {}).get("violation"))
+
+            r.accepted = [why for why in extra if acceptable(why)]
+            extra = [why for why in extra if why not in r.accepted]
+            if extra:
+                r.reasons += extra
+                r.status = "fail"
     res.peers = [results[n] for n in names]
     failed = [r.peer for r in res.peers if r.status != "pass"]
     if res.leftover_processes:
@@ -614,13 +767,19 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str) ->
 
 
 def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: list[CaseResult],
-                       touched: list[str] | None = None) -> dict:
+                       touched: list[str] | None = None, before: dict[str, str] | None = None) -> dict:
     """Plan 5.4: a checkpoint is met when every required case of its stage and the earlier ones ran
     and passed, and the run left the owner's data and the disc alone. A capacity result counts only
-    where the manifest says so (capacity_ok). (Not yet: "nothing that passed before fails" and
-    accepted failures; neither exists before stage 1A, which adds them.)"""
+    where the manifest says so (capacity_ok). A grade the manifest accepts for a case
+    (accepted_grades, with a reason) does not fail it; the line names it. A case of any kind that
+    passed in the run before and fails now is open ("nothing that passed before fails")."""
     ran = {r.case: r for r in results}
     open_cases = [f"guard: {folder} changed" for folder in (touched or [])]
+    for case_id, status in (before or {}).items():
+        r = ran.get(case_id)
+        if status == "pass" and r is not None and r.status in ("fail", "error"):
+            open_cases.append(f"{case_id} (passed before, fails now)")
+    accepted = sorted({f"{r.case}: {why}" for r in results for p in r.peers for why in p.accepted})
     for c in manifest.get("case", []):
         if c.get("kind") != "required" or str(c.get("stage")) not in stages:
             continue
@@ -633,8 +792,11 @@ def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: l
             continue
         elif r.status != "pass":
             open_cases.append(f"{c['id']} ({r.status})")
+    open_cases = list(dict.fromkeys(open_cases))
     line = f"checkpoint {stage}: met" if not open_cases else f"checkpoint {stage}: NOT met: {', '.join(open_cases)}"
-    return {"stage": stage, "met": not open_cases, "open": open_cases, "line": line}
+    if accepted:
+        line += f" (accepted: {'; '.join(accepted)})"
+    return {"stage": stage, "met": not open_cases, "open": open_cases, "accepted": accepted, "line": line}
 
 
 def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: dict, thresholds: dict,
@@ -819,10 +981,13 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     check_output_path(cfg, out)
     out.mkdir(parents=True)
     thresholds = tomllib.loads(cfg.thresholds.read_text(encoding="utf-8")) if cfg.thresholds.is_file() else {}
+    baseline = tomllib.loads(cfg.baseline.read_text(encoding="utf-8")) if cfg.baseline.is_file() else {}
     results = []
     for spec in specs:
         print(f"{spec.name} ({spec.layout}) ...", flush=True)
-        r = run_case(cfg, spec, snap, max_games, time.strftime("%Y%m%d-%H%M%S"))
+        entry = next((c for c in manifest.get("case", []) if c.get("id") == spec.name), {})
+        r = run_case(cfg, spec, snap, max_games, time.strftime("%Y%m%d-%H%M%S"), thresholds, baseline,
+                     tuple(entry.get("accepted_grades", [])))
         print(f"  {r.status.upper()}" + (f": {'; '.join(r.reasons)}" if r.reasons else ""), flush=True)
         results.append(r)
     after_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
@@ -834,8 +999,8 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                  and (stages is None or str(c.get("stage")) in stages)] if a.cases in ([], ["all"]) else []
     touched = [g["folder"] for g in guard if not g["unchanged"]]
     full_run = a.cases in ([], ["all"])
-    checkpoint = checkpoint_verdict(manifest, a.stage, stages, results, touched) if a.stage and full_run else None
     before = previous_statuses(cfg, out)
+    checkpoint = checkpoint_verdict(manifest, a.stage, stages, results, touched, before) if a.stage and full_run else None
     payload = {"snapshot": str(snap), "max_games": max_games, "stages": stages, "thresholds": thresholds,
                "guarded_folders": guard, "required_without_spec": unwritten, "checkpoint": checkpoint,
                "cases": [asdict(r) for r in results]}
@@ -889,6 +1054,11 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
         for key in ("id", "stage", "layout", "kind"):
             if key not in c:
                 problems.append(f"manifest: a case lacks `{key}`: {c}")
+        bad = [g for g in c.get("accepted_grades", []) if g not in GRADES]
+        if bad:
+            problems.append(f"manifest: {c.get('id')}: accepted_grades {bad} are not grades ({', '.join(GRADES)})")
+        if c.get("accepted_grades") and not c.get("reason"):
+            problems.append(f"manifest: {c.get('id')}: accepted_grades need a `reason`")
         if c.get("id") in ids:
             problems.append(f"manifest: {c.get('id')} twice")
         if order and str(c.get("stage")) not in order + ["v1"]:

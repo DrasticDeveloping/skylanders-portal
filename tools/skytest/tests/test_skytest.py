@@ -408,6 +408,147 @@ quit
         self.assertIn("named wrong-file but the case right-name", out.getvalue())
 
 
+    HOSTED = '''layout = "server+2"
+stage = "1A"
+server = "host"
+[peer.H]
+script = """
+online_host 0
+place 0 {figures}/Roller Brawl.dump
+fps 8
+quit
+"""
+[peer.D]
+script = """
+wait 1
+online_join {join}
+fps 8
+quit
+"""
+[peer.S]
+expect = ["Online: starting as the server"]
+'''
+
+    def test_a_hosted_server_is_graded_from_the_owners_session_folder(self) -> None:
+        self.spec("hosted", self.HOSTED)
+        r = self.run_cases("hosted")
+        case = r["cases"][0]
+        self.assertEqual(case["status"], "pass", case)
+        peers = {p["peer"]: p for p in case["peers"]}
+        self.assertEqual(sorted(peers), ["D", "H", "S"])
+        self.assertIsNone(peers["S"]["exit_code"], "the runner did not start the hosted server")
+        self.assertEqual(peers["S"]["command"], [])
+        self.assertEqual(peers["S"]["frame_p95_ms"], [12.0])
+        self.assertEqual(peers["S"]["peak_video_mb"], 410)
+        port = next(a.split("=", 1)[1] for a in peers["H"]["command"] if a.startswith("--online_port="))
+        self.assertTrue(port.isdigit() and int(port) > 0)
+        d_script = (Path(case["folder"]) / "D" / "script.txt").read_text(encoding="utf-8")
+        self.assertIn(f"online_join 127.0.0.1:{port}", d_script)
+        self.assertFalse((Path(case["folder"]) / "S").exists(), "no folder of its own for a hosted server")
+
+    def test_the_server_frame_time_and_client_fps_are_graded(self) -> None:
+        grades = ('\n[grade.server_frame_time]\nafter = "Level watch: tutorial_b: ready"\n'
+                  '[grade.client_fps]\npeer = "H"\n')
+        self.spec("graded", self.HOSTED + grades)
+        case = self.run_cases("graded")["cases"][0]
+        self.assertEqual(case["status"], "pass", case)
+        peers = {p["peer"]: p for p in case["peers"]}
+        self.assertEqual(peers["S"]["graded"]["server_frame_time"]["value_ms"], 12.0)
+        self.assertEqual(peers["S"]["graded"]["server_frame_time"]["windows"], 1, "the empty window does not count")
+        self.assertEqual(peers["H"]["graded"]["client_fps"]["value_fps"], 44.7)
+        # A slow server fails its grade; so does a client under the floor (44.7 < 0.8 x 60).
+        self.spec("slow", self.HOSTED.replace("online_host 0", "serverframes 50\nonline_host 0") + grades)
+        slow = self.run_cases("slow")["cases"][0]
+        self.assertEqual(slow["status"], "fail")
+        s = next(p for p in slow["peers"] if p["peer"] == "S")
+        self.assertTrue(any("p95 50.0 ms over 33 ms" in why for why in s["reasons"]), s["reasons"])
+
+    def test_a_hosted_server_spec_is_checked(self) -> None:
+        self.spec("bad1", 'layout = "solo"\nstage = "1A"\nserver = "host"\n[peer.H]\nscript = "quit\\n"\n')
+        self.spec("bad2", self.HOSTED.replace('expect = ["Online: starting as the server"]',
+                                              'args = ["--x=1"]'))
+        self.spec("bad3", self.HOSTED + '\n[grade.speed]\n')
+        for name in ("bad1", "bad2", "bad3"):
+            with self.assertRaises(skytest.SpecError, msg=name):
+                skytest.load_spec(self.repo / "tests" / "runtime" / f"{name}.toml", 20)
+
+    def test_a_level_load_is_graded_against_the_baseline(self) -> None:
+        (self.repo / "tests" / "baseline.toml").write_text("[solo.hub]\nhub_load_seconds = 0.001\n", encoding="utf-8")
+        self.cfg = skytest.load_config(self.repo)
+        self.cfg.start_gap = 0.0
+        self.spec("load", self.HOSTED.replace("online_host 0", "online_host 0\nwait 20") +
+                  '\n[measure.hub_load]\nfrom = "Online: hosting"\nto = "Input script: placed in slot 0"\n'
+                  '[grade.level_load]\npeer = "H"\nmeasure = "hub_load"\nbaseline = "solo.hub.hub_load_seconds"\n')
+        case = self.run_cases("load")["cases"][0]
+        h = next(p for p in case["peers"] if p["peer"] == "H")
+        self.assertIsNotNone(h["graded"]["level_load"]["ratio"])
+        self.assertGreater(h["graded"]["level_load"]["ratio"], 1.5)
+        self.assertTrue(any("grade level_load" in why for why in h["reasons"]), h["reasons"])
+        self.spec("load2", self.HOSTED + '\n[grade.level_load]\npeer = "H"\nmeasure = "nope"\nbaseline = "x"\n')
+        with self.assertRaises(skytest.SpecError):
+            skytest.load_spec(self.repo / "tests" / "runtime" / "load2.toml", 20)
+
+    def test_the_fps_floor_follows_the_peers_frame_limit(self) -> None:
+        settings = self.repo / "s.toml"
+        settings.write_text('["Graphics"]\nframe_rate_limit = 30\n', encoding="utf-8")
+        self.assertEqual(skytest.frame_rate_limit([], settings), 30.0)
+        self.assertEqual(skytest.frame_rate_limit(["--frame_rate_limit=120"], settings), 120.0)
+        self.assertEqual(skytest.frame_rate_limit([], self.repo / "missing.toml"), 60.0)
+        settings.write_text('["Graphics"]\nframe_rate_limit = 0\n', encoding="utf-8")
+        self.assertEqual(skytest.frame_rate_limit([], settings), 60.0)
+        # A 30 FPS peer at 25 FPS is over its floor of 21; at 60 it would be under 42.
+        (self.repo / "settings.example").write_text('["Graphics"]\nframe_rate_limit = 30\n', encoding="utf-8")
+        self.cfg = skytest.load_config(self.repo)
+        self.cfg.start_gap = 0.0
+        self.spec("slow30", self.HOSTED + '\n[grade.client_fps]\npeer = "H"\n')
+        h = next(p for p in self.run_cases("slow30")["cases"][0]["peers"] if p["peer"] == "H")
+        self.assertEqual(h["graded"]["client_fps"]["floor_fps"], 21.0)
+        self.assertNotIn("client_fps", " ".join(h["reasons"]))
+
+    def test_an_accepted_grade_is_named_and_a_regression_is_open(self) -> None:
+        graded = self.HOSTED.replace('stage = "1A"', 'stage = "0"').replace(
+            "online_host 0", "serverframes 50\nonline_host 0") + '\n[grade.server_frame_time]\n'
+        self.spec("slowsrv", graded)
+        entry = ('[[case]]\nid = "slowsrv"\nstage = "0"\nlayout = "server+2"\nkind = "required"\nspec = true\n')
+
+        def checkpoint(manifest_body: str) -> dict:
+            self.manifest(manifest_body)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                skytest.cmd_test(self.cfg, argparse.Namespace(cases=[], stage="0", max_games=3))
+            folder = Path(out.getvalue().strip().splitlines()[-1].split("report: ", 1)[1]).parent
+            return json.loads((folder / "results.json").read_text(encoding="utf-8"))["checkpoint"]
+
+        self.assertFalse(checkpoint(entry)["met"])  # the server's p95 of 50 ms fails
+        cp = checkpoint(entry + 'accepted_grades = ["server_frame_time"]\nreason = "one PC"\n')
+        self.assertTrue(cp["met"], cp)
+        self.assertIn("accepted: slowsrv: grade server_frame_time: p95 50.0 ms over 33 ms", cp["line"])
+        # It passed in the run before; now its flow breaks (the owner never hosts): open as a regression.
+        self.spec("slowsrv", graded.replace("online_host 0", "crash"))
+        cp = checkpoint(entry + 'accepted_grades = ["server_frame_time"]\nreason = "one PC"\n')
+        self.assertFalse(cp["met"])
+        self.assertIn("slowsrv (passed before, fails now)", cp["open"])
+
+    def test_an_accepted_grade_still_needs_its_measurement(self) -> None:
+        # client_fps accepted, but H measures no fps window: that is missing evidence, not accepted.
+        no_fps = self.HOSTED.replace('stage = "1A"', 'stage = "0"').replace("fps 8\nquit", "quit", 1) + \
+            '\n[grade.client_fps]\npeer = "H"\n'
+        self.spec("nofps", no_fps)
+        self.manifest('[[case]]\nid = "nofps"\nstage = "0"\nlayout = "server+2"\nkind = "required"\nspec = true\n'
+                      'accepted_grades = ["client_fps"]\nreason = "one PC"\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_test(self.cfg, argparse.Namespace(cases=[], stage="0", max_games=3))
+        folder = Path(out.getvalue().strip().splitlines()[-1].split("report: ", 1)[1]).parent
+        results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+        self.assertFalse(results["checkpoint"]["met"])
+        h = next(p for p in results["cases"][0]["peers"] if p["peer"] == "H")
+        self.assertEqual(h["accepted"], [])
+        self.assertTrue(any("no fps window" in why for why in h["reasons"]), h["reasons"])
+
+    def test_a_case_that_errors_after_passing_is_a_regression(self) -> None:
+        r = skytest.CaseResult(case="x", layout="solo", stage="0", status="error")
+        cp = skytest.checkpoint_verdict({"case": []}, "0", ["0"], [r], [], {"x": "pass"})
+        self.assertIn("x (passed before, fails now)", cp["open"])
+
 class JobTest(unittest.TestCase):
     @unittest.skipUnless(winjob.WINDOWS, "job objects are Windows only")
     def test_closing_the_job_ends_its_processes(self) -> None:
