@@ -708,6 +708,7 @@ expect = ["GPU: draw skip on"]
                         '[compare.run.peer.S]\nargs = ["--y=1"]', 1),
             "badname": ('name = "on"', 'name = "o n"', 1),
             "floor": ("load_floor_s = 1.0", "load_floor_s = -1", 1),
+            "ratefloor": ("load_floor_s = 1.0", "load_floor_s = 1.0\nrate_floor = -0.01", 1),
             "pattern": ('window_end = "Online: End session: closing"', 'window_end = "("', 1),
         }
         for name, (old, new, count) in bad.items():
@@ -737,22 +738,24 @@ def sampled(at: float, key_line: str, total: int) -> list[tuple[float, str]]:
 
 def server_log(skip: bool = False, level_load: float = 8.0, ticks: int = 7000, barriers: tuple[int, ...] = (2,),
                stop_before_level: bool = False, readbacks: int = 0, memexport: int = 0, swap: bool = False,
-               interleave: bool = False, dumps: tuple[dict, dict] | None = None) -> str:
+               interleave: bool = False, dumps: tuple[dict, dict] | None = None, spawns: int = 3, fps: int = 60,
+               acts: int = 0, gpu_lines: bool = True) -> str:
     """S's log of the item-3 workload as the server writes it (the lines' forms from session_host.cpp,
     level_watch.cpp, traces.cpp and the SDK's draw_skip.h): the hub, tutorial_b through barrier 2,
     two minutes at the spawn, End session. `swap`: the barrier released before the server has the
     level up (the session's own order changed); `interleave`: the level watch's load line after the
-    session's (only the two threads' interleaving changed)."""
+    session's (only the two threads' interleaving changed). `fps`: the server's frames per second (the
+    GPU lines' swaps per 10 s window); `acts`: a per-frame trigger key's sampled count in the window;
+    `gpu_lines`: False leaves the GPU lines out."""
     skipped = "7900/1200" if skip else "0/0"
-    gpu = (f"GPU: draws 8123 memexport {memexport} copies 1210 swaps 600 zpd 0 viz 0 readbacks {readbacks} "
+    gpu = (f"GPU: draws 8123 memexport {memexport} copies 1210 swaps {fps * 10} zpd 0 viz 0 readbacks {readbacks} "
            f"skipped {skipped} in 10.0 s")
     lines: list[tuple[float, str]] = [
         (0.0, "Skylanders: Swap Force test (build abc1234); Windows"),
         (0.5, "Online: starting as the server"),
         (18.0, "Online: peer 1 joined (Owner, owner) from 127.0.0.1:50123"),
         (24.0, "Online: the server is in its hub (town_state10)"),
-        (30.0, gpu),
-    ]
+    ] + ([(30.0, gpu)] if gpu_lines else [])
     if skip:
         lines.insert(2, (1.0, "GPU: draw skip on (render_hidden_draw off, window hidden): draws without memexport, "
                               "resolves and presents are skipped"))
@@ -780,8 +783,9 @@ def server_log(skip: bool = False, level_load: float = 8.0, ticks: int = 7000, b
         lines += [(t + 1.1, f"Trace count: {k} {n}") for k, n in dumps[0].items()]
     lines += sampled(t + 2.0, "Trace: trigger SpawnVolume#12 enter by Hero#5 (bits 0x21, #{n})", 1)
     lines += sampled(t + 3.0, "Trace: message CTickMessage to Hero#5 from - (#{n})", ticks)
-    lines += sampled(t + 4.0, "Trace: telegram CSpawnMessage sender Spawner#9 activator Hero#5 (#{n})", 3)
-    lines += [(t + 10.0 * k, gpu) for k in range(1, 13)]
+    lines += sampled(t + 4.0, "Trace: telegram CSpawnMessage sender Spawner#9 activator Hero#5 (#{n})", spawns)
+    lines += sampled(t + 5.0, "Trace: trigger Gate#7 act by Hero#5 (bits 0x3C, #{n})", acts)
+    lines += [(t + 10.0 * k, gpu) for k in range(1, 13)] if gpu_lines else []
     if dumps:
         lines.append((t + 120.0, f"Trace counts: {len(dumps[1])} keys"))
         lines += [(t + 120.0, f"Trace count: {k} {n}") for k, n in dumps[1].items()]
@@ -883,9 +887,9 @@ class CompareTest(unittest.TestCase):
             "the order": (server_log(swap=True),
                           "compare: barrier and level lines: on and off1 differ from the A/A: order at line 4: "
                           "'level 2: the server has it up' vs 'barrier 2 released (1 client(s))'"),
-            "a message count": (server_log(ticks=7500),
+            "a message count": (server_log(ticks=8000),
                                 "compare: world messages outside the A/A noise (sampled): message CTickMessage on "
-                                "7500 (A/A 7000/7000)"),
+                                "8000 (A/A 7000/7000; sampled, one step 500)"),
             "a slower load": (server_log(level_load=9.0),
                               "compare: load level 2 tutorial_b: open -> server up: on 9.100 s, over the A/A "
                               "8.100-8.100 s by more than 0.500 s"),
@@ -907,6 +911,60 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(self.compare({**aa, "on": server_log(memexport=1)}, {**COMPARE, "memexport_zero": False})
                          ["status"], "pass")
 
+    def test_a_sampled_count_is_known_to_within_one_step(self) -> None:
+        # traces.cpp logs a key's first 20 events and every 500th: a highest #n of 20 or more says the
+        # true count lies between it and the next logged number.
+        self.assertEqual(skytest.sampled_range(19), (19, 19))
+        self.assertEqual(skytest.sampled_range(20), (20, 500))
+        self.assertEqual(skytest.sampled_range(6500), (6500, 7000))
+        self.assertEqual(skytest.counts_within_noise([6500, 6500], 7000, True), (True, 500))
+        self.assertEqual(skytest.counts_within_noise([6500, 6500], 6000, True), (True, 500))
+        self.assertEqual(skytest.counts_within_noise([6500, 6500], 7500, True), (False, 500))
+        self.assertEqual(skytest.counts_within_noise([6500, 6500], 5500, True), (False, 500))
+        self.assertEqual(skytest.counts_within_noise([3, 3], 4, True), (False, 0), "under 20 stays exact")
+        self.assertEqual(skytest.counts_within_noise([19, 19], 20, True)[0], False, "19 is exact, 20 is at least 20")
+        self.assertEqual(skytest.counts_within_noise([6500, 6500], 7000, False), (False, 0), "exact stays exact")
+        # The A/A spread still widens the range on top of the step.
+        self.assertTrue(skytest.counts_within_noise([6000, 6500], 7500, True)[0])
+        self.assertFalse(skytest.counts_within_noise([6000, 6500], 8000, True)[0])
+
+    def test_the_p1e_case_passes_within_one_step(self) -> None:
+        # P1e's draw-skip-ab: two trigger keys at 6500 / 6500 / 7000, one event apart at most.
+        aa = {"off1": server_log(ticks=6500), "off2": server_log(ticks=6500)}
+        cmp = self.compare({**aa, "on": server_log(skip=True, ticks=7000)})
+        self.assertEqual(cmp["status"], "pass", cmp["reasons"])
+        e = cmp["messages"]["keys"]["message CTickMessage"]
+        self.assertEqual((e["ok"], e["within_step"], e["step"]), (True, True, 500))
+        self.assertEqual(cmp["messages"]["within_step"], 1)
+        md = "\n".join(skytest.compare_markdown(cmp))
+        self.assertIn("| message CTickMessage (sampled, within one step) | 6500 / 6500 | 7000 |", md)
+        self.assertIn("1 key(s) passed that way (marked 'sampled, within one step')", md)
+        # Two steps apart fails.
+        cmp = self.compare({**aa, "on": server_log(skip=True, ticks=7500)})
+        self.assertEqual(cmp["status"], "fail")
+        self.assertIn("compare: world messages outside the A/A noise (sampled): message CTickMessage on 7500 "
+                      "(A/A 6500/6500; sampled, one step 500)", cmp["reasons"])
+        self.assertIn("| message CTickMessage (FAIL) | 6500 / 6500 | 7500 |", "\n".join(skytest.compare_markdown(cmp)))
+        # A key under 20 stays exact: 3 / 3 / 4 fails.
+        cmp = self.compare({"off1": server_log(), "off2": server_log(), "on": server_log(spawns=4)})
+        self.assertEqual(cmp["status"], "fail")
+        self.assertIn("compare: world messages outside the A/A noise (sampled): telegram CSpawnMessage on 4 "
+                      "(A/A 3/3)", cmp["reasons"])
+
+    def test_exact_counts_stay_exact(self) -> None:
+        # Two `Trace counts` dumps in the window: counts are exact, one event off fails.
+        def dumped(n: int) -> str:
+            return server_log(dumps=({"message CTickMessage": 100}, {"message CTickMessage": 100 + n}))
+        cmp = self.compare({"off1": dumped(6500), "off2": dumped(6500), "on": dumped(6501)})
+        self.assertEqual(cmp["messages"]["mode"], "exact")
+        self.assertEqual(cmp["status"], "fail")
+        self.assertIn("compare: world messages outside the A/A noise (exact): message CTickMessage on 6501 "
+                      "(A/A 6500/6500)", cmp["reasons"])
+        md = "\n".join(skytest.compare_markdown(cmp))
+        self.assertNotIn("Sampled counts", md)
+        self.assertEqual(self.compare({"off1": dumped(6500), "off2": dumped(6500), "on": dumped(6500)})["status"],
+                         "pass")
+
     def test_a_stopped_run_is_not_reached(self) -> None:
         # The skip-on run stopped in the hub: no barrier 2, and its owner never ended the session.
         cmp = self.compare({"off1": server_log(), "off2": server_log(), "on": server_log(stop_before_level=True)},
@@ -927,6 +985,78 @@ class CompareTest(unittest.TestCase):
         self.assertIn("compare: world messages: no count in the window (trace_world_messages on the compared peer?)",
                       cmp["reasons"])
         self.assertIn("compare: run on: no `GPU: draws` line (gpu_draw_counters on the compared peer?)", cmp["reasons"])
+
+    def test_the_frames_in_a_window_come_from_the_swaps(self) -> None:
+        # Each GPU line counts the swaps of the 10 s before it; a line that covers the window in part
+        # counts that part.
+        log = skytest.parse_log(stamped(
+            (10.0, "GPU: draws 1 memexport 0 copies 1 swaps 600 zpd 0 viz 0 readbacks 0 skipped 0/0 in 10.0 s"),
+            (20.0, "GPU: draws 1 memexport 0 copies 1 swaps 500 zpd 0 viz 0 readbacks 0 skipped 0/0 in 10.0 s")))
+        base = log["lines"][0][0] - 10.0
+        self.assertEqual(skytest.window_frames(log["lines"], base + 5.0, base + 18.0), 700.0)
+        # The log ends at 20 s: 20-25 s is filled at the covered part's rate (800 swaps in 15 s).
+        self.assertEqual(skytest.window_frames(log["lines"], base + 5.0, base + 25.0), 1066.7)
+        self.assertIsNone(skytest.window_frames(log["lines"], base + 30.0, base + 40.0))
+        self.assertEqual(skytest.compare_keys(server_log(fps=57), COMPARE)["messages"]["frames"], 57 * 120.5)
+
+    def test_per_frame_keys_are_graded_as_rates(self) -> None:
+        # traces.cpp: act and touch come every server frame while the hero stands in the volume. With
+        # exact counts (two dumps, 118.9 s apart) and 0.9 events per frame, 57 fps gives 6100 and
+        # 60 fps 6421: unequal counts, equal rates.
+        def dumped(fps: int, per_frame: float, enters: int = 1) -> str:
+            n = round(per_frame * fps * 118.9)
+            return server_log(fps=fps, dumps=({"trigger act Gate#7": 0, "trigger enter Gate#7": 0},
+                                              {"trigger act Gate#7": n, "trigger enter Gate#7": enters}))
+        aa = {"off1": dumped(57, 0.9), "off2": dumped(57, 0.9)}
+        cmp = self.compare({**aa, "on": dumped(60, 0.9)})
+        self.assertEqual(cmp["status"], "pass", cmp["reasons"])
+        msgs = cmp["messages"]
+        self.assertEqual(msgs["rate_unit"], "frame")
+        self.assertEqual(sorted(msgs["rates"]), ["trigger act Gate#7"])
+        self.assertEqual(sorted(msgs["keys"]), ["trigger enter Gate#7"], "enter stays a count")
+        e = msgs["rates"]["trigger act Gate#7"]
+        self.assertEqual((e["noise"], e["test"]), ([6100, 6100], {"on": 6421}))
+        self.assertAlmostEqual(e["test_rate"]["on"][0], 0.9, places=3)
+        self.assertAlmostEqual(e["tolerance"], 0.009, places=4, msg="no A/A spread: 1% of the A/A rate")
+        md = "\n".join(skytest.compare_markdown(cmp))
+        self.assertIn("1 per-frame key(s) graded as rates (below)", md)
+        self.assertIn("Frames in the window: off1 6777.3 (57.00 per s over 118.9 s), off2 6777.3", md)
+        self.assertIn("| trigger act Gate#7 | 6100 / 6100 | 0.9001 / 0.9001 | 0.0090 | 6421: 0.9001 |", md)
+        # The per-frame rate doubled fails.
+        cmp = self.compare({**aa, "on": dumped(60, 1.8)})
+        self.assertEqual(cmp["status"], "fail")
+        self.assertIn("compare: per-frame keys outside the A/A noise (events per frame): trigger act Gate#7 on "
+                      "1.8000 (A/A 0.9001/0.9001, tolerance 0.0090)", cmp["reasons"])
+        self.assertIn("| trigger act Gate#7 (FAIL) |", "\n".join(skytest.compare_markdown(cmp)))
+        # Counts are unchanged: an extra enter fails as before, whatever the frame rate.
+        cmp = self.compare({**aa, "on": dumped(60, 0.9, enters=2)})
+        self.assertEqual(cmp["status"], "fail")
+        self.assertIn("compare: world messages outside the A/A noise (exact): trigger enter Gate#7 on 2 (A/A 1/1)",
+                      cmp["reasons"])
+        # A floor of 0 and a 1% faster rate: outside an A/A with no spread.
+        cmp = self.compare({**aa, "on": dumped(60, 0.91)}, {**COMPARE, "rate_floor": 0.0})
+        self.assertEqual(cmp["status"], "fail")
+        self.assertEqual(self.compare({**aa, "on": dumped(60, 0.905)})["status"], "pass", "within 1%")
+
+    def test_sampled_rates_are_ranges_and_seconds_without_frames(self) -> None:
+        # P1e: 6500 act events at 57 fps (twice) and 7000 at 60 fps, each known to one step of 500.
+        aa = {"off1": server_log(fps=57, acts=6500), "off2": server_log(fps=57, acts=6500)}
+        cmp = self.compare({**aa, "on": server_log(fps=60, acts=7000)})
+        self.assertEqual(cmp["status"], "pass", cmp["reasons"])
+        e = cmp["messages"]["rates"]["trigger act Gate#7"]
+        self.assertEqual([round(x, 4) for x in e["test_rate"]["on"]], [round(7000 / 7230, 4), round(7500 / 7230, 4)])
+        self.assertIn("(a sampled count gives a range of rates, low-high)", "\n".join(skytest.compare_markdown(cmp)))
+        cmp = self.compare({**aa, "on": server_log(fps=60, acts=14000)})
+        self.assertEqual(cmp["status"], "fail")
+        self.assertTrue(any(w.startswith("compare: per-frame keys outside the A/A noise (events per frame): "
+                                         "trigger act Gate#7 on 1.9364-2.0055") for w in cmp["reasons"]), cmp["reasons"])
+        # No GPU line in a window: every run's rate is per second of its window.
+        cmp = self.compare({**aa, "on": server_log(acts=7000, gpu_lines=False)})
+        self.assertEqual(cmp["messages"]["rate_unit"], "second")
+        self.assertAlmostEqual(cmp["messages"]["rates"]["trigger act Gate#7"]["noise_rate"][0][0], 6500 / 120.5,
+                               places=3)
+        self.assertIn("Seconds in the window: off1 120.5, off2 120.5, on 120.5.",
+                      "\n".join(skytest.compare_markdown(cmp)))
 
     def test_count_and_order_expectations(self) -> None:
         text = server_log()

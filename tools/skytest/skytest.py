@@ -106,7 +106,10 @@ BARRIER = re.compile(r"Online: barrier (\d+) released at tick \d+")
 SERVER_HUB = re.compile(r"Online: the server is in its hub")
 # trace_world_messages (src/online/dev/traces.cpp): each key is logged its first 20 times and then
 # every 500th with its running count (#n); `Trace counts: <k> keys` and `Trace count: <key> <n>`
-# lines (LogTraceCounts) give every key's exact count so far (code).
+# lines (LogTraceCounts) give every key's exact count so far (code). The sampling rule is
+# CountAndShouldLog (traces.cpp: n <= kFirstLines || n % kEvery == 0, trace_counts.h).
+TRACE_FIRST_LINES = 20
+TRACE_EVERY = 500
 TRACE_MESSAGE = re.compile(r"Trace: message (\S+) to .*\(#(\d+)\)\s*$")
 TRACE_TELEGRAM = re.compile(r"Trace: telegram (\S+) sender .*\(#(\d+)\)\s*$")
 TRACE_TRIGGER = re.compile(r"Trace: trigger (.+) (enter|exit|act|de-act|touch|other) by .*\(bits 0x[0-9A-Fa-f]+, "
@@ -115,7 +118,16 @@ TRACE_COUNTS = re.compile(r"Trace counts: (\d+) keys")
 TRACE_COUNT = re.compile(r"Trace count: (.+) (\d+)\s*$")
 DEFAULT_WINDOW = r"Online: barrier \d+ released at tick"
 RUN_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
-COMPARE_KEYS = {"peer", "run", "noise", "test", "reached", "window", "window_end", "load_floor_s", "memexport_zero"}
+COMPARE_KEYS = {"peer", "run", "noise", "test", "reached", "window", "window_end", "load_floor_s", "memexport_zero",
+                "rate_floor"}
+# The per-frame trigger events: sub_82AE9330 is called every server frame while an entity stands in
+# a volume with act (0x8) or touch (0x4), once for enter (0x1), exit (0x2) and de-act (0x10)
+# (traces.cpp: TriggerEvent names them, enter > exit > act > de-act > touch, and its listener trace
+# calls act and touch "the per-frame touch and act calls") (code). Their counts follow the server's
+# frame rate and the window's length, which the draw skip changes (P1e: about 57 fps off, 60 on), so
+# their keys ("trigger act <Name#id>", "trigger touch <Name#id>") are graded as events per frame.
+RATE_EVENTS = ("act", "touch")
+DEFAULT_RATE_FLOOR = 0.01  # a rate key's tolerance: the A/A spread plus this share of the A/A rate
 
 # The lifecycle script of the stand-in server peer until stage 1A: boots, stays up, quits.
 STANDIN_SERVER_SCRIPT = "wait {seconds}\nfps 5\nquit\n"
@@ -458,6 +470,9 @@ def check_compare(spec_name: str, c: object, names: list[str], server: str) -> N
     floor = c.get("load_floor_s", 0.0)
     if not isinstance(floor, (int, float)) or isinstance(floor, bool) or floor < 0:
         raise bad("`load_floor_s` is a number of seconds >= 0")
+    rate_floor = c.get("rate_floor", DEFAULT_RATE_FLOOR)
+    if not isinstance(rate_floor, (int, float)) or isinstance(rate_floor, bool) or rate_floor < 0:
+        raise bad("`rate_floor` is a share of the A/A rate >= 0 (0.01: 1%)")
     if not isinstance(c.get("memexport_zero", True), bool):
         raise bad("`memexport_zero` is true or false")
 
@@ -1019,7 +1034,16 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
 #     log's end: the owner at the spawn): a key whose A/A counts are equal must be equal in a test
 #     run; a key whose A/A counts differ is noisy and may differ by the A/A spread beyond the A/A
 #     range. Exact from two `Trace counts` dumps after the window starts, else sampled from the
-#     trace lines' running numbers (#n, the first 20 and every 500th: the highest seen);
+#     trace lines' running numbers (#n, the first 20 and every 500th: the highest seen). A sampled
+#     count under 20 is exact; one of 20 or more says only that the true count lies between it and
+#     the next logged number (one sampling step), so such a key passes when the runs agree within
+#     one step on top of the A/A spread (sampled_range, counts_within_noise);
+#   - the per-frame trigger keys (RATE_EVENTS: act and touch) as rates instead: the window's count
+#     divided by the server frames in the window (the swaps of the `GPU: draws` lines, prorated to
+#     the window: window_frames), or by its seconds when a run has no GPU line in it. A test run's
+#     rate must lie within the A/A rates widened by their spread plus `rate_floor` (default 0.01) of
+#     the mean A/A rate; a sampled count gives a range of rates (rates_within_noise). Enter, exit,
+#     de-act, messages and telegrams stay counts;
 #   - the load times: a test run no slower than the slowest A/A run plus the A/A spread (at least
 #     `load_floor_s`); faster passes (the skip saves GPU work);
 #   - the GPU counters: 0 resolve readbacks in every run, and 0 memexport draws (draw_skip.h: the
@@ -1033,6 +1057,30 @@ def is_world_message_key(key: str) -> bool:
     if key.startswith(("telegram send ", "telegram list ")):
         return False
     return key.startswith(("message ", "telegram ", "trigger "))
+
+
+def is_rate_key(key: str) -> bool:
+    """A per-frame trigger key ("trigger act <Name#id>", "trigger touch <Name#id>"), graded as a rate."""
+    return key.startswith(tuple(f"trigger {e} " for e in RATE_EVENTS))
+
+
+def window_frames(lines: list[tuple[float | None, str]], t0: float, t1: float) -> float | None:
+    """The server frames in the window [t0, t1] from the `GPU: draws` lines: each line counts the
+    swaps of the `in <s> s` before its time stamp, and a line that covers the window only in part
+    counts that part's share. A part of the window no line covers (the log ends before the next
+    line) is filled at the covered part's swap rate. None without a line in the window."""
+    swaps = covered = 0.0
+    for t, line in lines:
+        if t is None or not (m := GPU_COUNTERS.search(line)):
+            continue
+        s = float(m.group(10))
+        overlap = min(t, t1) - max(t - s, t0)
+        if s > 0 and overlap > 0:
+            swaps += int(m.group(4)) * overlap / s
+            covered += overlap
+    if covered <= 0 or t1 <= t0:
+        return None
+    return round(swaps * (t1 - t0) / covered, 1)
 
 
 def trace_dumps(texts: list[str]) -> list[tuple[int, dict[str, int]]]:
@@ -1087,7 +1135,8 @@ def compare_keys(text: str, c: dict) -> dict:
                 key = f"level watch {m.group(1)}: load call #{n}"
             loads[key] = int(m.group(2)) / 1000.0
 
-    messages: dict = {"mode": "none", "keys": {}, "window_s": None, "window": False}
+    messages: dict = {"mode": "none", "keys": {}, "window_s": None, "window": False, "seconds": None,
+                      "frames": None}
     window = re.compile(c.get("window", DEFAULT_WINDOW))
     start = max((i for i, line in enumerate(texts) if window.search(line)), default=None)
     if start is not None:
@@ -1116,8 +1165,11 @@ def compare_keys(text: str, c: dict) -> dict:
                 keys[k] = max(keys.get(k, 0), n)
             mode, span = ("sampled" if keys else "none"), lines[start:end + 1]
         ts = [t for t, _ in span if t is not None]
+        # The rate keys' denominators: the window's seconds and its server frames (window_frames).
+        seconds = round(ts[-1] - ts[0], 3) if len(ts) >= 2 else 0.0
         messages = {"mode": mode, "keys": keys, "window": True,
-                    "window_s": round(ts[-1] - ts[0], 1) if len(ts) >= 2 else 0.0}
+                    "window_s": round(ts[-1] - ts[0], 1) if len(ts) >= 2 else 0.0, "seconds": seconds,
+                    "frames": window_frames(lines, ts[0], ts[-1]) if len(ts) >= 2 else None}
 
     gpu: dict = {n: 0 for n in GPU_COUNTER_NAMES}
     gpu.update(windows=0, seconds=0.0)
@@ -1163,6 +1215,44 @@ def within_noise(noise: list[float], value: float, floor: float, slower_only: bo
     return value <= hi + tol and (slower_only or value >= lo - tol), round(tol, 3)
 
 
+def sampled_range(n: int) -> tuple[int, int]:
+    """What a sampled count (the highest #n seen) says about the true count: exact under the first
+    TRACE_FIRST_LINES (each of them is logged), else from n up to the next logged number (one step)."""
+    if n < TRACE_FIRST_LINES:
+        return n, n
+    return n, (n // TRACE_EVERY + 1) * TRACE_EVERY
+
+
+def counts_within_noise(noise: list[int], value: int, sampled: bool) -> tuple[bool, int]:
+    """Whether a world-message count is within the A/A noise: the A/A range widened by its spread.
+    Sampled counts are ranges (sampled_range): the test run's range has to meet the A/A's widened
+    range, so readings one sampling step apart pass. Returns the verdict and the step used (0: exact)."""
+    if not sampled:
+        return within_noise(noise, value, 0.0, False)[0], 0
+    spread = max(noise) - min(noise)
+    lo, hi = min(noise), max(sampled_range(n)[1] for n in noise)
+    tlo, thi = sampled_range(value)
+    step = max(r[1] - r[0] for r in map(sampled_range, noise + [value]))
+    return tlo <= hi + spread and thi >= lo - spread, step
+
+
+def rates_within_noise(noise: list[tuple[float, float]], value: tuple[float, float],
+                       floor: float) -> tuple[bool, float]:
+    """Whether a rate key's rate is within the A/A noise. Each rate is a range (low, high): a point
+    for an exact count, the count's sampling step divided by the frames for a sampled one. The A/A's
+    range widened by its spread (of the low ends) plus `floor` times the mean A/A rate has to meet the
+    test run's range. Returns the verdict and the tolerance."""
+    lows = [r[0] for r in noise]
+    lo, hi = min(lows), max(r[1] for r in noise)
+    tol = (max(lows) - lo) + floor * sum(lows) / len(lows)
+    return value[0] <= hi + tol and value[1] >= lo - tol, tol
+
+
+def rate_text(r: tuple[float, float] | list[float]) -> str:
+    """A rate (low, high) for the report: one number, or low-high for a sampled count's range."""
+    return f"{r[0]:.4f}" if r[0] == r[1] else f"{r[0]:.4f}-{r[1]:.4f}"
+
+
 def compare_runs(runs: list[dict], c: dict) -> dict:
     """The comparison of gathered runs (gather_run) under a [compare] table's noise and test."""
     noise, test = list(c["noise"]), list(c.get("test", []))
@@ -1204,21 +1294,68 @@ def compare_runs(runs: list[dict], c: dict) -> dict:
         reasons.append("compare: world messages: no count in the window (trace_world_messages on the compared peer?)")
     else:
         table, bad = {}, []
-        for k in sorted(set().union(*(keys[n]["messages"]["keys"] for n in names))):
+        sampled = modes[ref] == "sampled"
+        all_keys = sorted(set().union(*(keys[n]["messages"]["keys"] for n in names)))
+        for k in [k for k in all_keys if not is_rate_key(k)]:
             nv = [keys[n]["messages"]["keys"].get(k, 0) for n in noise]
-            entry = {"noise": nv, "tolerance": max(nv) - min(nv), "test": {}, "ok": True}
+            entry = {"noise": nv, "tolerance": max(nv) - min(nv), "step": 0, "test": {}, "ok": True,
+                     "within_step": False}
             for n in test:
                 v = keys[n]["messages"]["keys"].get(k, 0)
                 entry["test"][n] = v
-                if not within_noise(nv, v, 0.0, False)[0]:
+                ok, step = counts_within_noise(nv, v, sampled)
+                entry["step"] = max(entry["step"], step)
+                if not ok:
                     entry["ok"] = False
-                    bad.append(f"{k} {n} {v} (A/A {'/'.join(str(x) for x in nv)})")
+                    bad.append(f"{k} {n} {v} (A/A {'/'.join(str(x) for x in nv)}"
+                               + (f"; sampled, one step {step}" if step else "") + ")")
+                elif not within_noise(nv, v, 0.0, False)[0]:
+                    entry["within_step"] = True
+            entry["within_step"] = entry["within_step"] and entry["ok"]
             table[k] = entry
         out["messages"] = {"mode": next(iter(modes.values())), "keys": table,
                            "stable": sum(1 for e in table.values() if not e["tolerance"]),
-                           "noisy": sum(1 for e in table.values() if e["tolerance"])}
+                           "noisy": sum(1 for e in table.values() if e["tolerance"]),
+                           "within_step": sum(1 for e in table.values() if e["within_step"])}
         if bad:
             reasons.append(f"compare: world messages outside the A/A noise ({modes[ref]}): " + ", ".join(bad[:5])
+                           + (f" and {len(bad) - 5} more" if len(bad) > 5 else ""))
+
+        # The per-frame keys as rates: per server frame when every run has GPU lines in its window,
+        # else per second for all of them (one unit across the runs).
+        rate_keys = [k for k in all_keys if is_rate_key(k)]
+        per_frame = all(keys[n]["messages"]["frames"] for n in names)
+        unit = "frame" if per_frame else "second"
+        den = {n: keys[n]["messages"]["frames"] if per_frame else keys[n]["messages"]["seconds"] for n in names}
+        rate_floor = float(c.get("rate_floor", DEFAULT_RATE_FLOOR))
+        rates, bad = {}, []
+        if rate_keys and not all(den.values()):
+            reasons.append("compare: per-frame keys: no window length in run(s) "
+                           + ", ".join(n for n in names if not den[n]))
+        elif rate_keys:
+            def rate(n: str, k: str) -> tuple[float, float]:
+                v = keys[n]["messages"]["keys"].get(k, 0)
+                lo, hi = sampled_range(v) if sampled else (v, v)
+                return lo / den[n], hi / den[n]
+
+            for k in rate_keys:
+                nr = [rate(n, k) for n in noise]
+                entry = {"noise": [keys[n]["messages"]["keys"].get(k, 0) for n in noise], "noise_rate": nr,
+                         "tolerance": rates_within_noise(nr, nr[0], rate_floor)[1], "test": {}, "test_rate": {},
+                         "ok": True}
+                for n in test:
+                    tr = rate(n, k)
+                    entry["test"][n], entry["test_rate"][n] = keys[n]["messages"]["keys"].get(k, 0), tr
+                    ok, entry["tolerance"] = rates_within_noise(nr, tr, rate_floor)
+                    if not ok:
+                        entry["ok"] = False
+                        bad.append(f"{k} {n} {rate_text(tr)} (A/A {'/'.join(rate_text(r) for r in nr)}, "
+                                   f"tolerance {entry['tolerance']:.4f})")
+                rates[k] = entry
+        out["messages"].update(rates=rates, rate_unit=unit, rate_floor=rate_floor,
+                               denominators={n: den[n] for n in names})
+        if bad:
+            reasons.append(f"compare: per-frame keys outside the A/A noise (events per {unit}): " + ", ".join(bad[:5])
                            + (f" and {len(bad) - 5} more" if len(bad) > 5 else ""))
 
     # The load times: a test run no slower than the A/A allows.
@@ -1286,13 +1423,47 @@ def compare_markdown(cmp: dict) -> list[str]:
         lines += table(["Load (s)", f"A/A ({', '.join(noise)})", "Tolerance"] + test, rows)
     if cmp["messages"]:
         msgs = cmp["messages"]
-        lines += ["", f"World messages ({msgs['mode']}): {len(msgs['keys'])} keys, {msgs['stable']} equal in the A/A, "
-                      f"{msgs['noisy']} noisy (listed with any that failed)."]
-        rows = [[k + ("" if e["ok"] else " (FAIL)"), " / ".join(str(v) for v in e["noise"])]
+        rates = msgs.get("rates", {})
+        lines += ["", f"World messages ({msgs['mode']}): {len(msgs['keys'])} keys graded as counts, {msgs['stable']} "
+                      f"equal in the A/A, {msgs['noisy']} noisy (listed with any that failed or passed within one "
+                      f"step); {len(rates)} per-frame key(s) graded as rates (below)."]
+        if msgs["mode"] == "sampled":
+            lines += ["", f"Sampled counts: the trace logs a key's first {TRACE_FIRST_LINES} events and then every "
+                          f"{TRACE_EVERY}th, so a count under {TRACE_FIRST_LINES} is exact and a higher one is known "
+                          "only to within one sampling step (the true count lies between it and the next logged "
+                          "number). Such a key passes when the runs agree within one step on top of the A/A spread; "
+                          f"{msgs.get('within_step', 0)} key(s) passed that way (marked 'sampled, within one step')."]
+
+        def mark(e: dict) -> str:
+            return " (FAIL)" if not e["ok"] else " (sampled, within one step)" if e.get("within_step") else ""
+
+        rows = [[k + mark(e), " / ".join(str(v) for v in e["noise"])]
                 + [str(e["test"][n]) for n in test]
-                for k, e in msgs["keys"].items() if e["tolerance"] or not e["ok"]]
+                for k, e in msgs["keys"].items() if e["tolerance"] or not e["ok"] or e.get("within_step")]
         if rows:
             lines += table(["Key", "A/A"] + test, rows)
+        if rates:
+            unit, den = msgs["rate_unit"], msgs["denominators"]
+            secs = {r["name"]: r["keys"]["messages"]["seconds"] for r in cmp["runs"]}
+            source = ("server frames in the window, from the swaps of the `GPU: draws` lines" if unit == "frame" else
+                      "seconds of the window (a run has no `GPU: draws` line in it, so no frame count)")
+            lines += ["", f"Per-frame keys graded as rates ({', '.join(f'trigger {e}' for e in RATE_EVENTS)}: an "
+                          "event every server frame while an entity stands in the volume, so their counts follow "
+                          f"the frame rate): events per {unit}, the window's count divided by the {source}. A test "
+                          "run passes within the A/A rates widened by their spread plus "
+                          f"{msgs['rate_floor'] * 100:g}% of the mean A/A rate"
+                          + (" (a sampled count gives a range of rates, low-high)" if msgs["mode"] == "sampled" else "")
+                          + ".", "",
+                      f"{unit.capitalize()}s in the window: "
+                      + ", ".join(f"{n} {den[n]:g}" + (f" ({den[n] / secs[n]:.2f} per s over {secs[n]:g} s)"
+                                                       if unit == "frame" and secs.get(n) else "") for n in den)
+                      + "."]
+            rows = [[k + ("" if e["ok"] else " (FAIL)"), " / ".join(str(v) for v in e["noise"]),
+                     " / ".join(rate_text(r) for r in e["noise_rate"]), f"{e['tolerance']:.4f}"]
+                    + [f"{e['test'][n]}: {rate_text(e['test_rate'][n])}" for n in test]
+                    for k, e in rates.items()]
+            lines += table(["Key", "A/A counts", f"A/A per {unit}", "Tolerance"]
+                           + [f"{n} (count: per {unit})" for n in test], rows)
     return lines
 
 
