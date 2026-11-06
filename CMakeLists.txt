@@ -58,6 +58,15 @@ if(WIN32)
     target_link_libraries(skylanders_online PUBLIC ws2_32)
 endif()
 
+# skylanders_nav: a path planner over a navigation mesh of convex areas (islands, point lookup, A*
+# over the areas, a funnel over the shared edges) for the developer navto command. Game-independent,
+# no SDK, nothing on disk: the game fills the mesh from memory.
+add_library(skylanders_nav STATIC
+    src/nav/nav_planner.cpp
+)
+target_include_directories(skylanders_nav PUBLIC src)
+target_compile_features(skylanders_nav PUBLIC cxx_std_23)
+
 # skylanders_portal_figures: only the figure files (catalog, names, elements, stats), for programs
 # without the SDK such as the Core of Light launcher. On Windows it needs no SDK tree: AES and MD5
 # come from Windows (CNG). Built whenever REXSDK_DIR isn't set.
@@ -127,6 +136,13 @@ if(SKYLANDERS_PORTAL_TESTS)
         add_executable(skylanders_${t} tests/${t}.cpp)
         target_include_directories(skylanders_${t} PRIVATE tests)
         target_link_libraries(skylanders_${t} PRIVATE skylanders_online)
+        add_test(NAME skylanders_${t} COMMAND skylanders_${t})
+    endforeach()
+    # The navmesh planner (skylanders_nav), on hand-built meshes.
+    foreach(t nav_planner_test)
+        add_executable(skylanders_${t} tests/${t}.cpp)
+        target_include_directories(skylanders_${t} PRIVATE tests)
+        target_link_libraries(skylanders_${t} PRIVATE skylanders_nav)
         add_test(NAME skylanders_${t} COMMAND skylanders_${t})
     endforeach()
 endif()
