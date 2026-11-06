@@ -19,11 +19,6 @@ using std::chrono::microseconds;
 
 namespace {
 
-// Connections opened by datagrams from unknown addresses that have not sent a Hello yet.
-constexpr size_t kMaxPending = 16;
-// Datagrams taken from the socket per Pump, so a flood cannot hold the game's thread.
-constexpr int kMaxReceivePerPump = 4096;
-
 uint32_t RandomSessionId() {
   std::random_device rd;
   uint32_t id = 0;
@@ -99,6 +94,8 @@ void ServerSession::Pump(TimePoint now) {
   if (!transport_) return;
   std::vector<uint8_t> buffer;
   Endpoint from;
+  // An empty datagram (one the transport could not deliver whole) counts here and is dropped by
+  // HandleDatagram before it can open a connection.
   for (int i = 0; i < kMaxReceivePerPump && transport_->Receive(buffer, from); ++i) {
     HandleDatagram(from, buffer, now);
   }
@@ -129,7 +126,7 @@ bool ServerSession::PollEvent(ServerEvent& out) {
 
 void ServerSession::HandleDatagram(const Endpoint& from, std::span<const uint8_t> bytes,
                                    TimePoint now) {
-  auto datagram = netplay::DecodeDatagram(bytes);
+  auto datagram = netplay::DecodeDatagram(bytes);  // nullopt for an empty or short datagram
   if (!datagram) return;
   const netplay::DatagramHeader& h = datagram->header;
   if (h.session_id != 0 && h.session_id != settings_.session_id) return;
@@ -138,10 +135,13 @@ void ServerSession::HandleDatagram(const Endpoint& from, std::span<const uint8_t
   if (it == peers_.end()) {
     // Only a client's first datagrams (sent before it knows the session id) open a connection.
     if (h.session_id != 0 || h.lane != Lane::kGameplay || (h.flags & netplay::kFlagAckOnly)) return;
-    const auto pending = std::count_if(peers_.begin(), peers_.end(), [](const auto& entry) {
-      return entry.second->state == PeerState::kPending;
-    });
-    if (size_t(pending) >= kMaxPending) return;
+    // Every connection that is not welcomed counts, closing ones included: a Hello refused at once
+    // (version, digest, token, full) turns kClosing in this same call and lingers kCloseLinger,
+    // so counting only kPending would admit without bound. No kGone entry exists here (Pump erases
+    // them after the receive loop), and peers_ never holds more than kMaxClients + kMaxUnadmitted
+    // entries, so the scan in PeerCount stays short; a counter would have to follow every state
+    // change instead.
+    if (peers_.size() - PeerCount() >= kMaxUnadmitted) return;
     auto peer = std::make_unique<Peer>();
     peer->endpoint = from;
     peer->created = now;
@@ -467,7 +467,7 @@ void ClientSession::Pump(TimePoint now) {
   for (int i = 0; i < kMaxReceivePerPump && transport_->Receive(buffer, from); ++i) {
     if (from != server_) continue;
     auto datagram = netplay::DecodeDatagram(buffer);
-    if (!datagram) continue;
+    if (!datagram) continue;  // an empty datagram (too long, an error report) ends here
     if (session_id_ != 0 && datagram->header.session_id != session_id_) continue;
     conn_->OnDatagram(*datagram, now);
     LaneMessage m;

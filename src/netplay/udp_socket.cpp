@@ -226,8 +226,11 @@ bool UdpSocket::SendTo(std::string_view address, uint16_t port, std::span<const 
 bool UdpSocket::Receive(std::vector<uint8_t>& out, Endpoint& from) {
   if (!IsOpen()) return false;
   uint8_t buf[kMaxReceive + 1];  // one byte more: a datagram that fills it was too long
+  // One datagram per call, so a caller that counts calls (the session's kMaxReceivePerPump) counts
+  // every datagram a flood sends. What cannot be delivered whole comes back as an empty datagram
+  // instead of being skipped here; only an interrupted call (EINTR) is tried again.
   for (;;) {
-    sockaddr_in a{};
+    sockaddr_in a{};  // stays 0.0.0.0:0 when the call names no sender
 #ifdef _WIN32
     int len = sizeof(a);
 #else
@@ -236,18 +239,31 @@ bool UdpSocket::Receive(std::vector<uint8_t>& out, Endpoint& from) {
     auto got = recvfrom(NativeSocket(handle_), reinterpret_cast<char*>(buf), int(sizeof(buf)), 0,
                         reinterpret_cast<sockaddr*>(&a), &len);
     if (got >= 0) {
-      if (size_t(got) > kMaxReceive) continue;  // too long (POSIX truncates it silently)
-      out.assign(buf, buf + got);
       from = FromSockaddr(a);
+      if (size_t(got) > kMaxReceive) {
+        out.clear();  // too long (POSIX truncates it silently): taken, delivered empty
+      } else {
+        out.assign(buf, buf + got);
+      }
       return true;
     }
     const int e = LastSocketError();
     if (WouldBlock(e)) return false;
 #ifdef _WIN32
-    if (e == WSAECONNRESET || e == WSAEMSGSIZE) continue;  // a stale ICMP report, a long datagram
+    // WSAEMSGSIZE: a datagram longer than buf, taken and truncated by Windows. WSAECONNRESET: the
+    // ICMP "port unreachable" for an earlier send (only if SIO_UDP_CONNRESET could not be turned
+    // off in Open). Each is one datagram's worth of work: delivered empty.
+    const bool undeliverable = e == WSAECONNRESET || e == WSAEMSGSIZE;
 #else
-    if (e == ECONNREFUSED || e == EINTR) continue;
+    if (e == EINTR) continue;  // nothing was taken
+    // ECONNREFUSED: the ICMP "port unreachable" for an earlier send; delivered empty.
+    const bool undeliverable = e == ECONNREFUSED;
 #endif
+    if (undeliverable) {
+      out.clear();
+      from = FromSockaddr(a);
+      return true;
+    }
     Fail("recvfrom");
     return false;
   }

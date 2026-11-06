@@ -26,6 +26,15 @@ constexpr auto kCloseLinger = std::chrono::seconds(2);
 constexpr uint16_t kServerPeerId = 0;
 constexpr uint16_t kOwnerPeerId = 1;
 constexpr int kMaxClients = 4;
+// Connections the server holds that are not welcomed: pending ones (a datagram from an unknown
+// address, no valid Hello yet) and closing ones (refused, or welcomed once and gone, lingering
+// kCloseLinger). A new address is taken only while fewer than this are held, so the server holds
+// at most kMaxClients + kMaxUnadmitted connections, however many addresses send Hellos.
+constexpr size_t kMaxUnadmitted = 16;
+// Datagrams a session takes from its transport per Pump, so a flood cannot hold the thread that
+// pumps it. Every Transport::Receive call takes one datagram (an undeliverable one comes back
+// empty), so the bound holds for long datagrams and error reports too.
+constexpr int kMaxReceivePerPump = 4096;
 
 // Both sessions are driven by their owner: Pump(now) every frame receives, answers, resends and
 // times out; nothing runs on a thread of its own. `now` defaults to std::chrono::steady_clock;
@@ -133,6 +142,9 @@ class ServerSession {
   // The connected clients, by peer id.
   std::vector<PeerInfo> Peers() const;
   size_t PeerCount() const;
+  // Every connection the server holds: welcomed, pending and closing (never more than
+  // kMaxClients + kMaxUnadmitted).
+  size_t ConnectionCount() const { return peers_.size(); }
   const std::string& Error() const { return error_; }
 
  private:

@@ -121,8 +121,8 @@ if(SKYLANDERS_PORTAL_TESTS)
         add_test(NAME skylanders_${t} COMMAND skylanders_${t})
     endforeach()
     # The online session (skylanders_online), on the fake network and on loopback UDP.
-    foreach(t netplay_datagram_test netplay_lanes_test online_protocol_test online_join_code_test
-              online_tick_test online_session_test)
+    foreach(t netplay_datagram_test netplay_lanes_test netplay_udp_socket_test online_protocol_test
+              online_join_code_test online_tick_test online_session_test)
         add_executable(skylanders_${t} tests/${t}.cpp)
         target_include_directories(skylanders_${t} PRIVATE tests)
         target_link_libraries(skylanders_${t} PRIVATE skylanders_online)

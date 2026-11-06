@@ -359,6 +359,84 @@ void FakeNetworkStopAndQuiet() {
   CHECK(a.Last(CE::kDisconnected)->disconnect_reason == DisconnectReason::kBye);
 }
 
+// 5000 empty datagrams (what a socket delivers for one too long to take, or an error report) from
+// 5000 addresses: one Pump takes exactly kMaxReceivePerPump of them and opens no connection; a
+// real client still gets in afterwards.
+void FakeNetworkReceiveBudget() {
+  World w(11);
+  CHECK(w.StartServer(Settings()));
+  constexpr size_t kFlood = 5000;
+  for (uint32_t i = 0; i < kFlood; ++i) {
+    auto s = w.net.Bind(0x0B000000 + i, 4000);
+    CHECK(s && s->Send(kServerEp, {}));
+  }
+  CHECK(w.net.InFlight(kServerEp) == kFlood);
+  const uint64_t delivered = w.net.Stats().delivered;
+  w.server.Pump(w.net.Now());
+  CHECK(w.net.Stats().delivered - delivered == uint64_t(kMaxReceivePerPump));
+  CHECK(w.net.InFlight(kServerEp) == kFlood - size_t(kMaxReceivePerPump));
+  CHECK(w.server.ConnectionCount() == 0);
+  w.server.Pump(w.net.Now());
+  CHECK(w.net.InFlight(kServerEp) == 0);
+  ServerEvent none;
+  CHECK(w.server.ConnectionCount() == 0 && !w.server.PollEvent(none));
+  Client& a = w.Connect(MakeHello("A", true));
+  CHECK(w.RunUntil([&] { return a.session->Connected(); }));
+  CHECK(w.server.PeerCount() == 1 && w.server.ConnectionCount() == 1);
+}
+
+// 200 addresses send Hellos the server refuses at once (another protocol version). A refused
+// connection lingers kCloseLinger, so it counts against kMaxUnadmitted: the server never holds more
+// than kMaxClients + kMaxUnadmitted connections, refuses at most kMaxUnadmitted per linger, keeps
+// the owner, and lets real clients in once the flood stops; a full session still says kFull.
+void FakeNetworkHelloFlood() {
+  World w(77);
+  CHECK(w.StartServer(Settings()));
+  Client& owner = w.Connect(MakeHello("Owner", true));
+  CHECK(w.RunUntil([&] { return owner.session->Connected(); }));
+  const size_t refusals_before = w.Count(SE::kRefusalSent);
+
+  Hello bad = MakeHello("Flood");
+  bad.protocol_version = kProtocolVersion + 1;
+  std::vector<Client*> flood;
+  for (int i = 0; i < 200; ++i) flood.push_back(&w.Connect(bad));
+  const size_t cap = size_t(kMaxClients) + kMaxUnadmitted;
+  const auto start = w.net.Now();
+  bool bounded = true;
+  size_t most = 0;
+  size_t early = 0;  // refusals in the first 100 ms
+  while (w.net.Now() < start + 3s) {
+    w.Step();
+    bounded &= w.server.ConnectionCount() <= cap;
+    most = std::max(most, w.server.ConnectionCount());
+    if (w.net.Now() <= start + 100ms) early = w.Count(SE::kRefusalSent) - refusals_before;
+  }
+  const size_t refused = w.Count(SE::kRefusalSent) - refusals_before;
+  std::printf("hello flood: at most %zu connections, %zu refusals in 100 ms, %zu in 3 s\n", most,
+              early, refused);
+  CHECK(bounded);
+  CHECK(early >= 1 && early <= kMaxUnadmitted);
+  // Two waves at most in 3 s: the first at once, the next when it has lingered kCloseLinger.
+  CHECK(refused <= 2 * kMaxUnadmitted);
+  CHECK(owner.session->Connected() && w.server.PeerCount() == 1);
+  CHECK(w.Count(SE::kPeerLeft) == 0);
+
+  // The flood stops: a good client is welcomed within kPeerTimeout, then two more fill the session
+  // and a fifth is refused as full.
+  for (Client* c : flood) c->paused = true;
+  Client& good = w.Connect(MakeHello("Good"));
+  CHECK(w.RunUntil([&] { return good.session->Connected(); }, kPeerTimeout));
+  CHECK(good.session->PeerId() == 2);
+  Client& c3 = w.Connect(MakeHello("Three"));
+  Client& c4 = w.Connect(MakeHello("Four"));
+  CHECK(w.RunUntil([&] { return c3.session->Connected() && c4.session->Connected(); }));
+  CHECK(w.server.PeerCount() == size_t(kMaxClients));
+  Client& fifth = w.Connect(MakeHello("Five"));
+  CHECK(w.RunUntil([&] { return fifth.session->State() == ClientState::kRefused; }));
+  CHECK(fifth.Last(CE::kRefused) && fifth.Last(CE::kRefused)->refuse_reason == RefuseReason::kFull);
+  CHECK(owner.session->Connected() && w.server.ConnectionCount() <= cap);
+}
+
 // Real UDP sockets on 127.0.0.1 (port 0: any free one), real time.
 void LoopbackSession() {
   ServerSession server;
@@ -432,6 +510,8 @@ void LoopbackSession() {
 int main() {
   FakeNetworkSession();
   FakeNetworkStopAndQuiet();
+  FakeNetworkReceiveBudget();
+  FakeNetworkHelloFlood();
   LoopbackSession();
   return Finish("online_session");
 }
