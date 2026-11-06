@@ -665,6 +665,83 @@ int main() {
     CHECK(std::isinf(apart.WalkLength(2, Center(2, 0), 3, Center(5, 0), 1e6f)));
   }
 
+  // Shortest walks: along the walk itself, not through the midpoints. Two areas 200 wide share
+  // one long edge (y = 100): a step of 10 across it near one end is 10, where the midpoints make it
+  // 180 (WalkLength). Round an L's inner corner it is the straight line through the corner.
+  {
+    const auto rect = [](float x0, float y0, float x1, float y1, int below, int above) {
+      const Vec3 v[4] = {{x0, y0, 0}, {x1, y0, 0}, {x1, y1, 0}, {x0, y1, 0}};
+      const int across[4] = {below, -1, above, -1};
+      Area a;
+      for (int k = 0; k < 4; ++k) {
+        a.polygon.push_back(v[k]);
+        a.edges.push_back({across[k], v[k], v[(k + 1) % 4]});
+      }
+      a.center = {(x0 + x1) / 2, (y0 + y1) / 2, 0};
+      return a;
+    };
+    const NavMesh wide({rect(0, 0, 200, 100, -1, 1), rect(0, 100, 200, 200, 0, -1)});
+    const Vec3 a{10, 95, 0}, b{10, 105, 0};
+    CHECK(std::fabs(wide.ShortestWalk(0, a, 1, b, 20.0f) - 10.0f) < 0.01f);
+    CHECK(std::isinf(wide.WalkLength(0, a, 1, b, 20.0f)));
+    CHECK(std::fabs(wide.WalkLength(0, a, 1, b, 1000.0f) - 2.0f * std::hypot(90.0f, 5.0f)) < 0.01f);
+    CHECK(std::isinf(wide.ShortestWalk(0, a, 1, b, 9.0f)));  // longer than the bound
+    // One area: the straight line; out of range or not finite: none.
+    CHECK(std::fabs(wide.ShortestWalk(0, {10, 10, 0}, 0, {40, 50, 0}, 100.0f) - 50.0f) < 0.01f);
+    CHECK(std::isinf(wide.ShortestWalk(0, a, 2, b, 100.0f)));
+    CHECK(std::isinf(wide.ShortestWalk(-1, a, 1, b, 100.0f)));
+    CHECK(std::isinf(wide.ShortestWalk(0, {NAN, 95, 0}, 1, b, 100.0f)));
+
+    const NavMesh ell(Squares({{0, 0}, {1, 0}, {1, 1}}));
+    const float corner = std::hypot(S, S);  // (50, 50) to (150, 150), through the corner (S, S)
+    CHECK(std::fabs(ell.ShortestWalk(0, Center(0, 0), 2, Center(1, 1), 1000.0f) - corner) < 0.01f);
+    CHECK(ell.WalkLength(0, Center(0, 0), 2, Center(1, 1), 1000.0f) > corner + 20.0f);
+    CHECK(std::isinf(ell.ShortestWalk(0, Center(0, 0), 2, Center(1, 1), corner - 1.0f)));
+    // A U: the two ends are 2S apart in a straight line, S + S * sqrt(2) on foot (round the two
+    // inner corners of the bottom).
+    const NavMesh u(Squares({{0, 1}, {0, 0}, {1, 0}, {2, 0}, {2, 1}}));
+    const float round = u.ShortestWalk(0, Center(0, 1), 4, Center(2, 1), 1000.0f);
+    CHECK(std::fabs(round - (S + std::hypot(S, S))) < 0.01f);
+    CHECK(std::isinf(u.ShortestWalk(0, Center(0, 1), 4, Center(2, 1), 2.0f * S)));
+    // Not joined on foot: none, links or not.
+    NavMesh apart(Join(Squares(Row(0, 2)), Squares(Row(5, 7))));
+    apart.AddLinks(GenerateGapLinks(apart, limits));
+    CHECK(std::isinf(apart.ShortestWalk(2, Center(2, 0), 3, Center(5, 0), 1e6f)));
+  }
+
+  // Clearance: the corner of an L corridor moves off the inner vertex (2S, S), along the portals,
+  // and the path stays on the mesh; a clearance wider than half a portal goes through its middle.
+  {
+    const NavMesh mesh(Squares({{0, 0}, {1, 0}, {2, 0}, {2, 1}, {2, 2}}));
+    const Vec3 vertex{2 * S, S, 0};
+    const Plan tight = PlanPath(mesh, Center(0, 0), Center(2, 2));
+    CHECK(tight.reached && Parallel(tight));
+    bool on_vertex = false;
+    for (const Vec3& w : tight.waypoints) on_vertex |= Near(w, vertex);
+    CHECK(on_vertex);
+    const Plan clear = PlanPath(mesh, Center(0, 0), Center(2, 2), 20.0f);
+    CHECK(clear.reached && Parallel(clear));
+    REQUIRE_OR_RETURN(clear.waypoints.size() == 3);
+    CHECK(Near(clear.waypoints[0], 2 * S, S - 20.0f));
+    CHECK(Near(clear.waypoints[1], 2 * S + 20.0f, S));
+    CHECK(Near(clear.waypoints[2], Center(2, 2)));
+    CHECK(Inside(mesh, Center(0, 0), clear.waypoints));
+    for (const Vec3& w : clear.waypoints) CHECK(std::hypot(w.x - vertex.x, w.y - vertex.y) >= 20.0f - 0.01f);
+    const Plan middle = PlanPath(mesh, Center(0, 0), Center(2, 2), 60.0f);
+    CHECK(middle.reached && Parallel(middle));
+    REQUIRE_OR_RETURN(middle.waypoints.size() == 3);
+    CHECK(Near(middle.waypoints[0], 2 * S, 0.5f * S));
+    CHECK(Near(middle.waypoints[1], 2.5f * S, S));
+    CHECK(Inside(mesh, Center(0, 0), middle.waypoints));
+    // Along a straight corridor the start and the goal stay as given and the path stays on it.
+    const NavMesh row(Squares(Row(0, 9)));
+    const Plan straight = PlanPath(row, {10, 10, 0}, {990, 90, 0}, 20.0f);
+    CHECK(straight.reached);
+    REQUIRE_OR_RETURN(!straight.waypoints.empty());
+    CHECK(Near(straight.waypoints.back(), 990, 90));
+    CHECK(Inside(row, {10, 10, 0}, straight.waypoints));
+  }
+
   // A drop onto the floor under a bridge: a narrow bridge (one square wide, along y) 200 over a
   // wide floor whose edges are nowhere near the bridge's. Walking off its side lands on the floor.
   {

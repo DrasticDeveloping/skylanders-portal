@@ -90,6 +90,15 @@ class NavMesh {
   // a point is a short walk from another, such as a walker that came down near a link's landing
   // but in the area next to the landing's.
   float WalkLength(int from_area, const Vec3& from, int to_area, const Vec3& to, float bound) const;
+  // The same question measured along the walk itself: the length of the shortest line (the funnel
+  // over the shared edges, as PlanPath's) through the areas an entry-point search finds between
+  // the two points, among the areas within bound of `from` in xy (a walk no longer than bound
+  // cannot leave them). It is a real walk over the mesh, so it is never shorter than the best
+  // walk and never longer than WalkLength's; for two points of one area it is the straight line.
+  // Infinity when it is longer than bound, when walking does not join the two areas within that
+  // reach, or when an area is out of range or a point not finite. WalkLength's midpoints can make a
+  // point a few units across a long shared edge look a long walk away; this does not.
+  float ShortestWalk(int from_area, const Vec3& from, int to_area, const Vec3& to, float bound) const;
 
   // Adds one-way links to the graph and works out the islands again. A link whose areas are out of
   // range or the same area, or whose points are not finite, is left out. A link keeps its id when
@@ -106,7 +115,7 @@ class NavMesh {
   bool LinkDisabled(int id) const;
 
  private:
-  friend Plan PlanPath(const NavMesh& mesh, const Vec3& start, const Vec3& goal);
+  friend Plan PlanPath(const NavMesh& mesh, const Vec3& start, const Vec3& goal, float clearance);
   friend std::vector<Link> GenerateGapLinks(const NavMesh& mesh, const JumpLimits& limits);
 
   // Per-area facts worked out once in the constructor.
@@ -163,8 +172,13 @@ struct Plan {
 // the mesh, on another island, or not reachable over one-way neighbor links and links, the plan
 // goes to the closest point of the goal's xy among the areas the start can reach, with reached
 // false. A link cheaper than its straight length (a teleporter) scales the A* heuristic down so it
-// stays exact.
-Plan PlanPath(const NavMesh& mesh, const Vec3& start, const Vec3& goal);
+// stays exact. clearance keeps the walking corners off the shared edges' ends: each portal is
+// narrowed by that much from both ends (to its middle when it is narrower than twice that), so a
+// corner of the path is that far inside the corridor instead of on the corner of a ledge, where a
+// walker that cuts it a little walks off. Takeoffs, landings, the start and the goal stay where they
+// are; every point of the path is still on the mesh (each stretch runs between points of the
+// portals of convex areas).
+Plan PlanPath(const NavMesh& mesh, const Vec3& start, const Vec3& goal, float clearance = 0.0f);
 
 // Candidate jumps and drops for the mesh, pure geometry: the caller checks them in the world (a
 // wall between the two edges, a low ceiling) before AddLinks, for example with raycasts. Ids start

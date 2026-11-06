@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -276,6 +277,19 @@ std::vector<Vec3> PullString(const std::vector<Portal>& portals, const Vec3& sta
     prev = out[k];
   }
   return kept;
+}
+
+// A portal narrowed by `clearance` from both ends in xy (PlanPath's clearance), or its middle when
+// it is no wider than twice that. z runs along the portal as it does on the edge.
+Portal Narrowed(const Portal& p, float clearance) {
+  if (!(clearance > 0.0f)) return p;
+  const float width = std::sqrt(DistSqXY(p.left, p.right));
+  if (width <= 2.0f * clearance) {
+    const Vec3 mid = Midpoint(p.left, p.right);
+    return {mid, mid};
+  }
+  const float t = clearance / width;
+  return {Lerp(p.left, p.right, t), Lerp(p.right, p.left, t)};
 }
 
 std::string Format(const char* fmt, double a, double b = 0.0, double c = 0.0) {
@@ -600,6 +614,90 @@ float NavMesh::WalkLength(int from_area, const Vec3& from, int to_area, const Ve
   return walk.Length(from_area, from, to_area, to, bound);
 }
 
+float NavMesh::ShortestWalk(int from_area, const Vec3& from, int to_area, const Vec3& to,
+                            float bound) const {
+  const size_t n = areas_.size();
+  if (!InRange(from_area, n) || !InRange(to_area, n)) return kInf;
+  if (!Finite(from) || !Finite(to) || !(bound >= 0.0f)) return kInf;
+  const float straight = Dist(from, to);
+  if (straight > bound) return kInf;  // no walk is shorter than the straight line
+  if (from_area == to_area) return straight;  // a convex area: the straight line is on it
+
+  // A walk of at most bound stays within bound of `from` in xy: only areas whose box comes that
+  // close are searched.
+  const auto within = [&](int a) {
+    const Shape& s = shapes_[a];
+    const float dx = std::max({s.min_x - from.x, 0.0f, from.x - s.max_x});
+    const float dy = std::max({s.min_y - from.y, 0.0f, from.y - s.max_y});
+    return dx * dx + dy * dy <= bound * bound;
+  };
+  if (!within(to_area)) return kInf;
+
+  // The corridor: Dijkstra over the neighbor links with WalkSearch's entry-point metric (no cost
+  // bound: the funnel below is what is compared with bound).
+  struct Node {
+    float cost;
+    Vec3 entry;
+    int from_area, edge;  // how the search entered it
+  };
+  std::unordered_map<int, Node> nodes;
+  struct Open {
+    float g;
+    int area;
+  };
+  const auto later = [](const Open& a, const Open& b) { return a.g > b.g; };
+  std::vector<Open> heap;
+  nodes[from_area] = {0.0f, from, -1, -1};
+  heap.push_back({0.0f, from_area});
+  bool found = false;
+  while (!heap.empty()) {
+    std::pop_heap(heap.begin(), heap.end(), later);
+    const Open top = heap.back();
+    heap.pop_back();
+    const Node& here = nodes[top.area];
+    if (top.g > here.cost) continue;
+    if (top.area == to_area) {
+      found = true;
+      break;
+    }
+    const float g = here.cost;
+    const Vec3 at = here.entry;
+    const std::vector<Edge>& edges = areas_[top.area].edges;
+    for (size_t e = 0; e < edges.size(); ++e) {
+      const int v = edges[e].neighbor;
+      if (!ValidNeighbor(top.area, v) || !within(v)) continue;
+      const Vec3 mid = Midpoint(edges[e].a, edges[e].b);
+      const float c = g + Dist(at, mid);
+      auto it = nodes.find(v);
+      if (it != nodes.end() && !(c < it->second.cost)) continue;
+      nodes[v] = {c, mid, top.area, int(e)};
+      heap.push_back({c, v});
+      std::push_heap(heap.begin(), heap.end(), later);
+    }
+  }
+  if (!found) return kInf;
+
+  // The portals from `from` to `to` (as PlanPath makes them, not narrowed) and the shortest line
+  // through them.
+  std::vector<Portal> portals;
+  for (int a = to_area; a != from_area && portals.size() <= n;) {
+    const Node& node = nodes[a];
+    const Edge& e = areas_[node.from_area].edges[node.edge];
+    portals.push_back(shapes_[node.from_area].ccw ? Portal{e.b, e.a} : Portal{e.a, e.b});
+    a = node.from_area;
+  }
+  std::reverse(portals.begin(), portals.end());
+  portals.insert(portals.begin(), Portal{from, from});
+  portals.push_back({to, to});
+  float length = 0.0f;
+  Vec3 prev = from;
+  for (const Vec3& p : PullString(portals, from)) {
+    length += Dist(prev, p);
+    prev = p;
+  }
+  return length <= bound ? length : kInf;
+}
+
 bool NavMesh::Symmetric() const {
   for (size_t i = 0; i < areas_.size(); ++i) {
     for (const Edge& e : areas_[i].edges) {
@@ -614,8 +712,9 @@ bool NavMesh::Symmetric() const {
   return true;
 }
 
-Plan PlanPath(const NavMesh& mesh, const Vec3& start, const Vec3& goal) {
+Plan PlanPath(const NavMesh& mesh, const Vec3& start, const Vec3& goal, float clearance) {
   Plan plan;
+  if (!(clearance > 0.0f) || !std::isfinite(clearance)) clearance = 0.0f;
   const std::vector<Area>& areas = mesh.areas_;
   const Graph graph{areas, mesh.links_, mesh.out_links_};
 
@@ -703,11 +802,8 @@ Plan PlanPath(const NavMesh& mesh, const Vec3& start, const Vec3& goal) {
   for (const Step& s : steps) {
     if (s.link < 0) {
       const Edge& e = areas[s.area].edges[s.edge];
-      if (mesh.shapes_[s.area].ccw) {
-        portals.push_back({e.b, e.a});
-      } else {
-        portals.push_back({e.a, e.b});
-      }
+      const Portal p = mesh.shapes_[s.area].ccw ? Portal{e.b, e.a} : Portal{e.a, e.b};
+      portals.push_back(Narrowed(p, clearance));
       continue;
     }
     const Link& link = mesh.links_[s.link];
