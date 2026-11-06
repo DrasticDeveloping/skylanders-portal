@@ -97,8 +97,16 @@ struct Event {
 std::vector<uint32_t> g_scan_hits;
 
 // Seconds the timeline has moved from the times the script gives: down when a waitfor was met
-// early, up while a registered command ran. Every event and press is due at its time plus this.
+// early, up after a registered command ran. Every event and press is due at its time plus this.
+// Set when a blocking command (a registered command or a waitfor) returns, so that what follows it
+// counts from that return.
 std::atomic<double> g_timeline_shift{0.0};
+// The index of the first blocking command the script thread has not finished yet (the number of
+// events when none is left). The presses and stick moves at or after it are not played until it
+// has returned: the timeline shift above only knows a blocking command's length once it is over,
+// and before that the later presses would come during the command (a `tap start` written after a
+// long `navto` opened the pause menu in the middle of it, P1g). Set after the shift.
+std::atomic<size_t> g_playable_until{0};
 // SetScriptStick: a stick driven by code, over the script's own stick events while on.
 std::atomic<bool> g_code_stick_on{false};
 std::atomic<double> g_code_stick_x{0.0};
@@ -248,6 +256,18 @@ bool ParseButton(const std::string& name, Event& e) {
     if (end == std::string::npos) return true;
     start = end + 1;
   }
+}
+
+// A command whose length is only known when it returns: a registered command (none on the
+// timeline) or a waitfor (at most its seconds). What follows it waits for its return.
+bool IsBlocking(const Event& e) {
+  return e.kind == Event::Kind::kCustom || e.kind == Event::Kind::kWaitFor;
+}
+
+// The first blocking command at or after `from`, or events.size().
+size_t NextBlocking(const std::vector<Event>& events, size_t from) {
+  while (from < events.size() && !IsBlocking(events[from])) ++from;
+  return from;
 }
 
 // Returns false (and logs the line) on a syntax error, so a typo doesn't silently shift the
@@ -504,14 +524,26 @@ class ScriptInputDriver final : public rex::input::InputDriver {
         guest_frame_count_(std::move(guest_frame_count)),
         memory_(memory),
         run_in_ui_(std::move(run_in_ui)),
-        start_(Clock::now()) {}
+        start_(Clock::now()) {
+    g_playable_until = NextBlocking(events_, 0);
+  }
 
   X_STATUS Setup() override {
     // Logs, captures and quit fire at their time even while the game polls no input. The thread
     // works on copies and is detached, so it never outlives what it uses.
     std::thread([events = events_, start = start_, guest_frame_count = guest_frame_count_,
                  memory = memory_, run_in_ui = run_in_ui_] {
-      for (const Event& e : events) {
+      // A blocking command's end: the timeline from here on counts from now (its time on the
+      // timeline plus its reserved length, a waitfor's seconds, is now), then the presses after
+      // it up to the next blocking command may play.
+      auto returned = [&](size_t index) {
+        const Event& e = events[index];
+        g_timeline_shift = std::chrono::duration<double>(Clock::now() - start).count() -
+                           (e.start + e.duration);
+        g_playable_until = NextBlocking(events, index + 1);
+      };
+      for (size_t index = 0; index < events.size(); ++index) {
+        const Event& e = events[index];
         if (e.kind == Event::Kind::kPress || e.kind == Event::Kind::kStick) continue;
         std::this_thread::sleep_until(
             start + std::chrono::duration_cast<Clock::duration>(
@@ -691,15 +723,15 @@ class ScriptInputDriver final : public rex::input::InputDriver {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
           }
           const double seconds = waited();
-          if (met) g_timeline_shift = g_timeline_shift.load() - std::max(0.0, e.duration - seconds);
+          // Met early, the rest of the timeline moves up; timed out, it moves back by the last
+          // poll's overrun.
+          returned(index);
           REXLOG_INFO("Input script: waitfor {} {} after {:.1f} s", e.text, met ? "met" : "timed out",
                       seconds);
         } else if (e.kind == Event::Kind::kCustom) {
           const auto run = FindCommand(e.text);
-          const auto begin = Clock::now();
           run(e.args);
-          g_timeline_shift =
-              g_timeline_shift.load() + std::chrono::duration<double>(Clock::now() - begin).count();
+          returned(index);
         } else {
           REXLOG_INFO("Input script: quit");
           std::_Exit(0);
@@ -718,14 +750,17 @@ class ScriptInputDriver final : public rex::input::InputDriver {
     out.push_back(info);
   }
 
-  // What the script presses right now.
+  // What the script presses right now: nothing after a blocking command still running. The limit
+  // is read before the shift, which the script thread sets first.
   void Current(uint16_t& buttons, bool& lt, bool& rt, double& x, double& y) const {
+    const size_t playable = std::min(g_playable_until.load(), events_.size());
     const double now =
         std::chrono::duration<double>(Clock::now() - start_).count() - g_timeline_shift.load();
     buttons = 0;
     lt = rt = false;
     x = y = 0.0;
-    for (const Event& e : events_) {
+    for (size_t index = 0; index < playable; ++index) {
+      const Event& e = events_[index];
       if (now < e.start || now >= e.start + e.duration) continue;
       if (e.kind == Event::Kind::kPress) {
         buttons |= e.buttons;
