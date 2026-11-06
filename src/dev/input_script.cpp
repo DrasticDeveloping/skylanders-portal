@@ -103,6 +103,9 @@ std::atomic<double> g_timeline_shift{0.0};
 std::atomic<bool> g_code_stick_on{false};
 std::atomic<double> g_code_stick_x{0.0};
 std::atomic<double> g_code_stick_y{0.0};
+// SetScriptButtons: buttons held by code, added to the script's own presses while on.
+std::atomic<bool> g_code_buttons_on{false};
+std::atomic<uint16_t> g_code_buttons{0};
 
 // The script file's folder: where `shot` puts its pictures. Set before the timeline starts.
 std::filesystem::path g_script_dir;
@@ -730,6 +733,9 @@ class ScriptInputDriver final : public rex::input::InputDriver {
       x = g_code_stick_x.load(std::memory_order_relaxed);
       y = g_code_stick_y.load(std::memory_order_relaxed);
     }
+    if (g_code_buttons_on.load(std::memory_order_relaxed)) {
+      buttons |= g_code_buttons.load(std::memory_order_relaxed);
+    }
   }
 
   X_RESULT GetDeviceState(rex::input::DeviceId id, rex::input::X_INPUT_STATE* out_state) override {
@@ -874,6 +880,11 @@ void RegisterScriptCondition(const std::string& name, std::function<bool()> hold
   Registry& r = GetRegistry();
   std::lock_guard lock(r.mutex);
   r.conditions[name] = std::move(holds);
+}
+
+void SetScriptButtons(bool on, uint16_t buttons) {
+  g_code_buttons.store(buttons, std::memory_order_relaxed);
+  g_code_buttons_on.store(on, std::memory_order_relaxed);
 }
 
 void SetScriptStick(bool on, double x, double y) {

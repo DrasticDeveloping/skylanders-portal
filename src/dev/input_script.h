@@ -96,5 +96,9 @@ void RegisterScriptCondition(const std::string& name, std::function<bool()> hold
 // position each frame): while `on`, it replaces the script's `stick` events on the script's virtual
 // pad; x and y in -1..1. Any thread.
 void SetScriptStick(bool on, double x, double y);
+// Buttons the game's own developer code holds (the closed-loop walk's jump): while `on`, they are
+// added to the script's own presses; XInput button bits (A is 0x1000). Any thread.
+#define SKYLANDERS_DEV_SCRIPT_BUTTONS 1
+void SetScriptButtons(bool on, uint16_t buttons);
 
 }  // namespace skylanders::dev
