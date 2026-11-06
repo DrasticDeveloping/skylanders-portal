@@ -70,7 +70,8 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
                     r"private (-?\d+) working (-?\d+) video (-?\d+)")
 # Where a hosted server (`server = "host"`) writes its log: the owner's session folder.
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
-GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction")
+GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
+          "symmetry")
 # The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
 # online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
 # for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
@@ -81,6 +82,26 @@ REACTION = re.compile(r"Online: reaction (\d+):(\d+) after ([\d.]+) ms \(interim
 REACTION_OTHER = re.compile(r"Online: reaction (\d+):(\d+) (missed|refused) after ([\d.]+) ms \(interim\)"
                             r"(?:.*\(generation (\d+)\))?")
 ROUND_TRIP = re.compile(r"\(round trip (\d+) us\)")
+# The request lifecycle lines (stage 1B item 9; docs/online-1B.md section 5; the game's
+# session/session_host.cpp LogRequest and LogDecision, the same text on S and on the requester). A
+# key is "<generation>/<peer>/<kind>/<sequence>/<what>" (session_host.h RequestKeyText).
+REQ_KEY = r"(\d+/\d+/(?:enter|exit|touch|telegram|skip)/\d+/\S+)"
+REQUEST_LINE = re.compile(r"Online: request (\d+):(\d+) (enter|exit|touch|telegram|skip) " + REQ_KEY)
+DECIDED_APPLIED = re.compile(r"Online: decided " + REQ_KEY + r" applied seq (\d+)")
+DECIDED_PENDING = re.compile(r"Online: decided " + REQ_KEY + r" pending\s*$")
+CACHED_APPLIED = re.compile(r"Online: already applied " + REQ_KEY + r"\s*$")
+CACHED_PENDING = re.compile(r"Online: pending " + REQ_KEY + r"\s*$")
+CACHED_REFUSED = re.compile(r"Online: refused " + REQ_KEY + r" \((.+)\) cached\s*$")
+SERVER_FINAL = re.compile(r"Online: final " + REQ_KEY + r" refused \((.+)\)\s*$")
+REFUSED_LINE = re.compile(r"Online: refused " + REQ_KEY + r" \((.+)\)\s*$")
+APPLIED_STEP = re.compile(r"Online: applied step " + REQ_KEY + r" seq \d+ (.*?)\s*$")
+GONE_AT_CLOSE = re.compile(r"Online: peer (\d+) gone at close")
+# A request the session refused to send (End session began, or no connection): no decision can come.
+REQUEST_NOT_SENT = re.compile(r"Online: request " + REQ_KEY + r" not sent")
+SYMMETRY_RESET = re.compile(r"Online: symmetry reset (\d+) (\S+)")
+# The reasons a client may resend after (requests.h IsRetryable): for an enter or a touch, and for
+# an exit only `exit before enter`. Every other refusal is terminal.
+RETRYABLE_ENTER = ("too_far", "rate", "not released", "not in play")
 # A title folder's name (the game's title id in hex), for the save_copy grade.
 TITLE_ID = re.compile(r"^[0-9A-F]{8}$")
 ALWAYS_FORBIDDEN = [r"\] Crash: ", r"\[FATAL\]", r"Input script: cannot (parse|use)"]
@@ -385,6 +406,12 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         if gname == "save_copy":
             check_save_copy(path.name, g, names, server)
             continue
+        if gname == "requests_answered":
+            check_requests_answered(path.name, g, names)
+            continue
+        if gname == "symmetry":
+            check_symmetry(path.name, g, names)
+            continue
         if not isinstance(g, dict) or g.get("peer", "S" if gname == "server_frame_time" else "H") not in names:
             raise SpecError(f"{path.name}: grade {gname} names a peer not in {names}")
         if gname == "level_load" and (g.get("measure") not in d.get("measure", {}) or not g.get("baseline")):
@@ -521,6 +548,265 @@ def grade_press_to_reaction(lines: list[str], g: dict, thresholds: dict) -> tupl
             reasons.append(f"grade press_to_reaction: (interim) {statistic} {value:.1f} ms over {limit:.1f} ms")
             graded["violation"] = True
     return graded, reasons
+
+
+# --- the request grades (stage 1B item 9; docs/online-1B.md section 2 "The request state machine",
+# section 5 "Runner") ---------------------------------------------------------------------------
+
+def check_requests_answered(spec_name: str, g: object, names: list[str]) -> None:
+    """requests_answered's options: `peers` (default every client), whose logs are graded."""
+    if not isinstance(g, dict):
+        raise SpecError(f"{spec_name}: grade requests_answered must be a table")
+    peers = g.get("peers", [n for n in names if n != "S"])
+    if not isinstance(peers, list) or not peers or any(p not in names for p in peers):
+        raise SpecError(f"{spec_name}: grade requests_answered: `peers` must name peers of {names}")
+
+
+def check_symmetry(spec_name: str, g: object, names: list[str]) -> None:
+    """symmetry's options: `peer` (default S, the log that holds both halves), `owner` and `client`
+    (the peer ids whose halves are compared, default 1 and 2), `generations` (the two generations
+    whose `symmetry reset` lines start the halves; default the last two reset lines)."""
+    if not isinstance(g, dict) or g.get("peer", "S") not in names:
+        raise SpecError(f"{spec_name}: grade symmetry names a peer not in {names}")
+    gens = g.get("generations")
+    if gens is not None and (not isinstance(gens, list) or len(gens) != 2 or
+                             any(not isinstance(x, int) or isinstance(x, bool) or x < 1 for x in gens)):
+        raise SpecError(f"{spec_name}: grade symmetry: `generations` is two generation numbers")
+    for key, default in (("owner", 1), ("client", 2)):
+        v = g.get(key, default)
+        if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 4:
+            raise SpecError(f"{spec_name}: grade symmetry: `{key}` is a client peer id, 1 to 4")
+    if g.get("owner", 1) == g.get("client", 2):
+        raise SpecError(f"{spec_name}: grade symmetry: `owner` and `client` must differ")
+
+
+def key_kind(key: str) -> str:
+    return key.split("/")[2]
+
+
+def key_peer(key: str) -> str:
+    return key.split("/")[1]
+
+
+def refusal_final(key: str, reason: str) -> bool:
+    """A refusal a check gave (not S's own `final`) is the key's final decision unless the client may
+    resend after it (requests.h IsRetryable)."""
+    kind = key_kind(key)
+    if kind in ("enter", "touch"):
+        return reason not in RETRYABLE_ENTER
+    if kind == "exit":
+        return reason != "exit before enter"
+    return True
+
+
+def decision_of(line: str) -> tuple[str, str, str] | None:
+    """(key, what, reason) of a decision line: what is applied, pending, final_refused (S's final),
+    refused (a check's), cached_applied, cached_pending or cached_refused."""
+    if m := DECIDED_APPLIED.search(line):
+        return m.group(1), "applied", ""
+    if m := DECIDED_PENDING.search(line):
+        return m.group(1), "pending", ""
+    if m := CACHED_APPLIED.search(line):
+        return m.group(1), "cached_applied", ""
+    if m := CACHED_PENDING.search(line):
+        return m.group(1), "cached_pending", ""
+    if m := CACHED_REFUSED.search(line):
+        return m.group(1), "cached_refused", m.group(2)
+    if m := SERVER_FINAL.search(line):
+        return m.group(1), "final_refused", m.group(2)
+    if m := REFUSED_LINE.search(line):
+        return m.group(1), "refused", m.group(2)
+    return None
+
+
+def grade_requests_answered(text: str, gone_peers: set[str]) -> tuple[dict, list[str]]:
+    """requests_answered (item 9): on one peer's log, every key it logged a `request` line for has
+    exactly one final decision (applied, a terminal refusal, or S's `final ... refused`); no key is
+    applied twice, or applied and finally refused, or left with none. Cached answers repeat a
+    decision and are counted apart, and so are the retryable refusals (the key was resent or S made
+    the reason final later). On S's log the keys of a peer S logged `peer <n> gone at close` for are
+    left out (that peer's finals could not reach it), and on any log a key with no final that has a
+    `request <key> not sent` line (End session beat its send, so no answer can come)."""
+    keys: dict[str, None] = {}
+    finals: dict[str, list[str]] = {}
+    applied: dict[str, int] = {}
+    cached = retried = 0
+    unlogged = 0
+    not_sent: set[str] = set()
+    for line in text.splitlines():
+        if m := REQUEST_LINE.search(line):
+            keys.setdefault(m.group(4), None)
+            continue
+        if m := REQUEST_NOT_SENT.search(line):
+            not_sent.add(m.group(1))
+            continue
+        d = decision_of(line)
+        if not d:
+            continue
+        key, what, reason = d
+        if what.startswith("cached"):
+            cached += 1
+            continue
+        if what == "pending":
+            continue
+        if what == "applied":
+            applied[key] = applied.get(key, 0) + 1
+            finals.setdefault(key, []).append("applied")
+        elif what == "final_refused" or refusal_final(key, reason):
+            finals.setdefault(key, []).append(f"refused ({reason})")
+        else:
+            retried += 1
+        if key not in keys:
+            unlogged += 1
+    left_out = [k for k in keys if key_peer(k) in gone_peers]
+    unsent = [k for k in keys if key_peer(k) not in gone_peers and k in not_sent and not finals.get(k)]
+    graded_keys = [k for k in keys if key_peer(k) not in gone_peers and k not in unsent]
+    none = [k for k in graded_keys if not finals.get(k)]
+    several = [k for k in graded_keys if len(finals.get(k, [])) > 1]
+    twice = [k for k in graded_keys if applied.get(k, 0) > 1]
+    graded = {"keys": len(graded_keys), "finals": sum(1 for k in graded_keys if len(finals.get(k, [])) == 1),
+              "applied": sum(1 for k in graded_keys if applied.get(k)), "cached_answers": cached,
+              "retried_refusals": retried, "left_out_gone": len(left_out), "left_out_not_sent": len(unsent),
+              "decisions_for_unlogged_keys": unlogged}
+    reasons = []
+    if not graded_keys:
+        reasons.append("grade requests_answered: no request line (not reached)")
+    if none:
+        reasons.append(f"grade requests_answered: {len(none)} key(s) without a final decision: "
+                       f"{', '.join(none[:3])}{' ...' if len(none) > 3 else ''}")
+    if several:
+        k = several[0]
+        reasons.append(f"grade requests_answered: {len(several)} key(s) with more than one final decision: "
+                       f"{k} ({', '.join(finals[k])})")
+    if twice:
+        reasons.append(f"grade requests_answered: {len(twice)} key(s) applied twice: {twice[0]}")
+    if reasons:
+        graded["violation"] = True
+    return graded, reasons
+
+
+def normalize_key(key: str, generations: dict[str, str], peers: dict[str, str],
+                  sequences: dict[tuple[str, str], dict[str, str]]) -> tuple[str, str]:
+    """A key with its generation mapped (the half's start to 0, later ones by their order), its peer
+    swapped by `peers`, and its peer's sequence of that family (enter sequences for trigger keys,
+    request sequences for telegrams, skip sequences for skips) renumbered from 0 in the half, one
+    map per (peer, family). Returns the key and its normalized peer."""
+    g, peer, kind, seq, what = key.split("/", 4)
+    if g not in generations:
+        generations[g] = str(len(generations))
+    peer = peers.get(peer, peer)
+    family = "trigger" if kind in ("enter", "exit", "touch") else kind
+    order = sequences.setdefault((peer, family), {})
+    if seq not in order:
+        order[seq] = str(len(order))
+    return "/".join((generations[g], peer, kind, order[seq], what)), peer
+
+
+def symmetry_streams(lines: list[str], half_generation: str, swap: dict[str, str]) -> tuple[dict, int]:
+    """One half's normalized streams, per normalized peer: its requests (each key once, at its first
+    request line), its decisions (not the cached repeats, the `pending` answers or the retryable
+    refusals, which depend on timing), and its applied steps (the step list as S logged it, the
+    applied sequence left out). Returns the streams and the retryable refusals left out."""
+    generations = {half_generation: "0"}
+    sequences: dict = {}
+    streams: dict[str, dict[str, list[str]]] = {}
+    seen: set[str] = set()
+    retried = 0
+
+    def add(peer: str, stream: str, item: str) -> None:
+        streams.setdefault(peer, {"requests": [], "decisions": [], "applied": []})[stream].append(item)
+
+    for line in lines:
+        if m := REQUEST_LINE.search(line):
+            key = m.group(4)
+            if key in seen:
+                continue
+            seen.add(key)
+            nk, peer = normalize_key(key, generations, swap, sequences)
+            add(peer, "requests", nk)
+            continue
+        if m := APPLIED_STEP.search(line):
+            nk, peer = normalize_key(m.group(1), generations, swap, sequences)
+            add(peer, "applied", f"{nk} {m.group(2)}")
+            continue
+        d = decision_of(line)
+        if not d:
+            continue
+        key, what, reason = d
+        if what.startswith("cached") or what == "pending":
+            continue
+        if what == "refused" and not refusal_final(key, reason):
+            retried += 1
+            continue
+        nk, peer = normalize_key(key, generations, swap, sequences)
+        add(peer, "decisions", f"{nk} {what}{f' ({reason})' if reason else ''}")
+    return streams, retried
+
+
+def grade_symmetry(text: str, g: dict) -> tuple[dict, list[str]]:
+    """symmetry (item 9; docs/online-1B.md section 5): S's log holds both halves, each starting at a
+    `symmetry reset <generation> <digest>` line (the verified reset; S logs one at every barrier
+    release, the hub's too): the halves start at the reset lines of `generations`, or at the last
+    two; the second half runs to the next reset line or the log's end. Both digests must be equal,
+    or the case is not reached. Each half's streams are normalized (symmetry_streams; the second
+    half with the owner's and the client's peer ids swapped), then must be equal peer by peer."""
+    owner, client = str(g.get("owner", 1)), str(g.get("client", 2))
+    lines = text.splitlines()
+    resets = [(i, m.group(1), m.group(2)) for i, line in enumerate(lines) if (m := SYMMETRY_RESET.search(line))]
+    graded: dict = {"resets": len(resets)}
+    if "generations" in g:
+        want = [str(x) for x in g["generations"]]
+        picked = [next((r for r in resets if r[1] == w), None) for w in want]
+        if any(p is None for p in picked):
+            return graded, [f"grade symmetry: not reached (no `symmetry reset` line for generation(s) "
+                            f"{', '.join(w for w, p in zip(want, picked) if p is None)})"]
+        halves = picked
+    else:
+        if len(resets) < 2:
+            return graded, [f"grade symmetry: not reached ({len(resets)} `symmetry reset` line(s), two needed)"]
+        halves = resets[-2:]
+    (a, ga, da), (b, gb, db) = halves[0], halves[1]
+    graded.update({"generations": [ga, gb], "digests": [da, db]})
+    if b <= a:
+        return graded, ["grade symmetry: not reached (the second half's reset comes before the first's)"]
+    if da != db:
+        return graded, [f"grade symmetry: not reached (the halves' digests differ: {da} and {db})"]
+    end = next((i for i, _, _ in resets if i > b), len(lines))
+    first, retried_a = symmetry_streams(lines[a + 1:b], ga, {})
+    second, retried_b = symmetry_streams(lines[b + 1:end], gb, {owner: client, client: owner})
+    graded.update({"retried_refusals": [retried_a, retried_b],
+                   "keys": [sum(len(s["requests"]) for s in first.values()),
+                            sum(len(s["requests"]) for s in second.values())]})
+    reasons = []
+    if not first.get(owner, {}).get("requests"):
+        reasons.append(f"grade symmetry: not reached (no request of peer {owner} in the first half)")
+    for peer in sorted(set(first) | set(second)):
+        for stream in ("requests", "decisions", "applied"):
+            x = first.get(peer, {}).get(stream, [])
+            y = second.get(peer, {}).get(stream, [])
+            if x != y:
+                at = next((i for i in range(min(len(x), len(y))) if x[i] != y[i]), min(len(x), len(y)))
+                left = x[at] if at < len(x) else "(end)"
+                right = y[at] if at < len(y) else "(end)"
+                reasons.append(f"grade symmetry: peer {peer} {stream} differ at {at}: {left} | {right}")
+    if reasons:
+        graded["violation"] = True
+    return graded, reasons
+
+
+def grade_cross_peer(spec: Spec, r: PeerResult, texts: dict[str, str]) -> list[str]:
+    """The item 9 grades a peer's result carries: requests_answered on each peer it names (S's log
+    gives the peers gone at close), symmetry on its peer (S)."""
+    reasons: list[str] = []
+    for gname, g in spec.grades.items():
+        if gname == "requests_answered" and r.peer in g.get("peers", [n for n in spec.peers if n != "S"]):
+            gone = set(GONE_AT_CLOSE.findall(texts.get("S", "")))
+            r.graded[gname], why = grade_requests_answered(texts.get(r.peer, ""), gone)
+            reasons += why
+        elif gname == "symmetry" and g.get("peer", "S") == r.peer:
+            r.graded[gname], why = grade_symmetry(texts.get(r.peer, ""), g)
+            reasons += why
+    return reasons
 
 
 def save_copy_peers(g: dict, names: list[str]) -> list[str]:
@@ -850,6 +1136,8 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
     """Plan 5.5 against tests/thresholds.toml, for the grades the spec names for this peer."""
     reasons = []
     for gname, g in spec.grades.items():
+        if gname in ("requests_answered", "symmetry", "save_copy"):
+            continue  # graded across peers (grade_cross_peer, grade_save_copy)
         if g.get("peer", "S" if gname == "server_frame_time" else "H") != r.peer:
             continue
         after = lines_after(parsed["lines"], g.get("after"))
@@ -1117,8 +1405,9 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         return res
     saves_after = {n: save_state(run / n / "data", save_title) for n in saves_before}
     res.seconds = round(time.monotonic() - t_start, 1)
+    texts = {n: read_peer_log(run, n, hosted) for n in names}
     for n in names:
-        text = read_peer_log(run, n, hosted)
+        text = texts[n]
         parsed = parse_log(text)
         r = results[n]
         r.build, r.levels, r.fps, r.longest_frame_ms = parsed["build"], parsed["levels"], parsed["fps"], parsed["longest"]
@@ -1130,6 +1419,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             extra = grade_thresholds(spec, r, parsed, thresholds or {}, limit, baseline)
             if n in saves_before:
                 extra += grade_save_copy(r, saves_before[n], saves_after[n], save_title)
+            extra += grade_cross_peer(spec, r, texts)
             # A grade the manifest accepts for this case (plan 5.4: accepted failures with a reason)
             # is recorded, not failed on; everything else still has to pass.
             # Only a measured violation is accepted: a missing measurement or baseline still fails.

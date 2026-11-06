@@ -1198,6 +1198,175 @@ class PressToReactionTest(unittest.TestCase):
         self.assertIn("press_to_reaction", skytest.GRADES)
 
 
+def rq(line: str, t: str = "12:00:00.000") -> str:
+    """One `Online:` line as the game writes it."""
+    return f"[2026-11-06 {t}] [info] [core] [t1] Online: {line}"
+
+
+class RequestsAnsweredTest(unittest.TestCase):
+    """The requests_answered grade (stage 1B item 9) on hand-written logs."""
+
+    E1 = "2/1/enter/1/w00000962.1a2b3c4d.5e6f7a8b"
+    X1 = "2/1/exit/1/w00000962.1a2b3c4d.5e6f7a8b"
+    T1 = "2/1/touch/1/w00000962.1a2b3c4d.5e6f7a8b"
+    E2 = "2/1/enter/2/w00000999.1a2b3c4d.5e6f7a8b"
+
+    def test_one_final_per_key_passes_with_retries_and_cached_apart(self) -> None:
+        log = "\n".join([
+            rq(f"request 1:1 enter {self.E1}"),
+            rq(f"decided {self.E1} pending"),
+            rq(f"refused {self.E1} (too_far)"),           # retryable: not final
+            rq(f"resend {self.E1}"),
+            rq(f"decided {self.E1} applied seq 4"),
+            rq(f"already applied {self.E1}"),             # a cached repeat
+            rq(f"request 1:1 exit {self.X1}"),
+            rq(f"refused {self.X1} (exit before enter)"),  # retryable for an exit
+            rq(f"final {self.X1} refused (exit before enter)"),
+            rq(f"request 1:2 enter {self.E2}"),
+            rq(f"refused {self.E2} (already fired)"),     # terminal (amendment l)
+            rq(f"refused {self.E2} (already fired) cached"),
+        ])
+        graded, reasons = skytest.grade_requests_answered(log, set())
+        self.assertEqual(reasons, [])
+        self.assertEqual((graded["keys"], graded["finals"], graded["applied"], graded["cached_answers"],
+                          graded["retried_refusals"]), (3, 3, 1, 2, 2))
+
+    def test_no_final_two_finals_and_two_applies_fail(self) -> None:
+        log = "\n".join([
+            rq(f"request 1:1 enter {self.E1}"),
+            rq(f"refused {self.E1} (too_far)"),            # only retryable: no final
+            rq(f"request 1:1 touch {self.T1}"),
+            rq(f"decided {self.T1} applied seq 2"),
+            rq(f"final {self.T1} refused (generation ended)"),
+            rq(f"request 1:2 enter {self.E2}"),
+            rq(f"decided {self.E2} applied seq 3"),
+            rq(f"decided {self.E2} applied seq 5"),
+        ])
+        graded, reasons = skytest.grade_requests_answered(log, set())
+        self.assertTrue(graded["violation"])
+        self.assertEqual(len(reasons), 3)
+        self.assertIn("1 key(s) without a final decision: " + self.E1, reasons[0])
+        self.assertIn("more than one final decision", reasons[1])
+        self.assertIn("applied twice: " + self.E2, reasons[2])
+        self.assertEqual(reasons[0].split(":", 1)[0].removeprefix("grade "), "requests_answered")
+
+    def test_a_key_not_sent_at_end_session_is_left_out(self) -> None:
+        log = "\n".join([
+            rq(f"request 1:1 enter {self.E1}"),
+            rq(f"decided {self.E1} applied seq 1"),
+            rq(f"request 1:2 enter {self.E2}"),
+            rq(f"request {self.E2} not sent (End session or no connection)"),
+        ])
+        graded, reasons = skytest.grade_requests_answered(log, set())
+        self.assertEqual(reasons, [])
+        self.assertEqual((graded["keys"], graded["left_out_not_sent"]), (1, 1))
+        # A `not sent` line does not excuse a key that was sent (and answered) another time.
+        log += "\n" + rq(f"request 1:1 enter {self.E1}") + "\n" + rq(f"request {self.E1} not sent (End session)")
+        graded, reasons = skytest.grade_requests_answered(log, set())
+        self.assertEqual((graded["keys"], graded["left_out_not_sent"], reasons), (1, 1, []))
+
+    def test_a_peer_gone_at_close_is_left_out_and_no_request_is_not_reached(self) -> None:
+        log = rq(f"request 1:1 enter {self.E1}")
+        graded, reasons = skytest.grade_requests_answered(log, {"1"})
+        self.assertEqual(graded["left_out_gone"], 1)
+        self.assertEqual(reasons, ["grade requests_answered: no request line (not reached)"])
+        _, reasons = skytest.grade_requests_answered(rq("frames 600 fps 60.0"), set())
+        self.assertEqual(reasons, ["grade requests_answered: no request line (not reached)"])
+
+    def test_spec_options(self) -> None:
+        skytest.check_requests_answered("x.toml", {}, ["S", "H", "D"])
+        skytest.check_requests_answered("x.toml", {"peers": ["S", "H"]}, ["S", "H", "D"])
+        for bad in ({"peers": []}, {"peers": ["E"]}, {"peers": "H"}):
+            with self.assertRaises(skytest.SpecError, msg=str(bad)):
+                skytest.check_requests_answered("x.toml", bad, ["S", "H", "D"])
+        self.assertIn("requests_answered", skytest.GRADES)
+
+
+class SymmetryTest(unittest.TestCase):
+    """The symmetry grade (stage 1B item 9) on hand-written server logs: two halves after
+    `symmetry reset`, generations and sequences normalized, the peer ids swapped."""
+
+    T = "w00000962.1a2b3c4d.5e6f7a8b"
+    U = "w00000999.1a2b3c4d.5e6f7a8b"
+
+    def half(self, gen: int, peer: int, first_seq: int, digest: str = "d1g", extra: list[str] | None = None) -> list[str]:
+        e1 = f"{gen}/{peer}/enter/{first_seq}/{self.T}"
+        x1 = f"{gen}/{peer}/exit/{first_seq}/{self.T}"
+        e2 = f"{gen}/{peer}/enter/{first_seq + 1}/{self.U}"
+        lines = [
+            rq(f"symmetry reset {gen} {digest}"),
+            rq(f"request {peer}:{first_seq} enter {e1}"),
+            rq(f"decided {e1} pending"),
+            rq(f"applied step {e1} seq {gen * 10} steps 2: enter 0x3D; telegram w000003f1.0a0b0c0d.0e0f1011#2.cafe0001 other"),
+            rq(f"decided {e1} applied seq {gen * 10}"),
+            rq(f"request {peer}:{first_seq} exit {x1}"),
+            rq(f"decided {x1} applied seq {gen * 10 + 1}"),
+            rq(f"request {peer}:{first_seq + 1} enter {e2}"),
+            rq(f"refused {e2} (already fired)"),
+        ]
+        return lines + (extra or [])
+
+    def test_equal_halves_pass(self) -> None:
+        text = "\n".join(self.half(3, 1, 1) + self.half(4, 2, 7))
+        graded, reasons = skytest.grade_symmetry(text, {})
+        self.assertEqual(reasons, [])
+        self.assertEqual(graded["generations"], ["3", "4"])
+        self.assertEqual(graded["keys"], [3, 3])
+        # Timing-dependent answers are left out: a retryable refusal, cached repeats.
+        text = "\n".join(self.half(3, 1, 1) + self.half(4, 2, 7) + [
+            rq(f"refused 4/2/enter/8/{self.U} (too_far)"),
+            rq(f"pending 4/2/enter/7/{self.T}"),
+        ])
+        graded, reasons = skytest.grade_symmetry(text, {})
+        self.assertEqual(reasons, [])
+        self.assertEqual(graded["retried_refusals"], [0, 1])
+
+    def test_a_different_decision_fails_with_where(self) -> None:
+        second = self.half(4, 2, 7)
+        second[-1] = second[-1].replace("(already fired)", "(unsupported)")
+        graded, reasons = skytest.grade_symmetry("\n".join(self.half(3, 1, 1) + second), {})
+        self.assertTrue(graded["violation"])
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("grade symmetry: peer 1 decisions differ at 2", reasons[0])
+        self.assertIn("(already fired)", reasons[0])
+        self.assertIn("(unsupported)", reasons[0])
+
+    def test_unequal_digests_and_a_missing_reset_are_not_reached(self) -> None:
+        _, reasons = skytest.grade_symmetry("\n".join(self.half(3, 1, 1) + self.half(4, 2, 7, digest="other")), {})
+        self.assertEqual(reasons, ["grade symmetry: not reached (the halves' digests differ: d1g and other)"])
+        _, reasons = skytest.grade_symmetry("\n".join(self.half(3, 1, 1)), {})
+        self.assertEqual(reasons, ["grade symmetry: not reached (1 `symmetry reset` line(s), two needed)"])
+
+    def test_the_halves_by_generation_and_the_hub_reset_before_them(self) -> None:
+        hub = [rq("symmetry reset 1 0000hub0")]
+        text = "\n".join(hub + self.half(3, 1, 1) + self.half(4, 2, 7))
+        graded, reasons = skytest.grade_symmetry(text, {})  # the last two
+        self.assertEqual(reasons, [])
+        graded, reasons = skytest.grade_symmetry(text, {"generations": [3, 4]})
+        self.assertEqual((reasons, graded["generations"]), ([], ["3", "4"]))
+        _, reasons = skytest.grade_symmetry(text, {"generations": [3, 5]})
+        self.assertEqual(reasons, ["grade symmetry: not reached (no `symmetry reset` line for generation(s) 5)"])
+        _, reasons = skytest.grade_symmetry(text, {"generations": [1, 3]})
+        self.assertIn("not reached (the halves' digests differ", reasons[0])
+
+    def test_the_wrong_peer_in_the_second_half_fails(self) -> None:
+        # The owner played both halves: after the swap its second half reads as peer 2's.
+        graded, reasons = skytest.grade_symmetry("\n".join(self.half(3, 1, 1) + self.half(4, 1, 7)), {})
+        self.assertTrue(graded["violation"])
+        self.assertTrue(any("peer 1 requests differ" in r for r in reasons))
+        self.assertTrue(any("peer 2 requests differ" in r for r in reasons))
+
+    def test_spec_options(self) -> None:
+        skytest.check_symmetry("x.toml", {}, ["S", "H", "D"])
+        skytest.check_symmetry("x.toml", {"owner": 1, "client": 3}, ["S", "H", "D", "E"])
+        skytest.check_symmetry("x.toml", {"generations": [2, 3]}, ["S", "H", "D"])
+        for bad in ({"peer": "E"}, {"owner": 2, "client": 2}, {"owner": 0}, {"client": True},
+                    {"generations": [2]}, {"generations": [2, "3"]}, {"generations": [0, 1]}):
+            with self.assertRaises(skytest.SpecError, msg=str(bad)):
+                skytest.check_symmetry("x.toml", bad, ["S", "H", "D"])
+        self.assertIn("symmetry", skytest.GRADES)
+
+
 class JobTest(unittest.TestCase):
     @unittest.skipUnless(winjob.WINDOWS, "job objects are Windows only")
     def test_closing_the_job_ends_its_processes(self) -> None:
