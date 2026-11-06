@@ -44,6 +44,11 @@ class SkytestTest(unittest.TestCase):
         (owner / "saves" / "B13EBABEBABEBABE").mkdir(parents=True)
         (owner / "saves" / "B13EBABEBABEBABE" / "SAVE.xsg").write_bytes(b"save")
         (owner / "saves" / "cache").mkdir()
+        title = owner / "saves" / "B13EBABEBABEBABE" / "415608E9"
+        (title / "00000001" / "SWAPFORCE_0").mkdir(parents=True)
+        (title / "00000001" / "SWAPFORCE_0" / "SWAPFORCE_0.xsg").write_bytes(b"slot 0")
+        (title / "Headers" / "00000001").mkdir(parents=True)
+        (title / "Headers" / "00000001" / "SWAPFORCE_0.header").write_bytes(b"header")
         (owner / "figures").mkdir(parents=True)
         (owner / "figures" / "Roller Brawl.dump").write_bytes(b"\0" * 1024)
         (self.repo / "tests" / "skytest.toml").write_text(f"""
@@ -52,6 +57,7 @@ exe = "game.exe"
 build = "out/build"
 rom = "rom"
 settings_template = "settings.example"
+title_id = "415608E9"
 launcher = [{toml_str(sys.executable)}, "-I", {toml_str(FAKE)}]
 
 [fixtures]
@@ -548,6 +554,62 @@ expect = ["Online: starting as the server"]
         r = skytest.CaseResult(case="x", layout="solo", stage="0", status="error")
         cp = skytest.checkpoint_verdict({"case": []}, "0", ["0"], [r], [], {"x": "pass"})
         self.assertIn("x (passed before, fails now)", cp["open"])
+
+    def test_save_copy_passes_when_no_save_is_written(self) -> None:
+        # H hosts (its session folder goes into its data folder, outside the save folder) and D writes
+        # only into the SDK's save-backup: neither changes a save.
+        self.spec("nosave", self.HOSTED.replace("online_join {join}", "online_join {join}\nsavewrite backup") +
+                  '\n[grade.save_copy]\n')
+        case = self.run_cases("nosave")["cases"][0]
+        self.assertEqual(case["status"], "pass", case)
+        peers = {p["peer"]: p for p in case["peers"]}
+        for n in ("H", "D"):
+            self.assertEqual(peers[n]["graded"]["save_copy"]["files"], 2, peers[n]["graded"])
+            self.assertEqual(peers[n]["graded"]["save_copy"]["changed"], [])
+        self.assertNotIn("save_copy", peers["S"]["graded"], "a hosted server has no save copy of its own")
+        self.assertTrue((Path(case["folder"]) / "H" / skytest.HOSTED_SERVER_LOG).is_file())
+
+    def test_save_copy_fails_when_a_save_is_written(self) -> None:
+        self.spec("save", self.HOSTED.replace("online_join {join}", "online_join {join}\nsavewrite") +
+                  '\n[grade.save_copy]\n')
+        case = self.run_cases("save")["cases"][0]
+        self.assertEqual(case["status"], "fail")
+        peers = {p["peer"]: p for p in case["peers"]}
+        self.assertEqual(peers["H"]["status"], "pass", peers["H"]["reasons"])
+        d = peers["D"]
+        self.assertTrue(d["graded"]["save_copy"]["violation"])
+        self.assertEqual(d["graded"]["save_copy"]["changed"],
+                         ["B13EBABEBABEBABE/415608E9/00000001/SWAPFORCE_0/SWAPFORCE_0.xsg"])
+        self.assertTrue(any(why.startswith("grade save_copy: the save copy changed: changed B13EBABEBABEBABE/")
+                            for why in d["reasons"]), d["reasons"])
+        # Only the named peers are graded.
+        self.spec("saveh", self.HOSTED.replace("online_join {join}", "online_join {join}\nsavewrite") +
+                  '\n[grade.save_copy]\npeers = ["H"]\n')
+        case = self.run_cases("saveh")["cases"][0]
+        self.assertEqual(case["status"], "pass", case)
+        self.assertNotIn("save_copy", next(p for p in case["peers"] if p["peer"] == "D")["graded"])
+
+    def test_save_copy_needs_a_save_to_compare(self) -> None:
+        self.spec("nosaves", self.HOSTED + '\n[grade.save_copy]\npeers = ["H"]\ntitle = "DEADBEEF"\n')
+        case = self.run_cases("nosaves")["cases"][0]
+        h = next(p for p in case["peers"] if p["peer"] == "H")
+        self.assertEqual(h["status"], "fail")
+        self.assertIn("grade save_copy: no save in <data>/<profile>/DEADBEEF before the run (nothing to compare)",
+                      h["reasons"])
+        self.assertNotIn("violation", h["graded"]["save_copy"], "missing evidence is never an accepted failure")
+
+    def test_a_save_copy_spec_is_checked(self) -> None:
+        bad = {"s": 'peers = ["S"]', "x": 'peers = ["X"]', "none": "peers = []", "title": 'title = "save"'}
+        for name, body in bad.items():
+            self.spec(f"bad-{name}", self.HOSTED + f"\n[grade.save_copy]\n{body}\n")
+            with self.assertRaises(skytest.SpecError, msg=name):
+                skytest.load_spec(self.repo / "tests" / "runtime" / f"bad-{name}.toml", 20)
+        # A server the runner starts itself (stand-in) has its own data folder and may be named.
+        self.spec("standin", 'layout = "server+1"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n'
+                  '[grade.save_copy]\npeers = ["S", "H"]\n')
+        spec = skytest.load_spec(self.repo / "tests" / "runtime" / "standin.toml", 20)
+        self.assertEqual(skytest.save_copy_peers(spec.grades["save_copy"], list(spec.peers)), ["S", "H"])
+
 
 class JobTest(unittest.TestCase):
     @unittest.skipUnless(winjob.WINDOWS, "job objects are Windows only")

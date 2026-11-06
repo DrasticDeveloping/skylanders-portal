@@ -67,7 +67,9 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
                     r"private (-?\d+) working (-?\d+) video (-?\d+)")
 # Where a hosted server (`server = "host"`) writes its log: the owner's session folder.
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
-GRADES = ("server_frame_time", "client_fps", "level_load")
+GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy")
+# A title folder's name (the game's title id in hex), for the save_copy grade.
+TITLE_ID = re.compile(r"^[0-9A-F]{8}$")
 ALWAYS_FORBIDDEN = [r"\] Crash: ", r"\[FATAL\]", r"Input script: cannot (parse|use)"]
 
 # The lifecycle script of the stand-in server peer until stage 1A: boots, stays up, quits.
@@ -99,6 +101,8 @@ class Config:
     owner_saves: Path
     owner_figures: Path
     launcher: list[str]
+    # The game's title id (its save folder <data>/<profile>/<title_id>), for the save_copy grade.
+    title_id: str = ""
 
 
 def repo_root(start: Path) -> Path:
@@ -137,6 +141,7 @@ def load_config(repo: Path) -> Config:
         owner_figures=expand(fx["owner_figures"]),
         # Only the runner's own tests set this: a command that stands in for the game's exe.
         launcher=[os.path.expandvars(x) for x in g.get("launcher", [])],
+        title_id=str(g.get("title_id", "")),
     )
 
 
@@ -295,6 +300,9 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
     for gname, g in grades.items():
         if gname not in GRADES:
             raise SpecError(f"{path.name}: grade {gname} is not one of {', '.join(GRADES)}")
+        if gname == "save_copy":
+            check_save_copy(path.name, g, names, server)
+            continue
         if not isinstance(g, dict) or g.get("peer", "S" if gname == "server_frame_time" else "H") not in names:
             raise SpecError(f"{path.name}: grade {gname} names a peer not in {names}")
         if gname == "level_load" and (g.get("measure") not in d.get("measure", {}) or not g.get("baseline")):
@@ -311,6 +319,24 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         peers=peers, measures=measures, standin_seconds=float(d.get("standin_seconds", 45)),
         server=server, grades=grades,
     )
+
+
+def save_copy_peers(g: dict, names: list[str]) -> list[str]:
+    """The peers a save_copy grade checks: its `peers`, or every client."""
+    return list(g.get("peers", [n for n in names if n != "S"]))
+
+
+def check_save_copy(spec_name: str, g: object, names: list[str], server: str) -> None:
+    if not isinstance(g, dict):
+        raise SpecError(f"{spec_name}: grade save_copy must be a table")
+    peers = g.get("peers", [n for n in names if n != "S"])
+    if not isinstance(peers, list) or not peers or any(p not in names for p in peers):
+        raise SpecError(f"{spec_name}: grade save_copy: `peers` must name peers of {names}")
+    if server == "host" and "S" in peers:
+        raise SpecError(f"{spec_name}: grade save_copy: a hosted server has no data folder of its own (its saves"
+                        " are in the owner's session folder)")
+    if "title" in g and not TITLE_ID.match(str(g["title"])):
+        raise SpecError(f"{spec_name}: grade save_copy: `title` is a title id, eight hex digits")
 
 
 def all_specs(cfg: Config) -> list[Spec]:
@@ -591,6 +617,57 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
     return reasons
 
 
+def save_folders(data: Path, title: str) -> list[Path]:
+    """The game's save folders in a peer's data folder: each profile folder's title folder
+    (<data>/<profile>/<title>). Nothing else in the data folder counts: the session folder of a hosted
+    server (Online), the SDK's save-backup, the shader cache."""
+    if not title or not data.is_dir():
+        return []
+    return sorted(p / title for p in data.iterdir() if p.is_dir() and not p.is_symlink() and (p / title).is_dir())
+
+
+def save_state(data: Path, title: str) -> dict[str, str]:
+    """Every file in the peer's save folders: its path relative to the data folder and the SHA-256 of
+    its bytes. Links are never followed."""
+    out: dict[str, str] = {}
+    for folder in save_folders(data, title):
+        for d, dirs, files in os.walk(folder, followlinks=False):
+            dirs[:] = [x for x in dirs if not os.path.islink(os.path.join(d, x))]
+            for f in files:
+                full = Path(d) / f
+                if full.is_symlink():
+                    continue
+                h = hashlib.sha256()
+                try:
+                    with open(full, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(1 << 20), b""):
+                            h.update(chunk)
+                except OSError as e:
+                    h.update(f"unreadable: {e}".encode())
+                out[full.relative_to(data).as_posix()] = h.hexdigest()
+    return out
+
+
+def grade_save_copy(r: PeerResult, before: dict[str, str], after: dict[str, str], title: str) -> list[str]:
+    """The save_copy grade (stage 1B, item 2): a client's save copy is byte-equal after the run (plan
+    decision 13: a session never writes a client's save). Any file changed, added or removed fails."""
+    changed = sorted(k for k in before.keys() & after.keys() if before[k] != after[k])
+    added = sorted(after.keys() - before.keys())
+    removed = sorted(before.keys() - after.keys())
+    r.graded["save_copy"] = {"title": title, "files": len(before), "changed": changed, "added": added,
+                             "removed": removed}
+    if not title:
+        return ["grade save_copy: no title id (the grade's `title` or tests/skytest.toml [game] title_id)"]
+    if not before:
+        return [f"grade save_copy: no save in <data>/<profile>/{title} before the run (nothing to compare)"]
+    if changed or added or removed:
+        r.graded["save_copy"]["violation"] = True
+        parts = [f"{what} {', '.join(files[:3])}{' ...' if len(files) > 3 else ''}"
+                 for what, files in (("changed", changed), ("added", added), ("removed", removed)) if files]
+        return [f"grade save_copy: the save copy changed: {'; '.join(parts)}"]
+    return []
+
+
 def measure(lines: list[tuple[float | None, str]], start: str | None, end: str) -> float | None:
     """Seconds from the first line matching `start` (or the first line) to the next matching `end`."""
     t0 = None
@@ -666,11 +743,17 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
     t_start = time.monotonic()
     procs: dict[str, subprocess.Popen] = {}
     results = {n: PeerResult(peer=n) for n in names}
+    save_grade = spec.grades.get("save_copy")
+    save_title = str(save_grade.get("title", cfg.title_id)) if save_grade is not None else ""
+    saves_before: dict[str, dict[str, str]] = {}
     try:
         # Every peer's folder first (copies take a moment), then all games start close together, and
         # a spec error in a later peer starts no game at all.
         port = free_loopback_port() if hosted else 0
         prepared = {n: prepare_peer(cfg, spec, n, run, port) for n in starts}
+        # save_copy: each named peer's save copy as it is before any game starts.
+        if save_grade is not None:
+            saves_before = {n: save_state(run / n / "data", save_title) for n in save_copy_peers(save_grade, names)}
         started: dict[str, float] = {}
         ended: dict[str, float] = {}  # each game's own end, for its time
 
@@ -728,6 +811,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         # Every game started so far went with the job when it closed.
         res.status, res.reasons = "error", [str(e)]
         return res
+    saves_after = {n: save_state(run / n / "data", save_title) for n in saves_before}
     res.seconds = round(time.monotonic() - t_start, 1)
     for n in names:
         log = run / "H" / HOSTED_SERVER_LOG if hosted and n == "S" else run / n / "game.log"
@@ -741,6 +825,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         if spec.grades:
             limit = frame_rate_limit(r.command, run / n / "settings.toml")
             extra = grade_thresholds(spec, r, parsed, thresholds or {}, limit, baseline)
+            if n in saves_before:
+                extra += grade_save_copy(r, saves_before[n], saves_after[n], save_title)
             # A grade the manifest accepts for this case (plan 5.4: accepted failures with a reason)
             # is recorded, not failed on; everything else still has to pass.
             # Only a measured violation is accepted: a missing measurement or baseline still fails.

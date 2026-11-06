@@ -5,7 +5,9 @@ Extra commands only this fake knows: `hang` (never quits), `crash` (logs a crash
 `exit <code>`. `place` logs the hub as the level, as a figure placed after a save is loaded does.
 `online_host` writes a hosted server's log into the session folder as the real owner's game does
 (its frame-time windows with the p95 of `serverframes <ms>`, 12 by default); `online_join <addr>`
-logs the connection when the address has the owner's port."""
+logs the connection when the address has the owner's port. `savewrite` rewrites the first save under
+the data folder's <profile>/415608E9 (as a save the game writes); `savewrite backup` writes only into
+the data folder's save-backup (as the SDK does), which is no save."""
 import os
 import sys
 import time
@@ -74,6 +76,19 @@ def main() -> int:
                     line(f"Online: online_join: connected to {rest}")
                 else:
                     line(f"Online: online_join {rest}: no server", "error")
+            elif cmd == "savewrite":
+                data = arg("user_data_root")
+                if rest == "backup":
+                    os.makedirs(os.path.join(data, "save-backup", "previous"), exist_ok=True)
+                    with open(os.path.join(data, "save-backup", "previous", "package"), "wb") as f:
+                        f.write(b"old")
+                    line("Content: SWAPFORCE_0 saved; the version before it is in save-backup")
+                else:
+                    target = next(os.path.join(d, f) for d, _, files in sorted(os.walk(data))
+                                  if os.sep + "415608E9" in d for f in sorted(files))
+                    with open(target, "ab") as f:
+                        f.write(b"progress")
+                    line(f"Content: saving {os.path.relpath(target, data)} anew")
             elif cmd == "hang":
                 time.sleep(3600)
             elif cmd == "crash":
