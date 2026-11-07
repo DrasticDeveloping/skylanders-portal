@@ -7,12 +7,14 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -28,6 +30,11 @@ def setUpModule() -> None:
     # The runner's own token is not what these tests check (a test run from a sandbox would be refused
     # at every case); the preflight's tests set it themselves.
     skytest.token_restriction = lambda: ""
+    # The load sample's CPU window (PS12) at each case's start: short here, the fake games end at once.
+    skytest.CPU_SAMPLE_S = 0.1
+    # The machine budget's memory check (PS15) reads the real machine's free memory: off here (another
+    # program's load must not make a test a capacity result); MachineTest sets it.
+    skytest.GB_PER_GAME = 0.0
 
 
 def tearDownModule() -> None:
@@ -79,6 +86,7 @@ owner_figures = {toml_str(owner / 'figures')}
 [defaults]
 args = ["--portal_mode=software", "--audio_mute=true", "--fullscreen=false"]
 timeout = 20
+machine_games = 16
 """, encoding="utf-8")
         self.cfg = skytest.load_config(self.repo)
         self.cfg.start_gap = 0.0
@@ -88,8 +96,12 @@ timeout = 20
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def spec(self, name: str, body: str) -> Path:
+    def spec(self, name: str, body: str, scenes: bool = True) -> Path:
+        """A spec file; it says `scenes = "skip"` (a spec must say its scene policy) unless the body says
+        one (the key or the setting) or `scenes` is False."""
         p = self.repo / "tests" / "runtime" / f"{name}.toml"
+        if scenes and "scenes" not in body:
+            body = 'scenes = "skip"\n' + body
         p.write_text(f'name = "{name}"\n' + body, encoding="utf-8")
         return p
 
@@ -272,6 +284,307 @@ quit
         toml.write_text(text.replace("timeout = 20\n", "timeout = 20\nfail_fast_grace_seconds = -1\n"), encoding="utf-8")
         with self.assertRaises(SystemExit):
             skytest.load_config(self.repo)
+
+    def test_a_dead_sessions_default_lines_stop_the_run(self) -> None:
+        # PS5: a waitfor of a session condition that timed out, on any peer, is fatal without a forbid:
+        # S (a stand-in for 3000 s) is stopped a grace after it, and the peer fails on it.
+        self.cfg.fail_fast_grace = 0.5
+        self.spec("dead", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 3000\ntimeout = 60\n'
+                  '[peer.H]\nscript = "log waitfor online_barrier timed out after 600.0 s\\nhang\\nquit\\n"\n')
+        t0 = time.monotonic()
+        case = self.run_cases("dead")["cases"][0]
+        self.assertLess(time.monotonic() - t0, 30)
+        self.assertRegex(case["stopped_early"],
+                         r"^stopped early: H .*Input script: waitfor online_barrier timed out after 600.0 s \(fail fast\)$")
+        h = {p["peer"]: p for p in case["peers"]}["H"]
+        self.assertTrue(any(w.startswith("log has forbidden /Input script: waitfor (online_connected|") and
+                            "(a dead session's default fatal line)" in w for w in h["reasons"]), h["reasons"])
+        self.assertEqual(case["status"], "fail")
+
+    def test_the_default_fatal_lines_per_peer_and_their_opt_outs(self) -> None:
+        def fatal(spec, peer: str, line: str) -> bool:
+            return any(re.search(rx, line) for rx in skytest.fail_fast_patterns(spec, peer))
+
+        base = 'layout = "server+2"\nstage = "0"\n[peer.all]\nscript = "quit\\n"\n'
+        plain = skytest.load_spec(self.spec("plain", base), 20)
+        lines = {
+            "S": ["[t] [error] Online: the server's session did not start: bind failed",
+                  "[t] [error] Online: could not connect the control pipe \\\\.\\pipe\\x (Windows error 2); the server ends"],
+            "H": ["[t] [warning] Online: server: error the server did not reach its hub",
+                  "[t] [warning] Online: the server ended by itself; the session is over"],
+            "*": ["[t] Input script: waitfor online_connected timed out after 60.0 s",
+                  "[t] Input script: waitfor menu_ready timed out after 8.0 s",
+                  "[t] Input script: waitfor front_end_left timed out after 30.0 s",
+                  "[t] [error] Dev: level tutorial_b: no player frame within 30 s; not requested",
+                  "[t] [error] Online: x19 refused: dev_trigger_commands is off"],
+        }
+        for peer in ("S", "H", "D"):
+            for who, ls in lines.items():
+                for line in ls:
+                    self.assertEqual(fatal(plain, peer, line), who in ("*", peer), (peer, line))
+        # title_ready and level_ready timeouts stay out (passes recovered from them).
+        for line in ("Input script: waitfor title_ready timed out after 75.0 s",
+                     "Input script: waitfor level_ready timed out after 90.0 s",
+                     "Input script: waitfor online_barrier met after 3.0 s"):
+            self.assertFalse(fatal(plain, "H", line), line)
+        # tolerate takes the lines it matches out, for the defaults only; forbid and crashes stay.
+        tol = skytest.load_spec(self.spec("tol", "tolerate = ['waitfor menu_ready', 'dev_\\w+ is off']\n" + base
+                                          + "forbid = ['menu_ready timed out after 9']\n"), 20)
+        self.assertEqual(tol.tolerate, ["waitfor menu_ready", "dev_\\w+ is off"])
+        self.assertFalse(fatal(tol, "H", "Input script: waitfor menu_ready timed out after 8.0 s"))
+        self.assertFalse(fatal(tol, "D", "Online: x19 refused: dev_trigger_commands is off"))
+        self.assertTrue(fatal(tol, "H", "Input script: waitfor online_barrier timed out after 3.0 s"))
+        self.assertTrue(fatal(tol, "H", "Input script: waitfor menu_ready timed out after 9.0 s"))  # its forbid
+        self.assertTrue(fatal(tol, "H", "[t] [error] [core] [t1] Crash: exception"))
+        # The grade agrees with fail fast (the whole log searched with re.M).
+        r = skytest.PeerResult(peer="H", exit_code=0)
+        text = ("[t] Input script: waitfor menu_ready timed out after 8.0 s\n"
+                "[t] Input script: Online: x19 refused: dev_trigger_commands is off\n")
+        skytest.grade_peer(tol, r, text, skytest.parse_log(text))
+        self.assertEqual(r.status, "pass", r.reasons)
+        skytest.grade_peer(plain, r, text, skytest.parse_log(text))
+        self.assertEqual(len([w for w in r.reasons if "default fatal line" in w]), 2, r.reasons)
+        # A teardown case: the server ending by itself is not fatal there.
+        down = skytest.load_spec(self.spec("session-teardown", base), 20)
+        self.assertFalse(fatal(down, "H", "Online: the server ended by itself; the session is over"))
+        self.assertTrue(fatal(down, "H", "Online: server: error the server did not reach its hub"))
+        for bad, why in (("tolerate = 'x'\n", "tolerate is a list"), ("tolerate = ['(']\n", "tolerate: bad pattern")):
+            with self.assertRaisesRegex(skytest.SpecError, why):
+                skytest.load_spec(self.spec("bad", bad + base), 20)
+
+    def test_a_case_that_is_not_ready_starts_no_game(self) -> None:
+        # PS2: ready = false with a reason, or a PLACEHOLDER comment without a ready key.
+        self.spec("waits", 'layout = "solo"\nstage = "0"\nready = false\nreason = "legs 11+ (X11)"\n'
+                  '[peer.H]\nscript = "hang\\nquit\\n"\n')
+        self.spec("marked", 'layout = "server+1"\nstage = "0"\n[peer.H]\nscript = """\nwait 1\n'
+                  '# PLACEHOLDER legs 11+ (P1j case 8, X11): the winch\nhang\nquit\n"""\n',
+                  scenes=False)  # its line numbers as written; it never runs
+        self.spec("fine", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
+        t0 = time.monotonic()
+        a = argparse.Namespace(cases=["waits", "marked", "fine"], stage=None, max_games=5)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_test(self.cfg, a)
+        self.assertLess(time.monotonic() - t0, 15)  # neither hang ran
+        text = out.getvalue()
+        self.assertEqual(code, 1)  # not ready is not met
+        self.assertIn("waits: NOT READY: legs 11+ (X11) (no game started)", text)
+        self.assertIn("marked: NOT READY: PLACEHOLDER at line 7: legs 11+ (P1j case 8, X11) (no game started)", text)
+        self.assertIn("2 case(s) not ready (no game started; not met): marked (PLACEHOLDER at line 7: legs 11+ (P1j"
+                      " case 8, X11)); waits (legs 11+ (X11))", text)
+        folder = Path(text.strip().splitlines()[-1].split("report: ", 1)[1]).parent
+        results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+        cases = {c["case"]: c for c in results["cases"]}
+        self.assertEqual([c["case"] for c in results["cases"]], ["fine", "marked", "waits"])  # the run's order
+        for name in ("waits", "marked"):
+            self.assertEqual(cases[name]["status"], "not ready")
+            self.assertEqual(cases[name]["seconds"], 0.0)
+            self.assertEqual(cases[name]["peers"], [])
+            self.assertEqual(cases[name]["reasons"], [f"not ready: {cases[name]['not_ready']}"])
+        self.assertEqual(cases["fine"]["status"], "pass")
+        self.assertFalse(any(p.name.endswith(("-waits", "-marked")) for p in (self.cfg.store / "runs").iterdir()))
+        report = (folder / "report.md").read_text(encoding="utf-8")
+        self.assertIn("| waits | solo | 0 | NOT READY | 0 s | not ready: legs 11+ (X11) |", report)
+        # --run-not-ready runs it anyway; ready = true overrides a PLACEHOLDER; ready = false needs a reason.
+        self.spec("waits", 'layout = "solo"\nstage = "0"\nready = false\nreason = "legs 11+"\n'
+                  '[peer.H]\nscript = "quit\\n"\n')
+        a = argparse.Namespace(cases=["waits"], stage=None, max_games=5, run_not_ready=True)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(skytest.cmd_test(self.cfg, a), 0)
+        self.assertNotIn("NOT READY", out.getvalue())
+        over = skytest.load_spec(self.spec("over", 'layout = "solo"\nstage = "0"\nready = true\n[peer.H]\n'
+                                                   'script = """\n# PLACEHOLDER x\nquit\n"""\n'), 20)
+        self.assertEqual(over.not_ready, "")
+        # The marker's own line, also after a blank line.
+        blank = skytest.load_spec(self.spec("blank", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = """\n\n'
+                                                     '# PLACEHOLDER legs\nquit\n"""\n', scenes=False), 20)
+        self.assertEqual(blank.not_ready, "PLACEHOLDER at line 7: legs")
+        for bad, why in (('ready = false\n', "ready = false needs a `reason`"), ('ready = "no"\n', "ready is true or false"),
+                         ('ready = false\nreason = 3\n', "reason is a string")):
+            with self.assertRaisesRegex(skytest.SpecError, why):
+                skytest.load_spec(self.spec("bad", bad + 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n'), 20)
+        # PLACEHOLDERS (another word) is no marker.
+        other = skytest.load_spec(self.spec("other", '# PLACEHOLDERS filled from the research\nlayout = "solo"\n'
+                                                     'stage = "0"\n[peer.H]\nscript = "quit\\n"\n'), 20)
+        self.assertEqual(other.not_ready, "")
+        # list names it.
+        (self.repo / "tests" / "runtime" / "bad.toml").unlink()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_list(self.cfg, argparse.Namespace())
+        self.assertIn("(not ready: PLACEHOLDER at line 7: legs 11+ (P1j case 8, X11))", out.getvalue())
+
+    def test_a_not_ready_case_is_not_met_in_the_checkpoint(self) -> None:
+        manifest = {"stages": ["0"], "case": [{"id": "r", "stage": "0", "kind": "required", "spec": True}]}
+        r = skytest.CaseResult(case="r", layout="solo", stage="0", status="not ready", not_ready="legs 11+")
+        v = skytest.checkpoint_verdict(manifest, "0", ["0"], [r])
+        self.assertFalse(v["met"])
+        self.assertEqual(v["open"], ["r (not ready: legs 11+)"])
+
+    def test_the_snapshot_survives_a_runner_that_put_it_there_first(self) -> None:
+        # PS11: each runner copies into its own partial folder; when another runner renamed the same
+        # snapshot into place first, the rename fails and that snapshot is used.
+        first = skytest.snapshot_build(self.cfg)
+        import shutil
+        shutil.rmtree(first)
+        real_copy = skytest.shutil.copy2
+        partials = []
+
+        def copy_and_race(src, dst, *args, **kw):
+            partials.append(Path(dst).parent.name)
+            if not first.exists():  # the other lane finishes first, during this one's copy
+                first.mkdir(parents=True)
+                for f in [self.cfg.build / self.cfg.exe, *sorted(self.cfg.build.glob("*.dll"))]:
+                    real_copy(f, first / f.name)
+            return real_copy(src, dst, *args, **kw)
+
+        skytest.shutil.copy2 = copy_and_race
+        try:
+            snap = skytest.snapshot_build(self.cfg)
+        finally:
+            skytest.shutil.copy2 = real_copy
+        self.assertEqual(snap, first)
+        self.assertTrue(all(n.startswith(f"{first.name}.partial-{os.getpid()}-") for n in partials), partials)
+        self.assertEqual([p.name for p in first.parent.iterdir()], [first.name])  # no partial folder left
+        # Two runners at once (threads here): both get the one snapshot, nothing fails.
+        shutil.rmtree(first)
+        got, errors = [], []
+
+        def build() -> None:
+            try:
+                got.append(skytest.snapshot_build(self.cfg))
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=build) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(got, [first] * 4)
+        self.assertTrue((first / "game.exe").is_file() and (first / "runtime.dll").is_file())
+        self.assertEqual([p.name for p in first.parent.iterdir()], [first.name])
+
+    def test_results_record_what_ran_and_the_load(self) -> None:
+        # PS12: per case the spec's sha256, the args hash, the fixture hash and the runner's version,
+        # and the load beside it; report.md prints one load line per case.
+        path = self.spec("prov", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB)
+        r = self.run_cases("prov")
+        case = r["cases"][0]
+        import hashlib
+        prov = case["provenance"]
+        self.assertEqual(prov["spec_sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(len(prov["args_sha256"]), 64)
+        self.assertEqual(len(prov["fixture_sha256"]), 64)
+        self.assertRegex(prov["runner"], r"^skytest [0-9a-f]{12}$")
+        self.assertEqual(r["runner"], prov["runner"])
+        load = case["load"]
+        self.assertGreaterEqual(load["samples"], 1)
+        if os.name == "nt":
+            self.assertIn("games_alive_mean", load)
+            self.assertEqual(load["games_alive_max"], 0)  # the fake game is python, not game.exe
+            self.assertEqual(load["outside_games_max"], 0)
+            self.assertGreater(load["memory_available_gb_start"], 0)
+            self.assertIn("cpu_busy_percent", load)
+            self.assertIsInstance(load["top_cpu"], list)
+        report = (r["folder"] / "report.md").read_text(encoding="utf-8")
+        self.assertIn("Load: games alive 0.0 mean, 0 max" if os.name == "nt" else "Load: ", report)
+        # The args hash follows the spec's args, not the run's own folders.
+        spec = skytest.load_spec(path, 20)
+        self.assertEqual(skytest.args_sha256(self.cfg, spec), prov["args_sha256"])
+        spec.peers["H"].args.append("--dev_x=1")
+        self.assertNotEqual(skytest.args_sha256(self.cfg, spec), prov["args_sha256"])
+
+    def write_janitor(self, body: str) -> None:
+        tools = self.repo / "tools"
+        tools.mkdir(exist_ok=True)
+        (tools / "test_store_janitor.py").write_text(body, encoding="utf-8")
+
+    def test_the_store_line_comes_after_the_cases_and_never_holds_them(self) -> None:
+        # PS1: the janitor runs beside the cases and its line comes after them, before the report line.
+        stamp = Path(self.tmp.name) / "janitor-started.txt"
+        self.write_janitor("import sys, time\n"
+                           f"open({str(stamp)!r}, 'w').write(str(time.time()))\n"
+                           "print('test store: 1.00 GB in 3 run(s); `just janitor --apply` would reclaim 0.00 GB')\n")
+        self.spec("quick", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_test(self.cfg, argparse.Namespace(cases=["quick"], stage=None, max_games=5))
+        lines = out.getvalue().strip().splitlines()
+        self.assertEqual(lines[-2], "test store: 1.00 GB in 3 run(s); `just janitor --apply` would reclaim 0.00 GB")
+        # PS14: the report's path first (it is rewritten after every case), then the case.
+        self.assertTrue(lines[0].startswith("report (rewritten after every case): "), lines)
+        self.assertTrue(lines[1].startswith("quick (solo) ..."), lines)
+        # One that takes too long is ended and named; the run does not wait for it.
+        self.write_janitor("import time\ntime.sleep(60)\nprint('never')\n")
+        t0 = time.monotonic()
+        j = skytest.StoreJanitor(self.cfg).start()
+        line = j.line(1.0)
+        self.assertLess(time.monotonic() - t0, 20)
+        self.assertRegex(line, r"^test store: not measured \(the janitor's walk was still running after \d+ s; ")
+        self.assertIsNotNone(j.proc.poll())
+
+    def test_a_run_with_a_case_that_runs_alone_skips_the_janitors_walk(self) -> None:
+        # The janitor never loads a measured case, and the run never waits for it at its end: a run with
+        # a case that runs alone (anywhere in it) does not start it.
+        stamp = Path(self.tmp.name) / "janitor-started.txt"
+        self.write_janitor("import time\n"
+                           f"open({str(stamp)!r}, 'w').write(str(time.time()))\n"
+                           "print('test store: ok')\n")
+        self.spec("quick", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
+        self.spec("timed", 'layout = "solo"\nstage = "0"\nexclusive = true\n[peer.H]\nscript = "wait 100\\nquit\\n"\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_test(self.cfg, argparse.Namespace(cases=["quick", "timed"], stage=None, max_games=5))
+        lines = out.getvalue().strip().splitlines()
+        self.assertEqual(lines[-2], "test store: not measured (a case of this run runs alone: the janitor's walk never"
+                                    " runs beside a measured case; `just janitor` reports the store)")
+        self.assertFalse(stamp.exists())
+        # Another runner's case holds every slot: the walk is not started either.
+        budget = skytest.machine_budget(self.cfg)
+        lease = skytest.MachineBudget(budget.folder, budget.games, "other runner").acquire(budget.games, "timed-x")
+        try:
+            j = skytest.StoreJanitor(self.cfg).start(budget)
+            self.assertIsNone(j.proc)
+            self.assertEqual(j.line(), "test store: not measured (every machine slot is held by timed-x (other runner):"
+                                       " the walk never runs beside a measured case; `just janitor` reports the store)")
+        finally:
+            lease.release()
+        self.assertFalse(stamp.exists())
+        # A walk still running when a case that runs alone starts (one the queue added) is ended.
+        self.write_janitor("import time\ntime.sleep(60)\nprint('never')\n")
+        j = skytest.StoreJanitor(self.cfg).start(budget)
+        self.assertIsNotNone(j.proc)
+        j.stop("a case that runs alone started")
+        self.assertIsNotNone(j.proc.poll())
+        self.assertEqual(j.line(), "test store: not measured (the janitor's walk was ended: a case that runs alone"
+                                   " started; `just janitor` reports the store)")
+
+    def test_the_janitor_runs_in_background_mode_with_its_own_command_line(self) -> None:
+        # JANITOR_BOOTSTRAP: the janitor script gets its own argv and __name__, its output is the line.
+        self.write_janitor("import sys\nprint('argv', sys.argv[0].endswith('test_store_janitor.py'), sys.argv[1:],"
+                           " __name__)\n")
+        line = skytest.StoreJanitor(self.cfg).start().line(30)
+        self.assertEqual(line, f"argv True ['--repo', {str(self.cfg.repo)!r}, '--line'] __main__")
+
+    def test_the_load_helpers(self) -> None:
+        # count_games: the games machine-wide, and those that do not descend from this runner.
+        me = 100
+        table = [(100, 1, "python.exe"), (200, 100, "Game.exe"), (300, 200, "game.exe"),  # H and its hosted S
+                 (400, 50, "game.exe"), (50, 1, "python.exe"), (500, 100, "other.exe"),
+                 (600, 700, "game.exe"), (700, 600, "x.exe")]  # a reused pid making a loop
+        self.assertEqual(skytest.count_games(table, "game.exe", me), (4, 2))
+        self.assertEqual(skytest.load_line({}), "Load: not recorded.")
+        line = skytest.load_line({"games_alive_mean": 2.5, "games_alive_max": 3, "outside_games_max": 1,
+                                  "memory_available_gb_start": 20.0, "memory_available_gb_min": 18.5,
+                                  "cpu_busy_percent": 23.4, "top_cpu": [{"name": "Discord.exe", "cores": 1.8}],
+                                  "power_scheme": "Balanced (381b4222-f694-41f0-9685-ff5bb260df2e)"})
+        self.assertEqual(line, "Load: games alive 2.5 mean, 3 max (1 max not started by this runner); memory 20.0 GB"
+                               " free at the start, 18.5 GB lowest; CPU 23.4 % busy at the start, top: Discord.exe"
+                               " 1.80 cores; power: Balanced (381b4222-f694-41f0-9685-ff5bb260df2e).")
+        if os.name == "nt":
+            self.assertGreater(len(skytest.process_table() or []), 1)
+            self.assertIsNotNone(skytest.available_memory_gb())
+            s = skytest.cpu_sample("game.exe", 0.2)
+            self.assertIn("cpu_busy_percent", s)
+            self.assertIsInstance(s["top_cpu"], list)
 
     def test_a_log_tail_reads_only_new_whole_lines(self) -> None:
         log = Path(self.tmp.name) / "tail.log"
@@ -546,6 +859,33 @@ quit
             code = skytest.cmd_lint(self.cfg, argparse.Namespace())
         self.assertEqual(code, 1)
         self.assertIn("accepted-failure case needs a reason", out.getvalue())
+
+    def test_lint_notes_a_tolerated_line_in_the_last_pass_and_a_case_not_ready(self) -> None:
+        # PS5: a spec whose last pass logged a default fatal line it tolerates is named (a note, not a
+        # problem); so is a case that is not ready (PS2).
+        self.spec("tol", "tolerate = ['menu_ready']\nlayout = \"server+1\"\nstage = \"0\"\n[peer.H]\nscript = \"quit\\n\"\n")
+        self.spec("later", 'layout = "solo"\nstage = "0"\nready = false\nreason = "legs 11+"\n[peer.H]\nscript = "quit\\n"\n')
+        old = self.cfg.store / "runs" / "20261101-100000-tol"
+        new = self.cfg.store / "runs" / "20261102-100000-tol"
+        for folder, line in ((old, "Input script: waitfor menu_ready timed out after 8.0 s (old)"),
+                             (new, "Input script: waitfor menu_ready timed out after 8.0 s")):
+            (folder / "H").mkdir(parents=True)
+            (folder / "H" / "game.log").write_text(f"[2026-11-06 10:00:00.000] [info] [core] [t1] {line}\n"
+                                                   "[2026-11-06 10:00:01.000] [info] [core] [t1] Input script: waitfor"
+                                                   " online_barrier met after 3.0 s\n", encoding="utf-8")
+            session = folder.parent / (folder.name.replace("-tol", "-session"))
+            session.mkdir()
+            (session / "results.json").write_text(json.dumps({"cases": [{"case": "tol", "status": "pass",
+                                                                         "folder": str(folder)}]}), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_lint(self.cfg, argparse.Namespace())
+        text = out.getvalue()
+        self.assertEqual(code, 0, text)
+        self.assertIn("note: tol.toml: its last pass (20261102-100000-tol) logged a line it tolerates: H [2026-11-06"
+                      " 10:00:00.000] [info] [core] [t1] Input script: waitfor menu_ready timed out after 8.0 s\n", text)
+        self.assertNotIn("(old)", text)
+        self.assertIn("note: later.toml: not ready (legs 11+)", text)
+        self.assertIn("0 problem(s)", text)
 
     def test_lint_catches_a_stage_that_drifted(self) -> None:
         self.spec("ok", 'layout = "solo"\nstage = "1A"\n[peer.H]\nscript = "quit\\n"\n')
@@ -1014,7 +1354,8 @@ expect = ["GPU: draw skip on"]
         self.assertEqual(case["status"], "pass", case["reasons"])
         self.assertEqual([p["peer"] for p in case["peers"]], ["off1:S", "off1:H", "off2:S", "off2:H", "on:S", "on:H"])
         folder = Path(case["folder"])
-        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["compare.json", "compare.md", "off1", "off2", "on"])
+        self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                         ["compare.json", "compare.md", "off1", "off2", "on", "result.json"])
         on_h = next(p for p in case["peers"] if p["peer"] == "on:H")
         self.assertIn("--render_hidden_draw=false", on_h["command"])
         self.assertEqual(case["compare"]["status"], "pass")
@@ -1192,37 +1533,153 @@ class GateTest(unittest.TestCase):
         (self.cfg.store / "runs" / "20261105-100000-session").mkdir(parents=True)
         (self.cfg.store / "runs" / "20261105-100000-session" / "results.json").write_text("{not json", encoding="utf-8")
 
-    def results(self, folder: str, cases: list[tuple[str, str, float]]) -> None:
+    def results(self, folder: str, cases: list[tuple[str, str, float]], jobs: int | None = None,
+                **extra) -> None:
         d = self.cfg.store / "runs" / folder
         d.mkdir(parents=True)
-        (d / "results.json").write_text(json.dumps(
-            {"cases": [{"case": c, "status": s, "seconds": t} for c, s, t in cases]}), encoding="utf-8")
+        payload = {"cases": [{"case": c, "status": s, "seconds": t, **extra} for c, s, t in cases]}
+        if jobs is not None:
+            payload["jobs"] = jobs
+        (d / "results.json").write_text(json.dumps(payload), encoding="utf-8")
 
     def estimate(self, stage: str | None) -> dict:
         manifest = skytest.load_manifest(self.cfg)
         stages = skytest.stages_up_to(manifest, stage) if stage else None
         return skytest.gate_estimate(self.cfg, manifest, stages, skytest.all_specs(self.cfg))
 
-    def test_the_latest_pass_wins_and_a_timeout_stands_in(self) -> None:
+    def test_the_median_of_passes_alone_and_a_timeout_apart(self) -> None:
+        # PS13: a's passes known to have run alone (300 s, and 340 s below: load sampled, no game of
+        # another runner, no case beside it, --jobs 1) make its median; the passes beside another case
+        # (ran_with), in a --jobs 2 run, with games of another runner alive (PS12's load), or with no
+        # load recorded (the 20261101 pass and the one without samples: unknown, not alone) do not.
+        self.results("20261101-110000-session", [("a", "pass", 300.0)], jobs=1, ran_with=[], load={"samples": 3, "outside_games_max": 0})
+        self.results("20261106-100000-session", [("a", "pass", 900.0)], ran_with=["x"])
+        self.results("20261106-110000-session", [("a", "pass", 800.0)], jobs=2, ran_with=[],
+                     load={"samples": 3, "outside_games_max": 0})
+        self.results("20261106-120000-session", [("a", "pass", 700.0)], load={"outside_games_max": 2})
+        self.results("20261106-125000-session", [("a", "pass", 600.0)], jobs=1, ran_with=[],
+                     load={"samples": 0, "outside_games_max": 0})
+        self.results("20261106-130000-session", [("a", "pass", 340.0)], jobs=1, ran_with=[], load={"samples": 3, "outside_games_max": 0})
         g = self.estimate("1A")
         rows = {r["case"]: r for r in g["cases"]}
         self.assertEqual(sorted(rows), ["a", "b", "nospec"])  # gate cases of 0 and 1A only
-        self.assertEqual(rows["a"]["seconds"], 300.0)
-        self.assertEqual(rows["a"]["source"], "last pass 20261101-100000-session")
+        self.assertEqual(rows["a"]["seconds"], 320.0)
+        self.assertEqual(rows["a"]["basis"], "alone")
+        self.assertEqual(rows["a"]["source"], "median of 2 pass(es) alone, newest 20261106-130000-session")
         self.assertEqual(rows["b"]["seconds"], 1800.0)
+        self.assertEqual(rows["b"]["basis"], "timeout")
         self.assertEqual(rows["b"]["source"],
                          "spec timeout (never passed; longest fail 0.7 min, 20261104-100000-session)")
         self.assertIsNone(rows["nospec"]["seconds"])
         self.assertEqual(rows["nospec"]["source"], "no spec")
-        self.assertEqual(g["minutes"], 35.0)
-        self.assertTrue(g["over"])
+        # The measured minutes apart from the timeouts (an upper bound for the case that never passed).
+        self.assertAlmostEqual(g["minutes"], 5.3)
+        self.assertEqual(g["timeout_minutes"], 30.0)
+        self.assertFalse(g["over"])
         self.assertEqual(g["from_runs"], ["a"])
         self.assertEqual(g["from_timeouts"], ["b"])
         self.assertEqual(g["no_spec"], ["nospec"])
         line = skytest.gate_line(g)
-        self.assertIn("gate: 3 cases, expected 35 min (1 from their last passes, 1 from spec timeouts: b)", line)
+        self.assertIn("gate: 3 cases, expected 5 min measured (1 from the median of their passes: 1 run alone);"
+                      " + up to 30 min for 1 never passed (spec timeouts: b)", line)
         self.assertIn("no spec, not counted: nospec", line)
-        self.assertIn("the plan's subset is 30 min (over by 5 min)", line)
+        self.assertIn("the plan's subset is 30 min (up to 35 min with the timeouts)", line)
+        self.assertIn("<= 30 min", "\n".join(skytest.gate_table(g)))
+
+    def test_without_a_pass_alone_the_median_of_all_passes_is_named(self) -> None:
+        (self.cfg.store / "runs" / "20261101-100000-session" / "results.json").unlink()
+        self.results("20261106-100000-session", [("a", "pass", 600.0)], ran_with=["x"])
+        self.results("20261106-110000-session", [("a", "pass", 1200.0)], jobs=3, ran_with=["z"])
+        self.results("20261106-120000-session", [("a", "pass", 2400.0)], ran_with=["y"])
+        rows = {r["case"]: r for r in self.estimate("1A")["cases"]}
+        self.assertEqual(rows["a"]["seconds"], 1200.0)
+        self.assertEqual(rows["a"]["basis"], "beside")
+        self.assertIn("beside other games, none alone", rows["a"]["source"])
+        line = skytest.gate_line(self.estimate("1A"))
+        self.assertIn("(1 from the median of their passes: 0 run alone, 1 beside other games: a)", line)
+
+    def test_a_pass_whose_load_was_not_recorded_is_unknown_not_alone(self) -> None:
+        # PS12 round 2 (S2): every pass from before the load was recorded (the setUp's 300 s for a) and
+        # a pass with a load sampled only by tasklist (no outside count) say nothing about other games.
+        self.results("20261106-100000-session", [("a", "pass", 500.0)], jobs=1, ran_with=[], load={"samples": 4})
+        self.results("20261106-110000-session", [("a", "pass", 900.0)], ran_with=["x"])
+        g = self.estimate("1A")
+        rows = {r["case"]: r for r in g["cases"]}
+        self.assertEqual(rows["a"]["seconds"], 500.0)
+        self.assertEqual(rows["a"]["basis"], "unknown")
+        self.assertEqual(rows["a"]["source"], "median of 3 pass(es), none known alone (2 with no recorded load,"
+                                              " 1 beside other games), newest 20261106-110000-session")
+        self.assertEqual(g["from_unknown"], ["a"])
+        self.assertEqual(g["from_runs"], ["a"])
+        self.assertAlmostEqual(g["minutes"], 8.3)
+        self.assertIn("(1 from the median of their passes: 0 run alone, 1 of unknown load (no pass known"
+                      " alone): a)", skytest.gate_line(g))
+        self.assertIn("~ 8.3 min", "\n".join(skytest.gate_table(g)))
+        self.assertEqual(skytest.pass_basis({}, {"case": "a"}), "unknown")
+        self.assertEqual(skytest.pass_basis({"jobs": 1}, {"ran_with": [], "load": {"samples": 2,
+                                                                                    "outside_games_max": 0}}), "alone")
+        self.assertEqual(skytest.pass_basis({"jobs": 1}, {"ran_with": [], "load": {"samples": 2,
+                                                                                    "outside_games_max": 1}}), "beside")
+
+    def test_passes_of_another_spec_text_or_other_arguments_are_left_out(self) -> None:
+        # PS12's provenance: a pass recorded with another spec sha256 or args hash than the spec's now
+        # does not stand for its length; passes without provenance stay.
+        spec = {s.name: s for s in skytest.all_specs(self.cfg)}["a"]
+        now = {"spec_sha256": spec.sha256, "args_sha256": skytest.args_sha256(self.cfg, spec)}
+        self.results("20261106-100000-session", [("a", "pass", 900.0)], provenance={**now, "spec_sha256": "old"},
+                     jobs=1, ran_with=[], load={"samples": 3, "outside_games_max": 0})
+        self.results("20261106-110000-session", [("a", "pass", 800.0)], provenance={**now, "args_sha256": "old"},
+                     jobs=1, ran_with=[], load={"samples": 3, "outside_games_max": 0})
+        self.results("20261106-120000-session", [("a", "pass", 340.0)], provenance=now, jobs=1, ran_with=[], load={"samples": 3, "outside_games_max": 0})
+        rows = {r["case"]: r for r in self.estimate("1A")["cases"]}
+        self.assertEqual(rows["a"]["seconds"], 340.0)
+        self.assertEqual(rows["a"]["source"], "median of 1 pass(es) alone, newest 20261106-120000-session; 2 pass(es)"
+                                              " of another spec text or arguments left out")
+        # Only passes of another version: the spec's timeout stands, and says why.
+        (self.cfg.store / "runs" / "20261101-100000-session" / "results.json").unlink()
+        (self.cfg.store / "runs" / "20261106-120000-session" / "results.json").unlink()
+        rows = {r["case"]: r for r in self.estimate("1A")["cases"]}
+        self.assertEqual(rows["a"]["basis"], "timeout")
+        self.assertEqual(rows["a"]["source"], "spec timeout (only passes of another spec text or arguments; longest"
+                                              " fail 7.0 min, 20261102-100000-session)")
+        # The spec's sha256 is the text load_spec read, not the file's later state.
+        path = self.repo / "tests" / "runtime" / "a.toml"
+        self.assertEqual(spec.sha256, skytest.hashlib.sha256(path.read_bytes()).hexdigest())
+        path.write_text(path.read_text(encoding="utf-8") + "# edited\n", encoding="utf-8")
+        self.assertEqual(skytest.case_provenance(self.cfg, spec, "f")["spec_sha256"], spec.sha256)
+
+    def test_a_case_that_is_not_ready_counts_0_min_and_is_named(self) -> None:
+        # PS2 in the estimate: b (never passed, its timeout 30 min) is not ready: 0 min, named apart.
+        self.spec("b", 'ready = false\nreason = "legs 11+"\n' + self.QUIT.format(stage="1A", timeout=1800))
+        g = self.estimate("1A")
+        rows = {r["case"]: r for r in g["cases"]}
+        self.assertEqual(rows["b"]["seconds"], 0.0)
+        self.assertEqual(rows["b"]["basis"], "not ready")
+        self.assertEqual(rows["b"]["source"], "not ready: legs 11+")
+        self.assertEqual(g["not_ready"], ["b"])
+        self.assertEqual(g["timeout_minutes"], 0.0)
+        self.assertIn("; not ready, 0 min: b;", skytest.gate_line(g))
+        # A gate run reports it at 0 s, starts no game for it, and its verdict is not met.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_test(self.cfg, argparse.Namespace(cases=["a", "b"], stage="1A", max_games=5, gate=True))
+        lines = out.getvalue().strip().splitlines()
+        self.assertEqual(code, 1)
+        self.assertIn("b: NOT READY: legs 11+ (no game started)", lines)
+        self.assertTrue(any(line.startswith("gate: ") and line.endswith("NOT met: b (not ready: legs 11+)")
+                            for line in lines), lines)
+        folder = Path(lines[-1].split("report: ", 1)[1]).parent
+        results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+        cases = {c["case"]: c for c in results["cases"]}
+        self.assertEqual(cases["b"]["status"], "not ready")
+        self.assertEqual(cases["b"]["seconds"], 0.0)
+        self.assertEqual(cases["b"]["not_ready"], "legs 11+")
+        self.assertEqual(cases["b"]["folder"], "")
+        self.assertEqual(cases["a"]["status"], "pass")
+        self.assertFalse(results["gate"]["verdict"]["met"])
+        self.assertEqual(results["gate"]["verdict"]["open"], ["b (not ready: legs 11+)"])
+        self.assertIn("| b | solo | 1A | NOT READY | 0 s | not ready: legs 11+ |",
+                      (folder / "report.md").read_text(encoding="utf-8"))
+        self.assertEqual([p.name for p in (self.cfg.store / "runs").iterdir() if p.name.endswith("-b")], [])
 
     def test_the_stage_filter(self) -> None:
         self.assertEqual([r["case"] for r in self.estimate("0")["cases"]], ["a"])
@@ -1234,9 +1691,10 @@ class GateTest(unittest.TestCase):
             code = skytest.cmd_list(self.cfg, argparse.Namespace(gate=True, stage="1A"))
         self.assertEqual(code, 0)
         text = out.getvalue()
-        self.assertIn("last pass 20261101-100000-session", text)
+        self.assertIn("median of 1 pass(es), none known alone (1 with no recorded load), newest"
+                      " 20261101-100000-session", text)
         self.assertIn("no spec", text)
-        self.assertIn("gate: 3 cases, expected 35 min", text)
+        self.assertIn("gate: 3 cases, expected 5 min measured", text)
         self.assertNotIn("later", text)
         self.assertFalse(any((self.cfg.store / "runs").glob("*/report.md")))
         # Without --gate, list is as before.
@@ -1248,7 +1706,7 @@ class GateTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             code = skytest.cmd_test(self.cfg, argparse.Namespace(cases=[], stage="1A", max_games=5, gate=True))
         lines = out.getvalue().strip().splitlines()
-        self.assertTrue(lines[0].startswith("gate: 3 cases, expected 35 min"), lines[0])
+        self.assertTrue(lines[0].startswith("gate: 3 cases, expected 5 min measured"), lines[0])
         self.assertTrue(any(line.startswith("gate: ") and "(the cases" in line for line in lines), lines)
         folder = Path(lines[-1].split("report: ", 1)[1]).parent
         results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
@@ -1259,16 +1717,20 @@ class GateTest(unittest.TestCase):
         self.assertIn("actual_minutes", results["gate"])
         self.assertIn("## Gate", (folder / "report.md").read_text(encoding="utf-8"))
         self.assertEqual(code, 0)
-        # The run just made is the newest: its times now stand for a and b.
+        self.assertFalse(results["gate"]["verdict"]["met"])  # nospec has no spec
+        self.assertEqual(results["gate"]["verdict"]["open"], ["nospec (no spec)"])
+        # The run just made is the newest pass: a's median now takes it in, and b has a pass.
         g = self.estimate("1A")
-        self.assertTrue(all(r["source"] == f"last pass {folder.name}" for r in g["cases"] if r["case"] in ("a", "b")))
+        self.assertTrue(all(r["source"].endswith(f"newest {folder.name}") for r in g["cases"] if r["case"] in ("a", "b")))
 
     def test_a_gate_run_of_named_cases_counts_only_those(self) -> None:
         with contextlib.redirect_stdout(io.StringIO()) as out:
             code = skytest.cmd_test(self.cfg, argparse.Namespace(cases=["a"], stage="1A", max_games=5, gate=True))
         lines = out.getvalue().strip().splitlines()
         self.assertEqual(code, 0)
-        self.assertTrue(lines[0].startswith("gate: 1 cases, expected 5 min (1 from their last passes, 0 from"), lines[0])
+        self.assertTrue(lines[0].startswith("gate: 1 cases, expected 5 min measured (1 from the median of their"
+                                            " passes: 0 run alone, 1 of unknown load (no pass known alone):"
+                                            " a)"), lines[0])
         self.assertNotIn("over by", lines[0])
         folder = Path(lines[-1].split("report: ", 1)[1]).parent
         results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
@@ -1280,6 +1742,218 @@ class GateTest(unittest.TestCase):
         first = out.getvalue().splitlines()[0]
         self.assertTrue(first.startswith("gate: 2 cases"), first)
         self.assertIn("no spec, not counted: nospec", first)
+
+    # --- the route per build (the owner's decision 3, 2026-11-07) -------------------------------------
+
+    def add_route(self, gate: str = '"per-build"') -> None:
+        self.spec("route", self.QUIT.format(stage="1A", timeout=2400))
+        manifest = self.repo / "tests" / "manifest.toml"
+        manifest.write_text(manifest.read_text(encoding="utf-8")
+                            + '[[case]]\nid = "route"\nstage = "1A"\nlayout = "solo"\nkind = "required"\n'
+                            + f"gate = {gate}\nspec = true\n", encoding="utf-8")
+
+    def gate_run(self, *cases: str, per_build: bool = False) -> tuple[int, list[str], dict]:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_test(self.cfg, argparse.Namespace(cases=list(cases), stage="1A", max_games=5, gate=True,
+                                                                 per_build=per_build))
+        lines = out.getvalue().strip().splitlines()
+        folder = Path(lines[-1].split("report: ", 1)[1]).parent
+        return code, lines, json.loads((folder / "results.json").read_text(encoding="utf-8"))
+
+    def test_the_per_build_verdict(self) -> None:
+        # gate_verdict alone: a per-build case is met when its newest result on this build is a pass (per_build_state), else open
+        # with the words of the owner's decision; not ready (PS2) wins over a pass.
+        g = {"cases": [{"case": "a", "basis": "alone"}], "cadence": "daily", "build": "abc123",
+             "per_build": [{"case": "route", "basis": "timeout", "source": "spec timeout"}]}
+        a = [skytest.CaseResult(case="a", layout="solo", stage="0", status="pass")]
+        met = {"met": True, "pass": "20261107-100000-session", "last": ["pass", "20261107-100000-session"], "other": 0}
+        v = skytest.gate_verdict(g, a, {"route": None})
+        self.assertFalse(v["met"])
+        self.assertEqual(v["line"], "gate: NOT met: per-build case route has no pass for this build")
+        v = skytest.gate_verdict(g, a, {"route": {"met": False, "pass": None, "last": ["fail", "r2"], "other": 1}})
+        self.assertEqual(v["open"], ["per-build case route has no pass for this build (last result on it: fail in"
+                                     " r2; 1 pass(es) of another spec text or arguments, or with no provenance,"
+                                     " left out)"])
+        # A later fail undid an earlier pass on the same build: open, and it says so.
+        v = skytest.gate_verdict(g, a, {"route": {"met": False, "pass": None, "last": ["fail", "r3"], "undone": "r2",
+                                                  "other": 0}})
+        self.assertEqual(v["open"], ["per-build case route's last result on this build is not a pass (last result on"
+                                     " it: fail in r3; its pass in r2 came before that result, the newest result"
+                                     " decides)"])
+        v = skytest.gate_verdict(g, a, {"route": met})
+        self.assertTrue(v["met"])
+        self.assertEqual(v["line"], "gate: met (per-build, passed on build abc123: route (20261107-100000-session))")
+        # A daily case that failed keeps the gate open even when the route passed on this build.
+        v = skytest.gate_verdict(g, [replace(a[0], status="fail")], {"route": met})
+        self.assertEqual(v["open"], ["a (fail)"])
+        # Not ready wins: the route's spec says ready = false, whatever passed on this build before.
+        nr = {**g, "per_build": [{"case": "route", "basis": "not ready", "source": "not ready: legs 11+"}]}
+        v = skytest.gate_verdict(nr, a, {"route": met})
+        self.assertEqual(v["open"], ["route (not ready: legs 11+)"])
+        # list --gate's row of a not-ready per-build case: no minutes, its reason once.
+        row = {"case": "route", "layout": "solo", "stage": "1B", "seconds": 0, "basis": "not ready",
+               "source": "not ready: legs 11+"}
+        table = skytest.per_build_table({**nr, "per_build": [row]})
+        self.assertEqual(len(table), 2)
+        self.assertIn("    - min  not ready: legs 11+", table[1])
+        self.assertEqual(table[1].count("legs 11+"), 1)
+        self.assertNotIn("|", table[1])
+        nospec = {**g, "per_build": [{"case": "route", "basis": "no spec", "source": "no spec"}]}
+        self.assertEqual(skytest.gate_verdict(nospec, a, {"route": met})["open"], ["route (no spec)"])
+        # A --per-build run's verdict is over its own cases, with its own label.
+        pb = {"cases": [{"case": "route", "basis": "timeout"}], "cadence": "per-build", "per_build": []}
+        route = skytest.CaseResult(case="route", layout="solo", stage="1A", status="pass")
+        self.assertEqual(skytest.gate_verdict(pb, [route])["line"], "gate (per-build): met")
+        self.assertEqual(skytest.gate_verdict(pb, [])["line"], "gate (per-build): NOT met: route (not run)")
+
+    def test_a_per_build_pass_counts_only_on_the_same_build_and_spec(self) -> None:
+        self.add_route()
+        spec = {s.name: s for s in skytest.all_specs(self.cfg)}["route"]
+        now = {"spec_sha256": spec.sha256, "args_sha256": skytest.args_sha256(self.cfg, spec)}
+        build = "0123456789ab"
+
+        def snap(h: str) -> dict:
+            return {"snapshot": str(self.cfg.store / "snapshots" / h)}
+
+        def state() -> dict:
+            return skytest.per_build_state(self.cfg, spec, skytest.build_results(self.cfg, build).get("route", []),
+                                           build)
+
+        d = self.cfg.store / "runs"
+        for name, h, status, prov in [("20261107-090000-session", "ffffffffffff", "pass", now),  # another build
+                                      ("20261107-100000-session", build, "fail", now),
+                                      ("20261107-110000-session", build, "pass", {**now, "spec_sha256": "old"})]:
+            (d / name).mkdir(parents=True)
+            (d / name / "results.json").write_text(json.dumps({**snap(h), "cases": [
+                {"case": "route", "status": status, "seconds": 1500.0, "provenance": prov}]}), encoding="utf-8")
+        s = state()
+        self.assertFalse(s["met"])
+        self.assertEqual(s["last"], ["fail", "20261107-100000-session"])
+        self.assertEqual(s["other"], 1)
+        left_out = "; 1 pass(es) of another spec text or arguments, or with no provenance, left out"
+        self.assertEqual(s["text"], "no pass on this build: last result on it: fail (20261107-100000-session)"
+                         + left_out)
+
+        def add(name: str, status: str, prov: dict) -> None:
+            (d / name).mkdir(parents=True)
+            (d / name / "results.json").write_text(json.dumps({**snap(build), "cases": [
+                {"case": "route", "status": status, "seconds": 1500.0, "provenance": prov}]}), encoding="utf-8")
+
+        # A pass of the spec as it is now on this build meets it. A fail with no provenance, and a result
+        # that never started the game (capacity), are left out: the pass stands.
+        add("20261107-120000-session", "pass", now)
+        add("20261107-121000-session", "fail", {})
+        add("20261107-122000-session", "capacity", now)
+        s = state()
+        self.assertTrue(s["met"])
+        self.assertEqual(s["pass"], "20261107-120000-session")
+        self.assertEqual(s["text"], "last result on this build: pass (20261107-120000-session)" + left_out)
+        # The owner's decision 3: the newest result decides. A later fail of the same spec text and arguments
+        # on this build undoes the pass; a pass with no provenance does not count.
+        add("20261107-123000-session", "fail", now)
+        add("20261107-124000-session", "pass", {})
+        s = state()
+        self.assertFalse(s["met"])
+        self.assertIsNone(s["pass"])
+        self.assertEqual(s["undone"], "20261107-120000-session")
+        self.assertEqual(s["other"], 2)
+        self.assertEqual(s["text"], "last result on this build: fail (20261107-123000-session), after its pass in"
+                                    " 20261107-120000-session (the newest result decides); 2 pass(es) of another"
+                                    " spec text or arguments, or with no provenance, left out")
+        # A new pass of it decides again.
+        add("20261107-125000-session", "pass", now)
+        s = state()
+        self.assertTrue(s["met"])
+        self.assertEqual(s["pass"], "20261107-125000-session")
+        self.assertIsNone(s["undone"])
+        # A snapshot path written with slashes or backslashes names the same build; no build: never met.
+        (d / "20261107-140000-session").mkdir(parents=True)
+        (d / "20261107-140000-session" / "results.json").write_text(json.dumps({
+            "snapshot": f"C:/store/snapshots/{build}", "cases": [{"case": "other", "status": "pass"}]}), encoding="utf-8")
+        (d / "20261107-150000-session").mkdir(parents=True)
+        (d / "20261107-150000-session" / "results.json").write_text(json.dumps({
+            "snapshot": f"C:\\store\\snapshots\\{build}", "cases": [{"case": "third", "status": "fail"}]}),
+            encoding="utf-8")
+        found = skytest.build_results(self.cfg, build)
+        self.assertEqual(found["other"], [("20261107-140000-session", "pass", {})])
+        self.assertEqual(found["third"], [("20261107-150000-session", "fail", {})])
+        self.assertEqual(skytest.build_results(self.cfg, ""), {})
+        self.assertFalse(skytest.per_build_state(self.cfg, spec, [], "")["met"])
+
+    def test_the_daily_gate_leaves_the_route_out_and_counts_its_pass_on_this_build(self) -> None:
+        self.add_route()
+        # The daily gate: route is not run, listed apart, and has no pass on this build yet.
+        code, lines, results = self.gate_run()
+        self.assertIn("per-build, not run here (once per build, `test --gate --per-build`): route (no pass on this"
+                      " build)", lines[0])
+        self.assertTrue(lines[0].startswith("gate: 3 cases"), lines[0])  # a, b, nospec: route's minutes apart
+        self.assertEqual(sorted(c["case"] for c in results["cases"]), ["a", "b"])
+        build = skytest.build_hash(self.cfg)
+        self.assertEqual(Path(results["snapshot"]).name, build)
+        self.assertEqual(results["gate"]["verdict"]["open"],
+                         ["nospec (no spec)", "per-build case route has no pass for this build"])
+        # PS118 in a gate run: b (never passed: its 30 min timeout) starts before a (about 5 min).
+        self.assertTrue(any(line.startswith("order (exclusive first, then longest first): b (30.0 min), a (") for line in lines), lines)
+        self.assertLess(lines.index("b (solo) ..."), lines.index("a (solo) ..."))
+        # The idle slot's run: only the per-build cases, its own label and verdict.
+        code, lines, results = self.gate_run(per_build=True)
+        self.assertEqual(code, 0)
+        self.assertTrue(lines[0].startswith("gate (per-build): 1 cases"), lines[0])
+        self.assertNotIn("the plan's subset", lines[0])
+        self.assertEqual([c["case"] for c in results["cases"]], ["route"])
+        self.assertTrue(results["gate"]["verdict"]["met"])
+        self.assertTrue(any(line.startswith("gate (per-build): ") and line.endswith("); met") for line in lines), lines)
+        # The daily gate again: route counts as met by that pass on the same build.
+        code, lines, results = self.gate_run()
+        self.assertIn("route (passed on this build (", lines[0])
+        self.assertEqual(results["gate"]["verdict"]["open"], ["nospec (no spec)"])
+        self.assertTrue(results["gate"]["verdict"]["per_build"]["route"]["met"])
+        self.assertEqual(results["gate"]["build"], build)
+        # list --gate shows it apart with its last result on this build.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_list(self.cfg, argparse.Namespace(gate=True, stage="1A"))
+        text = out.getvalue()
+        self.assertIn(f"per-build (once per build in an idle slot, not in the daily gate; this build: {build}):", text)
+        self.assertRegex(text, r"route +solo +stage 1A .*\| last result on this build: pass \(\d{8}-\d{6}-session\)")
+        # A new build is a new snapshot: no pass on it yet.
+        exe = self.repo / "out" / "build" / "game.exe"
+        exe.write_bytes(b"MZ fake, rebuilt")
+        self.assertNotEqual(skytest.build_hash(self.cfg), build)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_list(self.cfg, argparse.Namespace(gate=True, stage="1A"))
+        self.assertIn("| no result on this build", out.getvalue())
+        # Naming the route in a daily gate run says where it runs; --per-build needs --gate.
+        code, lines, results = self.gate_run("a", "route")
+        self.assertIn("gate: route is a per-build case: not run in the daily gate (`test --gate --per-build` runs it);"
+                      " its pass on this build counts", lines)
+        self.assertEqual([c["case"] for c in results["cases"]], ["a"])
+        self.assertEqual(results["gate"]["verdict"]["open"], ["per-build case route has no pass for this build"])
+        with self.assertRaises(SystemExit):
+            skytest.cmd_test(self.cfg, argparse.Namespace(cases=[], stage=None, max_games=5, per_build=True))
+
+    def test_lint_refuses_another_gate_value(self) -> None:
+        self.add_route('"weekly"')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_lint(self.cfg, argparse.Namespace())
+        self.assertEqual(code, 1)
+        self.assertIn("manifest: route: gate must be true, false or \"per-build\" (not 'weekly')", out.getvalue())
+        self.assertEqual(skytest.gate_cadence({"gate": True}), "daily")
+        self.assertEqual(skytest.gate_cadence({"gate": "per-build"}), "per-build")
+        self.assertEqual(skytest.gate_cadence({"gate": 1}), "")
+        self.assertEqual(skytest.gate_cadence({}), "")
+
+    def test_the_run_order_is_exclusive_first_then_longest_by_the_estimate(self) -> None:
+        # RunOrder reads the gate estimate's basis: a's passes (about 5 min), b's timeout (never passed,
+        # 30 min), plain's pass (0.5 min); x is exclusive and short, and still goes first.
+        self.spec("x", 'exclusive = true\n' + self.QUIT.format(stage="0", timeout=60))
+        specs = {s.name: s for s in skytest.all_specs(self.cfg)}
+        order = skytest.RunOrder(self.cfg)
+        self.assertEqual(order.seconds(specs["b"]), 1800.0)
+        self.assertEqual(order.seconds(specs["a"]), 300.0)
+        ranked = sorted([specs[n] for n in ("plain", "a", "x", "b")], key=order)
+        self.assertEqual([s.name for s in ranked], ["x", "b", "a", "plain"])
+        self.assertEqual(order.line([specs["a"], specs["x"]]),
+                         "order (exclusive first, then longest first): x (exclusive, 1.0 min), a (5.0 min)")
 
 
 class CompareTest(unittest.TestCase):
@@ -2607,6 +3281,64 @@ class SchedulerTest(unittest.TestCase):
             skytest._PORTS_GIVEN.clear()
             skytest._PORTS_GIVEN.update(given)
 
+    # --- PS118: exclusive first, then longest first ---------------------------------------------------
+
+    def test_the_rank_starts_the_exclusive_case_first_then_the_longest(self) -> None:
+        seconds = {"s": 10.0, "l": 900.0, "x": 60.0, "m": 300.0, "y": 30.0}
+        specs = [fake_spec("s"), fake_spec("l"), fake_spec("x", exclusive=True), fake_spec("m"),
+                 fake_spec("y", grades={"level_load": {}})]  # y: a timed grade runs alone like an exclusive
+        lock = threading.Lock()
+        started: list[str] = []
+
+        def run_one(spec):
+            with lock:
+                started.append(spec.name)
+            time.sleep(0.05)
+            return skytest.CaseResult(case=spec.name, layout=spec.layout, stage="0", status="pass")
+
+        rank = lambda sp: skytest.order_key(skytest.runs_alone(sp), seconds[sp.name])  # noqa: E731
+        lines: list[str] = []
+        results = skytest.schedule_cases(specs, 2, 20, run_one, say=lines.append, poll=0.01, rank=rank)
+        self.assertEqual(started, ["x", "y", "l", "m", "s"])  # alone ones first (longer first), then the longest
+        self.assertEqual([r.case for r in results], ["s", "l", "x", "m", "y"], "results in the specs' order")
+        by = {r.case: r for r in results}
+        self.assertEqual(by["x"].ran_with, [])
+        self.assertEqual(by["y"].ran_with, [])
+        self.assertIn("l", by["m"].ran_with)  # the rest still packs two at once
+        # Without a rank the given order stands (one job, and --jobs runs that pass none).
+        started.clear()
+        skytest.schedule_cases(specs, 2, 20, run_one, say=lines.append, poll=0.01)
+        self.assertEqual(started[0], "s")
+
+    def test_the_rank_orders_each_queue_take_among_itself_and_never_lets_a_case_overtake(self) -> None:
+        seconds = {"a": 500.0, "p": 10.0, "q": 900.0, "big": 100.0, "t": 5.0}
+        given = [False]
+
+        def more() -> list:
+            if given[0]:
+                return []
+            given[0] = True
+            return [fake_spec("p"), fake_spec("q")]
+
+        lock = threading.Lock()
+        started: list[str] = []
+
+        def run_one(spec):
+            with lock:
+                started.append(spec.name)
+            time.sleep(0.05)
+            return skytest.CaseResult(case=spec.name, layout=spec.layout, stage="0", status="pass")
+
+        rank = lambda sp: skytest.order_key(skytest.runs_alone(sp), seconds[sp.name])  # noqa: E731
+        skytest.schedule_cases([fake_spec("a")], 2, 20, run_one, say=[].append, poll=0.01, more=more, rank=rank)
+        self.assertEqual(started, ["q", "p", "a"])  # the take runs next, its longest first
+        # No overtaking in the order chosen: `big` (4 games) is next and waits for room; the short case
+        # behind it that would fit beside the running one does not start first.
+        started.clear()
+        specs = [fake_spec("a", 2), fake_spec("big", 4), fake_spec("t", 1)]
+        skytest.schedule_cases(specs, 3, 5, run_one, say=[].append, poll=0.01, rank=rank)
+        self.assertEqual(started, ["a", "big", "t"])
+
 
 class ParallelRunTest(unittest.TestCase):
     """`test --jobs N` through cmd_test with the fake game."""
@@ -2651,8 +3383,8 @@ expect = ["Online: starting as the server"]
         pacers: list = []
         real = skytest.StartPacer
 
-        def recording(gap: float):
-            pacers.append(real(gap))
+        def recording(gap: float, *rest):
+            pacers.append(real(gap, *rest))
             return pacers[-1]
 
         self.spec("one", self.HOSTED2)
@@ -2702,7 +3434,8 @@ expect = ["Online: starting as the server"]
     def test_one_job_is_the_run_as_before(self) -> None:
         self.spec("solo1", 'layout = "solo"\nstage = "0"\n[peer.H]\n' + SkytestTest.HUB)
         r = self.run_jobs("solo1", jobs=1)
-        self.assertEqual(r["printed"][-3:-1], ["solo1 (solo) ...", "  PASS"])
+        self.assertEqual(r["printed"][-4:-2], ["solo1 (solo) ...", "  PASS"])
+        self.assertTrue(r["printed"][-2].startswith("  report: "), r["printed"])  # PS14: after each case
         report = (r["folder"] / "report.md").read_text(encoding="utf-8")
         self.assertIn("At most 5 game(s) at once.\n", report)
         self.assertEqual(r["cases"][0]["ran_with"], [])
@@ -2748,6 +3481,1011 @@ expect = ["Online: starting as the server"]
         self.assertEqual(code, 0, out.getvalue())
         self.assertEqual(skytest.timed_grades(skytest.load_spec(self.repo / "tests" / "runtime" / "timed.toml", 10)),
                          ["client_fps"])
+
+
+
+def waitfor_log(*waits: tuple[str, str, float]) -> str:
+    """A game.log with `Input script: waitfor <condition> met|timed out after <s> s` lines."""
+    return "".join(f"[2026-11-06 10:00:{i:02d}.000] [info] [core] [t1] Input script: waitfor {c} {kind} after {v} s\n"
+                   for i, (c, kind, v) in enumerate(waits))
+
+
+class GroupBTest(unittest.TestCase):
+    """PS14 (results after every case, --queue), PS6 (the scenes key), C10 (fps windows nothing grades)
+    and C6 (waitfor timeouts against their history)."""
+
+    setUp = SkytestTest.setUp
+    tearDown = SkytestTest.tearDown
+    spec = SkytestTest.spec
+    QUIT = '[peer.H]\nscript = "quit\\n"\n'
+
+    def run_test(self, a: argparse.Namespace) -> tuple[int, list[str], Path]:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_test(self.cfg, a)
+        printed = out.getvalue().strip().splitlines()
+        return code, printed, Path(printed[-1].split("report: ", 1)[1]).parent
+
+    def lint(self, **kw) -> tuple[int, str]:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_lint(self.cfg, argparse.Namespace(**kw))
+        return code, out.getvalue()
+
+    def command(self, case: dict, peer: str = "H") -> list[str]:
+        return next(p for p in case["peers"] if p["peer"] == peer)["command"]
+
+    # --- PS6 ---------------------------------------------------------------------------------------
+
+    def test_the_runner_passes_the_scene_skip_itself_and_refuses_a_spec_without_a_policy(self) -> None:
+        self.spec("pair", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\nscenes = "skip"\n' + self.QUIT)
+        self.spec("watch", 'layout = "solo"\nstage = "0"\nscenes = "play"\nscenes_reason = "the conversation"\n'
+                  + self.QUIT)
+        self.spec("skips", 'layout = "solo"\nstage = "0"\nscenes = "skip"\n' + self.QUIT)
+        self.spec("plain", 'layout = "solo"\nstage = "0"\n' + self.QUIT, scenes=False)
+        code, printed, folder = self.run_test(argparse.Namespace(cases=["pair", "watch", "skips", "plain"], stage=None,
+                                                             max_games=5))
+        self.assertEqual(code, 1, printed)  # plain says no policy: an error, no game started
+        cases = {c["case"]: c for c in json.loads((folder / "results.json").read_text(encoding="utf-8"))["cases"]}
+        for peer in ("S", "H"):  # every game the runner starts
+            self.assertEqual([a for a in self.command(cases["pair"], peer) if "dev_skip_scenes" in a],
+                             ["--dev_skip_scenes=true"])
+        self.assertEqual([a for a in self.command(cases["watch"]) if "dev_skip_scenes" in a], ["--dev_skip_scenes=false"])
+        self.assertEqual([a for a in self.command(cases["skips"]) if "dev_skip_scenes" in a], ["--dev_skip_scenes=true"])
+        self.assertEqual(cases["pair"]["scenes"], "skip")
+        self.assertEqual(cases["plain"]["status"], "error")
+        self.assertTrue(all(not p["command"] for p in cases["plain"]["peers"]))
+        self.assertIn('plain.toml: no scenes key: say scenes = "skip"', "; ".join(cases["plain"]["reasons"]))
+        self.assertEqual(cases["plain"]["scenes"], "none (no scenes key, no --dev_skip_scenes): refused")
+        self.assertEqual(cases["watch"]["scenes"], "play (the conversation)")
+        self.assertIn("Scenes: play (the conversation)", (folder / "report.md").read_text(encoding="utf-8"))
+        # What ran differs, so the args hash does.
+        specs = {s.name: s for s in skytest.all_specs(self.cfg)}
+        self.assertNotEqual(skytest.args_sha256(self.cfg, specs["watch"]), skytest.args_sha256(self.cfg, specs["skips"]))
+
+    def test_a_spec_that_sets_the_skip_in_its_args_keeps_it_without_the_key(self) -> None:
+        self.spec("old", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\nargs = ["--dev_skip_scenes=false"]\n')
+        spec = skytest.load_spec(self.repo / "tests" / "runtime" / "old.toml", 20)
+        self.assertEqual(skytest.scene_args(self.cfg, spec), [])
+        _, args = skytest.prepare_peer(self.cfg, spec, "H", skytest.make_run_dir(self.cfg, self.cfg.store / "runs" / "x"))
+        self.assertEqual([a for a in args if "dev_skip_scenes" in a], ["--dev_skip_scenes=false"])  # never two
+        self.assertEqual(skytest.scene_policy(self.cfg, spec), "the spec's args (--dev_skip_scenes), no scenes key")
+        # The args hash of a spec without scene args is the one it had before the key (comparable runs).
+        self.assertEqual(skytest.args_sha256(self.cfg, spec), skytest.hashlib.sha256(skytest.json.dumps(
+            [self.cfg.default_args, ["H", [], ["--dev_skip_scenes=false"]]], sort_keys=True).encode()).hexdigest())
+
+    def test_the_scenes_key_is_checked(self) -> None:
+        body = 'layout = "solo"\nstage = "0"\n'
+        for extra, why in (('scenes = "some"\n', r"scenes = 'some' \(skip, play or movies\)"),
+                           ('scenes = "play"\n', r'scenes = "play" needs a `scenes_reason`'),
+                           ('scenes = "skip"\nscenes_reason = "x"\n', r'scenes_reason without scenes = "play"'),
+                           ('scenes = "play"\nscenes_reason = 3\n', "scenes_reason is a string")):
+            with self.assertRaisesRegex(skytest.SpecError, why):
+                skytest.load_spec(self.spec("bad", body + extra + self.QUIT), 20)
+        # The key and the setting in the args do not go together.
+        with self.assertRaisesRegex(skytest.SpecError, "sets --dev_skip_scenes in its args beside the spec's scenes key"):
+            skytest.load_spec(self.spec("bad", body + 'scenes = "skip"\n[peer.H]\nscript = "quit\\n"\n'
+                                        'args = ["--dev_skip_scenes=true"]\n'), 20)
+        (self.repo / "tests" / "runtime" / "bad.toml").unlink()
+        self.spec("both", body + 'scenes = "skip"\n[peer.H]\nscript = "quit\\n"\nargs = ["--dev_skip_scenes=true"]\n')
+        code, text = self.lint()
+        self.assertEqual(code, 1)
+        self.assertIn("both.toml: peer H sets --dev_skip_scenes in its args beside the spec's scenes key", text)
+
+    def test_movies_needs_the_games_movies_skip(self) -> None:
+        self.spec("movie", 'layout = "solo"\nstage = "0"\nscenes = "movies"\n' + self.QUIT)
+        code, text = self.lint()
+        self.assertEqual(code, 1)
+        self.assertIn('movie.toml: scenes = "movies" needs the game\'s movies skip', text)
+        code, printed, folder = self.run_test(argparse.Namespace(cases=["movie"], stage=None, max_games=5))
+        case = json.loads((folder / "results.json").read_text(encoding="utf-8"))["cases"][0]
+        self.assertEqual(case["status"], "error")  # refused before any game started
+        self.assertTrue(all(not p["command"] for p in case["peers"]))
+        self.assertIn("needs the game's movies skip", "; ".join(case["reasons"]))
+        self.cfg.movies_skip = True
+        code, printed, folder = self.run_test(argparse.Namespace(cases=["movie"], stage=None, max_games=5))
+        case = json.loads((folder / "results.json").read_text(encoding="utf-8"))["cases"][0]
+        self.assertEqual(case["status"], "pass", case["reasons"])
+        self.assertIn("--dev_skip_scenes=movies", self.command(case))
+        self.assertEqual(self.lint()[0], 0)
+
+    def test_a_defaults_skip_may_not_reach_a_play_spec(self) -> None:
+        self.cfg.default_args = self.cfg.default_args + ["--dev_skip_scenes=true"]
+        self.spec("watch", 'layout = "solo"\nstage = "0"\nscenes = "play"\nscenes_reason = "the intro"\n' + self.QUIT)
+        self.spec("skips", 'layout = "solo"\nstage = "0"\nscenes = "skip"\n' + self.QUIT)
+        self.spec("plain", 'layout = "solo"\nstage = "0"\n' + self.QUIT, scenes=False)  # [defaults].args says it
+        self.spec("old", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\nargs = ["--dev_skip_scenes=false"]\n')
+        code, text = self.lint()
+        self.assertEqual(code, 1)
+        self.assertIn("watch.toml: [defaults].args sets --dev_skip_scenes=true, which would reach this scenes = \"play\""
+                      " spec", text)
+        self.assertIn("old.toml: sets --dev_skip_scenes=false in its args and [defaults].args sets"
+                      " --dev_skip_scenes=true", text)
+        self.assertNotIn("skips.toml", text)
+        self.assertNotIn("plain.toml", text)
+        specs = {s.name: s for s in skytest.all_specs(self.cfg)}
+        self.assertEqual(skytest.scene_args(self.cfg, specs["skips"]), [])  # [defaults].args says it already
+        self.assertEqual(skytest.scene_args(self.cfg, specs["plain"]), [])
+
+    def test_lint_refuses_a_spec_without_a_scene_policy(self) -> None:
+        self.spec("plain", 'layout = "solo"\nstage = "0"\n' + self.QUIT, scenes=False)
+        self.spec("old", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\nargs = ["--dev_skip_scenes=true"]\n')
+        self.spec("keyed", 'layout = "solo"\nstage = "0"\nscenes = "skip"\n' + self.QUIT)
+        code, text = self.lint()
+        self.assertEqual(code, 1, text)
+        self.assertIn('plain.toml: no scenes key: say scenes = "skip" (playtests skip their scenes) or scenes = "play"'
+                      " with a scenes_reason (a case whose subject is a scene); the runner assumes neither\n", text)
+        self.assertIn("note: 1 spec(s) set --dev_skip_scenes in their args instead of the scenes key (scenes = \"skip\""
+                      " or \"play\" says it): old\n", text)
+        self.assertNotIn("keyed", text)
+        self.assertIn("1 problem(s)", text)
+
+    # --- C10 ---------------------------------------------------------------------------------------
+
+    def test_lint_warns_of_an_fps_window_nothing_grades(self) -> None:
+        self.spec("idle", 'layout = "server+1"\nstage = "0"\n[peer.H]\nscript = "wait 1\\nfps 5\\nlog x\\nquit\\n"\n')
+        self.spec("expects", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "fps 5\\nquit\\n"\n'
+                  'expect = ["guest FPS"]\n')
+        self.spec("graded", 'layout = "solo"\nstage = "0"\nexclusive = true\n[peer.H]\nscript = "fps 5\\nquit\\n"\n'
+                  '[grade.client_fps]\npeer = "H"\n')
+        # S14: a 2 s window is the liveness check PS67 keeps; nothing to shorten, no warning.
+        self.spec("short", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "fps 2\\nquit\\n"\n')
+        code, text = self.lint()
+        self.assertEqual(code, 0, text)  # a warning, not a problem
+        self.assertIn("warning: idle.toml: fps window(s) with no FPS grade or expect: H line 2 (5 s); only the"
+                      " frozen-game check reads them (a window of 0 FPS fails the peer), so keep each window: shorten"
+                      " it to `fps 2`, enough for that check (3 s per run less), or grade it (client_fps, or an"
+                      " expect on `guest FPS`)", text)
+        # The window feeds the zero-FPS grade: the text never says to delete one.
+        for word in ("drop", "delete", "remove"):
+            self.assertNotIn(word, text.split("idle.toml", 1)[1].splitlines()[0])
+        self.assertNotIn("expects.toml", text)
+        self.assertNotIn("graded.toml", text)
+        self.assertNotIn("short.toml", text)
+        self.assertIn("0 problem(s), 1 warning(s)", text)
+
+    # --- C6 ----------------------------------------------------------------------------------------
+
+    def store_log(self, rel: str, *waits: tuple[str, str, float]) -> None:
+        f = self.cfg.store / "runs" / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(waitfor_log(*waits), encoding="utf-8")
+
+    def test_timeouts_reads_the_waitfor_history_of_the_store(self) -> None:
+        barrier = [("online_barrier", "met", float(v)) for v in (10, 12, 14, 16, 20)]
+        self.store_log("20261105-100000-a/H/game.log", *barrier[:3], ("title_ready", "met", 49.9))
+        self.store_log("20261105-100000-a/H/data/Online/session/game.log", barrier[3])  # a hosted server
+        self.store_log("20261105-110000-c/off1/H/game.log", barrier[4], ("online_barrier", "timed out", 300.0))
+        self.store_log("20261105-100000-a/H/figures/game.log", ("online_barrier", "met", 999.0))  # never read
+        self.store_log("20261104-090000-old/H/game.log", ("online_barrier", "met", 500.0))
+        self.spec("waits", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "waitfor title_ready 35\\n'
+                  'waitfor online_barrier 600\\nwaitfor online_barrier 70\\nquit\\n"\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_timeouts(self.cfg, argparse.Namespace(since="20261105"))
+        text = out.getvalue()
+        self.assertEqual(code, 0, text)  # advisory
+        self.assertIn("waitfor history: 3 game.log file(s)", text)
+        self.assertIn("(runs from 20261105 on): 6 met, 1 timed out", text)
+        self.assertIn("| online_barrier | 5 | 1 | 14 s | 20 s | 20 s | 20261105-110000-c | 70, 600 |", text)
+        self.assertIn("warning: `waitfor online_barrier 600` is over max(3 x p95 20, max 20 + 60) = 80 s of 5 met"
+                      " waits: a silent hang waits 600 s for its timed-out line; it fits 20-80 s; in 1 spec line(s):"
+                      " waits (H line 2)", text)
+        self.assertIn("warning: `waitfor title_ready 35` is below the longest met wait seen, 49.9 s"
+                      " (20261105-100000-a): a slow but healthy run times out there; it fits 50 s or more; in 1 spec"
+                      " line(s): waits (H line 1)", text)
+        self.assertNotIn("online_barrier 70`", text)  # 70 s fits
+        self.assertIn("1 spec(s), 2 warning(s)", text)
+        # Without --since the old run counts (its 500 s is the max now); lint --timeouts warns the same way.
+        code, text = self.lint(timeouts=True, since=None)
+        self.assertEqual(code, 0, text)
+        self.assertIn("warning: `waitfor online_barrier 70` is below the longest met wait seen, 500 s", text)
+        self.assertNotIn("999", text)
+
+    # --- PS14 --------------------------------------------------------------------------------------
+
+    def test_results_are_written_after_every_case(self) -> None:
+        self.spec("one", 'layout = "solo"\nstage = "0"\n[peer.H]\n' + SkytestTest.HUB)
+        self.spec("two", 'layout = "solo"\nstage = "0"\n[peer.H]\n' + SkytestTest.HUB)
+        seen: list[tuple[str, str, dict]] = []
+        real = skytest.run_case
+
+        def spy(cfg, spec, *rest, **kw):
+            runs = sorted((self.cfg.store / "runs").glob("*-session"))
+            if runs:
+                seen.append((spec.name, (runs[-1] / "report.md").read_text(encoding="utf-8"),
+                             json.loads((runs[-1] / "results.json").read_text(encoding="utf-8"))))
+            return real(cfg, spec, *rest, **kw)
+
+        skytest.run_case = spy
+        try:
+            code, printed, folder = self.run_test(argparse.Namespace(cases=["one", "two"], stage=None, max_games=5))
+        finally:
+            skytest.run_case = real
+        self.assertEqual(code, 0, printed)
+        self.assertEqual(printed[0], f"report (rewritten after every case): {folder / 'report.md'}")
+        self.assertEqual(printed.count(f"  report: {folder / 'report.md'}"), 2)
+        # When the second case started, the first one's rows were there, and said the run goes on.
+        name, report, results = seen[1]
+        self.assertEqual(name, "two")
+        self.assertIn("**In progress: 1 of 2 case(s) ended.**", report)
+        self.assertIn("| one | solo | 0 | PASS |", report)
+        self.assertNotIn("| two |", report)
+        self.assertNotIn("## Left alone", report)
+        self.assertEqual([c["case"] for c in results["cases"]], ["one"])
+        self.assertEqual(results["in_progress"], "1 of 2 case(s) ended")
+        # The end: the whole report, results without in_progress, and each case's result.json in its folder.
+        final = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+        self.assertNotIn("in_progress", final)
+        self.assertNotIn("In progress", (folder / "report.md").read_text(encoding="utf-8"))
+        self.assertIn("## Left alone", (folder / "report.md").read_text(encoding="utf-8"))
+        for c in final["cases"]:
+            own = json.loads((Path(c["folder"]) / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual((own["case"], own["status"], own["session"]), (c["case"], "pass", str(folder)))
+        self.assertFalse(list(folder.glob("*.tmp-*")))
+
+    def test_a_queue_file_is_read_before_each_case_and_its_new_cases_run_next(self) -> None:
+        for name in ("one", "two", "three"):
+            self.spec(name, 'layout = "solo"\nstage = "0"\n' + self.QUIT)
+        self.spec("later", 'layout = "solo"\nstage = "0"\nready = false\nreason = "legs 11+"\n' + self.QUIT)
+        queue = Path(self.tmp.name) / "lane.txt"
+        queue.write_text("# lane 1\none nope\n", encoding="utf-8")
+        real = skytest.run_case
+        started: list[str] = []
+
+        def spy(cfg, spec, *rest, **kw):
+            started.append(spec.name)
+            if spec.name == "one":  # the tester adds cases while one runs
+                with open(queue, "a", encoding="utf-8") as f:
+                    f.write("two  # after triage\nlater\n")
+            return real(cfg, spec, *rest, **kw)
+
+        skytest.run_case = spy
+        try:
+            code, printed, folder = self.run_test(argparse.Namespace(cases=["three"], stage=None, max_games=5,
+                                                                 queue=str(queue)))
+        finally:
+            skytest.run_case = real
+        self.assertEqual(code, 1, printed)  # an entry that names no case
+        self.assertEqual(started, ["three", "one", "two"])
+        self.assertIn("queue: nope matches no case (skipped); `skytest.py list` names them", printed)
+        self.assertIn("later: NOT READY: legs 11+ (no game started)", printed)
+        final = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual([(c["case"], c["status"]) for c in final["cases"]],
+                         [("three", "pass"), ("one", "pass"), ("two", "pass"), ("later", "not ready")])
+        self.assertEqual(final["queue"], {"file": str(queue), "unmatched": ["nope"]})
+        self.assertIsNone(final["checkpoint"])
+        self.assertIn("## Queue entries that matched no case\n\nnope", (folder / "report.md").read_text(encoding="utf-8"))
+        # Only the queue (no case named): not every case; a case named twice runs twice.
+        queue.write_text("two\ntwo\n", encoding="utf-8")
+        code, printed, folder = self.run_test(argparse.Namespace(cases=[], stage=None, max_games=5, queue=str(queue)))
+        self.assertEqual(code, 0, printed)
+        final = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual([c["case"] for c in final["cases"]], ["two", "two"])
+        self.assertEqual(len({c["folder"] for c in final["cases"]}), 2)
+        # Refused: with --gate, or a file that is not there.
+        for kw, why in (({"gate": True}, "--queue and --gate"), ({}, "no such file")):
+            a = argparse.Namespace(cases=[], stage=None, max_games=5, queue=str(queue) if kw else str(queue) + ".x", **kw)
+            with self.assertRaisesRegex(SystemExit, why):
+                skytest.cmd_test(self.cfg, a)
+
+    def test_a_queue_takes_a_new_spec_file_and_an_edited_spec_s_new_text(self) -> None:
+        # R2: the queue's entries run the spec files as they are when taken; provenance records the
+        # text that ran; a case named on the command line runs the text read at the start and says so.
+        self.spec("one", 'layout = "solo"\nstage = "0"\n' + self.QUIT)
+        self.spec("edited", 'layout = "solo"\nstage = "0"\ntimeout = 20\n' + self.QUIT)
+        queue = Path(self.tmp.name) / "lane.txt"
+        queue.write_text("", encoding="utf-8")
+        real = skytest.run_case
+        ran: dict[str, float] = {}
+
+        def spy(cfg, spec, *rest, **kw):
+            ran[spec.name] = spec.timeout
+            if spec.name == "one":
+                self.spec("fresh", 'layout = "solo"\nstage = "0"\n' + self.QUIT)  # written after the start
+                self.spec("edited", 'layout = "solo"\nstage = "0"\ntimeout = 30\n' + self.QUIT)
+                queue.write_text("fresh\nedited\n", encoding="utf-8")
+            return real(cfg, spec, *rest, **kw)
+
+        skytest.run_case = spy
+        try:
+            code, printed, folder = self.run_test(argparse.Namespace(cases=["one"], stage=None, max_games=5,
+                                                                 queue=str(queue)))
+        finally:
+            skytest.run_case = real
+        self.assertEqual(code, 0, printed)
+        self.assertEqual(ran, {"one": 20.0, "fresh": 20.0, "edited": 30.0})
+        self.assertIn("queue: edited.toml changed since it was read; the queue's entries run its new text", printed)
+        final = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+        prov = {c["case"]: c["provenance"]["spec_sha256"] for c in final["cases"]}
+        path = self.repo / "tests" / "runtime" / "edited.toml"
+        self.assertEqual(prov["edited"], skytest.hashlib.sha256(path.read_bytes()).hexdigest())
+        # A named case whose file changed after the start: the text read at the start runs, and it says so.
+        self.spec("two", 'layout = "solo"\nstage = "0"\n' + self.QUIT)
+
+        def edit_two(cfg, spec, *rest, **kw):
+            if spec.name == "one":
+                self.spec("two", 'layout = "solo"\nstage = "0"\ntimeout = 40\n' + self.QUIT)
+            ran[spec.name] = spec.timeout
+            return real(cfg, spec, *rest, **kw)
+
+        skytest.run_case = edit_two
+        try:
+            code, printed, folder = self.run_test(argparse.Namespace(cases=["one", "two"], stage=None, max_games=5))
+        finally:
+            skytest.run_case = real
+        self.assertEqual(ran["two"], 20.0)
+        self.assertIn("two: two.toml changed since it was read; the case runs the text read before (provenance records"
+                      " that text's sha256)", printed)
+
+    def test_the_case_queue_takes_each_entry_once(self) -> None:
+        f = Path(self.tmp.name) / "q.txt"
+        f.write_text("a b # two\n\n# none\nc\n", encoding="utf-8")
+        q = skytest.CaseQueue(f)
+        self.assertEqual(q.take(), ["a", "b", "c"])
+        self.assertEqual(q.take(), [])
+        f.write_text("a b\nc\nd*\n", encoding="utf-8")
+        self.assertEqual(q.take(), ["d*"])
+        # An entry taken and then removed, with a new one added: the new one is taken (the count of lines
+        # does not decide), and the removed one comes back only as a new occurrence.
+        f.write_text("b\nc\ne\n", encoding="utf-8")
+        self.assertEqual(q.take(), ["e"])
+        f.write_text("x\nb\nc\ne\na\na\n", encoding="utf-8")
+        self.assertEqual(q.take(), ["x", "a"])  # the second a is a second occurrence
+        f.unlink()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(q.take(), [])
+            self.assertEqual(q.take(), [])
+        self.assertEqual(out.getvalue().count("nothing more is taken from it"), 1)
+
+    def test_the_scheduler_runs_new_cases_next_and_reports_each_as_it_ends(self) -> None:
+        a, b, c = fake_spec("a", 1), fake_spec("b", 1), fake_spec("c", 1)
+        given = [False]
+        ended: list[tuple[str, list[str], bool]] = []
+
+        def more() -> list:
+            if given[0] or not ended:
+                return []
+            given[0] = True
+            return [c]
+
+        def run_one(spec):
+            time.sleep(0.05)
+            return skytest.CaseResult(case=spec.name, layout=spec.layout, stage="0", status="pass")
+
+        specs = [a, b]
+        lines: list[str] = []
+        results = skytest.schedule_cases(specs, 1, 5, run_one, say=lines.append, poll=0.01,
+                                         done=lambda sp, r: ended.append((sp.name, list(r.ran_with), r.exclusive)),
+                                         more=more)
+        self.assertEqual([r.case for r in results], ["a", "b", "c"])  # the list's order (c was added)
+        self.assertEqual([n for n, _, _ in ended], ["a", "c", "b"])  # c ran next
+        self.assertEqual(specs, [a, b, c])
+        # Two jobs: ran_with is known when a case ends.
+        ended.clear()
+        skytest.schedule_cases([fake_spec("x", 1), fake_spec("y", 1)], 2, 5, run_one, say=lines.append, poll=0.01,
+                               done=lambda sp, r: ended.append((sp.name, list(r.ran_with), r.exclusive)))
+        self.assertEqual(sorted((n, w) for n, w, _ in ended), [("x", ["y"]), ("y", ["x"])])
+        # A done() that fails leaves the case's result alone.
+        out = skytest.schedule_cases([fake_spec("z", 1)], 1, 5, run_one, say=lines.append, poll=0.01,
+                                     done=lambda sp, r: 1 / 0)
+        self.assertEqual(out[0].status, "pass")
+        self.assertTrue(any("its results were not written now (ZeroDivisionError" in s for s in lines), lines)
+
+class ReviewFixesTest(unittest.TestCase):
+    """The review of groups A, B and C: the scheduler's wait, a report a reader holds, tolerate patterns
+    that take nothing out, a timed case beside games of another runner."""
+
+    setUp = SkytestTest.setUp
+    tearDown = SkytestTest.tearDown
+    spec = SkytestTest.spec
+
+    def test_a_case_that_only_waited_for_the_machine_ran_beside_nothing(self) -> None:
+        a, b = fake_spec("a", 1), fake_spec("b", 1)
+        gate = threading.Event()
+
+        def run_one(spec):
+            skytest.case_waits()
+            if spec.name == "b":
+                gate.wait(10)  # b waits for a's slots while a runs
+            skytest.case_begins()
+            if spec.name == "a":
+                time.sleep(0.3)
+                gate.set()
+            else:
+                time.sleep(0.05)
+            return skytest.CaseResult(case=spec.name, layout=spec.layout, stage="0", status="pass")
+
+        out = skytest.schedule_cases([a, b], 2, 5, run_one, say=lambda s: None, poll=0.01)
+        self.assertEqual([(r.case, r.ran_with) for r in out], [("a", []), ("b", [])])
+        # A case that ends while it waits (a capacity or breaker result) overlaps nothing.
+        def never_begins(spec):
+            skytest.case_waits()
+            time.sleep(0.2 if spec.name == "c" else 0.05)
+            if spec.name == "c":
+                return skytest.CaseResult(case=spec.name, layout=spec.layout, stage="0", status="breaker")
+            skytest.case_begins()
+            time.sleep(0.3)
+            return skytest.CaseResult(case=spec.name, layout=spec.layout, stage="0", status="pass")
+
+        out = skytest.schedule_cases([fake_spec("c", 1), fake_spec("d", 1)], 2, 5, never_begins, say=lambda s: None,
+                                     poll=0.01)
+        self.assertEqual([(r.case, r.ran_with) for r in out], [("c", []), ("d", [])])
+
+    def test_a_report_a_reader_holds_is_not_written_in_place(self) -> None:
+        target = Path(self.tmp.name) / "report.md"
+        target.write_text("old, whole\n", encoding="utf-8")
+        real = skytest.os.replace
+
+        def held(src, dst):
+            raise PermissionError(13, "in use", str(dst))
+
+        skytest.os.replace = held
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertFalse(skytest.write_text_replacing(target, "new\n", retry_s=0.2))
+        finally:
+            skytest.os.replace = real
+        self.assertEqual(target.read_text(encoding="utf-8"), "old, whole\n")
+        left = list(target.parent.glob("report.md.tmp-*"))
+        self.assertEqual(len(left), 1)
+        self.assertEqual(left[0].read_text(encoding="utf-8"), "new\n")
+        self.assertIn("report.md: held open by a reader, not replaced; the previous file stays whole", out.getvalue())
+        # The next write replaces the file and takes the text left over with it.
+        self.assertTrue(skytest.write_text_replacing(target, "newer\n"))
+        self.assertEqual(target.read_text(encoding="utf-8"), "newer\n")
+        self.assertEqual(list(target.parent.glob("report.md.tmp-*")), [])
+
+    def test_lint_warns_of_a_tolerate_pattern_that_takes_nothing_out(self) -> None:
+        self.spec("stall", 'layout = "solo"\nstage = "0"\ntolerate = ["Online: disconnected \\\\(timeout\\\\)",'
+                  ' "menu_ready"]\n[peer.H]\nscript = "quit\\n"\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_lint(self.cfg, argparse.Namespace())
+        text = out.getvalue()
+        self.assertEqual(code, 0, text)
+        self.assertIn("warning: stall.toml: tolerate pattern(s) that match no dead session's default fatal line:"
+                      " 'Online: disconnected \\\\(timeout\\\\)'; they take nothing out", text)
+        self.assertNotIn("'menu_ready'", text)
+
+    def test_a_timed_case_beside_games_of_another_runner_is_marked(self) -> None:
+        timed = fake_spec("t", 2, grades={"client_fps": {}})
+        self.assertIn("2 game(s) not started by this runner ran beside this exclusive or timed case",
+                      skytest.not_alone_note(timed, {"outside_games_max": 2}))
+        self.assertEqual(skytest.not_alone_note(timed, {"outside_games_max": 0}), "")
+        self.assertEqual(skytest.not_alone_note(fake_spec("plain", 2), {"outside_games_max": 2}), "")
+        line = skytest.machine_line({"slots": 4, "of": 4, "all": True, "waited_s": 0.0, "boot_wait_s": 7.5,
+                                     "not_alone": "x"})
+        self.assertEqual(line, "Machine: 4 of 4 game slots (all: nothing of another runner beside it); its games waited"
+                               " 8 s in all for the machine's boot turn (in its seconds); NOT ALONE: x.")
+
+
+class FakeProc:
+    """A process for the boot token's watch: alive until ended."""
+
+    def __init__(self) -> None:
+        self.code = None
+
+    def poll(self):
+        return self.code
+
+
+class ThreadOut(io.TextIOBase):
+    """sys.stdout for runners in threads: each thread's prints go to its own buffer."""
+
+    def __init__(self) -> None:
+        self.buffers: dict[int, io.StringIO] = {}
+        self.lock = threading.Lock()
+
+    def write(self, text: str) -> int:
+        with self.lock:
+            return self.buffers.setdefault(threading.get_ident(), io.StringIO()).write(text)
+
+    def flush(self) -> None:
+        pass
+
+
+CRASH_A = ("[2026-11-06 03:16:20.031] [error] [core] [t39816] Crash: exception C0000005, read of guest 00000024 on"
+           " thread 39816; call chain: sub_8298D2E8+0xF1 <- sub_829D5478+0x19E <- sub_829D97C0+0xF1")
+
+
+class MachineTest(unittest.TestCase):
+    """PS15 (the machine's game budget, the boot token) and C7 (the circuit breaker)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.slots = Path(self.tmp.name) / skytest.STORE / "slots"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def budget(self, games: int = 4, owner: str = "") -> "skytest.MachineBudget":
+        return skytest.MachineBudget(self.slots, games, owner)
+
+    def acquire_in_thread(self, budget, need: int, case: str, said: list, memory_games: int = 0) -> tuple:
+        box: dict = {}
+
+        def go() -> None:
+            box["lease"] = budget.acquire(need, case, memory_games=memory_games, say=said.append, poll=0.02)
+
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        return t, box
+
+    def wait_until(self, cond, seconds: float = 10.0) -> None:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if cond():
+                return
+            time.sleep(0.02)
+        self.fail("condition not met in time")
+
+    def test_two_runners_share_one_budget_and_the_waiter_says_for_what(self) -> None:
+        a, b = self.budget(owner="runner A"), self.budget(owner="runner B")
+        held = a.acquire(3, "big")
+        self.assertEqual(len(held.slots), 3)
+        said: list[str] = []
+        t, box = self.acquire_in_thread(b, 2, "small", said)
+        self.wait_until(lambda: said)
+        self.assertNotIn("lease", box)
+        self.assertEqual(said[0], "machine slots: needs 2 of 4, 1 free; held by big (runner A, 3)")
+        held.release()
+        t.join(timeout=10)
+        lease = box["lease"]
+        self.assertEqual(len(lease.slots), 2)
+        self.assertGreater(lease.waited_s, 0.0)
+        self.assertEqual(lease.summary()["waited_for"], said)
+        self.assertFalse(lease.summary()["all"])
+        lease.release()
+        # Every slot is free again: a whole-machine case takes them all at once.
+        whole = a.acquire(4, "timed")
+        self.assertEqual(whole.summary()["all"], True)
+        whole.release()
+
+    @unittest.skipUnless(os.name == "nt", "the slot locks are Windows byte-range locks")
+    def test_a_dead_runner_process_frees_its_slots(self) -> None:
+        code = ("import sys, time; from pathlib import Path; sys.path.insert(0, sys.argv[1]); import skytest; "
+                "skytest.GB_PER_GAME = 0.0; b = skytest.MachineBudget(Path(sys.argv[2]), 2, 'child runner'); b.acquire(2, 'child-case'); "
+                "print('held', flush=True); time.sleep(60)")
+        child = subprocess.Popen([sys.executable, "-I", "-c", code, str(HERE.parent), str(self.slots)],
+                                 stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "held")
+            said: list[str] = []
+            t, box = self.acquire_in_thread(self.budget(2, "parent"), 1, "mine", said)
+            self.wait_until(lambda: said)
+            self.assertIn("held by child-case (child runner, 2)", said[0])
+            self.assertNotIn("lease", box)
+            child.kill()  # no release: its handles go with it
+            child.wait(timeout=10)
+            t.join(timeout=10)
+            self.assertEqual(len(box["lease"].slots), 1)
+            box["lease"].release()
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.stdout.close()
+
+    def test_a_case_that_needs_every_slot_is_not_starved_by_smaller_ones(self) -> None:
+        a = self.budget(owner="lane 1")
+        first = a.acquire(1, "solo-a")
+        said_x: list[str] = []
+        tx, bx = self.acquire_in_thread(self.budget(owner="lane 2"), 4, "timed-x", said_x)
+        self.wait_until(lambda: said_x)
+        self.assertIn("needs every slot, 3 free", said_x[0])
+        said_c: list[str] = []
+        tc, bc = self.acquire_in_thread(self.budget(owner="lane 3"), 1, "solo-c", said_c)
+        self.wait_until(lambda: said_c)
+        self.assertEqual(said_c[0], "machine slots: timed-x (lane 2) waits first for 4")
+        self.assertNotIn("lease", bc)  # three slots are free, but timed-x is first
+        first.release()
+        tx.join(timeout=10)
+        self.assertEqual(len(bx["lease"].slots), 4)
+        time.sleep(0.2)
+        self.assertNotIn("lease", bc)  # nothing beside the timed case
+        bx["lease"].release()
+        tc.join(timeout=10)
+        self.assertEqual(len(bc["lease"].slots), 1)
+        bc["lease"].release()
+
+    def test_memory_is_checked_at_each_case_start(self) -> None:
+        real_mem, real_gb, real_recheck = skytest.available_memory_gb, skytest.GB_PER_GAME, skytest.MEMORY_RECHECK_S
+        skytest.GB_PER_GAME = 1.5
+        skytest.MEMORY_RECHECK_S = 0.3
+        free = [2.0]
+        skytest.available_memory_gb = lambda: free[0]
+        try:
+            other = self.budget(owner="lane 1").acquire(1, "running")
+            said: list[str] = []
+            t, box = self.acquire_in_thread(self.budget(owner="lane 2"), 2, "pair", said)
+            self.wait_until(lambda: said)
+            self.assertEqual(said[0], "memory: needs 3.0 GB free for 2 game(s), 2.0 GB free; slots held by running"
+                                      " (lane 1, 1)")
+            free[0] = 4.0  # the other lane's games ended or shrank
+            t.join(timeout=10)
+            self.assertEqual(len(box["lease"].slots), 2)
+            box["lease"].release()
+            other.release()
+            # Short with nothing else running: a capacity result after the re-check, not a wait for ever.
+            free[0] = 1.0
+            t0 = time.monotonic()
+            lease = self.budget().acquire(1, "lonely")
+            self.assertGreaterEqual(time.monotonic() - t0, 0.25)
+            self.assertEqual(lease.slots, [])
+            self.assertIn("needs 1.5 GB of free memory for 1 game(s), 1.0 GB free with no other runner's game", lease.capacity)
+            # Memory that comes back within the re-check (the last case's games just exited): no capacity.
+            samples = iter([1.0, 1.0, 3.0])
+            skytest.available_memory_gb = lambda: next(samples, 3.0)
+            lease = self.budget().acquire(1, "after")
+            self.assertEqual(len(lease.slots), 1)
+            self.assertEqual(lease.capacity, "")
+            lease.release()
+            skytest.available_memory_gb = lambda: free[0]
+            # An exclusive case takes every slot but needs memory only for its own games.
+            free[0] = 3.5
+            lease = self.budget().acquire(4, "timed", memory_games=2)
+            self.assertEqual(len(lease.slots), 4)
+            lease.release()
+        finally:
+            skytest.available_memory_gb, skytest.GB_PER_GAME, skytest.MEMORY_RECHECK_S = real_mem, real_gb, real_recheck
+
+    def test_the_need_of_a_case(self) -> None:
+        self.assertEqual(skytest.machine_need(fake_spec("pair", 2), 4), 2)
+        self.assertEqual(skytest.machine_need(fake_spec("lone", 2, exclusive=True), 4), 4)
+        self.assertEqual(skytest.machine_need(fake_spec("timed", 2, grades={"client_fps": {}}), 4), 4)
+        self.assertEqual(skytest.machine_need(fake_spec("five", 5), 4), 4)  # over the budget: alone
+
+    def test_one_game_boots_at_a_time_on_the_machine(self) -> None:
+        log = Path(self.tmp.name) / "game.log"
+        log.write_text("[2026-11-06 10:00:00.000] [info] [core] [t1] Skylanders\n", encoding="utf-8")
+        a, b = self.budget(owner="lane 1"), self.budget(owner="lane 2")
+        hold = a.boot_turn(0.0)
+        proc = FakeProc()
+        hold.watch(log, proc)
+        box: dict = {}
+        t = threading.Thread(target=lambda: box.update(hold=b.boot_turn(0.0)), daemon=True)
+        t.start()
+        time.sleep(0.4)
+        self.assertNotIn("hold", box)  # the first game has not shown a frame yet
+        with open(log, "a", encoding="utf-8") as f:
+            f.write("[2026-11-06 10:00:01.000] [info] [core] [t1] Swap: game presentation interval 2 (swap word"
+                    " 00000200)\n")
+        t.join(timeout=5)
+        self.assertIn("hold", box)
+        self.assertRegex(hold.outcome, r"^first frame after \d+\.\d s$")
+        self.assertGreater(box["hold"].waited_s, 0.3)
+        # A game that never logs its first frame holds the token only until the timeout; one that exits
+        # frees it at once.
+        box["hold"].watch(log.with_name("none.log"), FakeProc(), timeout=1.0)
+        third = a.boot_turn(0.0)
+        self.assertEqual(box["hold"].outcome, "no first frame line within 1 s")
+        gone = FakeProc()
+        gone.code = 0
+        third.watch(log.with_name("none.log"), gone)
+        fourth = b.boot_turn(0.0)
+        self.assertRegex(third.outcome, r"^exited after")
+        fourth.release()
+        fourth.release()  # twice is harmless
+
+    def test_the_start_gap_holds_across_runners(self) -> None:
+        a, b = self.budget(owner="lane 1"), self.budget(owner="lane 2")
+        a.boot_turn(0.5).release()
+        t0 = time.monotonic()
+        b.boot_turn(0.5).release()
+        self.assertGreaterEqual(time.monotonic() - t0, 0.4)
+
+    def test_a_worktree_shares_the_main_checkouts_slots(self) -> None:
+        main = Path(self.tmp.name) / "main"
+        main.mkdir()
+        subprocess.run(["git", "init", "-q", str(main)], check=True)
+        subprocess.run(["git", "-C", str(main), "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit",
+                        "-q", "--allow-empty", "-m", "init"], check=True)
+        wt = Path(self.tmp.name) / "wt"
+        subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(wt)], check=True)
+        self.assertEqual(skytest.main_store(wt), (main / skytest.STORE).resolve())
+        self.assertEqual(skytest.main_store(main), (main / skytest.STORE).resolve())
+
+    # --- the circuit breaker (C7) ---
+
+    def test_a_signature_drops_times_threads_and_heap_addresses_and_keeps_the_crash_site(self) -> None:
+        a = skytest.normalize_fatal(CRASH_A)
+        self.assertEqual(a, "Crash: exception C0000005, read of guest 00000024 on thread <n>; call chain:"
+                            " sub_8298D2E8+0xF1 <- sub_829D5478+0x19E <- sub_829D97C0+0xF1")
+        b = CRASH_A.replace("03:16:20.031", "09:01:02.999").replace("t39816", "t4764").replace("39816;", "4764;")
+        self.assertEqual(skytest.normalize_fatal(b), a)
+        heap1 = CRASH_A.replace("00000024", "B4737AB0")
+        heap2 = CRASH_A.replace("00000024", "9C112340")
+        self.assertEqual(skytest.normalize_fatal(heap1), skytest.normalize_fatal(heap2))
+        self.assertIn("read of guest <addr>", skytest.normalize_fatal(heap1))
+        self.assertNotEqual(skytest.normalize_fatal(heap1), a)  # a null offset is not a heap address
+        other_site = CRASH_A.replace("sub_829D5478+0x19E", "sub_829D5478+0x1A2")
+        self.assertNotEqual(skytest.normalize_fatal(other_site), a)
+        host = CRASH_A.replace("sub_829D97C0+0xF1", "0x00007FF6A1B2C3D4")
+        self.assertTrue(skytest.normalize_fatal(host).endswith("<- <addr>"))
+        self.assertEqual(skytest.normalize_fatal("[2026-11-06 10:00:00.000] [error] [core] [t1] Online: server: error:"
+                                                 " bind 127.0.0.1:53412 failed (pid 4410)"),
+                         "Online: server: error: bind 127.0.0.1:<port> failed (pid <n>)")
+        long_chain = CRASH_A + "".join(f" <- sub_8200{i:04X}+0x1" for i in range(20))
+        self.assertEqual(skytest.normalize_fatal(long_chain).count(" <- "), skytest.BREAKER_FRAMES - 1)
+
+    def test_the_case_signature_is_its_crash_else_its_first_specific_fatal_line(self) -> None:
+        sp = fake_spec("c", 2)
+        timed_out = "[2026-11-06 10:00:01.000] [info] [core] [t1] Input script: waitfor online_barrier timed out after 600 s"
+        ended = "[2026-11-06 10:00:02.000] [info] [core] [t1] Online: the server ended by itself"
+        crash = CRASH_A.replace("2026-11-06 03:16:20.031", "2026-11-06 10:00:03.000")
+        sig = skytest.case_signature(sp, {"S": crash + "\n", "H": timed_out + "\n" + ended + "\n"})
+        self.assertEqual((sig["peer"], sig["kind"]), ("S", "crash"))
+        self.assertTrue(sig["signature"].startswith("Crash: exception C0000005"))
+        # A symptom that many causes produce (a timed-out wait, a dead session's default line, the
+        # missing hub, a script that cannot be parsed) is no signature, also when the spec forbids it.
+        weak = [timed_out, ended,
+                "[2026-11-06 10:00:02.500] [error] [core] [t1] Online: server: error: bind failed",
+                "[2026-11-06 10:00:02.600] [info] [core] [t1] Dev: navto: no player frame within 5 s",
+                "[2026-11-06 10:00:02.700] [info] [core] [t1] refused: dev_navto is off",
+                "[2026-11-06 10:00:02.800] [info] [core] [t1] Online: the server did not reach its hub",
+                "[2026-11-06 10:00:02.900] [info] [core] [t1] Input script: cannot parse line 3"]
+        forbids = replace(sp, peers={**sp.peers, "H": replace(sp.peers["H"], forbid=["ended by itself", "server: error"])})
+        self.assertEqual(skytest.case_signature(forbids, {"S": "", "H": "\n".join(weak) + "\n"}), {})
+        # A [FATAL] line and a spec's own forbid line that is not weak are signatures, the earliest first.
+        own = replace(sp, peers={**sp.peers, "H": replace(sp.peers["H"], forbid=["(?i)DESYNC at"])})
+        fatal = "[2026-11-06 10:00:04.000] [critical] [core] [t1] [FATAL] out of guest memory"
+        desync = "[2026-11-06 10:00:03.500] [info] [core] [t1] Online: desync at tick 812"
+        sig = skytest.case_signature(own, {"S": fatal + "\n", "H": timed_out + "\n" + desync + "\n"})
+        self.assertEqual((sig["peer"], sig["kind"], sig["signature"]), ("H", "line", "Online: desync at tick 812"))
+        sig = skytest.case_signature(own, {"S": fatal + "\n", "H": ""})
+        self.assertEqual((sig["peer"], sig["signature"]), ("S", "out of guest memory"))  # the prefix goes
+
+    def test_a_tolerate_pattern_with_a_global_flag_is_refused_at_load(self) -> None:
+        # default_fatal puts the tolerate patterns in a lookahead: a global (?i) there would break every grade.
+        d = Path(self.tmp.name)
+        path = d / "t.toml"
+        path.write_text('name = "t"\nlayout = "solo"\nstage = "0"\ntolerate = ["(?i)menu_ready"]\n'
+                        '[peer.H]\nscript = "quit\\n"\n', encoding="utf-8")
+        with self.assertRaisesRegex(skytest.SpecError, r"tolerate: .*global flag.*\(\?i:\.\.\.\)"):
+            skytest.load_spec(path, 20)
+        path.write_text(path.read_text(encoding="utf-8").replace("(?i)menu_ready", "(?i:MENU)_ready"), encoding="utf-8")
+        sp = skytest.load_spec(path, 20)
+        self.assertEqual(sp.tolerate, ["(?i:MENU)_ready"])
+        for rx, _ in skytest.default_fatal(sp, "H"):
+            re.compile(rx)
+
+    def test_the_default_fatal_examples_match_their_patterns(self) -> None:
+        for who, rx in skytest.DEFAULT_FATAL:
+            self.assertTrue(any(re.search(rx, ex) for ex in skytest.DEFAULT_FATAL_EXAMPLES), rx)
+
+    def test_the_breaker_trips_at_three_distinct_cases_of_one_build(self) -> None:
+        br = skytest.CircuitBreaker(self.budget(), "abc123")
+        sig = {"signature": "Crash: x", "peer": "S", "line": "...", "kind": "crash"}
+        br.record("one", "r1", sig)
+        br.record("one", "r2", sig)  # the same case twice is one case
+        br.record("two", "r3", sig)
+        br.record("three", "r4", {**sig, "signature": "Crash: y"})
+        self.assertIsNone(br.tripped())
+        other_build = skytest.CircuitBreaker(self.budget(), "def456")
+        other_build.record("three", "r5", sig)
+        self.assertIsNone(br.tripped())
+        br.record("three", "r6", sig)
+        t = br.tripped()
+        self.assertEqual((t["signature"], t["cases"], t["peers"]), ("Crash: x", ["one", "two", "three"], ["S"]))
+        self.assertIsNone(other_build.tripped())
+        self.assertIn("circuit breaker: 3 cases on build abc123 stopped on `Crash: x` (one, two, three)",
+                      skytest.breaker_line(t))
+        self.assertIn(f"`skytest.py breaker --reset` clears it ({br.path}; rows older than 12 h do not count)",
+                      skytest.breaker_line(t))
+        # Rows older than the window do not count: 13 h later the breaker is clear again.
+        self.assertIsNone(br.tripped(now=time.time() + 13 * 3600))
+        # A row with no readable time does not count either; an `at` stamp alone reads.
+        with open(br.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"case": "four", "signature": "Crash: z", "at": "garbage"}) + "\n")
+            f.write(json.dumps({"case": "five", "signature": "Crash: z", "at": time.strftime("%Y%m%d-%H%M%S")}) + "\n")
+        self.assertEqual(skytest.breaker_row_time({"at": "garbage"}), None)
+        self.assertIsNotNone(skytest.breaker_row_time({"at": time.strftime("%Y%m%d-%H%M%S")}))
+
+    def test_the_breaker_command_shows_and_resets_the_files(self) -> None:
+        repo = Path(self.tmp.name)
+        cfg = argparse.Namespace(slots=self.slots, machine_games=4, rom=repo / "rom")
+        br = skytest.CircuitBreaker(self.budget(), "abc123")
+        for n in ("one", "two", "three"):
+            br.record(n, "r", {"signature": "Crash: x", "peer": "S", "line": "...", "kind": "crash"})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(skytest.cmd_breaker(cfg, argparse.Namespace(reset=False)), 0)
+        self.assertIn("circuit breaker: 3 cases on build abc123", out.getvalue())
+        self.assertIn("1 breaker file(s) in", out.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(skytest.cmd_breaker(cfg, argparse.Namespace(reset=True)), 0)
+        self.assertIn("circuit breaker: reset, 1 file(s) deleted", out.getvalue())
+        self.assertIsNone(br.tripped())
+
+    # --- R2 review fixes: stale and failing lock files ---
+
+    def test_a_boot_note_in_the_future_never_blocks(self) -> None:
+        a = self.budget(owner="lane 1")
+        a.boot_turn(0.0).release()
+        with open(self.slots / "boot.lock", "r+b") as f:  # a clock set back by a day, or a garbage float
+            f.write(json.dumps({"last_start": time.time() + 86400}).encode().ljust(skytest.SLOT_NOTE_BYTES))
+        t0 = time.monotonic()
+        a.boot_turn(0.5).release()
+        self.assertLess(time.monotonic() - t0, 0.4)
+        with open(self.slots / "boot.lock", "r+b") as f:
+            f.write(b'{"last_start": NaN}'.ljust(skytest.SLOT_NOTE_BYTES))
+        t0 = time.monotonic()
+        a.boot_turn(0.5).release()
+        self.assertLess(time.monotonic() - t0, 0.4)
+        # A recent start still holds the gap (and never more than the gap).
+        t0 = time.monotonic()
+        a.boot_turn(0.5).release()
+        self.assertGreaterEqual(time.monotonic() - t0, 0.4)
+        self.assertLess(time.monotonic() - t0, 2.0)
+
+    def test_a_lock_file_that_cannot_be_opened_frees_what_was_taken(self) -> None:
+        b = self.budget(owner="lane 1")
+        real = skytest._open_lock_file
+        calls = [0]
+
+        def failing(path):
+            calls[0] += 1
+            if path.name in ("boot.lock", "slot-02"):
+                raise PermissionError(13, "sharing violation", str(path))
+            return real(path)
+
+        skytest._open_lock_file = failing
+        try:
+            with self.assertRaises(PermissionError):
+                b.boot_turn(0.0)
+            with self.assertRaises(PermissionError):
+                with b.mutex():
+                    b._probe()
+        finally:
+            skytest._open_lock_file = real
+        # The runner's boot lock was given back, and slots 00 and 01 (locked before 02 failed) are free.
+        b.boot_turn(0.0).release()
+        lease = self.budget(owner="lane 2").acquire(4, "all")
+        self.assertEqual(sorted(lease.slots), [0, 1, 2, 3])
+        lease.release()
+
+    def test_a_holder_of_every_slot_leaves_none_to_a_runner_with_a_larger_budget(self) -> None:
+        small, big = self.budget(4, "lane 1"), self.budget(8, "lane 2")
+        timed = small.acquire(4, "timed")
+        self.assertTrue(timed.summary()["all"])
+        self.assertEqual(big.held_all(), "timed (lane 1)")
+        said: list[str] = []
+        t, box = self.acquire_in_thread(big, 1, "solo", said)
+        self.wait_until(lambda: said)
+        self.assertEqual(said[0], "machine slots: needs 1 of 8, 0 free; held by timed (lane 1, 4)")
+        timed.release()
+        t.join(timeout=10)
+        self.assertEqual(len(box["lease"].slots), 1)
+        self.assertEqual(big.held_all(), "")
+        box["lease"].release()
+
+    @unittest.skipUnless(os.name == "nt", "the slot locks are Windows byte-range locks")
+    def test_a_runner_waiting_for_the_machine_mutex_says_so(self) -> None:
+        b = self.budget(owner="lane 1")
+        fd = skytest._open_lock_file(self.slots / "machine.lock")
+        self.assertTrue(skytest._try_lock(fd))  # another runner, frozen while it holds the mutex
+        real = skytest.MUTEX_TELL_S
+        skytest.MUTEX_TELL_S = 0.2
+        out = io.StringIO()
+        try:
+            def free_later() -> None:
+                time.sleep(0.6)
+                skytest._unlock_close(fd)
+
+            threading.Thread(target=free_later, daemon=True).start()
+            with contextlib.redirect_stdout(out):
+                with b.mutex():
+                    pass
+        finally:
+            skytest.MUTEX_TELL_S = real
+        self.assertIn("machine.lock for 0 s: another runner holds it", out.getvalue())
+
+
+class MachineRunTest(unittest.TestCase):
+    """PS15 and C7 through cmd_test with the fake game."""
+
+    setUp = SkytestTest.setUp
+    tearDown = SkytestTest.tearDown
+    spec = SkytestTest.spec
+
+    def run_runner(self, cfg, names: list[str], box: dict, key: str, **extra) -> None:
+        a = argparse.Namespace(cases=names, stage=None, max_games=5, jobs=1, **extra)
+        box[key] = skytest.cmd_test(cfg, a)
+
+    def test_two_runners_never_run_more_games_than_the_machine_budget(self) -> None:
+        self.cfg.machine_games = 2
+        script = '[peer.H]\nscript = "wait 150\\nquit\\n"\n'
+        self.spec("lane-a", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 150\n' + script)
+        self.spec("lane-b", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 150\n' + script)
+        out, box = ThreadOut(), {}
+        real = sys.stdout
+        sys.stdout = out
+        try:
+            ta = threading.Thread(target=self.run_runner, args=(self.cfg, ["lane-a"], box, "a"))
+            tb = threading.Thread(target=self.run_runner, args=(replace(self.cfg), ["lane-b"], box, "b"))
+            ta.start()
+            time.sleep(0.3)
+            tb.start()
+            ta.join(timeout=60)
+            tb.join(timeout=60)
+        finally:
+            sys.stdout = real
+        self.assertEqual((box.get("a"), box.get("b")), (0, 0))
+        text = "\n".join(b.getvalue() for b in out.buffers.values())
+        runs = {}
+        for line in text.splitlines():
+            if line.startswith("report: "):
+                data = json.loads((Path(line[8:]).parent / "results.json").read_text(encoding="utf-8"))
+                runs[data["cases"][0]["case"]] = (data, Path(line[8:]))
+        cases = {k: v[0]["cases"][0] for k, v in runs.items()}
+        # Whichever runner came second waited for the other's slots; the two never overlapped.
+        waiter = max(cases, key=lambda k: cases[k]["machine"]["waited_s"])
+        first = "lane-a" if waiter == "lane-b" else "lane-b"
+        self.assertRegex(text, rf"{waiter}: waits for machine slots: needs every slot, 0 free; held by {first} "
+                               r"\(skytest pid \d+, \d{8}-\d{6}-session(-\d+)?, 2\)")
+        self.assertGreater(cases[waiter]["machine"]["waited_s"], 0.3)
+        self.assertIn(f"held by {first}", cases[waiter]["machine"]["waited_for"][0])
+        self.assertEqual(cases[first]["machine"]["slots"], 2)
+        self.assertEqual(runs["lane-a"][0]["machine"]["games"], 2)
+        self.assertTrue(all(p["boot"] for c in cases.values() for p in c["peers"]), cases)
+        self.assertTrue(all(p["boot"].startswith("first frame after") for c in cases.values() for p in c["peers"]
+                            if p["peer"] == "H"), cases)
+        md = runs[waiter][1].read_text(encoding="utf-8")
+        self.assertIn("The machine's budget, shared with every other runner: 2 game(s)", md)
+        self.assertRegex(md, r"Machine: 2 of 2 game slots \(all: nothing of another runner beside it\); "
+                             r"waited \d+ s \(machine slots: needs every slot")
+
+    def test_the_slot_folder_and_machine_games_are_checked(self) -> None:
+        self.assertEqual(self.cfg.machine_games, 16)
+        self.assertEqual(self.cfg.slots, (self.repo / skytest.STORE / "slots").resolve())
+        toml = self.repo / "tests" / "skytest.toml"
+        toml.write_text(toml.read_text(encoding="utf-8").replace("machine_games = 16", "machine_games = 0"),
+                        encoding="utf-8")
+        with self.assertRaises(SystemExit) as e:
+            skytest.load_config(self.repo)
+        self.assertIn("machine_games is a whole number from 1 to 32", str(e.exception))
+        toml.write_text(toml.read_text(encoding="utf-8").replace("machine_games = 0\n", ""), encoding="utf-8")
+        self.assertEqual(skytest.load_config(self.repo).machine_games, skytest.MACHINE_GAMES)
+        with self.assertRaises(SystemExit):
+            skytest.check_slots_folder(self.cfg, Path(self.tmp.name) / "elsewhere" / "slots")
+        with self.assertRaises(SystemExit):
+            skytest.check_slots_folder(self.cfg, self.cfg.rom / skytest.STORE / "slots")
+
+    def test_a_tripped_breaker_starts_no_further_case(self) -> None:
+        crash = 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "crash\\nquit\\n"\n'
+        for n in ("c1", "c2", "c3"):
+            self.spec(n, crash)
+        self.spec("fine", 'layout = "solo"\nstage = "0"\n[peer.H]\n' + SkytestTest.HUB)
+        self.spec("crashtest", 'layout = "solo"\nstage = "0"\nbreaker = false\n[peer.H]\n' + SkytestTest.HUB)
+        a = argparse.Namespace(cases=["c1", "c2", "c3", "fine", "crashtest"], stage=None, max_games=5)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_test(self.cfg, a)
+        printed = out.getvalue()
+        report = printed.strip().splitlines()[-1].split("report: ", 1)[1]
+        r = json.loads((Path(report).parent / "results.json").read_text(encoding="utf-8"))
+        st = {c["case"]: c for c in r["cases"]}
+        self.assertEqual(code, 1)
+        self.assertEqual([st[n]["status"] for n in ("c1", "c2", "c3")], ["fail"] * 3)
+        self.assertEqual(st["c1"]["signature"]["signature"], "Crash: exception C0000005 on thread <n>; call chain:"
+                                                             " sub_82000000")
+        self.assertEqual(st["fine"]["status"], "breaker")
+        self.assertEqual(st["fine"]["seconds"], 0.0)
+        self.assertIn("not started: circuit breaker: 3 cases on build", st["fine"]["reasons"][0])
+        self.assertEqual(st["crashtest"]["status"], "pass")  # breaker = false still runs
+        self.assertEqual(r["breaker"]["cases"], ["c1", "c2", "c3"])
+        self.assertIn("circuit breaker: 3 cases on build", printed)
+        self.assertIn("1 case(s) not started by the circuit breaker (not met): fine", printed)
+        md = Path(report).read_text(encoding="utf-8")
+        self.assertIn("| fine | solo | 0 | BREAKER | 0 s |", md)
+        self.assertIn("Fatal signature (H, crash): `Crash: exception C0000005 on thread <n>", md)
+        # Another runner on the same build: nothing starts; --no-breaker starts it.
+        a = argparse.Namespace(cases=["fine"], stage=None, max_games=5)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(skytest.cmd_test(self.cfg, a), 1)
+        a = argparse.Namespace(cases=["fine"], stage=None, max_games=5, no_breaker=True)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(skytest.cmd_test(self.cfg, a), 0)
+        self.assertIn("--no-breaker: cases go on starting", out.getvalue())
+        # A spec's breaker key is checked.
+        self.spec("bad", 'layout = "solo"\nstage = "0"\nbreaker = "no"\n[peer.H]\n' + SkytestTest.HUB)
+        with self.assertRaises(skytest.SpecError) as e:
+            skytest.load_spec(self.repo / "tests" / "runtime" / "bad.toml", 20)
+        self.assertIn("breaker is true or false", str(e.exception))
 
 
 class JobTest(unittest.TestCase):

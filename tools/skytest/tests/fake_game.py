@@ -2,7 +2,8 @@
 input script's commands fast, and writes the log lines the real game writes.
 
 Extra commands only this fake knows: `hang` (never quits), `crash` (logs a crash and exits 3),
-`exit <code>`. `place` logs the hub as the level, as a figure placed after a save is loaded does.
+`exit <code>`, `nopresent` (anywhere in the script: no first frame line; it is logged first otherwise,
+after FAKE_BOOT_SECONDS from the environment if set). `place` logs the hub as the level, as a figure placed after a save is loaded does.
 `online_host` writes a hosted server's log into the session folder as the real owner's game does
 (its frame-time windows with the p95 of `serverframes <ms>`, 12 by default); `online_join <addr>`
 logs the connection when the address has the owner's port. `savewrite` rewrites the first save under
@@ -32,9 +33,15 @@ def main() -> int:
             log.flush()
 
         line("Skylanders: Swap Force test (build fake123); Windows")
+        script_text = open(script_path, encoding="utf-8").read()
+        boot = os.environ.get("FAKE_BOOT_SECONDS")  # the first frame line this much later (the boot token)
+        if "nopresent" not in script_text:
+            if boot:
+                time.sleep(float(boot))
+            line("Swap: game presentation interval 2 (swap word 00000200)")
         line(f"Input script: playing '{script_path}'")
         server_p95 = 12.0
-        for raw in open(script_path, encoding="utf-8").read().splitlines():
+        for raw in script_text.splitlines():
             cmd, _, rest = raw.strip().partition(" ")
             if not cmd or cmd.startswith("#"):
                 continue
