@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace skylanders::nav {
@@ -21,9 +22,13 @@ struct Vec3 {
 
 // One side of an area: the edge from vertex a to vertex b (counter-clockwise in xy, so the area's
 // inside is on the left of a->b). neighbor is the area across the edge, -1 for a boundary.
+// clearance, for a boundary edge only: how far PlanPath keeps the walking corners at its ends off
+// it in xy (a wall's or a ledge's own clearance, PlanPath below); 0 leaves them to PlanPath's
+// clearance. NavMesh::SetBoundaryClearance changes it on a mesh already made.
 struct Edge {
   int neighbor;
   Vec3 a, b;
+  float clearance = 0.0f;
 };
 
 // A convex area (convex in xy). polygon holds its vertices counter-clockwise in xy; edges its
@@ -114,6 +119,13 @@ class NavMesh {
   // True when a link with that id was disabled; false for an enabled or unknown id.
   bool LinkDisabled(int id) const;
 
+  // Sets Edge::clearance of edge `edge` of area `area`, a boundary edge (no valid neighbor), for
+  // the plans from then on. A clearance that is negative or not a number becomes 0. False (nothing
+  // changed) for an area or edge out of range or an edge with a neighbor.
+  bool SetBoundaryClearance(int area, int edge, float clearance);
+  // That edge's clearance as set; 0 when none was or the edge is out of range.
+  float BoundaryClearance(int area, int edge) const;
+
  private:
   friend Plan PlanPath(const NavMesh& mesh, const Vec3& start, const Vec3& goal, float clearance);
   friend std::vector<Link> GenerateGapLinks(const NavMesh& mesh, const JumpLimits& limits);
@@ -136,6 +148,17 @@ class NavMesh {
   Vec3 ClosestPointXY(int area, float x, float y) const;
   // Flood fill over the neighbor links and the enabled links; also rebuilds out_links_.
   void ComputeIslands();
+  // How far along a portal PlanPath keeps a corner from the portal's end `end` (its other end
+  // `other`): `base`, or more where a boundary edge with a clearance of its own has an end at `end`
+  // (PlanPath's comment says how much).
+  float EndKeep(const Vec3& end, const Vec3& other, float base) const;
+
+  // An end of a boundary edge: edge `edge` of area `area`, its b end (at_b) or its a end.
+  struct BoundaryEnd {
+    int area;
+    int edge;
+    bool at_b;
+  };
 
   std::vector<Area> areas_;
   std::vector<Shape> shapes_;
@@ -145,6 +168,8 @@ class NavMesh {
   std::vector<char> link_disabled_;          // parallel to links_
   std::vector<std::vector<int>> out_links_;  // per area: indices into links_ of its enabled links
   int next_link_id_ = 0;
+  // The ends of the boundary edges by a small xy grid cell of the end (EndKeep's lookup).
+  std::unordered_map<int64_t, std::vector<BoundaryEnd>> boundary_ends_;
 };
 
 // What the walker does to reach a waypoint: walk to it, or arrive at it by the link's action.
@@ -175,9 +200,18 @@ struct Plan {
 // stays exact. clearance keeps the walking corners off the shared edges' ends: each portal is
 // narrowed by that much from both ends (to its middle when it is narrower than twice that), so a
 // corner of the path is that far inside the corridor instead of on the corner of a ledge, where a
-// walker that cuts it a little walks off. Takeoffs, landings, the start and the goal stay where they
-// are; every point of the path is still on the mesh (each stretch runs between points of the
-// portals of convex areas).
+// walker that cuts it a little walks off. Where a boundary edge with a clearance of its own
+// (Edge::clearance, SetBoundaryClearance: a wall's, a ledge's) has an end at a portal's end, that
+// portal end is narrowed so far that a corner there is at least that clearance from the edge in
+// xy: the clearance over the sine of the angle between the portal and the edge when the edge runs
+// along the portal's side of the end (at most a right angle between them; less for an edge too
+// short to reach beside that corner: just as far as puts the corner the clearance from its far
+// end), the clearance itself when the edge turns away from the portal; the larger of that and
+// `clearance` at that end. A
+// portal narrower than its two ends' amounts together goes through the point that divides it in
+// their proportion (its middle when they are alike), so no corridor closes. Takeoffs, landings, the
+// start and the goal stay where they are; every point of the path is still on the mesh (each
+// stretch runs between points of the portals of convex areas).
 Plan PlanPath(const NavMesh& mesh, const Vec3& start, const Vec3& goal, float clearance = 0.0f);
 
 // Candidate jumps and drops for the mesh, pure geometry: the caller checks them in the world (a

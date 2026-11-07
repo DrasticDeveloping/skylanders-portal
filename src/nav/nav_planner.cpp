@@ -279,18 +279,45 @@ std::vector<Vec3> PullString(const std::vector<Portal>& portals, const Vec3& sta
   return kept;
 }
 
-// A portal narrowed by `clearance` from both ends in xy (PlanPath's clearance), or its middle when
-// it is no wider than twice that. z runs along the portal as it does on the edge.
-Portal Narrowed(const Portal& p, float clearance) {
-  if (!(clearance > 0.0f)) return p;
+// A portal narrowed by `left` from its left end and `right` from its right end in xy (PlanPath's
+// clearance and the boundary edges' own, NavMesh::EndKeep), or the point that divides it in their
+// proportion when it is no wider than the two together (its middle when they are alike). z runs
+// along the portal as it does on the edge. Alike, it is the single clearance's narrowing exactly.
+Portal Narrowed(const Portal& p, float left, float right) {
+  if (!(left > 0.0f) && !(right > 0.0f)) return p;
   const float width = std::sqrt(DistSqXY(p.left, p.right));
-  if (width <= 2.0f * clearance) {
-    const Vec3 mid = Midpoint(p.left, p.right);
-    return {mid, mid};
+  if (left == right) {
+    if (width <= 2.0f * left) {
+      const Vec3 mid = Midpoint(p.left, p.right);
+      return {mid, mid};
+    }
+    const float t = left / width;
+    return {Lerp(p.left, p.right, t), Lerp(p.right, p.left, t)};
   }
-  const float t = clearance / width;
-  return {Lerp(p.left, p.right, t), Lerp(p.right, p.left, t)};
+  if (width <= left + right) {
+    const Vec3 at = Lerp(p.left, p.right, left / (left + right));
+    return {at, at};
+  }
+  return {Lerp(p.left, p.right, left / width), Lerp(p.right, p.left, right / width)};
 }
+
+// EndKeep's grid over the boundary edges' ends: a cell this wide holds an end, and a portal's end
+// finds the boundary ends within kEndMatch (xy) and kEndMatchZ (height) of it in its own cell and
+// the eight around. Edges that meet share their vertices exactly (the level meshes copy them), so
+// the match only has to forgive rounding.
+constexpr float kEndCell = 4.0f;
+constexpr float kEndMatch = 0.5f;
+constexpr float kEndMatchZ = 1.0f;
+// The smallest sine EndKeep divides by: an edge almost along the portal would ask for the whole
+// portal; the narrowing's proportion rule takes over long before.
+constexpr float kMinKeepSin = 0.1f;
+
+int64_t EndCellOf(float v) {
+  const float c = std::floor(v / kEndCell);
+  return int64_t(std::clamp(c, -1e9f, 1e9f));
+}
+
+int64_t EndCellKey(int64_t cx, int64_t cy) { return (cx << 32) ^ (cy & 0xFFFFFFFFll); }
 
 std::string Format(const char* fmt, double a, double b = 0.0, double c = 0.0) {
   char buf[160];
@@ -455,7 +482,77 @@ NavMesh::NavMesh(std::vector<Area> areas) : areas_(std::move(areas)) {
     s.normal = normal;
   }
 
+  // The boundary edges' ends, for EndKeep.
+  for (size_t i = 0; i < n; ++i) {
+    const std::vector<Edge>& edges = areas_[i].edges;
+    for (size_t k = 0; k < edges.size(); ++k) {
+      if (ValidNeighbor(int(i), edges[k].neighbor)) continue;
+      for (const bool at_b : {false, true}) {
+        const Vec3& v = at_b ? edges[k].b : edges[k].a;
+        if (!Finite(v)) continue;
+        boundary_ends_[EndCellKey(EndCellOf(v.x), EndCellOf(v.y))].push_back({int(i), int(k), at_b});
+      }
+    }
+  }
+
   ComputeIslands();
+}
+
+bool NavMesh::SetBoundaryClearance(int area, int edge, float clearance) {
+  if (!InRange(area, areas_.size()) || !InRange(edge, areas_[area].edges.size())) return false;
+  Edge& e = areas_[area].edges[edge];
+  if (ValidNeighbor(area, e.neighbor)) return false;
+  e.clearance = clearance > 0.0f && std::isfinite(clearance) ? clearance : 0.0f;
+  return true;
+}
+
+float NavMesh::BoundaryClearance(int area, int edge) const {
+  if (!InRange(area, areas_.size()) || !InRange(edge, areas_[area].edges.size())) return 0.0f;
+  return areas_[area].edges[edge].clearance;
+}
+
+float NavMesh::EndKeep(const Vec3& end, const Vec3& other, float base) const {
+  float keep = base;
+  if (boundary_ends_.empty()) return keep;
+  const float px = other.x - end.x, py = other.y - end.y;
+  const float plen = std::sqrt(px * px + py * py);
+  if (!(plen > 0.0f)) return keep;
+  const int64_t cx = EndCellOf(end.x), cy = EndCellOf(end.y);
+  for (int64_t dx = -1; dx <= 1; ++dx) {
+    for (int64_t dy = -1; dy <= 1; ++dy) {
+      const auto it = boundary_ends_.find(EndCellKey(cx + dx, cy + dy));
+      if (it == boundary_ends_.end()) continue;
+      for (const BoundaryEnd& be : it->second) {
+        const Edge& e = areas_[be.area].edges[be.edge];
+        if (!(e.clearance > 0.0f)) continue;
+        const Vec3& at = be.at_b ? e.b : e.a;
+        const Vec3& far = be.at_b ? e.a : e.b;
+        if (DistSqXY(at, end) > kEndMatch * kEndMatch || std::fabs(at.z - end.z) > kEndMatchZ) continue;
+        const float wx = far.x - at.x, wy = far.y - at.y;
+        const float wlen = std::sqrt(wx * wx + wy * wy);
+        if (!(wlen > 0.0f)) continue;
+        // Along the portal's side of the end (a right angle at most), a corner s along the portal is
+        // s * sin from the edge while it is beside the edge (s * cos within its length); past the
+        // edge's far end it is that end's distance, sqrt(s^2 - 2 s len cos + len^2), so a short edge
+        // needs only len * cos + sqrt(clearance^2 - (len * sin)^2). Turned away from the portal, the
+        // edge's nearest point to it is the end itself, s away.
+        float along = e.clearance;
+        const float dot = px * wx + py * wy;
+        if (dot > 0.0f) {
+          const float sine = std::fabs(px * wy - py * wx) / (plen * wlen);
+          const float cosine = dot / (plen * wlen);
+          along = e.clearance / std::max(sine, kMinKeepSin);
+          if (along * cosine > wlen) {
+            const float beside = wlen * sine;
+            const float past = std::sqrt(std::max(0.0f, e.clearance * e.clearance - beside * beside));
+            along = std::min(along, wlen * cosine + past);
+          }
+        }
+        keep = std::max(keep, along);
+      }
+    }
+  }
+  return keep;
 }
 
 void NavMesh::ComputeIslands() {
@@ -803,7 +900,8 @@ Plan PlanPath(const NavMesh& mesh, const Vec3& start, const Vec3& goal, float cl
     if (s.link < 0) {
       const Edge& e = areas[s.area].edges[s.edge];
       const Portal p = mesh.shapes_[s.area].ccw ? Portal{e.b, e.a} : Portal{e.a, e.b};
-      portals.push_back(Narrowed(p, clearance));
+      portals.push_back(
+          Narrowed(p, mesh.EndKeep(p.left, p.right, clearance), mesh.EndKeep(p.right, p.left, clearance)));
       continue;
     }
     const Link& link = mesh.links_[s.link];

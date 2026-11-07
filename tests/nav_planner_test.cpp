@@ -742,6 +742,90 @@ int main() {
     CHECK(Inside(row, {10, 10, 0}, straight.waypoints));
   }
 
+  // A boundary edge's own clearance (SetBoundaryClearance). On the L corridor, 20 on the two inner
+  // walls (right angles to every portal) puts the corners where a clearance of 20 does. On a slanted
+  // wall the corner moves along the portal by the clearance over the sine of the angle, so it is the
+  // clearance from the wall; without one the line goes straight. Shared edges take none.
+  {
+    NavMesh l(Squares({{0, 0}, {1, 0}, {2, 0}, {2, 1}, {2, 2}}));
+    CHECK(l.SetBoundaryClearance(1, 2, 20.0f));  // (1, 0)'s top, (2S, S) -> (S, S)
+    CHECK(l.SetBoundaryClearance(3, 3, 20.0f));  // (2, 1)'s left, (2S, 2S) -> (2S, S)
+    const Plan walls = PlanPath(l, Center(0, 0), Center(2, 2));
+    CHECK(walls.reached && Parallel(walls));
+    REQUIRE_OR_RETURN(walls.waypoints.size() == 3);
+    CHECK(Near(walls.waypoints[0], 2 * S, S - 20.0f));
+    CHECK(Near(walls.waypoints[1], 2 * S + 20.0f, S));
+    CHECK(Near(walls.waypoints[2], Center(2, 2)));
+
+    // A: a quad whose top edge slants from (S, S) down to (0, S/2); B: the square right of it.
+    const Vec3 a0{0, 0, 0}, a1{S, 0, 0}, a2{S, S, 0}, a3{0, 0.5f * S, 0};
+    const Vec3 b1{2 * S, 0, 0}, b2{2 * S, S, 0};
+    std::vector<Area> areas(2);
+    areas[0].polygon = {a0, a1, a2, a3};
+    areas[0].edges = {{-1, a0, a1}, {1, a1, a2}, {-1, a2, a3}, {-1, a3, a0}};
+    areas[0].center = {0.6f * S, 0.4f * S, 0};
+    areas[1].polygon = {a1, b1, b2, a2};
+    areas[1].edges = {{-1, a1, b1}, {-1, b1, b2}, {-1, b2, a2}, {0, a2, a1}};
+    areas[1].center = {1.5f * S, 0.5f * S, 0};
+    NavMesh slant(areas);
+    const Vec3 from{0.8f * S, 0.85f * S, 0}, to{1.2f * S, 0.99f * S, 0};
+    const Plan open = PlanPath(slant, from, to);
+    CHECK(open.reached && open.waypoints.size() == 1);
+    CHECK(!slant.SetBoundaryClearance(0, 1, 10.0f));  // shared with B
+    CHECK(!slant.SetBoundaryClearance(2, 0, 10.0f));  // no such area
+    CHECK(!slant.SetBoundaryClearance(0, 4, 10.0f));  // no such edge
+    CHECK(slant.BoundaryClearance(0, 2) == 0.0f);
+    CHECK(slant.SetBoundaryClearance(0, 2, 10.0f));
+    CHECK(slant.BoundaryClearance(0, 2) == 10.0f);
+    const Plan kept = PlanPath(slant, from, to);
+    CHECK(kept.reached && Parallel(kept));
+    REQUIRE_OR_RETURN(kept.waypoints.size() == 2);
+    const float along = 10.0f * std::sqrt(5.0f) / 2.0f;  // 10 / sin, the sine 2 / sqrt(5)
+    CHECK(Near(kept.waypoints[0], S, S - along));
+    const Vec3& corner = kept.waypoints[0];
+    const float off_wall = std::fabs((a3.x - a2.x) * (corner.y - a2.y) - (a3.y - a2.y) * (corner.x - a2.x)) /
+                           std::hypot(a3.x - a2.x, a3.y - a2.y);
+    CHECK(std::fabs(off_wall - 10.0f) < 0.01f);
+    CHECK(Near(kept.waypoints[1], to));
+    CHECK(Inside(slant, from, kept.waypoints));
+    // Too narrow for both ends: the portal's point that divides it in their proportion.
+    CHECK(slant.SetBoundaryClearance(0, 2, 200.0f));
+    CHECK(slant.SetBoundaryClearance(0, 0, 100.0f));
+    const Plan squeezed = PlanPath(slant, from, to);
+    CHECK(squeezed.reached);
+    REQUIRE_OR_RETURN(!squeezed.waypoints.empty());
+    CHECK(Inside(slant, from, squeezed.waypoints));
+
+    // A short boundary edge at a sharp angle to a portal 100 wide: the triangle (S, 0), (S, S),
+    // (S - 10, 60) left of square B. Its edge (S, S) -> (S - 10, 60) is 41.2 long at a sine of
+    // 0.243 to the portal; with a clearance of 20 it needs 20 / 0.243 = 82 along the portal from
+    // (S, S) only beside a long edge. Past its far end 57.3 along is 20 from it (40 + sqrt(300)),
+    // so with 40 kept at the other end (PlanPath's clearance) the window is 40..42.7 from (S, 0),
+    // not the proportion's point (33 from it) that 82 + 40 > 100 would give.
+    const Vec3 t1{S, 0, 0}, t2{S, S, 0}, t3{S - 10.0f, 60.0f, 0};
+    std::vector<Area> tri(2);
+    tri[0].polygon = {t1, t2, t3};
+    tri[0].edges = {{1, t1, t2}, {-1, t2, t3}, {-1, t3, t1}};
+    tri[0].center = {(t1.x + t2.x + t3.x) / 3.0f, (t1.y + t2.y + t3.y) / 3.0f, 0};
+    tri[1].polygon = {t1, b1, b2, t2};
+    tri[1].edges = {{-1, t1, b1}, {-1, b1, b2}, {-1, b2, t2}, {0, t2, t1}};
+    tri[1].center = {1.5f * S, 0.5f * S, 0};
+    NavMesh sharp(tri);
+    CHECK(sharp.SetBoundaryClearance(0, 1, 20.0f));
+    const Vec3 in_tri{97.0f, 30.0f, 0}, in_b{150.0f, 10.0f, 0};
+    const Plan short_edge = PlanPath(sharp, in_tri, in_b, 40.0f);
+    CHECK(short_edge.reached);
+    REQUIRE_OR_RETURN(short_edge.waypoints.size() == 2);
+    const Vec3& cross = short_edge.waypoints[0];
+    CHECK(std::fabs(cross.x - S) < 0.01f);
+    CHECK(cross.y >= 40.0f - 0.01f);                      // the other end's keep
+    CHECK(cross.y <= S - 57.32f + 0.01f);                 // the short edge's keep
+    const float cx = cross.x - t3.x, cy = cross.y - t3.y;  // the nearest point of the edge: its far end
+    CHECK(std::hypot(cx, cy) >= 20.0f - 0.01f);
+    CHECK(Near(short_edge.waypoints[1], in_b));
+    CHECK(Inside(sharp, in_tri, short_edge.waypoints));
+  }
+
   // A drop onto the floor under a bridge: a narrow bridge (one square wide, along y) 200 over a
   // wide floor whose edges are nowhere near the bridge's. Walking off its side lands on the floor.
   {
