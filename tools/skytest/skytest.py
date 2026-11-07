@@ -14,6 +14,9 @@ first fatal line: a crash, a forbidden line, or a crash exit code.
                                                             minutes before the run
                [--allow-restricted]                         start games even under a restricted token
                                                             (refused otherwise; timings not comparable)
+               [--jobs N]                                   up to N cases at once (default 1), their games
+                                                            within --max-games; a spec with
+                                                            `exclusive = true` runs alone
     skytest.py list [--gate [--stage S]]                    the cases and the manifest's state; with
                                                             --gate the gate cases and their expected
                                                             minutes (no game started)
@@ -54,6 +57,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from dataclasses import asdict, dataclass, field, replace
@@ -139,7 +143,10 @@ TRAFFIC_PEER = re.compile(r"Online: traffic peer (\d+) gameplay (\d+)/(\d+) stat
 RETRYABLE_ENTER = ("too_far", "rate", "not released", "not in play")
 # A title folder's name (the game's title id in hex), for the save_copy grade.
 TITLE_ID = re.compile(r"^[0-9A-F]{8}$")
-ALWAYS_FORBIDDEN = [r"\] Crash: ", r"\[FATAL\]", r"Input script: cannot (parse|use)"]
+# S's boot timeline ending outside play (server_role.cpp BootCheck) is fatal for every hosted case:
+# the owner's game then waits for a hub that never comes (P1m: a case ran to its 1200 s limit).
+ALWAYS_FORBIDDEN = [r"\] Crash: ", r"\[FATAL\]", r"Input script: cannot (parse|use)",
+                    r"Online: the server did not reach its hub"]
 # Fail fast (on unless a spec says `fail_fast = false`): while a run's games play, the runner reads the
 # new bytes of each peer's log every FAIL_FAST_POLL seconds and, at the first fatal line (a forbidden
 # one: the peer's `forbid` and ALWAYS_FORBIDDEN, a crash among them) or a game that exits with a crash
@@ -247,6 +254,9 @@ class Config:
     title_id: str = ""
     # Fail fast: seconds between a run's first fatal line and the stop of its games.
     fail_fast_grace: float = DEFAULT_FAIL_FAST_GRACE
+    # [defaults] show_server_window: the server peer's window is shown (a playtest the owner
+    # watches); a spec's own show_server_window wins. Missing: hidden, as before (show_server_args).
+    show_server_window: bool = False
 
 
 def repo_root(start: Path) -> Path:
@@ -270,6 +280,9 @@ def load_config(repo: Path) -> Config:
     grace = d.get("fail_fast_grace_seconds", DEFAULT_FAIL_FAST_GRACE)
     if not isinstance(grace, (int, float)) or isinstance(grace, bool) or grace < 0:
         raise SystemExit(f"{f}: [defaults] fail_fast_grace_seconds must be a number of seconds >= 0")
+    show = d.get("show_server_window", False)
+    if not isinstance(show, bool):
+        raise SystemExit(f"{f}: [defaults] show_server_window is true or false")
     return Config(
         repo=repo,
         store=repo / STORE,
@@ -290,6 +303,7 @@ def load_config(repo: Path) -> Config:
         launcher=[os.path.expandvars(x) for x in g.get("launcher", [])],
         title_id=str(g.get("title_id", "")),
         fail_fast_grace=float(grace),
+        show_server_window=show,
     )
 
 
@@ -402,6 +416,13 @@ class Spec:
     # Fail fast (FAIL_FAST_POLL): stop the run's games at the first fatal line; `fail_fast = false`
     # waits for the script's end or the timeout, as before. A compared case's runs follow it.
     fail_fast: bool = True
+    # show_server_window = true|false: the server peer's window shown or hidden for this case (a case
+    # whose subject needs a hidden server, e.g. the draw skip, says false); None: the [defaults] key.
+    show_server_window: bool | None = None
+    # exclusive = true: the case never runs beside another under `test --jobs N` (it waits until the
+    # running ones end, and nothing starts until it ends). A case whose grade measures time or load
+    # (TIMED_GRADES, a [compare]) needs it: beside another case it would measure that case's load too.
+    exclusive: bool = False
 
 
 def peers_of(layout: str) -> list[str]:
@@ -512,11 +533,28 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
     fail_fast = d.get("fail_fast", True)
     if not isinstance(fail_fast, bool):
         raise SpecError(f"{path.name}: fail_fast is true or false")
+    show = d.get("show_server_window")
+    if show is not None and not isinstance(show, bool):
+        raise SpecError(f"{path.name}: show_server_window is true or false")
+    for n, p in peers.items():
+        if any(a.startswith(f"--{SHOW_SERVER_SETTING}=") for a in p.args):
+            raise SpecError(f"{path.name}: peer {n} sets --{SHOW_SERVER_SETTING} in its args; the spec's"
+                            " show_server_window key does that")
+    exclusive = d.get("exclusive", False)
+    if not isinstance(exclusive, bool):
+        raise SpecError(f"{path.name}: exclusive is true or false")
+    # A [[compare.run]]'s extra args too (check_compare checked their shape above).
+    extra = [(n, a) for r in compare.get("run", []) for n, t in r.get("peer", {}).items() for a in t.get("args", [])]
+    for n, a in [(n, a) for n, p in peers.items() for a in p.args] + extra:
+        key = a.split("=", 1)[0]
+        if key in JOBS_OWNED_ARGS:
+            raise SpecError(f"{path.name}: peer {n} sets {key}: {JOBS_OWNED_ARGS[key]}")
     return Spec(
         name=d["name"], path=path, layout=d["layout"], stage=str(d["stage"]),
         description=d.get("description", ""), timeout=float(d.get("timeout", default_timeout)),
         peers=peers, measures=measures, standin_seconds=float(d.get("standin_seconds", 45)),
-        server=server, grades=grades, compare=compare, fail_fast=fail_fast,
+        server=server, grades=grades, compare=compare, fail_fast=fail_fast, show_server_window=show,
+        exclusive=exclusive,
     )
 
 
@@ -1280,6 +1318,21 @@ def fresh_dir(path: Path) -> Path:
     return candidate
 
 
+def make_run_dir(cfg: "Config", path: Path) -> Path:
+    """Create a fresh run folder (fresh_dir) and return it. Two runners started in the same second
+    (parallel playtesters, P1m) can pick the same name between fresh_dir's check and the mkdir: the
+    one that loses the mkdir takes the next suffix instead of failing with FileExistsError."""
+    for _ in range(64):
+        candidate = fresh_dir(path)
+        check_output_path(cfg, candidate)
+        try:
+            candidate.mkdir(parents=True)
+        except FileExistsError:
+            continue
+        return candidate
+    raise SystemExit(f"no free run folder next to {path} (64 tries)")
+
+
 def check_disc(cfg: Config) -> None:
     if not (cfg.rom / "default.xex").is_file():
         raise SystemExit(f"no disc at {cfg.rom} (rom/default.xex): a worktree links the main checkout's disc with"
@@ -1381,6 +1434,10 @@ class CaseResult:
     # Fail fast: `stopped early: <peer> <line> (fail fast)` when the runner stopped the run's games
     # after a fatal line (a compared case: the first of its runs that stopped).
     stopped_early: str = ""
+    # `test --jobs N`: the cases whose runs overlapped this one's (any part of it), so a failure can be
+    # tied to load (report.md's With column); empty when it ran alone. `exclusive`: the spec's key.
+    ran_with: list[str] = field(default_factory=list)
+    exclusive: bool = False
 
 
 def crash_exit_code(code: int | None) -> bool:
@@ -1493,11 +1550,52 @@ def peer_args(cfg: Config, args: list[str]) -> list[str]:
     return [a.replace("{repo}", cfg.repo.as_posix()) for a in args]
 
 
+# The ports this runner process handed to hosted servers: never one twice, so cases run at once
+# (`test --jobs N`) never share one, also before their server binds it (Host boots for a while
+# first). Host names its control pipe itself, after its own process id and a random nonce
+# (game: src/online/server/control_pipe.cpp ControlPipe::Create), so pipes never collide.
+_PORTS_GIVEN: set[int] = set()
+_PORTS_LOCK = threading.Lock()
+PORT_TRIES = 64
+
+
 def free_loopback_port() -> int:
-    """A port nothing listens on now, for a hosted server (its owner passes it on)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """A port nothing listens on now and that this runner has not handed out yet, for a hosted server
+    (its owner passes it on). OSError when Windows keeps returning ports already handed out."""
+    with _PORTS_LOCK:
+        for _ in range(PORT_TRIES):
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            if port not in _PORTS_GIVEN:
+                _PORTS_GIVEN.add(port)
+                return port
+    raise OSError(f"no free loopback port this run has not handed out already ({PORT_TRIES} tries)")
+
+
+class StartPacer:
+    """The start gap ([defaults] start_gap_seconds) between any two games the runner starts, across
+    every case running at once (`test --jobs N`): each start waits until `gap` seconds after the one
+    before, whichever case it was in. `wait_turn` calls `idle` while it waits (the caller watches the
+    games it already started) and takes the turn when it returns; `starts` keeps each turn's time."""
+
+    def __init__(self, gap: float) -> None:
+        self.gap = max(0.0, float(gap))
+        self.lock = threading.Lock()
+        self.last: float | None = None
+        self.starts: list[float] = []
+
+    def wait_turn(self, idle=lambda: None) -> float:
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                if self.last is None or now >= self.last + self.gap:
+                    self.last = now
+                    self.starts.append(now)
+                    return now
+                left = self.last + self.gap - now
+            idle()
+            time.sleep(min(0.2, max(0.01, left)))
 
 
 # --- the runner's environment: its token, the games' power throttling ------------------------------
@@ -1658,6 +1756,24 @@ def opt_out_of_power_throttling(handle: int) -> str:
     return f"failed: {why}"
 
 
+# The game's test-only setting that shows the online server's window (src/online/server/server_role.cpp):
+# on a server it keeps window_hidden false; on the owner's game Host passes it to the server it starts.
+SHOW_SERVER_SETTING = "dev_show_server_window"
+
+
+def show_server_args(cfg: Config, spec: Spec, peer: str) -> list[str]:
+    """How a peer's command line hides or shows the server's window. Hidden (no key anywhere): the
+    standalone S gets --window_hidden=true. Shown (the spec's show_server_window, else [defaults]):
+    a standalone S gets --dev_show_server_window=true instead, and in a hosted layout H gets it (Host
+    starts its server with it)."""
+    show = spec.show_server_window if spec.show_server_window is not None else cfg.show_server_window
+    if peer == "S":
+        return [f"--{SHOW_SERVER_SETTING}=true"] if show else ["--window_hidden=true"]
+    if peer == "H" and show and spec.server == "host":
+        return [f"--{SHOW_SERVER_SETTING}=true"]
+    return []
+
+
 def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -> tuple[Path, list[str]]:
     d = run / peer
     check_output_path(cfg, d)
@@ -1679,7 +1795,7 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -
         f"--game_data_root={cfg.rom.resolve()}",
         f"--input_script={script}",
         *cfg.default_args,
-        *(["--window_hidden=true"] if peer == "S" else []),
+        *show_server_args(cfg, spec, peer),
         *([f"--online_port={port}"] if port and peer == "H" else []),
         *peer_args(cfg, spec.peers[peer].args),
     ]
@@ -1965,9 +2081,12 @@ def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
 
 def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
              thresholds: dict | None = None, baseline: dict | None = None,
-             accepted_grades: tuple[str, ...] = (), folder: Path | None = None) -> CaseResult:
+             accepted_grades: tuple[str, ...] = (), folder: Path | None = None,
+             pacer: StartPacer | None = None) -> CaseResult:
     """One run of a case. `folder`: where the run goes (a compared case's run, inside the case's
-    folder); by default a new `<stamp>-<case>` folder in the store's runs."""
+    folder); by default a new `<stamp>-<case>` folder in the store's runs. `pacer`: the start gap
+    shared with the cases running beside it (`test --jobs N`); by default this case's own."""
+    pacer = pacer if pacer is not None else StartPacer(cfg.start_gap)
     names = list(spec.peers)
     hosted = spec.server == "host"
     # A hosted server is started by its owner H, not by the runner (it is still one of the games).
@@ -1977,9 +2096,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         res.status = "capacity"
         res.reasons = [f"needs {len(names)} games at once, this run allows {max_games} (--max-games)"]
         return res
-    run = fresh_dir(folder if folder is not None else cfg.store / "runs" / f"{stamp}-{spec.name}")
-    check_output_path(cfg, run)
-    run.mkdir(parents=True)
+    run = make_run_dir(cfg, folder if folder is not None else cfg.store / "runs" / f"{stamp}-{spec.name}")
     res.folder = str(run)
     exe = snap / cfg.exe
     t_start = time.monotonic()
@@ -2005,15 +2122,12 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                     ended[name] = time.monotonic()
 
         with winjob.Job() as job:
-            for i, n in enumerate(starts):
-                if i and cfg.start_gap > 0:
-                    # Games booting in the same instant crashed and froze each other in a test
-                    # (stage 0, five at once); real sessions never start them together either.
-                    # The games already started are watched meanwhile.
-                    gap_end = time.monotonic() + cfg.start_gap
-                    while time.monotonic() < gap_end:
-                        note_ends()
-                        time.sleep(min(0.2, max(0.0, gap_end - time.monotonic())))
+            for n in starts:
+                # Games booting in the same instant crashed and froze each other in a test
+                # (stage 0, five at once); real sessions never start them together either. The gap
+                # holds across every case running at once (StartPacer); the games already started
+                # are watched meanwhile.
+                pacer.wait_turn(note_ends)
                 d, args = prepared[n]
                 cmd = [*cfg.launcher, *args] if cfg.launcher else [str(exe), *args]
                 results[n].command = cmd
@@ -2617,7 +2731,7 @@ def variant_spec(spec: Spec, run: dict) -> Spec:
 
 def run_compare_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                      thresholds: dict | None = None, baseline: dict | None = None,
-                     accepted_grades: tuple[str, ...] = ()) -> CaseResult:
+                     accepted_grades: tuple[str, ...] = (), pacer: StartPacer | None = None) -> CaseResult:
     """A [compare] case: its runs one after another, each in its own folder inside the case's folder
     (graded as a run of its own: expect, forbid, grades), then the comparison. A run that does not
     reach its evidence ends the case there: the comparison is "not reached", and the case fails."""
@@ -2626,16 +2740,14 @@ def run_compare_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp:
         res.status = "capacity"
         res.reasons = [f"needs {len(spec.peers)} games at once, this run allows {max_games} (--max-games)"]
         return res
-    case_dir = fresh_dir(cfg.store / "runs" / f"{stamp}-{spec.name}")
-    check_output_path(cfg, case_dir)
-    case_dir.mkdir(parents=True)
+    case_dir = make_run_dir(cfg, cfg.store / "runs" / f"{stamp}-{spec.name}")
     res.folder = str(case_dir)
     t_start = time.monotonic()
     gathered, failed = [], False
     for run in spec.compare["run"]:
         name = run["name"]
         sub = run_case(cfg, variant_spec(spec, run), snap, max_games, time.strftime("%Y%m%d-%H%M%S"), thresholds,
-                       baseline, accepted_grades, folder=case_dir / name)
+                       baseline, accepted_grades, folder=case_dir / name, pacer=pacer)
         res.leftover_processes += sub.leftover_processes
         for p in sub.peers:
             p.peer = f"{name}:{p.peer}"
@@ -2696,14 +2808,26 @@ def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: l
 
 def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: dict, thresholds: dict,
                  max_games: int, guard: list[dict], unwritten: list[str], checkpoint: dict | None = None,
-                 gate: dict | None = None, token: dict | None = None) -> None:
-    lines = [f"# skytest run {out.name}", "", f"At most {max_games} game(s) at once.", ""]
+                 gate: dict | None = None, token: dict | None = None, jobs: int = 1) -> None:
+    head = f"At most {max_games} game(s) at once."
+    if jobs > 1:
+        head = (f"At most {max_games} game(s) and {jobs} case(s) at once (--jobs {jobs}); an exclusive case ran"
+                " alone. With: the cases that ran beside it.")
+    lines = [f"# skytest run {out.name}", "", head, ""]
     if token is not None:
         lines += [token_report_line(token), ""]
-    lines += ["| Case | Layout | Stage | Status | Time | Why |", "|---|---|---|---|---|---|"]
+    if jobs > 1:  # the With column only when cases could run at once: --jobs 1 keeps the table as before
+        lines += ["| Case | Layout | Stage | Status | Time | With | Why |", "|---|---|---|---|---|---|---|"]
+    else:
+        lines += ["| Case | Layout | Stage | Status | Time | Why |", "|---|---|---|---|---|---|"]
     for r in results:
         why = "; ".join(r.reasons) or ""
-        lines.append(f"| {r.case} | {r.layout} | {r.stage} | {r.status.upper()} | {r.seconds:.0f} s | {why} |")
+        if jobs > 1:
+            beside = ", ".join(r.ran_with) or ("alone (exclusive)" if r.exclusive else "-")
+            lines.append(f"| {r.case} | {r.layout} | {r.stage} | {r.status.upper()} | {r.seconds:.0f} s | {beside} "
+                         f"| {why} |")
+        else:
+            lines.append(f"| {r.case} | {r.layout} | {r.stage} | {r.status.upper()} | {r.seconds:.0f} s | {why} |")
     for r in results:
         if not r.peers:
             continue
@@ -2882,6 +3006,138 @@ def write_findings(out: Path, results: list[CaseResult], before: dict[str, str])
     (out / "findings.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# --- running cases at once (`test --jobs N`) --------------------------------------------------------
+#
+# The owner's playtests run several cases at once (stage 1B): with cases of two games (server+1), a
+# machine that runs five games runs two cases side by side. Each case keeps its own run folder,
+# peers, fixture copies, job object and hosted-server port (free_loopback_port; Host names its own
+# control pipe), and the start gap holds across all of them (StartPacer). Cases start in the
+# selection's order: the next one starts when a job is free and its games fit beside the running
+# ones' within --max-games, and no later case jumps ahead of it (so a big or exclusive case is never
+# starved). A case with `exclusive = true` waits until nothing runs and runs alone. The results stay
+# in the selection's order, each with the cases that ran beside it (CaseResult.ran_with).
+
+# Settings no spec may set (load_spec): the runner picks a hosted server's port per case and Host
+# names its control pipe per process; a fixed one would be shared by cases run at once.
+JOBS_OWNED_ARGS = {
+    "--online_port": "the runner gives each hosted case its own free port (cases run at once never share one)",
+    "--online_control_pipe": "Host names the control pipe after its own process (cases run at once never share one)",
+}
+# The grades that measure time or load: a spec with one of them, or a [compare], is `exclusive = true`
+# (lint), since beside another case the machine's load is not the case's own. The scheduler runs such
+# a spec alone even when the mark is missing (runs_alone), so a spec that skipped lint never measures
+# another case's load.
+TIMED_GRADES = ("server_frame_time", "client_fps", "level_load", "press_to_reaction", "bandwidth")
+
+
+def timed_grades(spec: Spec) -> list[str]:
+    """What in a spec measures time or load (TIMED_GRADES and a [compare]), for lint's exclusive check."""
+    return [g for g in TIMED_GRADES if g in spec.grades] + (["compare"] if spec.compare else [])
+
+
+def runs_alone(spec: Spec) -> bool:
+    """Whether the scheduler runs a case alone: `exclusive = true`, or a time or load grade (timed_grades)."""
+    return spec.exclusive or bool(timed_grades(spec))
+
+
+def case_games(spec: Spec, max_games: int) -> int:
+    """The games a case holds while it runs: every peer (a hosted server too, which its owner starts);
+    0 for a case over --max-games, which ends at once as a capacity result."""
+    n = len(spec.peers)
+    return n if n <= max_games else 0
+
+
+def schedule_cases(specs: list[Spec], jobs: int, max_games: int, run_one, say=None,
+                   poll: float = 0.2) -> list[CaseResult]:
+    """Runs `run_one(spec)` for every spec, up to `jobs` at once (1: one after another in this
+    thread, as before --jobs), each started in order once its games fit within `max_games` beside the
+    running ones; an exclusive spec only when nothing runs, and nothing beside it. A runner error in
+    one case (an exception) is that case's `error` result; a SystemExit or KeyboardInterrupt starts
+    nothing more, waits for the running cases and is raised again. Returns the results in the specs'
+    order, each with `ran_with` (the cases whose runs overlapped it) and `exclusive` set."""
+    jobs = max(1, jobs)
+    printing = threading.Lock()
+
+    def tell(text: str) -> None:
+        with printing:
+            (say or (lambda s: print(s, flush=True)))(text)
+
+    results: list[CaseResult | None] = [None] * len(specs)
+    spans: list[tuple[float, float]] = [(0.0, 0.0)] * len(specs)
+    running: dict[int, tuple[int, bool]] = {}  # index -> (games held, exclusive)
+    stop: list[BaseException] = []
+    cond = threading.Condition()  # an RLock inside: the inline run (jobs 1) takes it again
+
+    def one(i: int) -> None:
+        spec, t0, r = specs[i], time.monotonic(), None
+        try:
+            r = run_one(spec)
+        except Exception as e:  # noqa: BLE001 - one case's runner error never stops the others
+            r = CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage, status="error",
+                           reasons=[f"runner error: {type(e).__name__}: {e}"])
+        except BaseException as e:  # noqa: BLE001 - raised again once the running cases ended
+            with cond:
+                stop.append(e)
+        finally:
+            with cond:
+                results[i], spans[i] = r, (t0, time.monotonic())
+                try:
+                    if r is not None:  # before the case leaves `running`: the run's last line comes last
+                        why = f": {'; '.join(r.reasons)}" if r.reasons else ""
+                        tell(f"  {r.status.upper()}{why}" if jobs == 1 else f"{spec.name}: {r.status.upper()}{why}")
+                finally:  # a print that fails (encoding, a closed pipe) never keeps the case in `running`
+                    running.pop(i, None)
+                    cond.notify_all()
+
+    pending = list(range(len(specs)))
+    told: set[int] = set()
+    with cond:
+        while (pending and not stop) or running:
+            if pending and not stop:
+                i = pending[0]
+                spec = specs[i]
+                need = case_games(spec, max_games)
+                held = sum(g for g, _ in running.values())
+                beside = [specs[j].name for j in running]
+                if running and any(ex for _, ex in running.values()):
+                    why = f"waits: {', '.join(beside)} runs alone (exclusive)"
+                elif running and runs_alone(spec):
+                    why = f"waits for {', '.join(beside)} to end (exclusive: it runs alone)"
+                elif held + need > max_games:
+                    why = f"waits for games: needs {need}, {max_games - held} of {max_games} free (--max-games)"
+                elif len(running) >= jobs:
+                    why = ""  # a job ends first: nothing to say
+                else:
+                    pending.pop(0)
+                    running[i] = (need, runs_alone(spec))
+                    if jobs == 1:
+                        tell(f"{spec.name} ({spec.layout}) ...")
+                        one(i)
+                    else:
+                        tell(f"{spec.name} ({spec.layout}) ... started"
+                             + (f" beside {', '.join(beside)}" if beside else " alone")
+                             + (" (exclusive)" if runs_alone(spec) else "") + f", {held + need} of {max_games} games")
+                        threading.Thread(target=one, args=(i,), name=f"skytest-{spec.name}", daemon=True).start()
+                    continue
+                if why and i not in told:
+                    told.add(i)
+                    tell(f"{spec.name}: {why}")
+            cond.wait(timeout=poll)
+    if stop:
+        raise stop[0]
+    out: list[CaseResult] = []
+    for i, (spec, r) in enumerate(zip(specs, results)):
+        assert r is not None
+        r.exclusive = runs_alone(spec)
+        if r.status != "capacity":
+            s0, e0 = spans[i]
+            r.ran_with = [specs[j].name for j, (s1, e1) in enumerate(spans)
+                          if j != i and results[j] is not None and results[j].status != "capacity"
+                          and s1 < e0 and s0 < e1]
+        out.append(r)
+    return out
+
+
 # --- commands -------------------------------------------------------------------------------------
 
 
@@ -2999,24 +3255,28 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     gate_started = time.monotonic()
     check_disc(cfg)
     max_games = a.max_games or default_max_games()
+    jobs = getattr(a, "jobs", None)
+    jobs = 1 if jobs is None else int(jobs)
+    if jobs < 1:
+        raise SystemExit("--jobs is 1 or more")
     snap = snapshot_build(cfg)
     guarded = guarded_folders(cfg)
     before_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    out = fresh_dir(cfg.store / "runs" / f"{stamp}-session")
-    check_output_path(cfg, out)
-    out.mkdir(parents=True)
+    out = make_run_dir(cfg, cfg.store / "runs" / f"{stamp}-session")
     thresholds = tomllib.loads(cfg.thresholds.read_text(encoding="utf-8")) if cfg.thresholds.is_file() else {}
     baseline = tomllib.loads(cfg.baseline.read_text(encoding="utf-8")) if cfg.baseline.is_file() else {}
-    results = []
-    for spec in specs:
-        print(f"{spec.name} ({spec.layout}) ...", flush=True)
+    # --jobs N: up to N cases at once within --max-games, exclusive ones alone (schedule_cases); the
+    # start gap holds across them all (one StartPacer).
+    pacer = StartPacer(cfg.start_gap)
+
+    def run_one(spec: Spec) -> CaseResult:
         entry = next((c for c in manifest.get("case", []) if c.get("id") == spec.name), {})
         run = run_compare_case if spec.compare else run_case
-        r = run(cfg, spec, snap, max_games, time.strftime("%Y%m%d-%H%M%S"), thresholds, baseline,
-                tuple(entry.get("accepted_grades", [])))
-        print(f"  {r.status.upper()}" + (f": {'; '.join(r.reasons)}" if r.reasons else ""), flush=True)
-        results.append(r)
+        return run(cfg, spec, snap, max_games, time.strftime("%Y%m%d-%H%M%S"), thresholds, baseline,
+                   tuple(entry.get("accepted_grades", [])), pacer=pacer)
+
+    results = schedule_cases(specs, jobs, max_games, run_one)
     after_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
     guard = [{"folder": k, "before": before_state[k], "after": after_state[k],
               "unchanged": before_state[k] == after_state[k]} for k in guarded]
@@ -3031,7 +3291,7 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     full_run = a.cases in ([], ["all"]) and gate is None
     before = previous_statuses(cfg, out)
     checkpoint = checkpoint_verdict(manifest, a.stage, stages, results, touched, before) if a.stage and full_run else None
-    payload = {"snapshot": str(snap), "max_games": max_games, "stages": stages, "thresholds": thresholds,
+    payload = {"snapshot": str(snap), "max_games": max_games, "jobs": jobs, "stages": stages, "thresholds": thresholds,
                "guarded_folders": guard, "required_without_spec": unwritten, "checkpoint": checkpoint,
                "restricted_token": token["restricted"], "restricted_token_cause": token["cause"],
                "cases": [asdict(r) for r in results]}
@@ -3040,7 +3300,8 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         gate["case_minutes"] = round(sum(r.seconds for r in results) / 60, 1)
         payload["gate"] = gate
     (out / "results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    write_report(cfg, out, results, manifest, thresholds, max_games, guard, unwritten, checkpoint, gate, token)
+    write_report(cfg, out, results, manifest, thresholds, max_games, guard, unwritten, checkpoint, gate, token,
+                 jobs=jobs)
     write_findings(out, results, before)
     failed = [r for r in results if r.status not in ("pass", "capacity")]
     capacity = [r for r in results if r.status == "capacity"]
@@ -3080,9 +3341,7 @@ def cmd_compare(cfg: Config, a: argparse.Namespace) -> int:
         names.append(base if base not in names else f"{base}-{i + 1}")
     gathered = [gather_run(n, f, spec) for n, f in zip(names, folders)]
     cmp = compare_runs(gathered, {**spec.compare, "noise": names[:noise], "test": names[noise:]})
-    out = fresh_dir(cfg.store / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-compare-{spec.name}")
-    check_output_path(cfg, out)
-    out.mkdir(parents=True)
+    out = make_run_dir(cfg, cfg.store / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-compare-{spec.name}")
     write_compare(out, cmp)
     print(f"compare {spec.name}: {cmp['status'].upper()}" + (f": {'; '.join(cmp['reasons'])}" if cmp["reasons"] else ""))
     print(f"report: {out / 'compare.md'}")
@@ -3118,6 +3377,9 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
                 problems.append(f"{p.name}: the file is named {p.stem} but the case {s.name}")
             if s.name in specs:
                 problems.append(f"{p.name}: case name {s.name} also in {specs[s.name].path.name}")
+            if timed_grades(s) and not s.exclusive:
+                problems.append(f"{p.name}: grades time or load ({', '.join(timed_grades(s))}) but is not"
+                                " `exclusive = true`: beside another case (test --jobs) it would measure that load too")
             specs[s.name] = s
         except SpecError as e:
             problems.append(str(e))
@@ -3176,6 +3438,8 @@ def main(argv: list[str] | None = None) -> int:
                    " or all), with their expected minutes before the run")
     t.add_argument("--allow-restricted", action="store_true", help="start the games even when this runner has a"
                    " restricted token (an agent sandbox): their shader caches are unusable, timings not comparable")
+    t.add_argument("--jobs", type=int, default=1, help="most cases at once (default 1: one after another); their"
+                   " games count against --max-games, and a spec with exclusive = true runs alone")
     t.set_defaults(fn=cmd_test)
     ls = sub.add_parser("list")
     ls.add_argument("--gate", action="store_true", help="the gate cases and their expected minutes (from each"
