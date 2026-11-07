@@ -616,6 +616,23 @@ void FakeNetworkRequests() {
   CHECK(b.Count(CE::kLevelEnd) == 0 && owner.Count(CE::kReaction) == 0);
   CHECK(b.Last(CE::kReaction)->reaction.outcome == ReactionOutcome::kLanded);
 
+  // A late step of the owner's key (amendment w) goes to every client, the owner too (it decides
+  // there whether the late step is its own), and arrives with its flag.
+  AppliedStep late = step;
+  late.key.peer = owner.session->PeerId();
+  late.late_step = true;
+  late.steps.clear();
+  AppliedStepEntry late_entry;
+  late_entry.kind = StepKind::kTelegram;
+  late_entry.targets = kTargetOther;
+  late_entry.telegram.messenger = TestTrigger(g1);
+  late_entry.telegram.list_owner_hash = NameHash("CMessengerComponent");
+  late.steps.push_back(late_entry);
+  CHECK(w.server.SendAppliedStep(late, w.net.Now()));
+  CHECK(w.RunUntil([&] { return b.Count(CE::kAppliedStep) == 2 && owner.Count(CE::kAppliedStep) == 2; }));
+  CHECK(b.Last(CE::kAppliedStep)->applied == late && b.Last(CE::kAppliedStep)->applied.late_step);
+  CHECK(owner.Last(CE::kAppliedStep)->applied == late && owner.Last(CE::kAppliedStep)->applied.late_step);
+
   // A generation change: S's final for a key in retry goes before the new LevelLoad; a first send
   // that was in flight at the change is refused `stale` after it, with one final decision.
   w.verdict = RefusalReason::kTooFar;

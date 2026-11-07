@@ -60,6 +60,11 @@ const char* RefusalReasonName(RefusalReason reason) {
   return "other";
 }
 
+bool ValidElements(uint16_t elements) {
+  if (elements & ~kElementsUsed) return false;
+  return elements == 0 || (elements & kElementsKnown) != 0;
+}
+
 const char* TriggerChecksName(TriggerChecks checks) {
   switch (checks) {
     case TriggerChecks::kPassed: return "passed";
@@ -332,6 +337,8 @@ bool GetKey(ByteReader& r, RequestKey& k) {
 // final; only a refusal has a reason; S's own final is final").
 constexpr uint8_t kDecisionCached = 0x01;
 constexpr uint8_t kDecisionFinal = 0x02;
+// AppliedStep's trailing flags byte (amendment w).
+constexpr uint8_t kAppliedLateStep = 0x01;
 constexpr uint8_t kDecisionServerFinal = 0x04;
 bool ConsistentDecision(const WorldDecision& d) {
   switch (d.outcome) {
@@ -420,6 +427,7 @@ bool Fields(ByteWriter& w, const PlayerList& m) {
 }
 
 bool Fields(ByteWriter& w, const PlayerPose& m) {
+  if (!ValidElements(m.figure.elements)) return false;
   w.U32(m.pose_sequence);
   w.U32(m.generation);
   if (!PutFloats(w, m.position) || !PutFloats(w, m.rotation)) return false;
@@ -429,6 +437,7 @@ bool Fields(ByteWriter& w, const PlayerPose& m) {
   w.U16(m.figure.top_variant);
   w.U16(m.figure.bottom_id);
   w.U16(m.figure.bottom_variant);
+  w.U16(m.figure.elements);  // item 11: a trailing field, so a pose without it reads as 0 (not read)
   return true;
 }
 bool Fields(ByteWriter& w, const PlayerAction& m) {
@@ -470,6 +479,7 @@ bool Fields(ByteWriter& w, const AppliedStep& m) {
       return false;
     }
   }
+  w.U8(m.late_step ? kAppliedLateStep : 0);  // amendment w: a trailing byte, so a step without it reads as false
   return true;
 }
 bool Fields(ByteWriter& w, const LevelEnd& m) {
@@ -603,6 +613,11 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
       m.figure.top_variant = r.U16();
       m.figure.bottom_id = r.U16();
       m.figure.bottom_variant = r.U16();
+      if (ok && r.Ok() && r.Remaining() > 0) {
+        // Item 11's elements (absent in an earlier version 2 pose: 0, not read).
+        m.figure.elements = r.U16();
+        if (r.Ok() && !ValidElements(m.figure.elements)) return std::nullopt;
+      }
       result = m;
       break;
     }
@@ -669,6 +684,11 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
           ok = GetTelegram(r, e.telegram);
         }
         m.steps.push_back(e);
+      }
+      if (ok && r.Ok() && r.Remaining() > 0) {
+        // Amendment w's flags (absent in an earlier version 2 step: not a late step); the other bits
+        // are a later version's.
+        m.late_step = (r.U8() & kAppliedLateStep) != 0;
       }
       result = std::move(m);
       break;

@@ -257,6 +257,149 @@ void Version2Item9() {
   }
 }
 
+// Stage 1B item 11: the elements a client's hero plays, a trailing field of the pose's figure.
+void Version2Item11() {
+  // Bit e (1 to 8) with kElementsKnown; 0 is "not read".
+  CHECK(ValidElements(0));
+  CHECK(ValidElements(kElementsKnown));
+  CHECK(ValidElements(kElementsKnown | (1u << 1) | (1u << 8)));
+  CHECK(!ValidElements(1u << 3));            // an element without kElementsKnown
+  CHECK(!ValidElements(kElementsKnown | (1u << 9)));  // nothing above bit 8
+  CHECK(HasElement(kElementsKnown | (1u << 4), 4));
+  CHECK(!HasElement(kElementsKnown | (1u << 4), 5));
+  CHECK(!HasElement(1u << 4, 4));
+  CHECK(!HasElement(0x01FF, 0) && !HasElement(0x01FF, 9));
+  PlayerPose pose;
+  pose.pose_sequence = 9;
+  pose.generation = 2;
+  pose.position = {1, 2, 3};
+  pose.figure = CurrentFigure{0x03E8, 0, 0x07D0, 0x0001, 0x03E8, 0x0001, uint16_t(kElementsKnown | (1u << 2) | (1u << 7))};
+  CHECK(RoundTrip(pose));
+  for (int e = 1; e <= 8; ++e) {
+    PlayerPose p = pose;
+    p.figure.elements = uint16_t(kElementsKnown | (1u << e));
+    CHECK(RoundTrip(p));
+  }
+  // The wire: the six ids, then the elements, last (header, sequence, generation, 3 + 4 floats).
+  {
+    const auto b = EncodeMessage(pose);
+    REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 4 + 4 + 28 + 12 + 2);
+    CHECK(b[b.size() - 2] == uint8_t(pose.figure.elements) && b[b.size() - 1] == uint8_t(pose.figure.elements >> 8));
+  }
+  // A pose written before item 11 (no trailing field) reads as 0, not read.
+  {
+    std::vector<uint8_t> b = EncodeMessage(pose);
+    REQUIRE_OR_RETURN_VOID(b.size() > kMessageHeaderSize + 2);
+    b.resize(b.size() - 2);
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);
+    b[3] = 0;
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<PlayerPose>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    PlayerPose want = pose;
+    want.figure.elements = 0;
+    CHECK(*got == want);
+  }
+  // Half a trailing field is a cut message.
+  {
+    std::vector<uint8_t> b = EncodeMessage(pose);
+    b.pop_back();
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);
+    CHECK(!DecodeMessages(b));
+  }
+  // A value ValidElements refuses is neither encoded nor decoded.
+  {
+    PlayerPose p = pose;
+    p.figure.elements = uint16_t(1u << 3);
+    CHECK(EncodeMessage(p).empty());
+    p.figure.elements = uint16_t(kElementsKnown | (1u << 9));
+    CHECK(EncodeMessage(p).empty());
+    std::vector<uint8_t> b = EncodeMessage(pose);
+    REQUIRE_OR_RETURN_VOID(!b.empty());
+    b[b.size() - 1] = 0x02;  // bit 9
+    CHECK(!DecodeMessages(b));
+    b[b.size() - 1] = 0;
+    b[b.size() - 2] = 0x08;  // bit 3 without kElementsKnown
+    CHECK(!DecodeMessages(b));
+  }
+  // A later field after the elements is ignored, as for any message.
+  {
+    std::vector<uint8_t> b = EncodeMessage(pose);
+    b.push_back(0x5A);
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    CHECK((*back)[0] == Message{pose});
+  }
+}
+
+// Stage 1B amendment w: a request's late step, sent to the other clients, is an AppliedStep with a
+// trailing flags byte.
+void Version2LateStep() {
+  AppliedStep st;
+  st.key = SampleRequests()[0].key;
+  st.applied_sequence = 12;
+  AppliedStepEntry tele;
+  tele.kind = StepKind::kTelegram;
+  tele.targets = kTargetOther;
+  tele.telegram = Telegram();
+  st.steps.push_back(tele);
+  st.late_step = true;
+  CHECK(RoundTrip(st));
+  AppliedStep own = st;
+  own.late_step = false;
+  CHECK(RoundTrip(own));
+  // The wire: the flags byte comes last, 0x01 for a late step, 0 for the request's own apply.
+  {
+    const auto late = EncodeMessage(st);
+    const auto plain = EncodeMessage(own);
+    REQUIRE_OR_RETURN_VOID(!late.empty() && late.size() == plain.size());
+    CHECK(late.back() == 0x01 && plain.back() == 0x00);
+  }
+  // A step written before amendment w (no trailing byte) reads as the request's own apply.
+  {
+    std::vector<uint8_t> b = EncodeMessage(st);
+    REQUIRE_OR_RETURN_VOID(b.size() > kMessageHeaderSize);
+    b.pop_back();
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);  // the length (under 256 here)
+    b[3] = 0;
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<AppliedStep>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    CHECK(*got == own);
+  }
+  // Other flag bits are a later version's: ignored.
+  {
+    std::vector<uint8_t> b = EncodeMessage(own);
+    REQUIRE_OR_RETURN_VOID(!b.empty());
+    b.back() = 0xFE;
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    CHECK((*back)[0] == Message{own});
+    b.back() = 0x81;
+    back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    CHECK((*back)[0] == Message{st});
+  }
+  // A later field after the flags is ignored, as for any message.
+  {
+    std::vector<uint8_t> b = EncodeMessage(st);
+    b.push_back(0x5A);
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    CHECK((*back)[0] == Message{st});
+  }
+  // The longest late step (the longest key and 32 telegram steps) still fits one datagram.
+  AppliedStep longest = st;
+  longest.key = SampleRequests()[4].key;
+  longest.steps.assign(kMaxAppliedSteps, tele);
+  CHECK(RoundTrip(longest));
+  CHECK(EncodeMessage(longest).size() <= skylanders::netplay::kMaxPayload);
+}
+
 void Version2Limits() {
   // Not encoded: a non-finite float, an unknown ref kind, a trigger key with no event kind, an
   // inconsistent decision, too many steps, an unknown step target, an unknown reaction outcome.
@@ -665,6 +808,8 @@ int main() {
 
   Version2RoundTrips();
   Version2Item9();
+  Version2Item11();
+  Version2LateStep();
   Version2Limits();
   Version2Scenes();
 

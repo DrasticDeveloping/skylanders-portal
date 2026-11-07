@@ -256,9 +256,26 @@ RequestKey TelegramRequestKey(uint16_t peer, uint32_t generation, uint32_t reque
 RequestKey SkipRequestKey(uint16_t peer, uint32_t generation, const SceneKey& scene,
                           uint32_t skip_sequence);
 
-// What a client stands on: the character and, for a swapper, both halves (0 when not a swapper).
-// Where the client reads them is X7's (design section 6, the element gate); item 11's scaffold
-// reads them from here.
+// The elements a hero plays, as CurrentFigure::elements carries them (stage 1B item 11, the
+// element-gate scaffold): bit e (1 to 8) set when the game's own element test answered true for
+// element e on the client's hero (either half of a swapper), and kElementsKnown (bit 0) set when the
+// client read them at all. 0: not read (a client before item 11, or no hero to read); the server
+// then falls back to the figure at join. Nothing above bit 8 is used.
+constexpr uint16_t kElementsKnown = 0x0001;
+constexpr uint16_t kElementsUsed = 0x01FF;
+// A value the wire takes: no bit above 8, and element bits only with kElementsKnown.
+bool ValidElements(uint16_t elements);
+// Element e (1 to 8) is in `elements`.
+constexpr bool HasElement(uint16_t elements, int e) {
+  return (elements & kElementsKnown) && e >= 1 && e <= 8 && ((elements >> e) & 1u) != 0;
+}
+
+// What a client stands on: the character and, for a swapper, both halves (0 when not a swapper),
+// and the elements its hero plays now. Where a client reads the figure ids is still open (X7's;
+// design section 6, the element gate); item 11's scaffold reads `elements`, which the client asks
+// the game's own element test for, so it follows a swap of halves without a figure-id reader. On
+// the wire `elements` is a trailing u16 after the six ids (stage 1B item 11): a pose that ends
+// before it reads as 0 (not read); a value ValidElements refuses makes the message invalid.
 struct CurrentFigure {
   uint16_t figure_id = 0;
   uint16_t figure_variant = 0;
@@ -266,6 +283,7 @@ struct CurrentFigure {
   uint16_t top_variant = 0;
   uint16_t bottom_id = 0;
   uint16_t bottom_variant = 0;
+  uint16_t elements = 0;
   bool operator==(const CurrentFigure&) const = default;
 };
 
@@ -403,10 +421,16 @@ struct AppliedStepEntry {
 
 // Server to every client, gameplay lane: the steps S applied for one request, in order (the
 // originating step, then the follow-on steps of the same apply). The requester is the key's peer.
+// `late_step` (stage 1B amendment w): not the request's own apply but one telegram S's messengers
+// sent for it on a later frame (a late step), sent to every client but the requester (which plays
+// its own late steps locally); `applied_sequence` is then the apply's it follows. On the wire a
+// trailing flags byte (bit 0x01): a message that ends before it reads as false; other bits are a
+// later version's and are ignored.
 struct AppliedStep {
   RequestKey key;
   uint32_t applied_sequence = 0;
   std::vector<AppliedStepEntry> steps;  // at most kMaxAppliedSteps
+  bool late_step = false;
   bool operator==(const AppliedStep&) const = default;
 };
 

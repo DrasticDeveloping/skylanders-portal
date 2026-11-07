@@ -195,7 +195,8 @@ class ServerSession {
   bool SubmitEvaluation(const RequestKey& key, const EvaluationResult& result,
                         TimePoint now = Clock::now());
   const RequestTable& Requests() const { return requests_; }
-  // To every client: the steps S applied for one request. false if it cannot be encoded.
+  // To every client: the steps S applied for one request, or one of its late steps (`late_step`,
+  // stage 1B amendment w). false if it cannot be encoded.
   bool SendAppliedStep(const AppliedStep& step, TimePoint now = Clock::now());
   // To one client: a level end, a reaction. false if `peer` is not connected or it cannot be encoded.
   bool SendLevelEnd(uint16_t peer, const LevelEnd& end, TimePoint now = Clock::now());
