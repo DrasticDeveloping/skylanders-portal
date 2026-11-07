@@ -300,6 +300,11 @@ std::atomic<bool> g_crash_logged{false};
 // The unhandled-exception filter of InstallCrashReport: logs once, then lets the crash go on.
 LONG WINAPI OnCrash(PEXCEPTION_POINTERS info) {
   if (!g_crash_logged.exchange(true)) {
+    // First: with asynchronous logging (the dedicated server) the process ends 4 s from here even
+    // if a log sink hangs (on the log writer thread these lines go to the sinks directly); the
+    // logging below ends 150 ms before that at the latest (its waits share the watchdog's budget).
+    // Synchronous logging: does nothing.
+    rex::ArmExitWatchdog();
     const EXCEPTION_RECORD& record = *info->ExceptionRecord;
     const CONTEXT& ctx = *info->ContextRecord;
     uintptr_t frames[16] = {};
@@ -317,8 +322,11 @@ LONG WINAPI OnCrash(PEXCEPTION_POINTERS info) {
                   ? fmt::format(", {} of guest {:08X}", kind, uint32_t(address - g_membase))
                   : fmt::format(", {} of host {:X}", kind, address);
     }
-    REXLOG_ERROR("Crash: exception {:08X}{} on thread {}; call chain: {}", record.ExceptionCode,
-                 fault, GetCurrentThreadId(), chain);
+    // Urgent lines (the SDK's LogUrgent): with asynchronous logging (log_async, the dedicated
+    // server) an ordinary line waits for room in a full queue, forever if the writer is stuck or is
+    // the crashing thread; these never wait long, and on the writer they are written directly.
+    REXLOG_URGENT_ERROR("Crash: exception {:08X}{} on thread {}; call chain: {}",
+                        record.ExceptionCode, fault, GetCurrentThreadId(), chain);
     const DWORD64 regs[16] = {ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp,
                               ctx.Rsi, ctx.Rdi, ctx.R8,  ctx.R9,  ctx.R10, ctx.R11,
                               ctx.R12, ctx.R13, ctx.R14, ctx.R15};
@@ -326,9 +334,9 @@ LONG WINAPI OnCrash(PEXCEPTION_POINTERS info) {
     if (ReadGuestRegisters(regs, guest) >= 0) {
       std::string text;
       for (int r = 0; r < 32; ++r) text += fmt::format(" r{}={:08X}", r, guest[r]);
-      REXLOG_ERROR("Crash: guest registers{}", text);
+      REXLOG_URGENT_ERROR("Crash: guest registers{}", text);
     }
-    LogPlace("crash");
+    LogPlace("crash", true);
     rex::FlushLogging();
   }
   return g_previous_filter ? g_previous_filter(info) : EXCEPTION_CONTINUE_SEARCH;
@@ -363,6 +371,7 @@ std::string FrameName(uintptr_t address) {
 // bad call), then lets the abort go on.
 void OnAbort(int) {
   if (g_crash_logged.exchange(true)) return;
+  rex::ArmExitWatchdog();  // as in OnCrash (a REX_FATAL before the abort armed it already)
   constexpr int kAbortFrames = 24;
   static CONTEXT contexts[kAbortFrames];  // static: the handler may run on a small stack
   CONTEXT ctx{};
@@ -377,7 +386,7 @@ void OnAbort(int) {
     if (guest_frame < 0 && i > 0 && name.rfind("sub_", 0) == 0) guest_frame = i;
     chain += (chain.empty() ? "" : " <- ") + name;
   }
-  REXLOG_ERROR("Crash: abort on thread {}; call chain: {}", GetCurrentThreadId(), chain);
+  REXLOG_URGENT_ERROR("Crash: abort on thread {}; call chain: {}", GetCurrentThreadId(), chain);
   if (guest_frame >= 0) {
     const CONTEXT& at = contexts[guest_frame];
     const DWORD64 regs[16] = {at.Rax, at.Rcx, at.Rdx, at.Rbx, at.Rsp, at.Rbp,
@@ -387,10 +396,10 @@ void OnAbort(int) {
     if (ReadGuestRegisters(regs, guest) >= 0) {
       std::string text;
       for (int r = 0; r < 32; ++r) text += fmt::format(" r{}={:08X}", r, guest[r]);
-      REXLOG_ERROR("Crash: guest registers{}", text);
+      REXLOG_URGENT_ERROR("Crash: guest registers{}", text);
     }
   }
-  LogPlace("crash");
+  LogPlace("crash", true);
   rex::FlushLogging();
 }
 

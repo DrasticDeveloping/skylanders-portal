@@ -733,7 +733,10 @@ class ScriptInputDriver final : public rex::input::InputDriver {
           run(e.args);
           returned(index);
         } else {
-          REXLOG_INFO("Input script: quit");
+          // A deliberate exit: the line goes through the urgent path and a bounded flush, so with
+          // the server's async logging (rexglue-sdk log_async) it is in the log before _Exit.
+          REXLOG_URGENT_INFO("Input script: quit");
+          ::rex::FlushLogging();
           std::_Exit(0);
         }
       }
