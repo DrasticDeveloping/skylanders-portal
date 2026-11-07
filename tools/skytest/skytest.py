@@ -5,9 +5,18 @@ Run from a game repository (its `just test-online` calls this). A case is a TOML
 tests/runtime/; it names a layout and what each peer's game does (an input script) and what its log
 must show. The runner starts the layout's game processes, each on its own copies of the test data,
 ends them, and writes report.md and results.json in a new run folder of the worktree's test store.
+It stops a run early (fail fast, on unless a spec says `fail_fast = false`) a grace after a peer's
+first fatal line: a crash, a forbidden line, or a crash exit code.
 
     skytest.py test [CASE ...] [--stage S] [--max-games N]   run cases (a name, a glob, or all)
-    skytest.py list                                         the cases and the manifest's state
+               [--gate]                                     only the manifest's gate cases (gate = true)
+                                                            of the stages up to S, with their expected
+                                                            minutes before the run
+               [--allow-restricted]                         start games even under a restricted token
+                                                            (refused otherwise; timings not comparable)
+    skytest.py list [--gate [--stage S]]                    the cases and the manifest's state; with
+                                                            --gate the gate cases and their expected
+                                                            minutes (no game started)
     skytest.py lint                                         check every spec and the manifest
     skytest.py fixtures --from-owner                        copy the owner's saves and figures into
                                                             the fixture store (read only on their side)
@@ -27,7 +36,9 @@ Rules the runner enforces (docs/RULES.md of the game): outputs only inside the w
 .replication-tests/; never under the owner's data folder, never into the disc; the build is copied
 into a snapshot and run from there, never from the build folder; every setting passed is non-empty;
 every game is in a job object, so none outlives the run; a case that cannot run says why in its
-report (capacity, missing fixture, spec error) instead of being skipped silently.
+report (capacity, missing fixture, spec error) instead of being skipped silently. A runner with a
+restricted token (an agent sandbox) starts no game unless --allow-restricted (its games could not use
+the shader caches); every game it starts is opted out of Windows power throttling.
 
 Standard library only; run with `python -I`.
 """
@@ -71,7 +82,7 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
 # Where a hosted server (`server = "host"`) writes its log: the owner's session folder.
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
 GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
-          "symmetry")
+          "symmetry", "route", "bandwidth")
 # The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
 # online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
 # for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
@@ -99,12 +110,55 @@ GONE_AT_CLOSE = re.compile(r"Online: peer (\d+) gone at close")
 # A request the session refused to send (End session began, or no connection): no decision can come.
 REQUEST_NOT_SENT = re.compile(r"Online: request " + REQ_KEY + r" not sent")
 SYMMETRY_RESET = re.compile(r"Online: symmetry reset (\d+) (\S+)")
+# The level flow's lines (stage 1B item 13; the game's server/level_flow.h and client/level_guard.h).
+# S's first line of a level end (a duplicate, `not sent` and `sent to` lines read differently), the
+# server's own level change, the results screens' advance, and a client's level-guard passes.
+LEVEL_END_FIRST = re.compile(r"Online: level end (\w+) to (\S+) \(generation (\d+)\)\s*$")
+LEVEL_END_DUPLICATE = re.compile(r"Online: level end (\w+) to (\S+) duplicate \(generation (\d+);")
+OWN_LEVEL_OPEN = re.compile(r"Online: level (\d+) (\S+): open \(the server's own level change")
+RESULTS_ADVANCED = re.compile(r"Online: results screen \S+ advanced by (native|press)\b")
+RESULTS_DONE = re.compile(r"Online: results screens done: ")
+CLIENT_PASSED = re.compile(r"Online: level request 0x[0-9A-Fa-f]+ passed (\S+) \((.+?): (.+)\)\s*$")
+CLIENT_NATIVE_END = re.compile(r"Online: level end (\w+) to (\S+) played here \(not connected to the server\)")
+# A client's level-guard passes that do not take it out of the session's level by itself.
+CLIENT_PASS_OK = ("the session's own request", "not connected to the server",
+                  "a joiner's continue from its title")
+# The route checklist's evidence on S: the authority's replay of a request (`replay <key> <Name#id> by
+# <who> ...`, then `replay done <key> activated 1`), the encounter watch, the scene occurrences.
+REPLAY_LINE = re.compile(r"Online: replay (\S+) (\S+) by ")
+REPLAY_DONE = re.compile(r"Online: replay done (\S+) activated 1\b")
+ENCOUNTER_START = re.compile(r"Online: encounter start (\S+) \(from ")
+ENCOUNTER_COMPLETE = re.compile(r"Online: encounter complete (\S+)")
+SCENE_START = re.compile(r"Online: scene (\S+) start \S+ (.+?) recipient ")
+SCENE_END = re.compile(r"Online: scene (\S+) end by ")
+# The per-lane traffic (session_host.cpp LaneTraffic, every 10 s): on S per peer, bytes sent to it
+# (first sends, resends and acks) / received from it, cumulative.
+TRAFFIC_PEER = re.compile(r"Online: traffic peer (\d+) gameplay (\d+)/(\d+) state (\d+)/(\d+) fast (\d+)/(\d+) bytes")
 # The reasons a client may resend after (requests.h IsRetryable): for an enter or a touch, and for
 # an exit only `exit before enter`. Every other refusal is terminal.
 RETRYABLE_ENTER = ("too_far", "rate", "not released", "not in play")
 # A title folder's name (the game's title id in hex), for the save_copy grade.
 TITLE_ID = re.compile(r"^[0-9A-F]{8}$")
 ALWAYS_FORBIDDEN = [r"\] Crash: ", r"\[FATAL\]", r"Input script: cannot (parse|use)"]
+# Fail fast (on unless a spec says `fail_fast = false`): while a run's games play, the runner reads the
+# new bytes of each peer's log every FAIL_FAST_POLL seconds and, at the first fatal line (a forbidden
+# one: the peer's `forbid` and ALWAYS_FORBIDDEN, a crash among them) or a game that exits with a crash
+# code, stops every game of the run after a grace (tests/skytest.toml [defaults]
+# fail_fast_grace_seconds, so the lines after it are logged) instead of waiting for the timeout.
+FAIL_FAST_POLL = 1.0
+DEFAULT_FAIL_FAST_GRACE = 10.0
+# The guest's start in a game's log: the GPU's first SetInterruptCallback (the first line the guest
+# causes; the host's startup before it, e.g. the shader storage, can stall for seconds: P1j C2).
+GUEST_START = re.compile(r"SetInterruptCallback\(")
+# The startup stall (P1j; reported per peer, never graded): from the host's "Initializing shader
+# storage" (ReXApp::LaunchModule, which blocks there until the GPU thread has built its pipelines) to
+# the guest's first line, its first `VFS:` mount or SetInterruptCallback, whichever comes first (the
+# VFS line is 0.4-0.9 s before SetInterruptCallback in every log, so with the latter alone a warm start
+# would read 0.5 s and a loaded one near the warning). 0.01-0.16 s with usable shader caches, 4-32 s
+# without them (a restricted token, a cold cache) in 621 logs of 11/5-11/6.
+SHADER_STORAGE = re.compile(r"Initializing shader storage")
+GUEST_FIRST_LINE = re.compile(r"VFS:|SetInterruptCallback\(")
+STARTUP_STALL_WARN_S = 1.0
 
 # A case's [compare] (stage 1B item 3, the draw-skip A/A and A/B; docs/online-1B.md P3): the same
 # workload run several times, and what the compared peer's logs must agree on.
@@ -191,6 +245,8 @@ class Config:
     launcher: list[str]
     # The game's title id (its save folder <data>/<profile>/<title_id>), for the save_copy grade.
     title_id: str = ""
+    # Fail fast: seconds between a run's first fatal line and the stop of its games.
+    fail_fast_grace: float = DEFAULT_FAIL_FAST_GRACE
 
 
 def repo_root(start: Path) -> Path:
@@ -211,6 +267,9 @@ def load_config(repo: Path) -> Config:
         raise SystemExit(f"{f} is missing: the game repository names its exe, build and fixtures there")
     c = tomllib.loads(f.read_text(encoding="utf-8"))
     g, fx, d = c.get("game", {}), c.get("fixtures", {}), c.get("defaults", {})
+    grace = d.get("fail_fast_grace_seconds", DEFAULT_FAIL_FAST_GRACE)
+    if not isinstance(grace, (int, float)) or isinstance(grace, bool) or grace < 0:
+        raise SystemExit(f"{f}: [defaults] fail_fast_grace_seconds must be a number of seconds >= 0")
     return Config(
         repo=repo,
         store=repo / STORE,
@@ -230,6 +289,7 @@ def load_config(repo: Path) -> Config:
         # Only the runner's own tests set this: a command that stands in for the game's exe.
         launcher=[os.path.expandvars(x) for x in g.get("launcher", [])],
         title_id=str(g.get("title_id", "")),
+        fail_fast_grace=float(grace),
     )
 
 
@@ -271,6 +331,14 @@ def check_output_path(cfg: Config, path: Path) -> None:
     if inside(path, cfg.rom):
         raise SystemExit(f"refusing to write {path}: inside the disc")
 
+
+# What a spec's `args` may name: the game checkout the runner tests (its repository root, as
+# forward slashes), e.g. --online_route_file={repo}/tests/routes/tutorial_b.toml. Scripts take
+# {figures}, {peer} and {join} instead (peer_script).
+ARG_PLACEHOLDERS = ("{repo}",)
+ARG_PLACEHOLDER = re.compile(r"\{[A-Za-z_]+\}")
+# The plan's daily gate: each stage names a 30-minute subset (docs/online-fork-plan.md 5.4).
+GATE_MINUTES = 30
 
 # Settings the runner sets for each peer itself. A case or the defaults may not set them again: the
 # game takes the last of two, so a second --user_data_root would point a test at any folder.
@@ -331,6 +399,9 @@ class Spec:
     grades: dict[str, dict] = field(default_factory=dict)
     # [compare]: the workload is run once per [[compare.run]], and the runs' logs are compared.
     compare: dict = field(default_factory=dict)
+    # Fail fast (FAIL_FAST_POLL): stop the run's games at the first fatal line; `fail_fast = false`
+    # waits for the script's end or the timeout, as before. A compared case's runs follow it.
+    fail_fast: bool = True
 
 
 def peers_of(layout: str) -> list[str]:
@@ -384,6 +455,11 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             expect_count={**common.get("expect_count", {}), **own.get("expect_count", {})},
             expect_order=list(own.get("expect_order", common.get("expect_order", []))),
         )
+        for arg in peers[n].args:
+            for ph in ARG_PLACEHOLDER.findall(arg):
+                if ph not in ARG_PLACEHOLDERS:
+                    raise SpecError(f"{path.name}: peer {n}: {ph} in {arg!r} is not substituted in args (only"
+                                    f" {', '.join(ARG_PLACEHOLDERS)})")
         for rx, count in peers[n].expect_count.items():
             if not isinstance(count, int) or isinstance(count, bool) or count < 0:
                 raise SpecError(f"{path.name}: peer {n}: expect_count /{rx}/ must be a whole number >= 0")
@@ -412,6 +488,12 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         if gname == "symmetry":
             check_symmetry(path.name, g, names)
             continue
+        if gname == "route":
+            check_route(path.name, g, names)
+            continue
+        if gname == "bandwidth":
+            check_bandwidth(path.name, g, names)
+            continue
         if not isinstance(g, dict) or g.get("peer", "S" if gname == "server_frame_time" else "H") not in names:
             raise SpecError(f"{path.name}: grade {gname} names a peer not in {names}")
         if gname == "level_load" and (g.get("measure") not in d.get("measure", {}) or not g.get("baseline")):
@@ -427,11 +509,14 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
     compare = d.get("compare", {})
     if "compare" in d:
         check_compare(path.name, compare, names, server)
+    fail_fast = d.get("fail_fast", True)
+    if not isinstance(fail_fast, bool):
+        raise SpecError(f"{path.name}: fail_fast is true or false")
     return Spec(
         name=d["name"], path=path, layout=d["layout"], stage=str(d["stage"]),
         description=d.get("description", ""), timeout=float(d.get("timeout", default_timeout)),
         peers=peers, measures=measures, standin_seconds=float(d.get("standin_seconds", 45)),
-        server=server, grades=grades, compare=compare,
+        server=server, grades=grades, compare=compare, fail_fast=fail_fast,
     )
 
 
@@ -794,17 +879,291 @@ def grade_symmetry(text: str, g: dict) -> tuple[dict, list[str]]:
     return graded, reasons
 
 
-def grade_cross_peer(spec: Spec, r: PeerResult, texts: dict[str, str]) -> list[str]:
-    """The item 9 grades a peer's result carries: requests_answered on each peer it names (S's log
-    gives the peers gone at close), symmetry on its peer (S)."""
+def check_route(spec_name: str, g: object, names: list[str]) -> None:
+    """A route grade's options: `file` (the route file, relative to the game checkout; required),
+    `peer` (the server's log, default S) and `clients` (the clients whose level-guard lines must show
+    no level left by itself; default every client)."""
+    if not isinstance(g, dict):
+        raise SpecError(f"{spec_name}: grade route must be a table")
+    f = g.get("file")
+    if (not isinstance(f, str) or not f.strip() or Path(f).is_absolute() or f.startswith(("/", "\\"))
+            or ".." in Path(f).parts):
+        raise SpecError(f"{spec_name}: grade route: `file` is the route file's path inside the game checkout"
+                        " (tests/routes/<level>.toml)")
+    if g.get("peer", "S") not in names:
+        raise SpecError(f"{spec_name}: grade route: `peer` {g.get('peer')!r} is not in {names}")
+    clients = g.get("clients", [n for n in names if n != "S"])
+    if not isinstance(clients, list) or any(c not in names or c == "S" for c in clients):
+        raise SpecError(f"{spec_name}: grade route: `clients` must name clients of {names}")
+
+
+def route_name_matches(want: str, seen: str) -> bool:
+    """A checklist name against a logged `Name#id` (both case folded): `Name#id` or `Class#id` must
+    match whole, a bare `Name` matches any id of that name."""
+    want, seen = want.casefold(), seen.casefold()
+    if "#" in want:
+        return want == seen
+    return seen.rsplit("#", 1)[0] == want
+
+
+def load_route_checklist(path: Path) -> tuple[dict | None, str]:
+    """The route checklist of a route file (tests/routes/<level>.toml): [level_end] (class, optional
+    recipient and next_zone), the triggers whose class is request or two_player, [[encounter]]
+    (manager), [[checkpoint]] (trigger, optional expect, a pattern on S), [[scene]] (name). Returns the
+    checklist and "" or None and why it cannot be read."""
+    try:
+        d = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return None, f"the route file {path.name} cannot be read ({e})"
+    end = d.get("level_end", {})
+    if not isinstance(end, dict) or not isinstance(end.get("class"), str) or not end["class"]:
+        return None, f"the route file {path.name} has no [level_end] class (X11 names it)"
+    return {
+        "level_end": end,
+        "triggers": [t["name"] for t in d.get("trigger", []) if isinstance(t, dict) and isinstance(t.get("name"), str)
+                     and t.get("class", "request") in ("request", "two_player")],
+        "encounters": [e["manager"] for e in d.get("encounter", []) if isinstance(e, dict)
+                       and isinstance(e.get("manager"), str)],
+        "checkpoints": [c for c in d.get("checkpoint", []) if isinstance(c, dict) and isinstance(c.get("trigger"), str)],
+        "scenes": [c["name"] for c in d.get("scene", []) if isinstance(c, dict) and isinstance(c.get("name"), str)],
+    }, ""
+
+
+def grade_route(texts: dict[str, str], checklist: dict, g: dict) -> tuple[dict, list[str]]:
+    """route (stage 1B item 13; docs/online-1B.md P13): on the server's log (`peer`, default S), the
+    route checklist's evidence. The level end of [level_end] (its class, and its recipient when the
+    file names one) must have S's first `level end <class> to <recipient> (generation <g>)` line, else
+    the case is "not reached" (a run that stopped before the end), and every level end S logged must
+    come once per class and recipient. With `next_zone`, that level must open after it as S's own
+    level change, come up on S and have its barrier released; how S got past the results screens
+    (native or press) is recorded. Every request or two_player trigger of the file must have been
+    applied on S (a replay of it that activated), every encounter started and completed, every
+    checkpoint's trigger applied (and its `expect` pattern seen), every scene started and ended. No
+    client of `clients` may leave the level by itself: its level guard passes only the session's own
+    request, a request while not connected, or a joiner's continue from its title, it runs no level end
+    of its own, and it played the server's level end of [level_end]'s class and generation exactly once
+    (`level end <class> from the server played here (generation <g>, ...`)."""
+    server = texts.get(g.get("peer", "S"), "")
+    lines = server.splitlines()
+    end = checklist["level_end"]
+    want_class, want_recipient = end["class"], end.get("recipient")
+    firsts = [(i, m.group(1), m.group(2), m.group(3)) for i, line in enumerate(lines)
+              if (m := LEVEL_END_FIRST.search(line))]
+    duplicates = sum(1 for line in lines if LEVEL_END_DUPLICATE.search(line))
+    applied: set[str] = set()
+    names: dict[str, str] = {}
+    for line in lines:
+        if m := REPLAY_LINE.search(line):
+            if not m.group(1).startswith("done"):
+                names.setdefault(m.group(1), m.group(2))
+        elif m := REPLAY_DONE.search(line):
+            if m.group(1) in names:
+                applied.add(names[m.group(1)])
+    started = [m.group(1) for line in lines if (m := ENCOUNTER_START.search(line))]
+    completed = [m.group(1) for line in lines if (m := ENCOUNTER_COMPLETE.search(line))]
+    scene_keys = {m.group(1): m.group(2) for line in lines if (m := SCENE_START.search(line))}
+    scene_ended = {m.group(1) for line in lines if (m := SCENE_END.search(line))}
+
+    def trigger_applied(name: str) -> bool:
+        return any(route_name_matches(name, seen) for seen in applied)
+
+    graded: dict = {
+        "level_ends": len(firsts), "level_end_duplicates_skipped": duplicates,
+        "triggers": [len([t for t in checklist["triggers"] if trigger_applied(t)]), len(checklist["triggers"])],
+        "encounters": [len([e for e in checklist["encounters"]
+                            if any(route_name_matches(e, x) for x in started)
+                            and any(route_name_matches(e, x) for x in completed)]), len(checklist["encounters"])],
+        "scenes": [len([n for n in checklist["scenes"]
+                        if any(v.casefold() == n.casefold() and k in scene_ended for k, v in scene_keys.items())]),
+                   len(checklist["scenes"])],
+    }
+    ends = [f for f in firsts if f[1] == want_class and (not want_recipient or route_name_matches(want_recipient, f[2]))]
+    if not ends:
+        seen = ", ".join(f"{k} {v[0]} of {v[1]}" for k, v in graded.items() if isinstance(v, list))
+        return graded, [f"grade route: not reached (no `level end {want_class}"
+                        f"{' to ' + want_recipient if want_recipient else ''}` line on {g.get('peer', 'S')}; "
+                        f"seen before the run stopped: {seen})"]
+    at = ends[0][0]
+    graded["level_end"] = {"class": ends[0][1], "recipient": ends[0][2], "generation": int(ends[0][3])}
+    reasons = []
+    counts: dict[tuple[str, str], int] = {}
+    for _, cls, recipient, _ in firsts:
+        counts[(cls, recipient)] = counts.get((cls, recipient), 0) + 1
+    for (cls, recipient), n in counts.items():
+        if n > 1:
+            reasons.append(f"grade route: level end {cls} to {recipient} {n} times (once per class and recipient)")
+    advanced = [m.group(1) for line in lines[at:] if (m := RESULTS_ADVANCED.search(line))]
+    graded["results_advanced"] = {"native": advanced.count("native"), "press": advanced.count("press")}
+    graded["results_done"] = any(RESULTS_DONE.search(line) for line in lines[at:])
+    zone = end.get("next_zone")
+    if zone:
+        opened = [(m.group(1), m.group(2)) for line in lines[at:] if (m := OWN_LEVEL_OPEN.search(line))
+                  and m.group(2).replace("\\", "/").rsplit("/", 1)[-1].casefold() == zone.casefold()]
+        if not opened:
+            reasons.append(f"grade route: the next level {zone} did not open as the server's own level change after"
+                           " the level end")
+        else:
+            gen = opened[0][0]
+            graded["next_level"] = {"zone": zone, "generation": int(gen)}
+            up = any(re.search(rf"Online: level {gen}: the server has it up", line) for line in lines[at:])
+            released = any(re.search(rf"Online: barrier {gen} released at tick", line) for line in lines[at:])
+            graded["next_level"].update({"up": up, "released": released})
+            if not up:
+                reasons.append(f"grade route: the next level {zone} (generation {gen}) never came up on the server")
+            elif not released:
+                reasons.append(f"grade route: the next level {zone}'s barrier {gen} was never released")
+    for t in checklist["triggers"]:
+        if not trigger_applied(t):
+            reasons.append(f"grade route: trigger {t} never applied on the server")
+    for e in checklist["encounters"]:
+        if not any(route_name_matches(e, x) for x in started):
+            reasons.append(f"grade route: encounter {e} never started on the server")
+        elif not any(route_name_matches(e, x) for x in completed):
+            reasons.append(f"grade route: encounter {e} never completed on the server")
+    for c in checklist["checkpoints"]:
+        if not trigger_applied(c["trigger"]):
+            reasons.append(f"grade route: checkpoint {c['trigger']} never applied on the server")
+        elif c.get("expect") and not any(re.search(c["expect"], line) for line in lines):
+            reasons.append(f"grade route: checkpoint {c['trigger']}: /{c['expect']}/ not on the server")
+    for n in checklist["scenes"]:
+        keys = [k for k, v in scene_keys.items() if v.casefold() == n.casefold()]
+        if not keys:
+            reasons.append(f"grade route: scene {n} never started on the server")
+        elif not any(k in scene_ended for k in keys):
+            reasons.append(f"grade route: scene {n} never ended on the server")
+    end_generation = graded["level_end"]["generation"]
+    played_line = re.compile(rf"Online: level end {re.escape(want_class)} from the server played here "
+                             rf"\(generation {end_generation}, ")
+    graded["clients_played"] = {}
+    for peer in g.get("clients", [p for p in texts if p != "S"]):
+        played = sum(1 for line in texts.get(peer, "").splitlines() if played_line.search(line))
+        graded["clients_played"][peer] = played
+        if played != 1:
+            reasons.append(f"grade route: client {peer} played the server's level end {want_class} of generation"
+                           f" {end_generation} {played} times (exactly once)")
+        for line in texts.get(peer, "").splitlines():
+            if (m := CLIENT_PASSED.search(line)) and not m.group(3).startswith(CLIENT_PASS_OK):
+                reasons.append(f"grade route: client {peer} left the level by itself ({m.group(2)}: {m.group(3)})")
+                break
+            if m := CLIENT_NATIVE_END.search(line):
+                reasons.append(f"grade route: client {peer} ran its own level end ({m.group(1)} to {m.group(2)})")
+                break
+    if reasons:
+        graded["violation"] = True
+    return graded, reasons
+
+
+def check_bandwidth(spec_name: str, g: object, names: list[str]) -> None:
+    """A bandwidth grade's options: `peer` (the log with the per-peer traffic lines, default S),
+    `statistic` (p50, p95 or max over the 10 s windows; default p95), `after` and `until` (patterns
+    bounding the windows), `min_windows` (a whole number >= 1, default 3)."""
+    if not isinstance(g, dict):
+        raise SpecError(f"{spec_name}: grade bandwidth must be a table")
+    if g.get("peer", "S") not in names:
+        raise SpecError(f"{spec_name}: grade bandwidth: `peer` {g.get('peer')!r} is not in {names}")
+    if g.get("statistic", "p95") not in ("p50", "p95", "max"):
+        raise SpecError(f"{spec_name}: grade bandwidth: statistic is p50, p95 or max")
+    n = g.get("min_windows", 3)
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+        raise SpecError(f"{spec_name}: grade bandwidth: min_windows must be a whole number >= 1")
+    for key in ("after", "until"):
+        if key in g:
+            try:
+                re.compile(g[key])
+            except (re.error, TypeError) as e:
+                raise SpecError(f"{spec_name}: grade bandwidth: bad `{key}` pattern: {e}") from e
+
+
+def grade_bandwidth(lines: list[tuple[float | None, str]], g: dict, thresholds: dict) -> tuple[dict, list[str]]:
+    """bandwidth (stage 1B item 13; docs/online-1B.md section 5, `bandwidth-tutorial_b`): from the
+    server's per-peer traffic lines (`traffic peer <p> gameplay <sent>/<received> state ... fast ...
+    bytes`, cumulative, every 10 s), each client's rate per window between two lines: up is what the
+    server received from it, down what it sent to it, all lanes, in kilobytes (1000 bytes) per second.
+    Each client's `statistic` (p95 by default) must be within tests/thresholds.toml
+    [bandwidth_per_client]: up at most up_kilobytes_per_s, down at most steady_down_kilobytes_per_s
+    (1B measures the pose and request floor: no enemy records yet). Windows start after `after` and
+    end at `until` (both optional); a counter that went back (a new session) starts over. A client with
+    fewer than `min_windows` windows, or no traffic line at all, is "not reached"."""
+    t = thresholds.get("bandwidth_per_client", {})
+    up_limit = float(t.get("up_kilobytes_per_s", 4.0))
+    down_limit = float(t.get("steady_down_kilobytes_per_s", 20.0))
+    statistic = g.get("statistic", "p95")
+    min_windows = int(g.get("min_windows", 3))
+    after = re.compile(g["after"]) if g.get("after") else None
+    until = re.compile(g["until"]) if g.get("until") else None
+    started = after is None
+    last: dict[str, tuple[float, int, int]] = {}
+    windows: dict[str, list[tuple[float, float]]] = {}
+    for when, line in lines:
+        if not started:
+            started = bool(after.search(line))
+            continue
+        if until and until.search(line):
+            break
+        m = TRAFFIC_PEER.search(line)
+        if not m or when is None:
+            continue
+        peer = m.group(1)
+        down = int(m.group(2)) + int(m.group(4)) + int(m.group(6))
+        up = int(m.group(3)) + int(m.group(5)) + int(m.group(7))
+        prev = last.get(peer)
+        last[peer] = (when, up, down)
+        if prev is None or when <= prev[0] or up < prev[1] or down < prev[2]:
+            continue
+        dt = when - prev[0]
+        windows.setdefault(peer, []).append(((up - prev[1]) / dt / 1000.0, (down - prev[2]) / dt / 1000.0))
+
+    def stat(values: list[float]) -> float:
+        return max(values) if statistic == "max" else percentile(values, 50 if statistic == "p50" else 95)
+
+    graded: dict = {"statistic": statistic, "up_limit_kbps": up_limit, "down_limit_kbps": down_limit, "peers": {}}
+    reasons = []
+    if not last:
+        return graded, ["grade bandwidth: not reached (no `traffic peer` line in the window)"]
+    for peer in sorted(last):
+        w = windows.get(peer, [])
+        if len(w) < min_windows:
+            reasons.append(f"grade bandwidth: not reached (peer {peer}: {len(w)} window(s), {min_windows} needed)")
+            continue
+        ups, downs = [x[0] for x in w], [x[1] for x in w]
+        rec = {"windows": len(w), "up_kbps": round(stat(ups), 3), "down_kbps": round(stat(downs), 3),
+               "up_max_kbps": round(max(ups), 3), "down_max_kbps": round(max(downs), 3)}
+        graded["peers"][peer] = rec
+        if rec["up_kbps"] > up_limit:
+            reasons.append(f"grade bandwidth: peer {peer} up {rec['up_kbps']:.2f} KB/s ({statistic}) over {up_limit} KB/s")
+            graded["violation"] = True
+        if rec["down_kbps"] > down_limit:
+            reasons.append(f"grade bandwidth: peer {peer} down {rec['down_kbps']:.2f} KB/s ({statistic}) over"
+                           f" {down_limit} KB/s")
+            graded["violation"] = True
+    return graded, reasons
+
+
+def grade_cross_peer(spec: Spec, r: PeerResult, texts: dict[str, str], repo: Path | None = None,
+                     thresholds: dict | None = None) -> list[str]:
+    """The grades a peer's result carries across peers: requests_answered on each peer it names (S's
+    log gives the peers gone at close), symmetry on its peer (S) (item 9); route on its peer (S), with
+    the route file from the game checkout `repo`, and bandwidth on its peer (S) (item 13)."""
     reasons: list[str] = []
     for gname, g in spec.grades.items():
         if gname == "requests_answered" and r.peer in g.get("peers", [n for n in spec.peers if n != "S"]):
-            gone = set(GONE_AT_CLOSE.findall(texts.get("S", "")))
+            # Only S's log holds other peers' keys whose finals could not reach them.
+            gone = set(GONE_AT_CLOSE.findall(texts.get("S", ""))) if r.peer == "S" else set()
             r.graded[gname], why = grade_requests_answered(texts.get(r.peer, ""), gone)
             reasons += why
         elif gname == "symmetry" and g.get("peer", "S") == r.peer:
             r.graded[gname], why = grade_symmetry(texts.get(r.peer, ""), g)
+            reasons += why
+        elif gname == "route" and g.get("peer", "S") == r.peer:
+            checklist, why_not = load_route_checklist((repo or Path(".")) / g["file"])
+            if checklist is None:
+                r.graded[gname] = {}
+                reasons.append(f"grade route: {why_not}")
+                continue
+            r.graded[gname], why = grade_route(texts, checklist, g)
+            reasons += why
+        elif gname == "bandwidth" and g.get("peer", "S") == r.peer:
+            r.graded[gname], why = grade_bandwidth(parse_log(texts.get(r.peer, ""))["lines"], g, thresholds or {})
             reasons += why
     return reasons
 
@@ -1001,6 +1360,9 @@ class PeerResult:
     peak_video_mb: int = 0
     graded: dict[str, dict] = field(default_factory=dict)
     accepted: list[str] = field(default_factory=list)  # grade failures the manifest accepts
+    stopped_by: str = ""  # ended by the runner at a fail-fast stop (CaseResult.stopped_early), not a timeout
+    startup_stall_s: float | None = None  # shader storage -> the guest's first line (startup_stall)
+    power_throttling: str = ""  # the runner's opt-out for this game (opt_out_of_power_throttling)
 
 
 @dataclass
@@ -1016,6 +1378,108 @@ class CaseResult:
     peers: list[PeerResult] = field(default_factory=list)
     leftover_processes: int = 0
     compare: dict = field(default_factory=dict)  # a [compare] case's comparison (compare_runs)
+    # Fail fast: `stopped early: <peer> <line> (fail fast)` when the runner stopped the run's games
+    # after a fatal line (a compared case: the first of its runs that stopped).
+    stopped_early: str = ""
+
+
+def crash_exit_code(code: int | None) -> bool:
+    """A Windows exit code that is an exception status (0x8xxxxxxx or 0xCxxxxxxx: an access violation
+    0xC0000005, a stack overrun 0xC0000409, a breakpoint 0x80000003), not a plain exit code."""
+    if code is None:
+        return False
+    c = code & 0xFFFFFFFF
+    return 0xC0000000 <= c < 0xD0000000 or 0x80000000 <= c < 0x90000000
+
+
+class LogTail:
+    """The lines a game appended to its log since the last read: each read takes only the new bytes,
+    keeps an unfinished last line for the next read, and starts over when the log was replaced (it got
+    shorter, is another file, or is gone: a hosted server's log, which each Host's new session folder
+    replaces). `generation` counts those replacements. A log that does not exist yet (a hosted
+    server's, before the session) has none. The file is opened only when it grew: a log that no longer
+    grows (a server that exited) is never held open while Host deletes the session folder."""
+
+    def __init__(self, path: Path) -> None:
+        self.path, self.offset, self.rest = path, 0, b""
+        self.ident: tuple[int, int] | None = None
+        self.generation = 0
+
+    def _restart(self) -> None:
+        self.offset, self.rest, self.generation = 0, b"", self.generation + 1
+
+    def size(self) -> int | None:
+        """The log's size now (None while there is none), after noting a replacement."""
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            if self.ident is not None or self.offset:
+                self.ident = None
+                self._restart()
+            return None
+        ident = (st.st_dev, st.st_ino) if st.st_ino else None
+        if st.st_size < self.offset or (ident and self.ident and ident != self.ident):
+            self._restart()
+        self.ident = ident or self.ident
+        return st.st_size
+
+    def new_lines(self) -> list[str]:
+        end = self.size()
+        if end is None or end == self.offset:
+            return []
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.offset)
+                data = f.read(end - self.offset)
+        except OSError:
+            return []
+        self.offset += len(data)
+        *whole, self.rest = (self.rest + data).split(b"\n")
+        return [line.decode("utf-8", errors="replace").rstrip("\r") for line in whole]
+
+
+class FailFast:
+    """Fail fast's watch over one run: each peer's log (LogTail) against that peer's fatal patterns
+    (its `forbid` and ALWAYS_FORBIDDEN), and the started games' exit codes. `hit` is the first fatal
+    finding, (peer, what), and `hit_at` its time.monotonic(). A crash exit stays. A line stays while
+    its log does: when the log is replaced before the stop (a hosted server's, by Host's next
+    session), the line is no longer in the log that is graded, so the hit is dropped and the watch
+    goes on."""
+
+    def __init__(self, logs: dict[str, Path], patterns: dict[str, list[str]]) -> None:
+        self.tails = {n: LogTail(p) for n, p in logs.items()}
+        self.patterns = {n: [re.compile(rx, re.M) for rx in patterns.get(n, [])] for n in logs}
+        self.hit: tuple[str, str] | None = None
+        self.hit_at = 0.0
+        self._hit_generation: int | None = None  # the hit line's log generation; None for an exit code
+
+    def _found(self, hit: tuple[str, str], generation: int | None) -> tuple[str, str]:
+        self.hit, self.hit_at, self._hit_generation = hit, time.monotonic(), generation
+        return hit
+
+    def check(self, procs: dict[str, subprocess.Popen] | None = None) -> tuple[str, str] | None:
+        if self.hit is not None:
+            tail = self.tails[self.hit[0]] if self._hit_generation is not None else None
+            if tail is None:
+                return self.hit
+            tail.size()
+            if tail.generation == self._hit_generation:
+                return self.hit
+            self.hit = self._hit_generation = None
+        for n, tail in self.tails.items():
+            for line in tail.new_lines():
+                if any(rx.search(line) for rx in self.patterns[n]):
+                    return self._found((n, line.strip()[:200]), tail.generation)
+        for n, p in (procs or {}).items():
+            if crash_exit_code(code := p.poll()):
+                return self._found((n, f"exit code 0x{code & 0xFFFFFFFF:08X}"), None)
+        return None
+
+
+def fail_fast_patterns(spec: Spec, peer: str) -> list[str]:
+    """A peer's fatal lines for fail fast: exactly the forbidden lines grade_peer fails it on."""
+    ps = spec.peers.get(peer)
+    return (ps.forbid if ps else []) + ALWAYS_FORBIDDEN
 
 
 def peer_script(spec: Spec, peer: str, figures: Path, join: str = "") -> str:
@@ -1024,11 +1488,174 @@ def peer_script(spec: Spec, peer: str, figures: Path, join: str = "") -> str:
     return spec.peers[peer].script.replace("{figures}", str(figures)).replace("{peer}", peer).replace("{join}", join)
 
 
+def peer_args(cfg: Config, args: list[str]) -> list[str]:
+    """A peer's spec args as the game gets them: {repo} is the checkout under test (G3, stage 1B)."""
+    return [a.replace("{repo}", cfg.repo.as_posix()) for a in args]
+
+
 def free_loopback_port() -> int:
     """A port nothing listens on now, for a hosted server (its owner passes it on)."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+# --- the runner's environment: its token, the games' power throttling ------------------------------
+#
+# A runner started under a restricted token (an agent sandbox) starts its games with that token too.
+# They then cannot use the GPU shader caches in the user profile (%LOCALAPPDATA%\D3DSCache and the
+# driver's cache allow only SYSTEM, Administrators and the user) and compile every pipeline cold
+# before the guest starts: 4-32 s per start, more under load (P1j's startup stall). Their load and
+# frame times are then not comparable with other runs, so `test` refuses such a token unless
+# --allow-restricted.
+WINDOWS = os.name == "nt"
+TOKEN_QUERY = 0x0008
+TOKEN_INTEGRITY_LEVEL = 25  # TOKEN_INFORMATION_CLASS TokenIntegrityLevel
+TOKEN_IS_APP_CONTAINER = 29  # TOKEN_INFORMATION_CLASS TokenIsAppContainer
+MEDIUM_INTEGRITY_RID = 0x2000  # SECURITY_MANDATORY_MEDIUM_RID; low is 0x1000, untrusted 0
+_WIN: dict = {}
+
+
+def _win() -> tuple:
+    """advapi32 and kernel32 with the argument types the token check and the throttling opt-out use."""
+    if not _WIN:
+        import ctypes
+        from ctypes import wintypes
+
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        adv.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        adv.IsTokenRestricted.argtypes = [wintypes.HANDLE]
+        adv.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                            ctypes.POINTER(wintypes.DWORD)]
+        adv.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+        adv.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+        adv.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        adv.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+        _WIN.update(ctypes=ctypes, wintypes=wintypes, adv=adv, k32=k32)
+    return _WIN["ctypes"], _WIN["wintypes"], _WIN["adv"], _WIN["k32"]
+
+
+def token_handle_restriction(token: int) -> str:
+    """Why a token (a handle with TOKEN_QUERY) is restricted, '' when it is not: restricting SIDs
+    (IsTokenRestricted, as a sandbox's token has), an AppContainer token, or an integrity level below
+    medium. Each cause is checked on its own; one that cannot be read counts as absent."""
+    ctypes, wintypes, adv, _ = _win()
+    causes = []
+    if adv.IsTokenRestricted(token):
+        causes.append("a restricted token (IsTokenRestricted)")
+    flag, size = wintypes.DWORD(), wintypes.DWORD()
+    if adv.GetTokenInformation(token, TOKEN_IS_APP_CONTAINER, ctypes.byref(flag), ctypes.sizeof(flag),
+                               ctypes.byref(size)) and flag.value:
+        causes.append("an AppContainer token")
+    adv.GetTokenInformation(token, TOKEN_INTEGRITY_LEVEL, None, 0, ctypes.byref(size))
+    if size.value:
+        buf = ctypes.create_string_buffer(size.value)
+        if adv.GetTokenInformation(token, TOKEN_INTEGRITY_LEVEL, buf, size, ctypes.byref(size)):
+            sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]  # TOKEN_MANDATORY_LABEL.Label.Sid
+            rid = adv.GetSidSubAuthority(sid, adv.GetSidSubAuthorityCount(sid)[0] - 1)[0]
+            if rid < MEDIUM_INTEGRITY_RID:
+                causes.append(f"a low integrity level (0x{rid:04X})")
+    return "; ".join(causes)
+
+
+def token_restriction() -> str:
+    """Why the runner's own process token is restricted ('' when it is not, and off Windows); its
+    games inherit it. Raises OSError when the token cannot be opened. The tests replace it."""
+    if not WINDOWS:
+        return ""
+    ctypes, wintypes, adv, k32 = _win()
+    token = wintypes.HANDLE()
+    if not adv.OpenProcessToken(k32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
+        raise OSError(ctypes.get_last_error(), "OpenProcessToken failed")
+    try:
+        return token_handle_restriction(token)
+    finally:
+        k32.CloseHandle(token)
+
+
+def token_preflight(allow: bool) -> dict:
+    """`test`'s check before any game starts: {"restricted": True, False or None (not checked),
+    "cause": ...}. A restricted token is refused with one line (SystemExit) unless `allow`; a check
+    that cannot run is printed and the run goes on."""
+    try:
+        cause = token_restriction()
+    except Exception as e:  # noqa: BLE001 - an unreadable token is reported, not fatal
+        why = f"{type(e).__name__}: {e}"
+        print(f"skytest: could not check this runner's token ({why}); the games start, a restricted one "
+              "would show as a startup stall", flush=True)
+        return {"restricted": None, "cause": f"not checked: {why}"}
+    if not cause:
+        return {"restricted": False, "cause": ""}
+    if not allow:
+        raise SystemExit(f"skytest: refused to start games: this runner has {cause}, as in an agent sandbox, so its "
+                         "games could not use the GPU shader caches and would compile every pipeline cold at each "
+                         "start (4-32 s); run skytest outside the sandbox, or pass --allow-restricted to run anyway "
+                         "(timings then not comparable)")
+    print(f"skytest: WARNING: running with {cause} (--allow-restricted): the games compile their pipelines cold, "
+          "their timings are not comparable with other runs", flush=True)
+    return {"restricted": True, "cause": cause}
+
+
+def token_report_line(token: dict) -> str:
+    """report.md's line on the runner's token (token_preflight's result)."""
+    if token.get("restricted") is None:
+        return f"Token: not checked ({token.get('cause', '').removeprefix('not checked: ')})."
+    if token["restricted"]:
+        return (f"Token: RESTRICTED ({token['cause']}); started with --allow-restricted: the games could not use "
+                "the GPU shader caches, so this run's timings are not comparable with other runs.")
+    return "Token: not restricted."
+
+
+# Every game the runner starts opts out of Windows power throttling (EcoQoS), as the server does for
+# itself (game: src/online/server/server_role.cpp OptOutOfPowerThrottling): a busy machine (a parallel
+# build) otherwise slowed the test clients' loads for minutes while S, opted out, kept its pace
+# (stage 1B, level-guard-not-owner). PROCESS_POWER_THROTTLING_STATE is {Version, ControlMask,
+# StateMask}: a control bit with its state bit clear turns that throttling off for the process.
+PROCESS_POWER_THROTTLING = 4  # PROCESS_INFORMATION_CLASS ProcessPowerThrottling
+POWER_THROTTLING_VERSION = 1  # PROCESS_POWER_THROTTLING_CURRENT_VERSION
+POWER_THROTTLING_EXECUTION_SPEED = 0x1
+POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
+_THROTTLING_LOGGED: list[str] = []  # the one failure line printed in this runner process
+
+
+def set_process_information(handle: int, info_class: int, state: tuple[int, int, int]) -> int:
+    """kernel32 SetProcessInformation with a PROCESS_POWER_THROTTLING_STATE (Version, ControlMask,
+    StateMask): 0 when Windows took it, else its error code. The tests replace it."""
+    ctypes, wintypes, _, k32 = _win()
+    s = (wintypes.ULONG * 3)(*state)
+    if k32.SetProcessInformation(handle, info_class, ctypes.byref(s), ctypes.sizeof(s)):
+        return 0
+    return ctypes.get_last_error() or -1
+
+
+def opt_out_of_power_throttling(handle: int) -> str:
+    """Opts a started game (its process handle) out of power throttling: the execution speed and the
+    timer resolution, else the execution speed alone (a Windows without the timer flag). Returns what
+    took; a failure is printed once per runner process and never stops a run."""
+    if not WINDOWS:
+        return "not Windows"
+    try:
+        first = set_process_information(handle, PROCESS_POWER_THROTTLING, (
+            POWER_THROTTLING_VERSION,
+            POWER_THROTTLING_EXECUTION_SPEED | POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, 0))
+        if first == 0:
+            return "opted out"
+        second = set_process_information(handle, PROCESS_POWER_THROTTLING, (
+            POWER_THROTTLING_VERSION, POWER_THROTTLING_EXECUTION_SPEED, 0))
+        if second == 0:
+            return f"opted out (execution speed only; the timer resolution flag was refused, error {first})"
+        why = f"Windows error {second}"
+    except Exception as e:  # noqa: BLE001 - never stops a run
+        why = f"{type(e).__name__}: {e}"
+    if not _THROTTLING_LOGGED:
+        _THROTTLING_LOGGED.append(why)
+        print(f"skytest: could not opt a game out of Windows power throttling ({why}); the run goes on, "
+              "a busy machine may slow its games", flush=True)
+    return f"failed: {why}"
 
 
 def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -> tuple[Path, list[str]]:
@@ -1054,7 +1681,7 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -
         *cfg.default_args,
         *(["--window_hidden=true"] if peer == "S" else []),
         *([f"--online_port={port}"] if port and peer == "H" else []),
-        *spec.peers[peer].args,
+        *peer_args(cfg, spec.peers[peer].args),
     ]
     check_args(args)
     return d, args
@@ -1086,7 +1713,23 @@ def parse_log(text: str) -> dict:
             out["private"] = max(out["private"], int(fr.group(6)))
             out["working"] = max(out["working"], int(fr.group(7)))
             out["video"] = max(out["video"], int(fr.group(8)))
+    out["startup_stall"] = startup_stall(out["lines"])
     return out
+
+
+def startup_stall(lines: list[tuple[float | None, str]]) -> float | None:
+    """Seconds from the log's "Initializing shader storage" line to the guest's first line after it
+    (GUEST_FIRST_LINE); None when the log lacks either."""
+    t0 = None
+    for t, line in lines:
+        if t is None:
+            continue
+        if t0 is None:
+            if SHADER_STORAGE.search(line):
+                t0 = t
+        elif GUEST_FIRST_LINE.search(line):
+            return round(t - t0, 2)
+    return None
 
 
 def lines_after(lines: list[tuple[float | None, str]], after: str | None) -> list[str]:
@@ -1136,7 +1779,7 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
     """Plan 5.5 against tests/thresholds.toml, for the grades the spec names for this peer."""
     reasons = []
     for gname, g in spec.grades.items():
-        if gname in ("requests_answered", "symmetry", "save_copy"):
+        if gname in ("requests_answered", "symmetry", "save_copy", "route", "bandwidth"):
             continue  # graded across peers (grade_cross_peer, grade_save_copy)
         if g.get("peer", "S" if gname == "server_frame_time" else "H") != r.peer:
             continue
@@ -1232,9 +1875,14 @@ def grade_save_copy(r: PeerResult, before: dict[str, str], after: dict[str, str]
     return []
 
 
+def peer_log_path(run: Path, peer: str, hosted: bool) -> Path:
+    """Where a peer writes its log in a run folder: a hosted server's is in its owner's session folder."""
+    return run / "H" / HOSTED_SERVER_LOG if hosted and peer == "S" else run / peer / "game.log"
+
+
 def read_peer_log(run: Path, peer: str, hosted: bool) -> str:
     """A peer's log in a run folder: a hosted server's is in its owner's session folder."""
-    log = run / "H" / HOSTED_SERVER_LOG if hosted and peer == "S" else run / peer / "game.log"
+    log = peer_log_path(run, peer, hosted)
     return log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
 
 
@@ -1283,7 +1931,9 @@ def check_count_and_order(text: str, ps: PeerSpec) -> list[str]:
 
 def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
     reasons = []
-    if r.ended_by_runner:
+    if r.ended_by_runner and r.stopped_by:
+        reasons.append(f"ended by the runner: {r.stopped_by}")
+    elif r.ended_by_runner:
         reasons.append(f"did not quit within {spec.timeout:.0f} s; ended by the runner")
     elif r.exit_code is not None and r.exit_code != 0:  # None: a hosted server, its owner's child
         reasons.append(f"exit code {r.exit_code}")
@@ -1374,6 +2024,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                                          stdin=subprocess.DEVNULL, creationflags=winjob.SUSPENDED_START)
                 try:
                     job.add(p)
+                    # Before it runs: no power throttling (a failure is printed once, never fatal).
+                    results[n].power_throttling = opt_out_of_power_throttling(int(getattr(p, "_handle", 0) or 0))
                     winjob.resume(p)
                 except BaseException:
                     p.kill()
@@ -1383,13 +2035,27 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                 started[n] = time.monotonic()
                 results[n].started_after_s = round(started[n] - t_start, 1)
             deadline = time.monotonic() + spec.timeout
-            while len(ended) < len(procs) and time.monotonic() < deadline:
+            # Fail fast: the first fatal line (or crash exit) moves the stop to a grace after it.
+            watch = FailFast({n: peer_log_path(run, n, hosted) for n in names},
+                             {n: fail_fast_patterns(spec, n) for n in names}) if spec.fail_fast else None
+            stop_at, next_check, early = deadline, 0.0, False
+            while len(ended) < len(procs) and time.monotonic() < stop_at:
                 note_ends()
-                time.sleep(0.5)
+                if watch is not None and time.monotonic() >= next_check:
+                    next_check = time.monotonic() + FAIL_FAST_POLL
+                    # Checked through the grace too: a hit whose log was replaced meanwhile is dropped.
+                    stop_at = min(deadline, watch.hit_at + cfg.fail_fast_grace) if watch.check(procs) else deadline
+                    early = stop_at < deadline  # else the timeout comes first: a timeout as before
+                time.sleep(min(0.5, max(0.0, stop_at - time.monotonic())))
+            stopped = ""
+            if early and watch is not None and watch.hit and any(p.poll() is None for p in procs.values()):
+                stopped = f"stopped early: {watch.hit[0]} {watch.hit[1]} (fail fast)"
+                res.stopped_early = stopped
             for n, p in procs.items():
                 if p.poll() is None:
                     p.kill()
                     results[n].ended_by_runner = True
+                    results[n].stopped_by = stopped
                 try:
                     p.wait(timeout=30)
                 except subprocess.TimeoutExpired:
@@ -1413,13 +2079,14 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         r.build, r.levels, r.fps, r.longest_frame_ms = parsed["build"], parsed["levels"], parsed["fps"], parsed["longest"]
         r.peak_private_mb, r.peak_working_set_mb, r.errors = parsed["private"], parsed["working"], parsed["errors"]
         r.frame_p95_ms, r.peak_video_mb = parsed["frame_p95"], parsed["video"]
+        r.startup_stall_s = parsed["startup_stall"]
         grade_peer(spec, r, text, parsed)
         if spec.grades:
             limit = frame_rate_limit(r.command, run / n / "settings.toml")
             extra = grade_thresholds(spec, r, parsed, thresholds or {}, limit, baseline)
             if n in saves_before:
                 extra += grade_save_copy(r, saves_before[n], saves_after[n], save_title)
-            extra += grade_cross_peer(spec, r, texts)
+            extra += grade_cross_peer(spec, r, texts, cfg.repo, thresholds or {})
             # A grade the manifest accepts for this case (plan 5.4: accepted failures with a reason)
             # is recorded, not failed on; everything else still has to pass.
             # Only a measured violation is accepted: a missing measurement or baseline still fails.
@@ -1434,6 +2101,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                 r.status = "fail"
     res.peers = [results[n] for n in names]
     failed = [r.peer for r in res.peers if r.status != "pass"]
+    if res.stopped_early:
+        res.reasons.append(res.stopped_early)
     if res.leftover_processes:
         res.reasons.append(f"{res.leftover_processes} game process(es) still running after the case; ended")
     if failed:
@@ -1465,7 +2134,10 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
 #     the mean A/A rate; a sampled count gives a range of rates (rates_within_noise). Enter, exit,
 #     de-act, messages and telegrams stay counts;
 #   - the load times: a test run no slower than the slowest A/A run plus the A/A spread (at least
-#     `load_floor_s`); faster passes (the skip saves GPU work);
+#     `load_floor_s`); faster passes (the skip saves GPU work). They start at the guest's start, not
+#     at the log's first line (`guest start -> hub`), and a level the session opened before the
+#     game asked for it at its request line (`request -> server up`, `request -> barrier`; else
+#     `open -> ...`): the waits before them are startup stalls, not loads (P1j C2);
 #   - the GPU counters: 0 resolve readbacks in every run, and 0 memexport draws (draw_skip.h: the
 #     skip is trusted only while memexport is 0) unless `memexport_zero = false`.
 # A run without its `reached` evidence makes the comparison "not reached": a failure, never a pass.
@@ -1514,6 +2186,27 @@ def trace_dumps(texts: list[str]) -> list[tuple[int, dict[str, int]]]:
     return dumps
 
 
+# A level load key from compare_keys: (level <g> <zone>), its anchor, what it ends at.
+LOAD_ANCHOR = re.compile(r"^(level \S+ .+): (request|open) -> (server up|barrier)$")
+
+
+def level_span_start(lines: list[tuple[float | None, str]], i: int, g: str, zone: str) -> tuple[float, str]:
+    """Where level g's load spans start, for its open line at lines[i]: at the peer's own `Level watch:
+    <zone>: requested by the game` when that comes after the open (and before the level is up or the
+    next level opens): ("request" and its time). The session can open a level before the game asks
+    for it, e.g. the boot hub while the server still starts up, or the owner's continue that reaches S
+    before its guest runs (P1j C2): that wait is not the load's. Else the open line: ("open")."""
+    t_open = lines[i][0]
+    leaf = zone.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    for t, line in lines[i + 1:]:
+        if (u := LEVEL_UP.search(line)) and u.group(1) == g or LEVEL_OPEN.search(line):
+            break
+        if (t is not None and (w := LEVEL_WATCH_STEP.search(line)) and w.group(2) == "requested by the game"
+                and w.group(1).casefold() == leaf):
+            return t, "request"
+    return t_open, "open"
+
+
 def compare_keys(text: str, c: dict) -> dict:
     """What one run's log (the compared peer's) says: the barrier and level lines in order, the
     world-message counts in the window, the load times and the GPU counter totals."""
@@ -1531,21 +2224,25 @@ def compare_keys(text: str, c: dict) -> dict:
 
     loads: dict[str, float] = {}
     t_first = next((t for t, _ in lines if t is not None), None)
+    # The guest's start (GUEST_START; the log's first line without it): the host's startup before it
+    # can stall for seconds whatever the workload (P1j C2), so the spans do not count it.
+    t_guest = next((t for t, line in lines if t is not None and GUEST_START.search(line)), t_first)
     for i, (t, line) in enumerate(lines):
         if t is None:
             continue
-        if SERVER_HUB.search(line) and t_first is not None and "start -> hub" not in loads:
-            loads["start -> hub"] = round(t - t_first, 3)
+        if SERVER_HUB.search(line) and t_guest is not None and "guest start -> hub" not in loads:
+            loads["guest start -> hub"] = round(t - t_guest, 3)
         if m := LEVEL_OPEN.search(line):
             g, zone = m.groups()
-            up, bar = f"level {g} {zone}: open -> server up", f"level {g} {zone}: open -> barrier"
+            t0, anchor = level_span_start(lines, i, g, zone)
+            up, bar = f"level {g} {zone}: {anchor} -> server up", f"level {g} {zone}: {anchor} -> barrier"
             for t2, later in lines[i + 1:]:
                 if t2 is None:
                     continue
                 if up not in loads and (u := LEVEL_UP.search(later)) and u.group(1) == g:
-                    loads[up] = round(t2 - t, 3)
+                    loads[up] = round(t2 - t0, 3)
                 if bar not in loads and (b := BARRIER.search(later)) and b.group(1) == g:
-                    loads[bar] = round(t2 - t, 3)
+                    loads[bar] = round(t2 - t0, 3)
                 if up in loads and bar in loads:
                     break
         if m := LEVEL_WATCH_LOAD.search(line):
@@ -1564,7 +2261,7 @@ def compare_keys(text: str, c: dict) -> dict:
         if c.get("window_end"):
             end_rx = re.compile(c["window_end"])
             end = next((k for k in range(start + 1, len(texts)) if end_rx.search(texts[k])), len(texts))
-        after = [d for d in trace_dumps(texts) if d[0] > start]
+        after = [d for d in trace_dumps(texts) if start < d[0] < end]
         keys: dict[str, int] = {}
         if len(after) >= 2:
             (i0, first), (i1, last) = after[0], after[-1]
@@ -1780,6 +2477,7 @@ def compare_runs(runs: list[dict], c: dict) -> dict:
 
     # The load times: a test run no slower than the A/A allows.
     floor = float(c.get("load_floor_s", 0.0))
+    anchors_differ: set[str] = set()
     for k in sorted(set().union(*(keys[n]["loads"] for n in names))):
         lacking = [n for n in names if k not in keys[n]["loads"]]
         nv = [keys[n]["loads"][k] for n in noise if k in keys[n]["loads"]]
@@ -1787,6 +2485,21 @@ def compare_runs(runs: list[dict], c: dict) -> dict:
         out["loads"][k] = entry
         if lacking:
             entry["ok"] = False
+            # A level span that starts at the request in one run and at the open in another (the
+            # request reached S before or after the session opened the level): one clear reason for
+            # the pair, not two "not in run(s)" lines.
+            if a := LOAD_ANCHOR.match(k):
+                other = f"{a.group(1)}: {'open' if a.group(2) == 'request' else 'request'} -> {a.group(3)}"
+                if all(other in keys[n]["loads"] for n in lacking):
+                    pair = f"{a.group(1)}: -> {a.group(3)}"
+                    if pair not in anchors_differ:
+                        anchors_differ.add(pair)
+                        by = {w: [n for n in names if f"{a.group(1)}: {w} -> {a.group(3)}" in keys[n]["loads"]]
+                              for w in ("request", "open")}
+                        reasons.append(f"compare: load {a.group(1)} -> {a.group(3)}: the anchor differs between "
+                                       f"runs: the request in run(s) {', '.join(by['request'])}, the open in "
+                                       f"run(s) {', '.join(by['open'])}")
+                    continue
             reasons.append(f"compare: load {k}: not in run(s) {', '.join(lacking)}")
             continue
         for n in test:
@@ -1928,6 +2641,8 @@ def run_compare_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp:
             p.peer = f"{name}:{p.peer}"
             res.peers.append(p)
         res.reasons += [f"run {name}: {why}" for why in sub.reasons]
+        if sub.stopped_early and not res.stopped_early:
+            res.stopped_early = f"run {name}: {sub.stopped_early}"
         if sub.status == "error":
             res.status, res.seconds = "error", round(time.monotonic() - t_start, 1)
             return res
@@ -1980,8 +2695,11 @@ def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: l
 
 
 def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: dict, thresholds: dict,
-                 max_games: int, guard: list[dict], unwritten: list[str], checkpoint: dict | None = None) -> None:
+                 max_games: int, guard: list[dict], unwritten: list[str], checkpoint: dict | None = None,
+                 gate: dict | None = None, token: dict | None = None) -> None:
     lines = [f"# skytest run {out.name}", "", f"At most {max_games} game(s) at once.", ""]
+    if token is not None:
+        lines += [token_report_line(token), ""]
     lines += ["| Case | Layout | Stage | Status | Time | Why |", "|---|---|---|---|---|---|"]
     for r in results:
         why = "; ".join(r.reasons) or ""
@@ -1990,18 +2708,25 @@ def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: di
         if not r.peers:
             continue
         lines += ["", f"## {r.case} ({r.layout})", "", f"Folder: `{r.folder}`", "",
-                  "| Peer | Status | Exit | Time | Levels | FPS | Longest frame | Peak private MB | Errors | Measures |",
-                  "|---|---|---|---|---|---|---|---|---|---|"]
+                  "| Peer | Status | Exit | Time | Startup stall | Levels | FPS | Longest frame | Peak private MB "
+                  "| Errors | Measures |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|"]
         for p in r.peers:
             ms = ", ".join(f"{k} {v} s" if v is not None else f"{k} -" for k, v in p.measures.items())
             fps = ", ".join(f"{v:.1f}" for v in p.fps)
             lf = ", ".join(str(v) for v in p.longest_frame_ms)
             exit_ = "ended" if p.ended_by_runner else str(p.exit_code)
-            lines.append(f"| {p.peer} | {p.status.upper()} | {exit_} | {p.seconds:.0f} s | {' > '.join(p.levels)} "
-                         f"| {fps} | {lf} | {p.peak_private_mb} | {p.errors} | {ms} |")
+            stall = f"{p.startup_stall_s:.2f} s" if p.startup_stall_s is not None else "-"
+            lines.append(f"| {p.peer} | {p.status.upper()} | {exit_} | {p.seconds:.0f} s | {stall} "
+                         f"| {' > '.join(p.levels)} | {fps} | {lf} | {p.peak_private_mb} | {p.errors} | {ms} |")
         for p in r.peers:
             for why in p.reasons:
                 lines.append(f"- {p.peer}: {why}")
+        for p in r.peers:
+            if p.startup_stall_s is not None and p.startup_stall_s > STARTUP_STALL_WARN_S:
+                lines.append(f"- WARNING: {p.peer}: startup stall {p.startup_stall_s:.1f} s (shader storage to the "
+                             f"guest's first line, over {STARTUP_STALL_WARN_S:.0f} s): the GPU shader caches were cold "
+                             "or unusable (a restricted token?); this run's load and frame times carry it")
         if r.compare:
             lines += [""] + compare_markdown(r.compare)
     written = {s for s in (c.get("id") for c in manifest.get("case", []))}
@@ -2018,6 +2743,8 @@ def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: di
               f"{len(written)}."]
     if checkpoint:
         lines += ["", f"**{checkpoint['line']}**"]
+    if gate:
+        lines += ["", "## Gate", "", gate_line(gate), "", "```", *gate_table(gate), "```"]
     (out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -2036,6 +2763,110 @@ def previous_statuses(cfg: Config, current: Path) -> dict[str, str]:
         except (OSError, ValueError, KeyError):
             continue
     return seen
+
+
+def last_run_seconds(cfg: Config, current: Path | None = None) -> dict[str, dict[str, tuple[float, str]]]:
+    """Each case's recorded times, from the run store's results.json files (the same walk as
+    previous_statuses, oldest run folder first): under "pass" its newest pass, under "fail" its
+    longest fail, each as (`seconds`, the run folder's name). A fail can end early (a crash, a startup
+    failure), so only a pass sets an estimate; the longest fail is shown beside a timeout. A run that
+    ended in error, capacity or not run says nothing about the case's length and is skipped."""
+    seen: dict[str, dict[str, tuple[float, str]]] = {}
+    runs = cfg.store / "runs"
+    if not runs.is_dir():
+        return seen
+    for f in sorted(runs.glob("*/results.json")):
+        if f.parent == current:
+            continue
+        try:
+            cases = json.loads(f.read_text(encoding="utf-8")).get("cases", [])
+        except (OSError, ValueError):
+            continue
+        for c in cases:
+            try:
+                seconds = float(c.get("seconds", 0))
+                status = c.get("status")
+                if status not in ("pass", "fail") or seconds <= 0:
+                    continue
+                times = seen.setdefault(c["case"], {})
+                if status == "pass" or seconds >= times.get("fail", (0.0, ""))[0]:
+                    times[status] = (seconds, f.parent.name)
+            except (TypeError, ValueError, KeyError, AttributeError):
+                continue
+    return seen
+
+
+def gate_estimate(cfg: Config, manifest: dict, stages: list[str] | None, specs: list[Spec],
+                  current: Path | None = None) -> dict:
+    """The gate cases (gate = true) of these stages (all when None) and their expected minutes: a
+    case's newest pass, else its spec's timeout as an upper bound (per [[compare.run]] for a compared
+    case; a case that only failed names its longest fail beside it), else `no spec` (named, never
+    counted silently)."""
+    by_name = {s.name: s for s in specs}
+    last = last_run_seconds(cfg, current)
+    rows = []
+    for c in manifest.get("case", []):
+        if not c.get("gate") or (stages is not None and str(c.get("stage")) not in stages):
+            continue
+        row = {"case": c["id"], "stage": str(c.get("stage")), "layout": c.get("layout", ""), "seconds": None}
+        s = by_name.get(c["id"])
+        times = last.get(c["id"], {})
+        if "pass" in times and s is not None:
+            row["seconds"], run = times["pass"]
+            row["source"] = f"last pass {run}"
+        elif s is not None:
+            runs = max(1, len(s.compare.get("run", []))) if s.compare else 1
+            row["seconds"] = s.timeout * runs
+            fail = times.get("fail")
+            row["source"] = ("spec timeout" + (f" x {runs} runs" if runs > 1 else "")
+                             + (f" (never passed; longest fail {fail[0] / 60:.1f} min, {fail[1]})" if fail
+                                else " (never run)"))
+        else:
+            row["source"] = "no spec"
+        rows.append(row)
+    return gate_totals(stages, rows)
+
+
+def gate_totals(stages: list[str] | None, rows: list[dict]) -> dict:
+    """The gate's sums over its rows (gate_estimate's, or the ones a `test --gate CASE...` runs)."""
+    timed = [r for r in rows if r["seconds"] is not None]
+    minutes = sum(r["seconds"] for r in timed) / 60
+    return {
+        "stages": stages, "cases": rows, "minutes": round(minutes, 1),
+        "from_runs": [r["case"] for r in rows if r["source"].startswith("last pass")],
+        "from_timeouts": [r["case"] for r in rows if r["source"].startswith("spec timeout")],
+        "no_spec": [r["case"] for r in rows if r["source"] == "no spec"],
+        "limit_minutes": GATE_MINUTES, "over": minutes > GATE_MINUTES,
+    }
+
+
+def gate_only(g: dict, names: set[str], patterns: list[str]) -> dict:
+    """The estimate of a `test --gate CASE...` run: the rows of the cases it runs, and the spec-less
+    gate cases its patterns name; the sums over those alone."""
+    rows = [r for r in g["cases"] if r["case"] in names
+            or (r["source"] == "no spec" and any(fnmatch.fnmatch(r["case"], p) for p in patterns))]
+    return gate_totals(g["stages"], rows)
+
+
+def gate_line(g: dict) -> str:
+    """The line `test --gate` prints before it runs, and `list --gate` after its table."""
+    line = (f"gate: {len(g['cases'])} cases, expected {g['minutes']:.0f} min ({len(g['from_runs'])} from their last"
+            f" passes, {len(g['from_timeouts'])} from spec timeouts" +
+            (f": {', '.join(g['from_timeouts'])}" if g["from_timeouts"] else "") + ")")
+    if g["no_spec"]:
+        line += f"; no spec, not counted: {', '.join(g['no_spec'])}"
+    line += f"; the plan's subset is {g['limit_minutes']} min"
+    if g["over"]:
+        line += f" (over by {g['minutes'] - g['limit_minutes']:.0f} min)"
+    return line
+
+
+def gate_table(g: dict) -> list[str]:
+    lines = []
+    for r in g["cases"]:
+        t = f"{r['seconds'] / 60:5.1f} min" if r["seconds"] is not None else "    - min"
+        lines.append(f"{r['case']:<32} {r['layout']:<9} stage {r['stage']:<5} {t}  {r['source']}")
+    return lines
 
 
 def write_findings(out: Path, results: list[CaseResult], before: dict[str, str]) -> None:
@@ -2150,9 +2981,22 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     janitor_line(cfg)
     manifest = load_manifest(cfg)
     stages = stages_up_to(manifest, a.stage) if a.stage else None
-    specs = select(all_specs(cfg), a.cases, stages)
+    gate_run = bool(getattr(a, "gate", False))
+    gate = None
+    every_spec = all_specs(cfg)
+    specs = select(every_spec, a.cases, stages)
+    if gate_run:
+        gate = gate_estimate(cfg, manifest, stages, every_spec)
+        gate_ids = {r["case"] for r in gate["cases"]}
+        specs = [s for s in specs if s.name in gate_ids]
+        if a.cases not in ([], ["all"]):
+            gate = gate_only(gate, {s.name for s in specs}, a.cases)
+        print(gate_line(gate), flush=True)
     if not specs:
         raise SystemExit("no case to run")
+    # Before anything is copied or started: a restricted token is refused unless --allow-restricted.
+    token = token_preflight(bool(getattr(a, "allow_restricted", False)))
+    gate_started = time.monotonic()
     check_disc(cfg)
     max_games = a.max_games or default_max_games()
     snap = snapshot_build(cfg)
@@ -2180,15 +3024,23 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     unwritten = [c["id"] for c in manifest.get("case", [])
                  if c.get("kind") == "required" and not c.get("spec")
                  and (stages is None or str(c.get("stage")) in stages)] if a.cases in ([], ["all"]) else []
+    if gate is not None:
+        unwritten = list(gate["no_spec"])  # a gate run names its own spec-less cases, nothing else
     touched = [g["folder"] for g in guard if not g["unchanged"]]
-    full_run = a.cases in ([], ["all"])
+    # A gate run is a subset: never a checkpoint.
+    full_run = a.cases in ([], ["all"]) and gate is None
     before = previous_statuses(cfg, out)
     checkpoint = checkpoint_verdict(manifest, a.stage, stages, results, touched, before) if a.stage and full_run else None
     payload = {"snapshot": str(snap), "max_games": max_games, "stages": stages, "thresholds": thresholds,
                "guarded_folders": guard, "required_without_spec": unwritten, "checkpoint": checkpoint,
+               "restricted_token": token["restricted"], "restricted_token_cause": token["cause"],
                "cases": [asdict(r) for r in results]}
+    if gate is not None:
+        gate["actual_minutes"] = round((time.monotonic() - gate_started) / 60, 1)
+        gate["case_minutes"] = round(sum(r.seconds for r in results) / 60, 1)
+        payload["gate"] = gate
     (out / "results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    write_report(cfg, out, results, manifest, thresholds, max_games, guard, unwritten, checkpoint)
+    write_report(cfg, out, results, manifest, thresholds, max_games, guard, unwritten, checkpoint, gate, token)
     write_findings(out, results, before)
     failed = [r for r in results if r.status not in ("pass", "capacity")]
     capacity = [r for r in results if r.status == "capacity"]
@@ -2199,6 +3051,9 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
               f" {', '.join(r.case for r in capacity)}")
     if checkpoint:
         print(checkpoint["line"])
+    if gate is not None:
+        print(f"gate: {gate['actual_minutes']:.0f} min (the cases {gate['case_minutes']:.0f} min; expected"
+              f" {gate['minutes']:.0f})")
     print(f"report: {out / 'report.md'}")
     return 1 if failed or touched else 0
 
@@ -2235,6 +3090,14 @@ def cmd_compare(cfg: Config, a: argparse.Namespace) -> int:
 
 
 def cmd_list(cfg: Config, a: argparse.Namespace) -> int:
+    if getattr(a, "gate", False):
+        manifest = load_manifest(cfg)
+        stage = getattr(a, "stage", None)
+        g = gate_estimate(cfg, manifest, stages_up_to(manifest, stage) if stage else None, all_specs(cfg))
+        for line in gate_table(g):
+            print(line)
+        print(gate_line(g))
+        return 0
     specs = {s.name: s for s in all_specs(cfg)}
     for s in specs.values():
         print(f"{s.name:<32} {s.layout:<9} stage {s.stage:<4} {s.description}")
@@ -2309,8 +3172,16 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("cases", nargs="*", help="case names or globs; none or `all` runs every case")
     t.add_argument("--stage", default=None, help="this stage's cases and every earlier stage's (a checkpoint's set)")
     t.add_argument("--max-games", type=int, default=0, help="most games at once (default: from cores and memory)")
+    t.add_argument("--gate", action="store_true", help="only the manifest's gate cases (of the stages up to --stage,"
+                   " or all), with their expected minutes before the run")
+    t.add_argument("--allow-restricted", action="store_true", help="start the games even when this runner has a"
+                   " restricted token (an agent sandbox): their shader caches are unusable, timings not comparable")
     t.set_defaults(fn=cmd_test)
-    sub.add_parser("list").set_defaults(fn=cmd_list)
+    ls = sub.add_parser("list")
+    ls.add_argument("--gate", action="store_true", help="the gate cases and their expected minutes (from each"
+                    " case's last finished run, else its spec's timeout)")
+    ls.add_argument("--stage", default=None, help="with --gate: the gate cases of this stage and every earlier one")
+    ls.set_defaults(fn=cmd_list)
     sub.add_parser("lint").set_defaults(fn=cmd_lint)
     f = sub.add_parser("fixtures")
     f.add_argument("--from-owner", action="store_true")

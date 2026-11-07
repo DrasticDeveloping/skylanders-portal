@@ -20,6 +20,17 @@ import skytest  # noqa: E402
 import winjob  # noqa: E402
 
 FAKE = HERE / "fake_game.py"
+_REAL_TOKEN_RESTRICTION = skytest.token_restriction
+
+
+def setUpModule() -> None:
+    # The runner's own token is not what these tests check (a test run from a sandbox would be refused
+    # at every case); the preflight's tests set it themselves.
+    skytest.token_restriction = lambda: ""
+
+
+def tearDownModule() -> None:
+    skytest.token_restriction = _REAL_TOKEN_RESTRICTION
 
 
 def toml_str(p: Path | str) -> str:
@@ -164,6 +175,145 @@ quit
         self.assertEqual(p["status"], "fail")
         self.assertTrue(any("Crash: exception" in w for w in p["reasons"]), p["reasons"])
 
+    def test_fail_fast_stops_the_run_at_a_forbidden_line(self) -> None:
+        # D logs a line its spec forbids and plays on; S (a stand-in for 3000 s) and D are stopped a
+        # grace after it, long before the timeout, and the case is graded as usual.
+        self.cfg.fail_fast_grace = 0.5
+        self.spec("ff", 'layout = "server+2"\nstage = "0"\nstandin_seconds = 3000\ntimeout = 60\n'
+                  '[peer.H]\nscript = "quit\\n"\n'
+                  '[peer.D]\nscript = "wait 50\\nlog boom here\\nhang\\nquit\\n"\nforbid = ["boom"]\n')
+        t0 = time.monotonic()
+        r = self.run_cases("ff")
+        self.assertLess(time.monotonic() - t0, 30)
+        case = r["cases"][0]
+        peers = {p["peer"]: p for p in case["peers"]}
+        self.assertEqual(case["status"], "fail")
+        self.assertRegex(case["stopped_early"], r"^stopped early: D \[.*\] Input script: boom here \(fail fast\)$")
+        self.assertIn(case["stopped_early"], case["reasons"])
+        self.assertEqual(case["leftover_processes"], 0)
+        self.assertEqual(peers["H"]["status"], "pass")  # it quit on its own before the stop
+        self.assertFalse(peers["H"]["ended_by_runner"])
+        for n in ("S", "D"):
+            self.assertTrue(peers[n]["ended_by_runner"])
+            self.assertEqual(peers[n]["stopped_by"], case["stopped_early"])
+            self.assertIn(f"ended by the runner: {case['stopped_early']}", peers[n]["reasons"])
+            self.assertFalse(any("did not quit within" in w for w in peers[n]["reasons"]), peers[n]["reasons"])
+        self.assertTrue(any(w.startswith("log has forbidden /boom/") for w in peers["D"]["reasons"]))
+        self.assertIn("stopped early: D", (r["folder"] / "report.md").read_text(encoding="utf-8"))
+
+    def test_fail_fast_stops_the_run_at_a_crash(self) -> None:
+        # A Crash: line (always forbidden), and a game that exits with an exception code without one.
+        self.cfg.fail_fast_grace = 0.5
+        for name, script, hit in (("ffcrash", "crash", r"\[.*\] \[error\] .*Crash: exception C0000005"),
+                                  ("ffcode", "exit -1073741819", r"exit code 0xC0000005")):
+            self.spec(name, 'layout = "server+1"\nstage = "0"\nstandin_seconds = 3000\ntimeout = 60\n'
+                      f'[peer.H]\nscript = "{script}\\nquit\\n"\n')
+            t0 = time.monotonic()
+            case = self.run_cases(name)["cases"][0]
+            self.assertLess(time.monotonic() - t0, 30, name)
+            self.assertRegex(case["stopped_early"], rf"^stopped early: H {hit}.* \(fail fast\)$")
+            peers = {p["peer"]: p for p in case["peers"]}
+            self.assertTrue(peers["S"]["ended_by_runner"], name)
+            self.assertFalse(peers["H"]["ended_by_runner"], name)
+            self.assertEqual(case["status"], "fail")
+
+    def test_fail_fast_reads_a_hosted_servers_log(self) -> None:
+        # S is H's child: its crash line is in H's session folder, and H and D are stopped.
+        self.cfg.fail_fast_grace = 0.5
+        spec = self.HOSTED.replace("place 0 {figures}/Roller Brawl.dump\nfps 8\nquit",
+                                   "serverlog Crash: exception C0000005 on thread 7\nhang\nquit")
+        self.spec("ffhost", "timeout = 60\n" + spec.replace("fps 8\nquit", "hang\nquit"))
+        t0 = time.monotonic()
+        case = self.run_cases("ffhost")["cases"][0]
+        self.assertLess(time.monotonic() - t0, 30)
+        self.assertRegex(case["stopped_early"], r"^stopped early: S \[.*\] Crash: exception C0000005 on thread 7")
+        peers = {p["peer"]: p for p in case["peers"]}
+        self.assertTrue(peers["H"]["ended_by_runner"])
+        self.assertTrue(peers["D"]["ended_by_runner"])
+        self.assertEqual(case["status"], "fail")
+
+    def test_fail_fast_off_waits_for_the_timeout_and_a_missing_expect_never_stops(self) -> None:
+        self.cfg.fail_fast_grace = 0.5
+        self.spec("ffoff", 'layout = "solo"\nstage = "0"\ntimeout = 3\nfail_fast = false\n'
+                  '[peer.H]\nscript = "log boom\\nhang\\nquit\\n"\nforbid = ["boom"]\n')
+        # Only fatal lines stop a run: an expected line that has not come yet is no reason.
+        self.spec("ffexpect", 'layout = "solo"\nstage = "0"\ntimeout = 3\n'
+                  '[peer.H]\nscript = "log hello\\nhang\\nquit\\n"\nexpect = ["never logged"]\n')
+        t0 = time.monotonic()
+        cases = {c["case"]: c for c in self.run_cases("ffoff", "ffexpect")["cases"]}
+        self.assertGreaterEqual(time.monotonic() - t0, 5.5)  # both ran to their 3 s timeout
+        for name in ("ffoff", "ffexpect"):
+            case = cases[name]
+            self.assertEqual(case["stopped_early"], "", name)
+            h = case["peers"][0]
+            self.assertTrue(h["ended_by_runner"], name)
+            self.assertEqual(h["stopped_by"], "", name)
+            self.assertIn("did not quit within 3 s; ended by the runner", h["reasons"])
+        self.assertTrue(any(w.startswith("log has forbidden /boom/") for w in cases["ffoff"]["peers"][0]["reasons"]))
+
+    def test_fail_fast_settings(self) -> None:
+        self.assertEqual(self.cfg.fail_fast_grace, 10.0, "the default grace")
+        on = skytest.load_spec(self.spec("on", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n'), 20)
+        self.assertTrue(on.fail_fast, "on by default")
+        off = skytest.load_spec(self.spec("off", 'layout = "solo"\nstage = "0"\nfail_fast = false\n'
+                                                 '[peer.H]\nscript = "quit\\n"\n'), 20)
+        self.assertFalse(off.fail_fast)
+        # A compared case's runs follow their spec.
+        self.assertFalse(skytest.variant_spec(off, {"name": "off1"}).fail_fast)
+        self.assertTrue(skytest.variant_spec(on, {"name": "off1"}).fail_fast)
+        with self.assertRaisesRegex(skytest.SpecError, "fail_fast is true or false"):
+            skytest.load_spec(self.spec("bad", 'layout = "solo"\nstage = "0"\nfail_fast = "no"\n'
+                                               '[peer.H]\nscript = "quit\\n"\n'), 20)
+        toml = self.repo / "tests" / "skytest.toml"
+        text = toml.read_text(encoding="utf-8")
+        toml.write_text(text.replace("timeout = 20\n", "timeout = 20\nfail_fast_grace_seconds = 2.5\n"), encoding="utf-8")
+        self.assertEqual(skytest.load_config(self.repo).fail_fast_grace, 2.5)
+        toml.write_text(text.replace("timeout = 20\n", "timeout = 20\nfail_fast_grace_seconds = -1\n"), encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            skytest.load_config(self.repo)
+
+    def test_a_log_tail_reads_only_new_whole_lines(self) -> None:
+        log = Path(self.tmp.name) / "tail.log"
+        tail = skytest.LogTail(log)
+        self.assertEqual(tail.new_lines(), [], "no log yet")
+        log.write_bytes(b"one\r\ntwo\nthr")
+        self.assertEqual(tail.new_lines(), ["one", "two"])
+        self.assertEqual(tail.new_lines(), [])
+        with open(log, "ab") as f:
+            f.write(b"ee\nfour\n")
+        self.assertEqual(tail.new_lines(), ["three", "four"])
+        log.write_bytes(b"new\n")  # a shorter file: a new log in its place
+        self.assertEqual(tail.new_lines(), ["new"])
+        g = tail.generation
+        log.unlink()  # Host empties the session folder: a log that is gone ...
+        self.assertEqual(tail.new_lines(), [])
+        self.assertGreater(tail.generation, g)
+        log.write_bytes(b"a new server's first line\n")  # ... and the next one from its start
+        self.assertEqual(tail.new_lines(), ["a new server's first line"])
+        other = log.with_name("other.log")
+        other.write_bytes(b"x" * 40 + b"\nanother file, longer than what was read\n")
+        g = tail.generation
+        os.replace(other, log)  # another file in its place, longer: told apart by its identity
+        self.assertEqual(tail.new_lines(), ["x" * 40, "another file, longer than what was read"])
+        self.assertGreater(tail.generation, g)
+        # A fatal line in a log that is replaced before the stop is dropped; one in a kept log stays.
+        watch = skytest.FailFast({"S": log}, {"S": [r"Online: could not"]})
+        with open(log, "ab") as f:
+            f.write(b"Online: could not open the port\n")
+        self.assertEqual(watch.check(), ("S", "Online: could not open the port"))
+        with open(log, "ab") as f:
+            f.write(b"more\n")
+        self.assertEqual(watch.check(), ("S", "Online: could not open the port"))
+        log.unlink()
+        self.assertIsNone(watch.check())
+        log.write_bytes(b"the next session's server, clean\n")
+        self.assertIsNone(watch.check())
+        self.assertTrue(skytest.crash_exit_code(0xC0000005))
+        self.assertTrue(skytest.crash_exit_code(-1073741819))
+        self.assertTrue(skytest.crash_exit_code(0x80000003))
+        for code in (None, 0, 1, 3, -1, 0xFFFFFFFF):
+            self.assertFalse(skytest.crash_exit_code(code), code)
+
     def test_capacity_is_reported_not_skipped(self) -> None:
         self.spec("five", 'layout = "server+4"\nstage = "0"\n[peer.all]\n' + self.HUB)
         case = self.run_cases("five", max_games=2)["cases"][0]
@@ -201,6 +351,129 @@ quit
         case = self.run_cases("override")["cases"][0]
         self.assertEqual(case["status"], "error")
         self.assertIn("portal_mode", case["reasons"][0])
+
+    def test_repo_is_substituted_in_a_peers_args(self) -> None:
+        # G3 (stage 1B): a spec names a file of the checkout under test, e.g. the route file.
+        self.spec("routed", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n'
+                  'args = ["--online_route_file={repo}/tests/routes/r.toml", "--trace_saves=true"]\n')
+        case = self.run_cases("routed")["cases"][0]
+        command = case["peers"][0]["command"]
+        self.assertIn(f"--online_route_file={self.cfg.repo.as_posix()}/tests/routes/r.toml", command)
+        self.assertIn("--trace_saves=true", command)
+        self.assertFalse(any("{repo}" in a for a in command))
+        self.assertEqual(skytest.peer_args(self.cfg, ["--x={repo}/a", "--y=1"]),
+                         [f"--x={self.cfg.repo.as_posix()}/a", "--y=1"])
+        # Only {repo} is substituted in args: anything else in braces is a spec error, not passed on.
+        with self.assertRaises(skytest.SpecError):
+            skytest.load_spec(self.spec("unknown", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n'
+                                        'args = ["--online_route_file={figures}/r.toml"]\n'), 10)
+
+    def env_run(self, name: str, **flags) -> tuple[dict, str]:
+        """cmd_test on one case with extra flags: (results.json, what it printed)."""
+        a = argparse.Namespace(cases=[name], stage=None, max_games=5, **flags)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_test(self.cfg, a)
+        printed = out.getvalue()
+        report = printed.strip().splitlines()[-1].split("report: ", 1)[1]
+        results = json.loads((Path(report).parent / "results.json").read_text(encoding="utf-8"))
+        results["exit"], results["folder"] = code, Path(report).parent
+        return results, printed
+
+    def test_a_restricted_token_starts_no_game_unless_allowed(self) -> None:
+        self.addCleanup(setattr, skytest, "token_restriction", skytest.token_restriction)
+        self.spec("solo", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
+        skytest.token_restriction = lambda: "a restricted token (IsTokenRestricted)"
+        started = []
+        real_popen = skytest.subprocess.Popen
+
+        def recording_popen(*args, **kw):
+            started.append(args)
+            return real_popen(*args, **kw)
+
+        skytest.subprocess.Popen = recording_popen
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as e:
+                skytest.cmd_test(self.cfg, argparse.Namespace(cases=["solo"], stage=None, max_games=5))
+        finally:
+            skytest.subprocess.Popen = real_popen
+        why = str(e.exception.code)
+        self.assertNotIn("\n", why)
+        self.assertIn("a restricted token (IsTokenRestricted)", why)
+        self.assertIn("run skytest outside the sandbox", why)
+        self.assertIn("--allow-restricted", why)
+        self.assertIn("not comparable", why)
+        self.assertEqual(started, [], "no game may start")
+        runs = self.cfg.store / "runs"
+        self.assertFalse(runs.is_dir() and any(runs.iterdir()), "no run folder, no snapshot copy")
+        # --allow-restricted: the run goes on and says so in results.json and report.md.
+        r, printed = self.env_run("solo", allow_restricted=True)
+        self.assertEqual(r["cases"][0]["status"], "pass", r["cases"][0])
+        self.assertIs(r["restricted_token"], True)
+        self.assertEqual(r["restricted_token_cause"], "a restricted token (IsTokenRestricted)")
+        self.assertIn("WARNING: running with a restricted token (IsTokenRestricted) (--allow-restricted)", printed)
+        report = (r["folder"] / "report.md").read_text(encoding="utf-8")
+        self.assertIn("Token: RESTRICTED (a restricted token (IsTokenRestricted)); started with --allow-restricted",
+                      report)
+
+    def test_an_unrestricted_and_an_unreadable_token(self) -> None:
+        self.addCleanup(setattr, skytest, "token_restriction", skytest.token_restriction)
+        self.spec("solo", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
+        r, _ = self.env_run("solo")
+        self.assertIs(r["restricted_token"], False)
+        self.assertEqual(r["restricted_token_cause"], "")
+        self.assertIn("Token: not restricted.", (r["folder"] / "report.md").read_text(encoding="utf-8"))
+
+        def unreadable() -> str:
+            raise OSError(5, "OpenProcessToken failed")
+
+        skytest.token_restriction = unreadable
+        r, printed = self.env_run("solo")
+        self.assertEqual(r["cases"][0]["status"], "pass", "a check that cannot run never stops the run")
+        self.assertIsNone(r["restricted_token"])
+        self.assertTrue(r["restricted_token_cause"].startswith("not checked: OSError"), r["restricted_token_cause"])
+        self.assertIn("skytest: could not check this runner's token (OSError", printed)
+        self.assertIn("Token: not checked (OSError", (r["folder"] / "report.md").read_text(encoding="utf-8"))
+
+    def test_the_startup_stall_per_peer(self) -> None:
+        # The fake game logs the two lines through `log`; `wait 130` is 1.3 s for it.
+        self.spec("stall", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.H]\nscript = """\n'
+                  "log Initializing shader storage for title 415608E9...\nwait 130\nlog VFS: 'game:' -> mounted\n"
+                  'log SetInterruptCallback(82F58198, 40003980)\nquit\n"""\n')
+        r, _ = self.env_run("stall")
+        case = r["cases"][0]
+        peers = {p["peer"]: p for p in case["peers"]}
+        self.assertEqual(case["status"], "pass", "a stall is reported, never graded")
+        self.assertGreaterEqual(peers["H"]["startup_stall_s"], 1.2)
+        self.assertLess(peers["H"]["startup_stall_s"], 5.0)
+        self.assertIsNone(peers["S"]["startup_stall_s"], "the stand-in logs no shader storage")
+        report = (r["folder"] / "report.md").read_text(encoding="utf-8")
+        self.assertIn("| Peer | Status | Exit | Time | Startup stall |", report)
+        self.assertIn(f"| {peers['H']['startup_stall_s']:.2f} s |", report)
+        self.assertRegex(report, r"\| S \| PASS \| 0 \| \d+ s \| - \|")
+        self.assertIn(f"- WARNING: H: startup stall {peers['H']['startup_stall_s']:.1f} s (shader storage to the "
+                      "guest's first line, over 1 s)", report)
+        self.assertNotIn("WARNING: S:", report)
+
+    @unittest.skipUnless(skytest.WINDOWS, "power throttling is Windows only")
+    def test_every_started_game_is_opted_out_of_power_throttling(self) -> None:
+        self.spec("two", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.H]\nscript = "quit\\n"\n')
+        calls = []
+        self.addCleanup(setattr, skytest, "set_process_information", skytest.set_process_information)
+        self.addCleanup(skytest._THROTTLING_LOGGED.clear)
+        skytest.set_process_information = lambda h, c, st: calls.append((h, c, st)) or 0
+        r, _ = self.env_run("two")
+        self.assertEqual(len(calls), 2, "one call per started game (S and H)")
+        self.assertEqual({(c, st) for _, c, st in calls}, {(4, (1, 0x5, 0))})
+        self.assertTrue(all(h for h, _, _ in calls))
+        self.assertNotEqual(calls[0][0], calls[1][0])
+        self.assertEqual({p["power_throttling"] for p in r["cases"][0]["peers"]}, {"opted out"})
+        # Windows refuses every call: printed once, the run goes on.
+        skytest._THROTTLING_LOGGED.clear()
+        skytest.set_process_information = lambda h, c, st: 5
+        r, printed = self.env_run("two")
+        self.assertEqual(r["cases"][0]["status"], "pass", r["cases"][0])
+        self.assertEqual(printed.count("could not opt a game out of Windows power throttling"), 1)
+        self.assertEqual({p["power_throttling"] for p in r["cases"][0]["peers"]}, {"failed: Windows error 5"})
 
     def test_a_game_that_cannot_join_the_job_is_ended(self) -> None:
         self.spec("nojob", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "hang\\nquit\\n"\n')
@@ -799,6 +1072,131 @@ COMPARE = {"peer": "S", "noise": ["off1", "off2"], "test": ["on"], "window_end":
                                             "H": ["Online: the session ended"]}}
 
 
+class GateTest(unittest.TestCase):
+    """`--gate` (stage 1B item 15): the manifest's gate cases of the stages up to S and their expected
+    minutes, from each case's newest pass, else its spec's timeout, else `no spec`. The throwaway
+    repository of SkytestTest, without its tests."""
+
+    tearDown = SkytestTest.tearDown
+    spec = SkytestTest.spec
+
+    QUIT = 'layout = "solo"\nstage = "{stage}"\ntimeout = {timeout}\n[peer.H]\nscript = "quit\\n"\n'
+
+    def setUp(self) -> None:
+        SkytestTest.setUp(self)
+        self.spec("a", self.QUIT.format(stage="0", timeout=600))
+        self.spec("b", self.QUIT.format(stage="1A", timeout=1800))
+        self.spec("plain", self.QUIT.format(stage="0", timeout=60))
+        self.spec("later", self.QUIT.format(stage="1B", timeout=60))
+        case = 'id = "{id}"\nstage = "{stage}"\nlayout = "{layout}"\nkind = "required"\n'
+        (self.repo / "tests" / "manifest.toml").write_text(
+            'stages = ["0", "1A", "1B"]\n'
+            + "[[case]]\n" + case.format(id="a", stage="0", layout="solo") + "gate = true\nspec = true\n"
+            + "[[case]]\n" + case.format(id="b", stage="1A", layout="solo") + "gate = true\nspec = true\n"
+            + "[[case]]\n" + case.format(id="nospec", stage="1A", layout="server+3") + "gate = true\n"
+            + "[[case]]\n" + case.format(id="plain", stage="0", layout="solo") + "spec = true\n"
+            + "[[case]]\n" + case.format(id="later", stage="1B", layout="solo") + "gate = true\nspec = true\n",
+            encoding="utf-8")
+        # Recorded runs: a's newest pass wins over its newer fail; an error, a capacity result and a run
+        # with no time say nothing about its length; b never passed: its short fail (an early crash)
+        # never stands for its length.
+        self.results("20261101-100000-session", [("a", "pass", 300.0), ("b", "error", 2.0)])
+        self.results("20261102-100000-session", [("a", "fail", 420.0), ("plain", "pass", 30.0)])
+        self.results("20261103-100000-session", [("a", "error", 1.0), ("b", "capacity", 0.0)])
+        self.results("20261104-100000-session", [("a", "pass", 0.0), ("b", "fail", 42.0)])
+        (self.cfg.store / "runs" / "20261105-100000-session").mkdir(parents=True)
+        (self.cfg.store / "runs" / "20261105-100000-session" / "results.json").write_text("{not json", encoding="utf-8")
+
+    def results(self, folder: str, cases: list[tuple[str, str, float]]) -> None:
+        d = self.cfg.store / "runs" / folder
+        d.mkdir(parents=True)
+        (d / "results.json").write_text(json.dumps(
+            {"cases": [{"case": c, "status": s, "seconds": t} for c, s, t in cases]}), encoding="utf-8")
+
+    def estimate(self, stage: str | None) -> dict:
+        manifest = skytest.load_manifest(self.cfg)
+        stages = skytest.stages_up_to(manifest, stage) if stage else None
+        return skytest.gate_estimate(self.cfg, manifest, stages, skytest.all_specs(self.cfg))
+
+    def test_the_latest_pass_wins_and_a_timeout_stands_in(self) -> None:
+        g = self.estimate("1A")
+        rows = {r["case"]: r for r in g["cases"]}
+        self.assertEqual(sorted(rows), ["a", "b", "nospec"])  # gate cases of 0 and 1A only
+        self.assertEqual(rows["a"]["seconds"], 300.0)
+        self.assertEqual(rows["a"]["source"], "last pass 20261101-100000-session")
+        self.assertEqual(rows["b"]["seconds"], 1800.0)
+        self.assertEqual(rows["b"]["source"],
+                         "spec timeout (never passed; longest fail 0.7 min, 20261104-100000-session)")
+        self.assertIsNone(rows["nospec"]["seconds"])
+        self.assertEqual(rows["nospec"]["source"], "no spec")
+        self.assertEqual(g["minutes"], 35.0)
+        self.assertTrue(g["over"])
+        self.assertEqual(g["from_runs"], ["a"])
+        self.assertEqual(g["from_timeouts"], ["b"])
+        self.assertEqual(g["no_spec"], ["nospec"])
+        line = skytest.gate_line(g)
+        self.assertIn("gate: 3 cases, expected 35 min (1 from their last passes, 1 from spec timeouts: b)", line)
+        self.assertIn("no spec, not counted: nospec", line)
+        self.assertIn("the plan's subset is 30 min (over by 5 min)", line)
+
+    def test_the_stage_filter(self) -> None:
+        self.assertEqual([r["case"] for r in self.estimate("0")["cases"]], ["a"])
+        self.assertFalse(self.estimate("0")["over"])
+        self.assertEqual([r["case"] for r in self.estimate(None)["cases"]], ["a", "b", "nospec", "later"])
+
+    def test_list_gate_starts_no_game(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_list(self.cfg, argparse.Namespace(gate=True, stage="1A"))
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("last pass 20261101-100000-session", text)
+        self.assertIn("no spec", text)
+        self.assertIn("gate: 3 cases, expected 35 min", text)
+        self.assertNotIn("later", text)
+        self.assertFalse(any((self.cfg.store / "runs").glob("*/report.md")))
+        # Without --gate, list is as before.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_list(self.cfg, argparse.Namespace())
+        self.assertIn("manifest: 5 case(s)", out.getvalue())
+
+    def test_a_gate_run_runs_only_the_gate_cases_and_is_no_checkpoint(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_test(self.cfg, argparse.Namespace(cases=[], stage="1A", max_games=5, gate=True))
+        lines = out.getvalue().strip().splitlines()
+        self.assertTrue(lines[0].startswith("gate: 3 cases, expected 35 min"), lines[0])
+        self.assertTrue(any(line.startswith("gate: ") and "(the cases" in line for line in lines), lines)
+        folder = Path(lines[-1].split("report: ", 1)[1]).parent
+        results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(c["case"] for c in results["cases"]), ["a", "b"])
+        self.assertIsNone(results["checkpoint"])
+        self.assertEqual(results["required_without_spec"], ["nospec"])
+        self.assertEqual(results["gate"]["no_spec"], ["nospec"])
+        self.assertIn("actual_minutes", results["gate"])
+        self.assertIn("## Gate", (folder / "report.md").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0)
+        # The run just made is the newest: its times now stand for a and b.
+        g = self.estimate("1A")
+        self.assertTrue(all(r["source"] == f"last pass {folder.name}" for r in g["cases"] if r["case"] in ("a", "b")))
+
+    def test_a_gate_run_of_named_cases_counts_only_those(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_test(self.cfg, argparse.Namespace(cases=["a"], stage="1A", max_games=5, gate=True))
+        lines = out.getvalue().strip().splitlines()
+        self.assertEqual(code, 0)
+        self.assertTrue(lines[0].startswith("gate: 1 cases, expected 5 min (1 from their last passes, 0 from"), lines[0])
+        self.assertNotIn("over by", lines[0])
+        folder = Path(lines[-1].split("report: ", 1)[1]).parent
+        results = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual([r["case"] for r in results["gate"]["cases"]], ["a"])
+        self.assertEqual(results["required_without_spec"], [])
+        # A spec-less gate case a pattern names stays named.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_test(self.cfg, argparse.Namespace(cases=["a", "nospec"], stage="1A", max_games=5, gate=True))
+        first = out.getvalue().splitlines()[0]
+        self.assertTrue(first.startswith("gate: 2 cases"), first)
+        self.assertIn("no spec, not counted: nospec", first)
+
+
 class CompareTest(unittest.TestCase):
     """The [compare] grade on hand-written server logs (no game log from the disc)."""
 
@@ -836,8 +1234,10 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(k["sequences"]["level_watch"], [
             "tutorial_b: requested by the game (request 1)", "tutorial_b: loading screen up (request 1)",
             "tutorial_b: the game's load call returned (request 1)", "tutorial_b: ready (request 1)"])
-        self.assertEqual(k["loads"], {"start -> hub": 24.0, "level 2 tutorial_b: open -> server up": 8.1,
-                                      "level 2 tutorial_b: open -> barrier": 10.0,
+        # No SetInterruptCallback line: the guest's start falls back to the log's first line. S's own
+        # request line comes 0.2 s after the open: the level's spans start there.
+        self.assertEqual(k["loads"], {"guest start -> hub": 24.0, "level 2 tutorial_b: request -> server up": 7.9,
+                                      "level 2 tutorial_b: request -> barrier": 9.8,
                                       "level watch tutorial_b: load call": 7.7})
         # Sampled: the highest running number seen in the window (from barrier 2 to End session); the
         # shutdown's messages after End session do not count.
@@ -857,12 +1257,20 @@ class CompareTest(unittest.TestCase):
         # The difference between the two dumps, world-message keys only (not trace_telegrams' or the AI's).
         self.assertEqual(k["messages"]["keys"], {"message CTickMessage": 7123, "trigger enter SpawnVolume#12": 1})
 
+    def test_a_dump_after_the_window_end_is_not_used(self) -> None:
+        # A dump written after `window_end` (the shutdown) must not stand in for the window's last one.
+        dumps = ({"message CTickMessage": 2000}, {"message CTickMessage": 9123})
+        late = stamped((400.0, "Trace counts: 1 keys"), (400.0, "Trace count: message CTickMessage 99999"))
+        k = skytest.compare_keys(server_log(dumps=dumps) + late, COMPARE)
+        self.assertEqual(k["messages"]["mode"], "exact")
+        self.assertEqual(k["messages"]["keys"], {"message CTickMessage": 7123})
+
     def test_the_aa_pair_alone(self) -> None:
         c = {**COMPARE, "test": []}
         cmp = self.compare({"off1": server_log(level_load=8.0), "off2": server_log(level_load=8.4, ticks=7500)}, c)
         self.assertEqual(cmp["status"], "pass", cmp["reasons"])
         self.assertEqual(cmp["messages"]["noisy"], 1)
-        self.assertEqual(cmp["loads"]["level 2 tutorial_b: open -> server up"]["tolerance"], 0.5, "the floor")
+        self.assertEqual(cmp["loads"]["level 2 tutorial_b: request -> server up"]["tolerance"], 0.5, "the floor")
         md = "\n".join(skytest.compare_markdown(cmp))
         self.assertIn("A/A: off1, off2.", md)
         self.assertIn("| message CTickMessage | 7000 / 7500 |", md)
@@ -873,7 +1281,7 @@ class CompareTest(unittest.TestCase):
                             # The skip on: a faster load passes; 8000 is within 7000-7500 widened by 500.
                             "on": server_log(skip=True, level_load=6.0, ticks=8000)})
         self.assertEqual(cmp["status"], "pass", cmp["reasons"])
-        self.assertEqual(cmp["loads"]["level 2 tutorial_b: open -> server up"]["tolerance"], 1.0, "the A/A spread")
+        self.assertEqual(cmp["loads"]["level 2 tutorial_b: request -> server up"]["tolerance"], 1.0, "the A/A spread")
         md = "\n".join(skytest.compare_markdown(cmp))
         self.assertIn("### Comparison of S's logs: PASS", md)
         self.assertIn("| on | yes | 6 | 4 | 3 keys (sampled) | 120.5 s | 13 | 105599 | 0 | 0 | 102700/15600 |", md)
@@ -891,8 +1299,8 @@ class CompareTest(unittest.TestCase):
                                 "compare: world messages outside the A/A noise (sampled): message CTickMessage on "
                                 "8000 (A/A 7000/7000; sampled, one step 500)"),
             "a slower load": (server_log(level_load=9.0),
-                              "compare: load level 2 tutorial_b: open -> server up: on 9.100 s, over the A/A "
-                              "8.100-8.100 s by more than 0.500 s"),
+                              "compare: load level 2 tutorial_b: request -> server up: on 8.900 s, over the A/A "
+                              "7.900-7.900 s by more than 0.500 s"),
             "a readback": (server_log(readbacks=2), "compare: run on: 26 resolve readback(s), expected 0"),
             "memexport": (server_log(memexport=1), "compare: run on: 13 memexport draw(s)"),
         }
@@ -910,6 +1318,83 @@ class CompareTest(unittest.TestCase):
         # memexport_zero = false reports memexport draws without failing on them.
         self.assertEqual(self.compare({**aa, "on": server_log(memexport=1)}, {**COMPARE, "memexport_zero": False})
                          ["status"], "pass")
+
+    def test_load_spans_start_at_the_guest_and_at_the_request(self) -> None:
+        # P1j C2: the host stalled 4-20 s before the guest's first line, and the session opened the
+        # boot hub 47 s before S's game asked for it. Neither wait is a load.
+        log = stamped(
+            (0.0, "Skylanders: Swap Force test (build abc1234); Windows"),
+            (3.0, "Initializing shader storage"),
+            (15.0, "SetInterruptCallback(82F58198, 40003980)"),
+            (15.01, "Online: level 1 town/town_state10/town_state10: open"),
+            (40.0, "SetInterruptCallback(82F58198, 40003980)"),  # only the first one is the guest's start
+            (62.0, "Level watch: town_state10: requested by the game (request 1, zone 0xB52F6C70)"),
+            (79.0, "Online: the server is in its hub (town_state10)"),
+            (80.0, "Online: level 1: the server has it up"),
+            (89.0, "Online: barrier 1 released at tick 5226 (1 client)"),
+            # A request of another zone before this level is up, and its own request only after it is
+            # up: from the open.
+            (90.0, "Online: level 2 tutorial/tutorial_b/tutorial_b: open"),
+            (90.5, "Level watch: town_state10: requested by the game (request 2, zone 0xB52F6C70)"),
+            (98.0, "Online: level 2: the server has it up"),
+            (99.0, "Level watch: tutorial_b: requested by the game (request 3, zone 0xB52D7D38)"),
+            (100.0, "Online: barrier 2 released at tick 6232 (1 client)"),
+            # The game asked first, then the session opened it: from the open.
+            (110.0, "Level watch: ww1: requested by the game (request 4, zone 0xB52D0000)"),
+            (110.2, "Online: level 3 ww/ww1/WW1: open"),
+            (120.0, "Online: level 3: the server has it up"),
+            (121.0, "Online: barrier 3 released at tick 7000 (1 client)"),
+        )
+        loads = skytest.compare_keys(log, COMPARE)["loads"]
+        self.assertEqual(loads, {
+            "guest start -> hub": 64.0,
+            "level 1 town/town_state10/town_state10: request -> server up": 18.0,
+            "level 1 town/town_state10/town_state10: request -> barrier": 27.0,
+            "level 2 tutorial/tutorial_b/tutorial_b: open -> server up": 8.0,
+            "level 2 tutorial/tutorial_b/tutorial_b: open -> barrier": 10.0,
+            "level 3 ww/ww1/WW1: open -> server up": 9.8,
+            "level 3 ww/ww1/WW1: open -> barrier": 10.8,
+        })
+
+    def test_a_startup_stall_does_not_fail_the_load_grade(self) -> None:
+        # The C2 run: the on-run's host stalled 3.5 s longer before its guest started; from the guest's
+        # start on it was as fast as the A/A. Anchored at the log's first line it failed.
+        def run(stall: float) -> str:
+            return stamped(
+                (0.0, "Skylanders: Swap Force test (build abc1234); Windows"),
+                (11.5 + stall, "SetInterruptCallback(82F58198, 40003980)"),
+                (11.5 + stall + 0.01, "Online: level 1 town/town_state10/town_state10: open"),
+                (40.0 + stall, "Level watch: town_state10: requested by the game (request 1, zone 0xB52F6C70)"),
+                (77.5 + stall, "Online: the server is in its hub (town_state10)"),
+                (78.5 + stall, "Online: level 1: the server has it up"),
+                (90.0 + stall, "Online: barrier 1 released at tick 5226 (1 client)"),
+            )
+        c = {**COMPARE, "reached": {"S": [r"Online: barrier 1 released"]}}
+        cmp = self.compare({"off1": run(0.0), "off2": run(0.2), "on": run(3.5)}, c)
+        # (No trace or GPU lines in these logs: only the load grade is looked at.)
+        self.assertEqual([why for why in cmp["reasons"] if why.startswith("compare: load")], [])
+        self.assertTrue(all(e["ok"] for e in cmp["loads"].values()), cmp["loads"])
+        self.assertEqual(sorted(cmp["loads"]), ["guest start -> hub",
+                                                "level 1 town/town_state10/town_state10: request -> barrier",
+                                                "level 1 town/town_state10/town_state10: request -> server up"])
+        # A run whose request came before the open measures from the open: the anchor differs, said
+        # once per span, not as two "not in run(s)" lines.
+        early = stamped(
+            (0.0, "Skylanders: Swap Force test (build abc1234); Windows"),
+            (11.5, "SetInterruptCallback(82F58198, 40003980)"),
+            (12.0, "Level watch: town_state10: requested by the game (request 1, zone 0xB52F6C70)"),
+            (40.0, "Online: level 1 town/town_state10/town_state10: open"),
+            (77.5, "Online: the server is in its hub (town_state10)"),
+            (78.5, "Online: level 1: the server has it up"),
+            (90.0, "Online: barrier 1 released at tick 5226 (1 client)"),
+        )
+        cmp = self.compare({"off1": run(0.0), "off2": run(0.2), "on": early}, c)
+        loads = [why for why in cmp["reasons"] if why.startswith("compare: load")]
+        self.assertEqual(loads, [
+            "compare: load level 1 town/town_state10/town_state10 -> barrier: the anchor differs between runs: "
+            "the request in run(s) off1, off2, the open in run(s) on",
+            "compare: load level 1 town/town_state10/town_state10 -> server up: the anchor differs between runs: "
+            "the request in run(s) off1, off2, the open in run(s) on"], cmp["reasons"])
 
     def test_a_sampled_count_is_known_to_within_one_step(self) -> None:
         # traces.cpp logs a key's first 20 events and every 500th: a highest #n of 20 or more says the
@@ -1273,6 +1758,20 @@ class RequestsAnsweredTest(unittest.TestCase):
         _, reasons = skytest.grade_requests_answered(rq("frames 600 fps 60.0"), set())
         self.assertEqual(reasons, ["grade requests_answered: no request line (not reached)"])
 
+    def test_gone_at_close_leaves_out_keys_on_the_server_only(self) -> None:
+        # S's `peer 1 gone at close` explains S's own unanswered keys of peer 1; peer 1's own log
+        # still holds the answers it got, so its keys stay graded there.
+        spec = skytest.Spec(name="r", path=Path("r.toml"), layout="server+1", stage="1B", description="",
+                            timeout=1, peers={}, measures={}, standin_seconds=0,
+                            grades={"requests_answered": {"peers": ["S", "H"]}})
+        s_log = rq(f"request 1:1 enter {self.E1}") + "\n" + rq("peer 1 gone at close")
+        h_log = rq(f"request 1:1 enter {self.E1}") + "\n" + rq(f"decided {self.E1} applied seq 4")
+        for peer, expect_keys, expect_gone in (("S", 0, 1), ("H", 1, 0)):
+            r = skytest.PeerResult(peer=peer)
+            skytest.grade_cross_peer(spec, r, {"S": s_log, "H": h_log})
+            self.assertEqual((r.graded["requests_answered"]["keys"], r.graded["requests_answered"]["left_out_gone"]),
+                             (expect_keys, expect_gone), peer)
+
     def test_spec_options(self) -> None:
         skytest.check_requests_answered("x.toml", {}, ["S", "H", "D"])
         skytest.check_requests_answered("x.toml", {"peers": ["S", "H"]}, ["S", "H", "D"])
@@ -1365,6 +1864,434 @@ class SymmetryTest(unittest.TestCase):
             with self.assertRaises(skytest.SpecError, msg=str(bad)):
                 skytest.check_symmetry("x.toml", bad, ["S", "H", "D"])
         self.assertIn("symmetry", skytest.GRADES)
+
+
+ROUTE_FILE = """
+[[trigger]]
+name = "JumpHint_Trigger"
+class = "two_player"
+
+[[trigger]]
+name = "CScriptTriggerEntity#2392"
+class = "request"
+
+[[trigger]]
+name = "LocalHint"
+class = "local"
+
+[level_end]
+class = "COpenResultsScreenMessage"
+recipient = "WorldInstance#2048"
+next_zone = "town_state10"
+
+[[encounter]]
+manager = "EA_Manager_W1"
+
+[[checkpoint]]
+trigger = "CScriptTriggerEntity#2651"
+expect = 'Trace: message CCheckPoint\\w+Message to '
+
+[[scene]]
+name = "TutorialB_Intro"
+"""
+
+
+class RouteTest(unittest.TestCase):
+    """The route grade (stage 1B item 13) on hand-written logs and a hand-written route file."""
+
+    def checklist(self, text: str = ROUTE_FILE) -> dict:
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "tutorial_b.toml"
+            f.write_text(text, encoding="utf-8")
+            checklist, why = skytest.load_route_checklist(f)
+        self.assertEqual(why, "")
+        return checklist
+
+    def server(self, end: bool = True, twice: bool = False, next_level: bool = True) -> str:
+        lines = [
+            rq("level 2 tutorial/tutorial_b/tutorial_b: open"),
+            rq("barrier 2 released at tick 100 (3 clients)"),
+            rq("scene 2/1.w00000001.00000002.0000abcd start cutscene TutorialB_Intro recipient Tessa#12 from x"),
+            rq("scene 2/1.w00000001.00000002.0000abcd end by its timeline after 3.0 s (x)"),
+            rq("replay 2.0:2/2/enter/0/w1 JumpHint_Trigger#2394 by PeerPuppet_1#3830 flags 0x3D"),
+            rq("replay done 2.0:2/2/enter/0/w1 activated 1 depth 0"),
+            rq("replay 2.1:2/2/enter/1/w2 CScriptTriggerEntity#2392 by PeerPuppet_1#3830 flags 0x3D"),
+            rq("replay done 2.1:2/2/enter/1/w2 activated 1 depth 0"),
+            rq("encounter start EA_Manager_W1#2688 (from 0x82A0CE88)"),
+            rq("encounter complete EA_Manager_W1#2688"),
+            rq("replay 2.2:2/3/enter/0/w3 CScriptTriggerEntity#2651 by PeerPuppet_2#3831 flags 0x3D"),
+            rq("replay done 2.2:2/3/enter/0/w3 activated 1 depth 0"),
+            "[2026-11-06 12:00:00.000] [info] [core] [t1] Trace: message CCheckPointTriggeredMessage to Hero#1 from x (#1)",
+        ]
+        if end:
+            lines += [
+                rq("level end COpenResultsScreenMessage to WorldInstance#2048 (generation 2)"),
+                rq("level end COpenResultsScreenMessage sent to 3 client(s) (generation 2)"),
+                rq("level end CLevelCompleteMessage to WorldInstance#2048 (generation 2)"),
+                rq("level end CLevelCompleteMessage to WorldInstance#2048 not sent (it follows the results screen)"
+                   " (generation 2)"),
+                rq("level end CLevelCompleteMessage to WorldInstance#2048 duplicate (generation 2; CDDAManager"
+                   " sub_82A0AD78 skipped)"),
+                rq("results screen LevelStars up (+0.5 s)"),
+                rq("results screen LevelStars pressed A (press 1, 10.0 s without progress)"),
+                rq("results screen LevelStars advanced by press to LevelSummary (+11.0 s)"),
+                rq("results screen LevelSummary advanced by native to the next level (+14.0 s)"),
+                rq("results screens done: the game asked for town_state10 from 0x82BEA3FC (x) after 14.0 s, 1 press(es)"),
+            ]
+        if twice:
+            lines.append(rq("level end COpenResultsScreenMessage to WorldInstance#2048 (generation 3)"))
+        if end and next_level:
+            lines += [
+                rq("level 3 town/town_state10/town_state10: open (the server's own level change from 0x82BEA3FC, after"
+                   " the level end, x)"),
+                rq("level 3: the server has it up"),
+                rq("barrier 3 released at tick 900 (3 clients)"),
+            ]
+        return "\n".join(lines)
+
+    def client(self, extra: str = "", played: str = "played here (generation 2, recipient WorldInstance#2048)") -> str:
+        lines = [rq("level request 0x00000001 passed tutorial_b (the session: the session's own request)"),
+                 rq("level end COpenResultsScreenMessage to WorldInstance#2048 suppressed here (the server owns it;"
+                    " CJuiceComponent sub_82A280E8)"),
+                 rq(f"level end COpenResultsScreenMessage from the server {played}"),
+                 rq("level request 0x82BEA3FC blocked town_state10 (sub_82BEA370, hub map action: the server owns the"
+                    " level end (a request after the level end of generation 2))"),
+                 rq("level request 0x00000001 passed town_state10 (the session: the session's own request)")]
+        if extra:
+            lines.append(rq(extra))
+        return "\n".join(lines)
+
+    def test_full_route_passes(self) -> None:
+        texts = {"S": self.server(), "H": self.client(), "D": self.client()}
+        graded, reasons = skytest.grade_route(texts, self.checklist(), {"file": "tests/routes/tutorial_b.toml"})
+        self.assertEqual(reasons, [])
+        self.assertEqual(graded["level_end"], {"class": "COpenResultsScreenMessage", "recipient": "WorldInstance#2048",
+                                               "generation": 2})
+        self.assertEqual(graded["results_advanced"], {"native": 1, "press": 1})
+        self.assertTrue(graded["results_done"])
+        self.assertEqual(graded["next_level"], {"zone": "town_state10", "generation": 3, "up": True, "released": True})
+        self.assertEqual(graded["triggers"], [2, 2])  # the local one is not graded
+        self.assertEqual(graded["level_end_duplicates_skipped"], 1)
+        self.assertEqual(graded["clients_played"], {"H": 1, "D": 1})
+
+    def test_every_client_plays_the_servers_level_end_once(self) -> None:
+        texts = {"S": self.server(), "H": self.client(),
+                 "D": self.client(played="not played here (unresolved recipient: no entity)")}
+        graded, reasons = skytest.grade_route(texts, self.checklist(), {"file": "x"})
+        self.assertEqual(reasons, ["grade route: client D played the server's level end COpenResultsScreenMessage of"
+                                   " generation 2 0 times (exactly once)"])
+        self.assertEqual(graded["clients_played"], {"H": 1, "D": 0})
+        self.assertTrue(graded["violation"])
+        # Twice, or once in another generation, fails as well.
+        texts["D"] = self.client("level end COpenResultsScreenMessage from the server played here (generation 2,"
+                                 " recipient WorldInstance#2048)")
+        _, reasons = skytest.grade_route(texts, self.checklist(), {"file": "x"})
+        self.assertEqual(reasons, ["grade route: client D played the server's level end COpenResultsScreenMessage of"
+                                   " generation 2 2 times (exactly once)"])
+        texts["D"] = self.client(played="played here (generation 3, recipient WorldInstance#2048)")
+        _, reasons = skytest.grade_route(texts, self.checklist(), {"file": "x"})
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("0 times", reasons[0])
+
+    def test_a_stopped_run_is_not_reached(self) -> None:
+        texts = {"S": self.server(end=False), "H": self.client()}
+        graded, reasons = skytest.grade_route(texts, self.checklist(), {"file": "x"})
+        self.assertEqual(len(reasons), 1)
+        self.assertTrue(reasons[0].startswith("grade route: not reached (no `level end COpenResultsScreenMessage to"
+                                              " WorldInstance#2048` line on S; seen before the run stopped: "))
+        self.assertIn("triggers 2 of 2", reasons[0])
+        self.assertNotIn("violation", graded)
+        # An empty server log (the run died before anything): not reached as well.
+        _, reasons = skytest.grade_route({"S": ""}, self.checklist(), {"file": "x"})
+        self.assertTrue(reasons[0].startswith("grade route: not reached"))
+
+    def test_a_level_end_twice_fails(self) -> None:
+        graded, reasons = skytest.grade_route({"S": self.server(twice=True)}, self.checklist(), {"file": "x",
+                                                                                                 "clients": []})
+        self.assertIn("grade route: level end COpenResultsScreenMessage to WorldInstance#2048 2 times (once per class"
+                      " and recipient)", reasons)
+        self.assertTrue(graded["violation"])
+
+    def test_next_level_must_open_as_the_servers_own(self) -> None:
+        _, reasons = skytest.grade_route({"S": self.server(next_level=False)}, self.checklist(), {"file": "x",
+                                                                                                  "clients": []})
+        self.assertEqual(reasons, ["grade route: the next level town_state10 did not open as the server's own level"
+                                   " change after the level end"])
+
+    def test_a_client_leaving_by_itself_fails(self) -> None:
+        texts = {"S": self.server(), "H": self.client(),
+                 "D": self.client("level request 0x829C880C passed - (sub_829C87A0, main-menu return: out of the"
+                                  " session)")}
+        _, reasons = skytest.grade_route(texts, self.checklist(), {"file": "x"})
+        self.assertEqual(reasons, ["grade route: client D left the level by itself (sub_829C87A0, main-menu return:"
+                                   " out of the session)"])
+        texts["D"] = self.client("level end COpenResultsScreenMessage to WorldInstance#2048 played here (not connected"
+                                 " to the server)")
+        _, reasons = skytest.grade_route(texts, self.checklist(), {"file": "x"})
+        self.assertEqual(reasons, ["grade route: client D ran its own level end (COpenResultsScreenMessage to"
+                                   " WorldInstance#2048)"])
+
+    def test_missing_checklist_items_fail(self) -> None:
+        server = self.server().replace("encounter complete EA_Manager_W1#2688", "encounter waiting")
+        server = server.replace("replay done 2.1:2/2/enter/1/w2 activated 1", "replay done 2.1:2/2/enter/1/w2 activated 0")
+        server = server.replace("TutorialB_Intro recipient", "OtherScene recipient")
+        server = server.replace("Trace: message CCheckPointTriggeredMessage", "Trace: message Other")
+        _, reasons = skytest.grade_route({"S": server}, self.checklist(), {"file": "x", "clients": []})
+        self.assertEqual(reasons, [
+            "grade route: trigger CScriptTriggerEntity#2392 never applied on the server",
+            "grade route: encounter EA_Manager_W1 never completed on the server",
+            "grade route: checkpoint CScriptTriggerEntity#2651: /Trace: message CCheckPoint\\w+Message to / not on"
+            " the server",
+            "grade route: scene TutorialB_Intro never started on the server",
+        ])
+
+    def test_route_file_without_level_end(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "r.toml"
+            f.write_text("[[trigger]]\nname = \"x\"\nclass = \"request\"\n", encoding="utf-8")
+            checklist, why = skytest.load_route_checklist(f)
+            self.assertIsNone(checklist)
+            self.assertEqual(why, "the route file r.toml has no [level_end] class (X11 names it)")
+            checklist, why = skytest.load_route_checklist(Path(d) / "missing.toml")
+            self.assertIsNone(checklist)
+            self.assertTrue(why.startswith("the route file missing.toml cannot be read"))
+
+    def test_cross_peer_reads_the_route_file_from_the_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            (repo / "tests" / "routes").mkdir(parents=True)
+            (repo / "tests" / "routes" / "tutorial_b.toml").write_text(ROUTE_FILE, encoding="utf-8")
+            spec = skytest.Spec(name="r", path=repo / "r.toml", layout="server+1", stage="1B", description="",
+                                timeout=1, peers={}, measures={}, standin_seconds=0,
+                                grades={"route": {"file": "tests/routes/tutorial_b.toml", "clients": ["H"]}})
+            r = skytest.PeerResult(peer="S")
+            reasons = skytest.grade_cross_peer(spec, r, {"S": self.server(), "H": self.client()}, repo, {})
+            self.assertEqual(reasons, [])
+            self.assertEqual(r.graded["route"]["level_end"]["generation"], 2)
+            reasons = skytest.grade_cross_peer(spec, r, {"S": self.server(end=False)}, repo, {})
+            self.assertTrue(reasons[0].startswith("grade route: not reached"))
+
+    def test_route_name_matching(self) -> None:
+        self.assertTrue(skytest.route_name_matches("JumpHint_Trigger", "jumphint_trigger#2394"))
+        self.assertTrue(skytest.route_name_matches("CScriptTriggerEntity#2392", "CScriptTriggerEntity#2392"))
+        self.assertFalse(skytest.route_name_matches("CScriptTriggerEntity#2392", "CScriptTriggerEntity#2398"))
+        self.assertFalse(skytest.route_name_matches("JumpHint", "JumpHint_Trigger#2394"))
+
+    def test_spec_options(self) -> None:
+        skytest.check_route("x.toml", {"file": "tests/routes/tutorial_b.toml"}, ["S", "H", "D"])
+        skytest.check_route("x.toml", {"file": "tests/routes/tutorial_b.toml", "clients": ["D"]}, ["S", "H", "D"])
+        for bad in ({}, {"file": ""}, {"file": "/abs/route.toml"}, {"file": "../route.toml"},
+                    {"file": "r.toml", "peer": "E"}, {"file": "r.toml", "clients": ["S"]},
+                    {"file": "r.toml", "clients": "H"}):
+            with self.assertRaises(skytest.SpecError, msg=str(bad)):
+                skytest.check_route("x.toml", bad, ["S", "H", "D"])
+        self.assertIn("route", skytest.GRADES)
+
+
+class BandwidthTest(unittest.TestCase):
+    """The bandwidth grade (stage 1B item 13) on hand-written server traffic lines."""
+
+    THRESHOLDS = {"bandwidth_per_client": {"up_kilobytes_per_s": 4.0, "steady_down_kilobytes_per_s": 20.0}}
+
+    @staticmethod
+    def traffic(rows: list[tuple[str, int, int, int]], before: list[str] | None = None) -> list:
+        """rows: (time, peer, up bytes so far, down bytes so far), up and down on the fast lane."""
+        text = list(before or [])
+        for t, peer, up, down in rows:
+            text.append(rq(f"traffic peer {peer} gameplay 0/0 state 0/0 fast {down}/{up} bytes", t))
+        return skytest.parse_log("\n".join(text))["lines"]
+
+    def test_within_the_floor_passes(self) -> None:
+        rows = [(f"12:00:{10 * i:02d}.000", 2, 30000 * i, 100000 * i) for i in range(5)]
+        graded, reasons = skytest.grade_bandwidth(self.traffic(rows), {}, self.THRESHOLDS)
+        self.assertEqual(reasons, [])
+        self.assertEqual(graded["peers"]["2"]["windows"], 4)
+        self.assertAlmostEqual(graded["peers"]["2"]["up_kbps"], 3.0)
+        self.assertAlmostEqual(graded["peers"]["2"]["down_kbps"], 10.0)
+
+    def test_over_the_up_limit_fails(self) -> None:
+        rows = [(f"12:00:{10 * i:02d}.000", 3, 50000 * i, 1000 * i) for i in range(5)]
+        graded, reasons = skytest.grade_bandwidth(self.traffic(rows), {"statistic": "max"}, self.THRESHOLDS)
+        self.assertEqual(reasons, ["grade bandwidth: peer 3 up 5.00 KB/s (max) over 4.0 KB/s"])
+        self.assertTrue(graded["violation"])
+
+    def test_not_reached(self) -> None:
+        _, reasons = skytest.grade_bandwidth(self.traffic([]), {}, self.THRESHOLDS)
+        self.assertEqual(reasons, ["grade bandwidth: not reached (no `traffic peer` line in the window)"])
+        rows = [("12:00:00.000", 2, 0, 0), ("12:00:10.000", 2, 100, 100)]
+        _, reasons = skytest.grade_bandwidth(self.traffic(rows), {}, self.THRESHOLDS)
+        self.assertEqual(reasons, ["grade bandwidth: not reached (peer 2: 1 window(s), 3 needed)"])
+
+    def test_window_bounds_and_a_counter_reset(self) -> None:
+        early = [("11:59:00.000", 2, 0, 0), ("11:59:10.000", 2, 900000, 0)]  # before `after`: not graded
+        rows = [("12:00:00.000", 2, 1000, 0), ("12:00:10.000", 2, 21000, 0), ("12:00:20.000", 2, 100, 0),
+                ("12:00:30.000", 2, 20100, 0), ("12:00:40.000", 2, 40100, 0)]
+        lines = self.traffic(early) + self.traffic(rows, before=[rq("barrier 2 released at tick 1 (1 client)")])
+        graded, reasons = skytest.grade_bandwidth(lines, {"after": "barrier 2 released", "min_windows": 3},
+                                                  self.THRESHOLDS)
+        self.assertEqual(reasons, [])
+        self.assertEqual(graded["peers"]["2"]["windows"], 3)  # the window across the reset is left out
+        self.assertAlmostEqual(graded["peers"]["2"]["up_max_kbps"], 2.0)
+
+    def test_spec_options(self) -> None:
+        skytest.check_bandwidth("x.toml", {}, ["S", "H"])
+        skytest.check_bandwidth("x.toml", {"statistic": "max", "after": "barrier 2", "min_windows": 6}, ["S", "H"])
+        for bad in ({"peer": "D"}, {"statistic": "mean"}, {"min_windows": 0}, {"min_windows": True},
+                    {"after": "("}):
+            with self.assertRaises(skytest.SpecError, msg=str(bad)):
+                skytest.check_bandwidth("x.toml", bad, ["S", "H"])
+        self.assertIn("bandwidth", skytest.GRADES)
+
+
+class RunnerEnvironmentTest(unittest.TestCase):
+    """The runner's environment: the token preflight, the startup stall, the power throttling opt-out."""
+
+    def tearDown(self) -> None:
+        skytest._THROTTLING_LOGGED.clear()
+
+    @staticmethod
+    def log(*lines: str) -> str:
+        return "".join(f"{line}\n" for line in lines)
+
+    def test_the_stall_parser_on_hand_written_logs(self) -> None:
+        storage = "[2026-11-06 14:38:16.100] [info] [core] [t15248] Initializing shader storage for title 415608E9..."
+        vfs = "[2026-11-06 14:38:23.991] [warning] [fs] [t26924] VFS: 'E:\\' -> [no device]"
+        sic = "[2026-11-06 14:38:24.400] [info] [gpu] [t26924] SetInterruptCallback(82F58198, 40003980)"
+
+        def stall(text: str) -> float | None:
+            return skytest.parse_log(text)["startup_stall"]
+
+        # The guest's first line after the storage: the VFS mount (0.4-0.9 s before SetInterruptCallback).
+        self.assertEqual(stall(self.log(storage, "no stamp: a wrapped line", vfs, sic)), 7.89)
+        self.assertEqual(stall(self.log(storage, sic)), 8.3, "SetInterruptCallback alone")
+        self.assertEqual(skytest.startup_stall(skytest.parse_log(self.log(storage, sic))["lines"]), 8.3)
+        early_vfs = "[2026-11-06 14:38:15.000] [info] [fs] [t1] VFS: 'game:' -> mounted"
+        self.assertEqual(stall(self.log(early_vfs, storage, vfs)), 7.89, "a guest line before the storage is no end")
+        fast = "[2026-11-06 14:38:16.130] [warning] [fs] [t26924] VFS: 'E:\\' -> [no device]"
+        self.assertEqual(stall(self.log(storage, fast)), 0.03)
+        self.assertIsNone(stall(self.log(vfs, sic)), "no storage line")
+        self.assertIsNone(stall(self.log(storage)), "no guest line after it")
+        self.assertIsNone(stall(""))
+
+    @unittest.skipUnless(skytest.WINDOWS, "power throttling is Windows only")
+    def test_the_throttling_calls_arguments(self) -> None:
+        calls = []
+        self.addCleanup(setattr, skytest, "set_process_information", skytest.set_process_information)
+
+        def answering(*codes: int):
+            it = iter(codes)
+
+            def fake(handle: int, info_class: int, state: tuple[int, int, int]) -> int:
+                calls.append((handle, info_class, state))
+                return next(it)
+            return fake
+
+        # ProcessPowerThrottling (4); Version 1; control: execution speed (0x1) and timer resolution
+        # (0x4); state 0: both kinds of throttling off.
+        skytest.set_process_information = answering(0)
+        self.assertEqual(skytest.opt_out_of_power_throttling(77), "opted out")
+        self.assertEqual(calls, [(77, 4, (1, 0x5, 0))])
+        # A Windows without the timer flag: the execution speed alone.
+        calls.clear()
+        skytest.set_process_information = answering(87, 0)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            status = skytest.opt_out_of_power_throttling(77)
+        self.assertEqual(calls, [(77, 4, (1, 0x5, 0)), (77, 4, (1, 0x1, 0))])
+        self.assertEqual(status, "opted out (execution speed only; the timer resolution flag was refused, error 87)")
+        self.assertEqual(out.getvalue(), "", "a partial opt-out is no failure")
+        # Refused twice, and a call that raises: one printed line for the runner process, never raised.
+        skytest.set_process_information = answering(5, 5, 6, 6)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(skytest.opt_out_of_power_throttling(77), "failed: Windows error 5")
+            self.assertEqual(skytest.opt_out_of_power_throttling(78), "failed: Windows error 6")
+
+            def raising(*_):
+                raise OSError("no SetProcessInformation")
+            skytest.set_process_information = raising
+            self.assertTrue(skytest.opt_out_of_power_throttling(79).startswith("failed: OSError"))
+        self.assertEqual(out.getvalue(), "skytest: could not opt a game out of Windows power throttling (Windows "
+                         "error 5); the run goes on, a busy machine may slow its games\n")
+
+    @unittest.skipUnless(skytest.WINDOWS, "power throttling is Windows only")
+    def test_the_opt_out_takes_on_a_suspended_process(self) -> None:
+        ctypes, wintypes, _, k32 = skytest._win()
+        p = subprocess.Popen([sys.executable, "-I", "-c", "pass"], creationflags=winjob.SUSPENDED_START)
+        try:
+            self.assertEqual(skytest.opt_out_of_power_throttling(int(p._handle)), "opted out")
+            k32.GetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+            state = (wintypes.ULONG * 3)(1, 0, 0)
+            self.assertTrue(k32.GetProcessInformation(int(p._handle), 4, ctypes.byref(state), ctypes.sizeof(state)))
+            self.assertEqual(list(state), [1, 0x5, 0])
+        finally:
+            p.kill()
+            p.wait(timeout=10)
+
+    @unittest.skipUnless(skytest.WINDOWS, "tokens are Windows only")
+    def test_the_token_check_reads_real_tokens(self) -> None:
+        ctypes, wintypes, adv, k32 = skytest._win()
+        self.assertIsInstance(skytest.token_restriction(), str)
+        TOKEN_ALL_ACCESS = 0xF01FF
+        own = wintypes.HANDLE()
+        self.assertTrue(adv.OpenProcessToken(k32.GetCurrentProcess(), TOKEN_ALL_ACCESS, ctypes.byref(own)))
+        self.addCleanup(k32.CloseHandle, own)
+
+        class SidAndAttributes(ctypes.Structure):
+            _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+        adv.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+        everyone, low = ctypes.c_void_p(), ctypes.c_void_p()
+        self.assertTrue(adv.ConvertStringSidToSidW("S-1-1-0", ctypes.byref(everyone)))
+        self.assertTrue(adv.ConvertStringSidToSidW("S-1-16-4096", ctypes.byref(low)))  # Low Mandatory Level
+        # A copy with one restricting SID: what a sandbox's CreateRestrictedToken gives.
+        adv.CreateRestrictedToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                              wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+                                              ctypes.POINTER(wintypes.HANDLE)]
+        restricted = wintypes.HANDLE()
+        sid = SidAndAttributes(everyone, 0)
+        self.assertTrue(adv.CreateRestrictedToken(own, 0, 0, None, 0, None, 1, ctypes.byref(sid),
+                                                  ctypes.byref(restricted)))
+        self.addCleanup(k32.CloseHandle, restricted)
+        self.assertIn("a restricted token (IsTokenRestricted)", skytest.token_handle_restriction(restricted))
+        # A copy at low integrity.
+        adv.DuplicateTokenEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                         ctypes.POINTER(wintypes.HANDLE)]
+        adv.SetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        lowered = wintypes.HANDLE()
+        self.assertTrue(adv.DuplicateTokenEx(own, TOKEN_ALL_ACCESS, None, 2, 1, ctypes.byref(lowered)))
+        self.addCleanup(k32.CloseHandle, lowered)
+        label = SidAndAttributes(low, 0x20)  # SE_GROUP_INTEGRITY
+        self.assertTrue(adv.SetTokenInformation(lowered, skytest.TOKEN_INTEGRITY_LEVEL, ctypes.byref(label),
+                                                ctypes.sizeof(label)))
+        self.assertEqual(skytest.token_handle_restriction(lowered), "a low integrity level (0x1000)")
+
+    def test_the_preflight_and_its_report_line(self) -> None:
+        self.addCleanup(setattr, skytest, "token_restriction", skytest.token_restriction)
+        skytest.token_restriction = lambda: ""
+        self.assertEqual(skytest.token_preflight(False), {"restricted": False, "cause": ""})
+        self.assertEqual(skytest.token_report_line({"restricted": False, "cause": ""}), "Token: not restricted.")
+        skytest.token_restriction = lambda: "an AppContainer token"
+        with self.assertRaises(SystemExit) as e:
+            skytest.token_preflight(False)
+        self.assertEqual(str(e.exception.code),
+                         "skytest: refused to start games: this runner has an AppContainer token, as in an agent "
+                         "sandbox, so its games could not use the GPU shader caches and would compile every pipeline "
+                         "cold at each start (4-32 s); run skytest outside the sandbox, or pass --allow-restricted to "
+                         "run anyway (timings then not comparable)")
+        with contextlib.redirect_stdout(io.StringIO()):
+            t = skytest.token_preflight(True)
+        self.assertEqual(t, {"restricted": True, "cause": "an AppContainer token"})
+        self.assertTrue(skytest.token_report_line(t).startswith("Token: RESTRICTED (an AppContainer token)"))
+
+        def failing() -> str:
+            raise AttributeError("function 'IsTokenRestricted' not found")
+
+        skytest.token_restriction = failing
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            t = skytest.token_preflight(False)
+        self.assertIsNone(t["restricted"])
+        self.assertIn("could not check this runner's token (AttributeError", out.getvalue())
+        self.assertEqual(skytest.token_report_line(t),
+                         "Token: not checked (AttributeError: function 'IsTokenRestricted' not found).")
 
 
 class JobTest(unittest.TestCase):
