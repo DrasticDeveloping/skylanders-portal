@@ -104,6 +104,9 @@ struct ServerEvent {
     kPeerLevelLoaded,  // peer_id, generation: the client has the current generation's level up
                        // (its LevelLoaded; also a late joiner's, which no barrier waits for): the
                        // backend's OnPeerLevelReady
+    kOwnerFlags,       // peer_id (always the owner), owner_flags: stage 1C's flags snapshot, in
+                       // arrival order with the owner's requests; another peer's is refused
+                       // kNotOwner, and none is reported once End session began
   };
   Type type = Type::kPeerJoined;
   uint16_t peer_id = 0;
@@ -127,6 +130,7 @@ struct ServerEvent {
   SceneBarrier scene;  // kSceneAck
   netplay::Lane lane = netplay::Lane::kGameplay;  // kBackendFrame
   std::vector<uint8_t> frame;                     // kBackendFrame
+  OwnerFlags owner_flags;  // kOwnerFlags
 };
 
 struct PeerInfo {
@@ -393,6 +397,10 @@ class ClientSession {
   // S's backend mode and table digest from the Welcome (0 before it).
   uint8_t BackendMode() const { return backend_mode_; }
   uint64_t BackendTableDigest() const { return backend_table_digest_; }
+  // Stage 1C: the owner's flags snapshot, gameplay lane (ordered with SendWorldRequest). While
+  // connected and End session has not begun; false otherwise or when the post fails (the caller
+  // keeps the snapshot and sends it again).
+  bool SendOwnerFlags(const OwnerFlags& flags, TimePoint now = Clock::now());
   // End session began (SessionClosing came): no request leaves this client any more.
   bool Closing() const { return closing_; }
   // The connection's counters (per-lane bytes included); all zero with no connection.

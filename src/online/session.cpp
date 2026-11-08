@@ -254,6 +254,19 @@ void ServerSession::HandleMessage(Peer& peer, const Message& message, Lane lane,
     e.peer_id = peer.id;
     e.scene = *scene;
     events_.push_back(std::move(e));
+  } else if (const auto* flags = std::get_if<OwnerFlags>(&message)) {
+    // Stage 1C: only the owner's flags count (the row: "the owner's own ... from the owner's
+    // record"); after End session began nothing is applied any more.
+    if (!peer.owner) {
+      SendRefuse(peer, RefuseReason::kNotOwner, "only the owner sends its flags", now, false);
+      return;
+    }
+    if (requests_.Closing()) return;
+    ServerEvent e;
+    e.type = ServerEvent::Type::kOwnerFlags;
+    e.peer_id = peer.id;
+    e.owner_flags = *flags;
+    events_.push_back(std::move(e));
   }
 }
 
@@ -876,6 +889,11 @@ bool ClientSession::SendSceneAck(const SceneBarrier& scene, TimePoint now) {
   ack.end = SceneEndReason::kNone;
   ack.skips = 0;
   return Post(Lane::kGameplay, ack, now);
+}
+
+bool ClientSession::SendOwnerFlags(const OwnerFlags& flags, TimePoint now) {
+  if (!Connected() || closing_) return false;
+  return Post(Lane::kGameplay, flags, now);
 }
 
 bool ClientSession::Post(Lane lane, const Message& message, TimePoint now) {
