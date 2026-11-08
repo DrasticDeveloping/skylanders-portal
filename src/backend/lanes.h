@@ -83,6 +83,7 @@ enum class MessageType : uint16_t {
   kAck = 20,
   kObligationDone = 21,
   kMismatch = 22,
+  kOwnedDelta = 23,  // stage 4: a client's own player row (owned.h)
   // Gameplay lane, client to S.
   kRequest = 30,
   kLeaseRenew = 31,
@@ -188,6 +189,11 @@ struct Mismatch {
   // older reader ignores it (bytes past the fields it knows).
   bool lost = false;
 };
+// Stage 4 (owned.h): one row of the sender's own player. S stamps the writer from the link and
+// admits it by owned.h's six checks; nothing in the bytes names the sender.
+struct OwnedDelta {
+  Record record;
+};
 struct Request {  // on the wire: no peer, no peer epoch (S stamps both from the link; Sol F3)
   backend::Request request;
 };
@@ -216,7 +222,8 @@ using Message = std::variant<msg::StateHello, msg::EpochBegin, msg::Delta, msg::
                              msg::Manifest, msg::BaselineBegin, msg::BaselineRows,
                              msg::BaselineEnd, msg::Obligation, msg::ObligationAck, msg::Ack,
                              msg::ObligationDone, msg::Mismatch, msg::Request, msg::LeaseRenew,
-                             msg::LeaseReport, msg::Decision, msg::LeaseEnd, msg::Effect>;
+                             msg::LeaseReport, msg::Decision, msg::LeaseEnd, msg::Effect,
+                             msg::OwnedDelta>;
 
 MessageType TypeOf(const Message& m);
 // The lane a message rides (state, gameplay or fast).

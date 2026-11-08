@@ -12,6 +12,7 @@
 #include "backend/lease.h"
 #include "backend/limits.h"
 #include "backend/obligation.h"
+#include "backend/owned.h"
 #include "backend/record.h"
 #include "backend/request.h"
 #include "backend/world_state.h"
@@ -156,6 +157,11 @@ class Server {
   // Read-only views for tests and the map dump (item 4; the header's own).
   const RequestTable& Requests() const;
   const LeaseTable& Leases() const;
+  // Stage 4 (owned.h): the game's codec check for owned rows (admission check 6). Unset: every
+  // value decodes. Set once, before the first peer.
+  void SetOwnedSchema(OwnedSchemaCheck schema);
+  // Stage 4: the admission's counters (owned.h).
+  const OwnedAdmission& Owned() const;
 
  private:
   struct Impl;

@@ -70,6 +70,10 @@ struct Client::Impl {
   uint32_t peer_epoch = 0;
   uint32_t generation = 0;
   std::map<uint32_t, uint32_t> next_sequence;  // per generation
+  // Stage 4: the client's own revision counter per owned kind, and the newest owned row per kind
+  // waiting for the state lane (WriteOwned).
+  std::map<KindId, uint32_t> owned_revision;
+  std::map<KindId, Record> owned_waiting;
   std::map<RequestKey, Sent> requests;
   // Granted, by id, until its LeaseEnd: the last renew, and whether a report of it went to the
   // link and has no answer yet (a decision with this lease; N1: Report waits for it). While it has
@@ -113,6 +117,8 @@ struct Client::Impl {
     peer_epoch = 0;
     generation = 0;
     next_sequence.clear();
+    owned_revision.clear();
+    owned_waiting.clear();
     requests.clear();
     leases.clear();
     last_ack = msg::Ack{};
@@ -208,6 +214,10 @@ struct Client::Impl {
     if (mismatch && !Held(netplay::Lane::kState)) {
       Push(*mismatch);
       mismatch.reset();
+    }
+    if (!owned_waiting.empty() && !Held(netplay::Lane::kState)) {  // stage 4
+      for (const auto& [kind, record] : owned_waiting) Push(msg::OwnedDelta{record});
+      owned_waiting.clear();
     }
   }
 
@@ -730,6 +740,37 @@ bool Client::PollEvent(ClientEvent& out) {
   if (impl_->events.empty()) return false;
   out = std::move(impl_->events.front());
   impl_->events.pop_front();
+  return true;
+}
+
+// Stage 4 (owned.h).
+bool Client::WriteOwned(KindId kind, std::span<const uint8_t> value, TimePoint now) {
+  Impl& c = *impl_;
+  c.now = now;
+  if (!c.hello || !c.link) return false;
+  const KindSpec* spec = FindKind(c.table, kind);
+  if (spec == nullptr || spec->state_class != StateClass::kOwnedValue) return false;
+  Record r;
+  r.key = RecordKey{kind, Player(c.self, c.peer_epoch), 0};
+  r.revision = ++c.owned_revision[kind];
+  r.value.assign(value.begin(), value.end());
+  if (c.Held(netplay::Lane::kState) || c.owned_waiting.contains(kind)) {
+    c.owned_waiting[kind] = std::move(r);
+    return true;
+  }
+  c.Push(msg::OwnedDelta{std::move(r)});
+  return true;
+}
+
+bool Client::DevWriteOwnedAs(KindId kind, EntityId entity, std::span<const uint8_t> value, TimePoint now) {
+  Impl& c = *impl_;
+  c.now = now;
+  if (!c.hello || !c.link) return false;
+  Record r;
+  r.key = RecordKey{kind, entity, 0};
+  r.revision = ++c.owned_revision[kind];
+  r.value.assign(value.begin(), value.end());
+  c.Push(msg::OwnedDelta{std::move(r)});
   return true;
 }
 

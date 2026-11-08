@@ -10,6 +10,7 @@
 
 #include "netplay/fake_network.h"
 #include "online/join_code.h"
+#include "online/pose_rate.h"
 #include "online/session.h"
 #include "test_util.h"
 
@@ -99,6 +100,20 @@ struct World {
   bool game = true;
   RefusalReason verdict = RefusalReason::kNone;
   uint32_t applied = 0;
+  // The server's pose step, as the game's session_host takes each kPlayerPose: S's rate check when
+  // `rate` is set (records_players; without it every pose is accepted), then, for an accepted pose
+  // only, AcceptPose and the backend bridge's Server::OnPrecondition (recorded in `preconditions`).
+  std::unique_ptr<PoseRateCheck> rate;
+  std::vector<std::pair<uint16_t, uint32_t>> preconditions;
+
+  void HostPose(const ServerEvent& e) {
+    if (rate && rate->Check(e.peer_id, e.pose.generation, e.pose.pose_sequence, e.pose.position, e.pose.teleports,
+                            net.Now()) == PoseRateCheck::Verdict::kTooFast) {
+      return;  // dropped: neither request table sees it
+    }
+    server.AcceptPose(e.peer_id, e.pose);
+    preconditions.emplace_back(e.peer_id, e.pose.pose_sequence);
+  }
 
   bool StartServer(const ServerSettings& s) { return server.Start(net.Bind(kServerEp), s, net.Now()); }
 
@@ -116,6 +131,7 @@ struct World {
       std::vector<ServerEvent> evaluate;
       while (server.PollEvent(e)) {
         if (e.type == ServerEvent::Type::kEvaluateRequest) evaluate.push_back(e);
+        if (e.type == ServerEvent::Type::kPlayerPose) HostPose(e);
         server_events.push_back(e);
       }
       for (const ServerEvent& x : evaluate) {
@@ -468,6 +484,49 @@ void FakeNetworkHelloFlood() {
   CHECK(owner.session->Connected() && w.server.ConnectionCount() <= cap);
 }
 
+// Stage 4 item 2 (Opus 4 B6): a synthetic Hello is welcomed only with allow_synthetic on and from
+// a loopback address; from another address it is refused kOther even with the setting on. A plain
+// Hello from another address is unaffected.
+void FakeNetworkSyntheticHello() {
+  Hello synthetic = MakeHello("Synthetic");
+  synthetic.flags = kHelloSynthetic;
+  const auto join = [](World& w, uint32_t address, const Hello& h) -> Client& {
+    auto c = std::make_unique<Client>();
+    CHECK(c->session->Connect(w.net.Bind(address, 0), kServerEp, h, w.net.Now()));
+    w.clients.push_back(std::move(c));
+    return *w.clients.back();
+  };
+  {
+    World w(31);
+    ServerSettings s = Settings();
+    s.allow_synthetic = true;
+    CHECK(w.StartServer(s));
+    Client& lan = join(w, 0x0A000020, synthetic);  // 10.0.0.32: not this machine
+    CHECK(w.RunUntil([&] { return lan.session->State() == ClientState::kRefused; }));
+    REQUIRE_OR_RETURN_VOID(lan.Last(CE::kRefused) != nullptr);
+    CHECK(lan.Last(CE::kRefused)->refuse_reason == RefuseReason::kOther);
+    CHECK(lan.Last(CE::kRefused)->text == "synthetic peers only on loopback");
+    CHECK(w.Count(SE::kPeerJoined) == 0);
+    Client& local = join(w, 0x7F000002, synthetic);  // 127.0.0.2
+    CHECK(w.RunUntil([&] { return local.session->Connected(); }));
+    REQUIRE_OR_RETURN_VOID(w.Last(SE::kPeerJoined) != nullptr);
+    CHECK(w.Last(SE::kPeerJoined)->synthetic && w.server.PeerCount() == 1);
+    Client& plain = join(w, 0x0A000021, MakeHello("Plain"));
+    CHECK(w.RunUntil([&] { return plain.session->Connected(); }));
+    CHECK(!w.Last(SE::kPeerJoined)->synthetic && w.server.PeerCount() == 2);
+  }
+  {
+    // The setting off: refused from loopback too.
+    World w(32);
+    CHECK(w.StartServer(Settings()));
+    Client& local = join(w, 0x7F000002, synthetic);
+    CHECK(w.RunUntil([&] { return local.session->State() == ClientState::kRefused; }));
+    REQUIRE_OR_RETURN_VOID(local.Last(CE::kRefused) != nullptr);
+    CHECK(local.Last(CE::kRefused)->text == "synthetic peers are off");
+    CHECK(w.server.PeerCount() == 0);
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Version 2: requests through ServerSession's request table, on a lossy, reordering fake network
 // (docs/online-1B.md section 2, "The request state machine"; requests.h has the table's own
@@ -707,6 +766,68 @@ void FakeNetworkRequests() {
   CHECK(closed == 2 && left_closed == 2);
   CHECK(w.server.PeerCount() == 0);
   CHECK(!b.session->SendWorldRequest(tele, w.net.Now()));
+}
+
+// Stage 4 (Sol F1): a pose S's rate check drops meets no pose precondition, neither in the
+// session's request table nor in the backend's (the bridge's OnPrecondition). Pose N-1 accepted,
+// pose N too fast: a request naming N stays pending until a later pose the check passes.
+void FakeNetworkRateDroppedPose() {
+  World w(4404);
+  REQUIRE_OR_RETURN_VOID(w.StartServer(Settings()));
+  w.rate = std::make_unique<PoseRateCheck>(10.0f);  // 10 units per second
+  Client& owner = w.Connect(MakeHello("Owner", true));
+  CHECK(w.RunUntil([&] { return owner.session->Connected(); }));
+  Client& b = w.Connect(MakeHello("Bee"));
+  CHECK(w.RunUntil([&] { return b.session->Connected(); }));
+  const uint16_t bee = b.session->PeerId();
+  const uint32_t g1 = w.server.RequestLevel("levels/zone_a", w.net.Now());
+  CHECK(w.RunUntil([&] { return b.session->Generation() == g1 && owner.session->Generation() == g1; }));
+
+  auto poses_seen = [&](uint32_t seq) {
+    return size_t(std::count_if(w.server_events.begin(), w.server_events.end(), [&](const ServerEvent& e) {
+      return e.type == SE::kPlayerPose && e.peer_id == bee && e.pose.pose_sequence == seq;
+    }));
+  };
+  auto bridged = [&](uint32_t seq) {
+    return std::count(w.preconditions.begin(), w.preconditions.end(), std::pair<uint16_t, uint32_t>{bee, seq});
+  };
+  auto send_pose = [&](uint32_t seq, float x) {
+    PlayerPose pose;
+    pose.pose_sequence = seq;
+    pose.generation = g1;
+    pose.position = {x, 0, 0};
+    pose.figure.figure_id = 3;
+    CHECK(b.session->SendPlayerPose(pose, w.net.Now()));
+    CHECK(w.RunUntil([&] { return poses_seen(seq) == 1; }));
+  };
+
+  send_pose(4, 0.0f);    // N-1: the peer's first pose, accepted
+  send_pose(5, 100.0f);  // N: 100 units in one pose interval, dropped by the rate check
+  CHECK(bridged(4) == 1 && bridged(5) == 0);
+
+  WorldRequest r = EnterRequest(g1, 1, 5);
+  CHECK(b.session->SendWorldRequest(r, w.net.Now()));
+  r.key.peer = bee;  // what the client and the server set it to
+  auto evaluations = [&] {
+    return std::count_if(w.server_events.begin(), w.server_events.end(), [&](const ServerEvent& e) {
+      return e.type == SE::kEvaluateRequest && e.request.key == r.key;
+    });
+  };
+  CHECK(w.RunUntil([&] { return DecisionsFor(b, r.key).size() == 1; }));
+  w.Run(150ms);  // well inside kPoseWait
+  CHECK(evaluations() == 0 && w.server.Requests().StateOf(r.key) == RequestState::kPending);
+  auto ds = DecisionsFor(b, r.key);
+  REQUIRE_OR_RETURN_VOID(ds.size() == 1);
+  CHECK(Pending(ds[0].second));
+
+  // The next pose the check passes (close to the last accepted one) meets N: the request goes on.
+  send_pose(6, 0.1f);
+  CHECK(bridged(6) == 1);
+  CHECK(w.RunUntil([&] { return DecisionsFor(b, r.key).size() == 2; }));
+  ds = DecisionsFor(b, r.key);
+  REQUIRE_OR_RETURN_VOID(ds.size() == 2);
+  CHECK(ds[1].second.outcome == DecisionOutcome::kApplied && ds[1].second.final);
+  CHECK(evaluations() == 1);
 }
 
 // A client whose SessionClosed never comes (its game hangs): after kCloseWait the server takes it
@@ -1014,7 +1135,9 @@ int main() {
   FakeNetworkStopAndQuiet();
   FakeNetworkReceiveBudget();
   FakeNetworkHelloFlood();
+  FakeNetworkSyntheticHello();
   FakeNetworkRequests();
+  FakeNetworkRateDroppedPose();
   FakeNetworkCloseGone();
   FakeNetworkScenes();
   FakeNetworkBackendFrames();

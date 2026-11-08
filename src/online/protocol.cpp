@@ -14,7 +14,7 @@ using netplay::ByteWriter;
 // The variant's order is the type numbering (Hello = 1 ...), which TypeOf relies on, for the
 // contiguous run 1..kLastType; the number-block types after it (stage 1C's OwnerFlags = 50) are
 // mapped explicitly (TypeOf, IsKnown).
-static_assert(std::variant_size_v<Message> == 23);
+static_assert(std::variant_size_v<Message> == 25);
 static_assert(std::is_same_v<std::variant_alternative_t<0, Message>, Hello>);
 static_assert(std::is_same_v<std::variant_alternative_t<10, Message>, PlayerList>);
 static_assert(std::is_same_v<std::variant_alternative_t<11, Message>, PlayerPose>);
@@ -22,8 +22,9 @@ static_assert(std::is_same_v<std::variant_alternative_t<14, Message>, WorldDecis
 static_assert(std::is_same_v<std::variant_alternative_t<19, Message>, SessionClosed>);
 static_assert(std::is_same_v<std::variant_alternative_t<20, Message>, SceneBarrier>);
 static_assert(std::is_same_v<std::variant_alternative_t<21, Message>, BackendFrame>);
-constexpr uint16_t kLastType = uint16_t(MessageType::kBackendFrame);
-static_assert(std::is_same_v<std::variant_alternative_t<22, Message>, OwnerFlags>);
+static_assert(std::is_same_v<std::variant_alternative_t<23, Message>, PlayerPoseShown>);
+constexpr uint16_t kLastType = uint16_t(MessageType::kPlayerPoseShown);
+static_assert(std::is_same_v<std::variant_alternative_t<24, Message>, OwnerFlags>);
 constexpr size_t kBlockTypes = 1;  // OwnerFlags
 static_assert(kLastType + kBlockTypes == std::variant_size_v<Message>);
 
@@ -379,6 +380,27 @@ bool ConsistentScene(const SceneBarrier& m) {
   return m.end == SceneEndReason::kNone && m.skips == 0;
 }
 
+// A pose's fields, through the trailing ones (elements: item 11; teleports: stage 4); false if
+// short or invalid. Used for PlayerPose and for PlayerPoseShown, whose pose ends the message.
+bool ReadPose(ByteReader& r, PlayerPose& m) {
+  m.pose_sequence = r.U32();
+  m.generation = r.U32();
+  bool ok = GetFloats(r, m.position) && GetFloats(r, m.rotation);
+  m.figure.figure_id = r.U16();
+  m.figure.figure_variant = r.U16();
+  m.figure.top_id = r.U16();
+  m.figure.top_variant = r.U16();
+  m.figure.bottom_id = r.U16();
+  m.figure.bottom_variant = r.U16();
+  if (ok && r.Ok() && r.Remaining() > 0) {
+    // Item 11's elements (absent in an earlier version 2 pose: 0, not read).
+    m.figure.elements = r.U16();
+    if (r.Ok() && !ValidElements(m.figure.elements)) return false;
+  }
+  if (ok && r.Ok() && r.Remaining() > 0) m.teleports = r.U16();  // stage 4 (absent before: 0)
+  return ok && r.Ok();
+}
+
 bool Fields(ByteWriter& w, const Hello& m) {
   w.U16(m.protocol_version);
   w.Bytes(m.build_digest);
@@ -386,6 +408,8 @@ bool Fields(ByteWriter& w, const Hello& m) {
   w.U16(m.figure_variant);
   if (!PutString(w, m.name, kMaxNameBytes)) return false;
   w.Bytes(m.owner_token);
+  if ((m.flags & ~kHelloFlagsKnown) != 0) return false;
+  w.U8(m.flags);  // stage 4: a trailing byte, so a Hello without it reads as 0
   return true;
 }
 bool Fields(ByteWriter& w, const Welcome& m) {
@@ -450,7 +474,21 @@ bool Fields(ByteWriter& w, const PlayerPose& m) {
   w.U16(m.figure.bottom_id);
   w.U16(m.figure.bottom_variant);
   w.U16(m.figure.elements);  // item 11: a trailing field, so a pose without it reads as 0 (not read)
+  w.U16(m.teleports);        // stage 4: trailing too, so a pose without it reads as 0
   return true;
+}
+bool Fields(ByteWriter& w, const PlayerActionShown& m) {
+  w.U16(m.peer);
+  w.U32(m.peer_epoch);
+  w.U32(m.generation);
+  w.U32(m.press_sequence);
+  w.U32(m.attack_id);
+  w.U32(m.pose_sequence);
+  return true;
+}
+bool Fields(ByteWriter& w, const PlayerPoseShown& m) {
+  w.U16(m.peer);
+  return Fields(w, m.pose);
 }
 bool Fields(ByteWriter& w, const PlayerAction& m) {
   w.U32(m.press_sequence);
@@ -561,6 +599,10 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
       m.figure_variant = r.U16();
       ok = GetString(r, kMaxNameBytes, m.name);
       GetArray(r, m.owner_token);
+      if (ok && r.Ok() && r.Remaining() > 0) {  // stage 4's flags (absent before: 0)
+        m.flags = r.U8();
+        if (r.Ok() && (m.flags & ~kHelloFlagsKnown) != 0) return std::nullopt;
+      }
       result = std::move(m);
       break;
     }
@@ -639,20 +681,7 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
     }
     case MessageType::kPlayerPose: {
       PlayerPose m;
-      m.pose_sequence = r.U32();
-      m.generation = r.U32();
-      ok = GetFloats(r, m.position) && GetFloats(r, m.rotation);
-      m.figure.figure_id = r.U16();
-      m.figure.figure_variant = r.U16();
-      m.figure.top_id = r.U16();
-      m.figure.top_variant = r.U16();
-      m.figure.bottom_id = r.U16();
-      m.figure.bottom_variant = r.U16();
-      if (ok && r.Ok() && r.Remaining() > 0) {
-        // Item 11's elements (absent in an earlier version 2 pose: 0, not read).
-        m.figure.elements = r.U16();
-        if (r.Ok() && !ValidElements(m.figure.elements)) return std::nullopt;
-      }
+      ok = ReadPose(r, m);
       result = m;
       break;
     }
@@ -767,6 +796,24 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
       // An unknown end reason reads as "other", as an unknown refusal reason does.
       m.end = end <= uint8_t(SceneEndReason::kOther) ? SceneEndReason(end) : SceneEndReason::kOther;
       ok = ok && ConsistentScene(m);
+      result = m;
+      break;
+    }
+    case MessageType::kPlayerActionShown: {
+      PlayerActionShown m;
+      m.peer = r.U16();
+      m.peer_epoch = r.U32();
+      m.generation = r.U32();
+      m.press_sequence = r.U32();
+      m.attack_id = r.U32();
+      m.pose_sequence = r.U32();
+      result = m;
+      break;
+    }
+    case MessageType::kPlayerPoseShown: {
+      PlayerPoseShown m;
+      m.peer = r.U16();
+      ok = r.Ok() && ReadPose(r, m.pose);
       result = m;
       break;
     }

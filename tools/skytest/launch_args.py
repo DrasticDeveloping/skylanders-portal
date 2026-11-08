@@ -703,32 +703,100 @@ def build_game(ctx: RunContext, spec_args: list[str], script_text: str, *, fixtu
     return args
 
 
-# --- the synthetic peer (stage 4's program) -------------------------------------------------------
+# --- the synthetic peer (stage 4's program, launch role `synthetic-peer`) ---------------------------
+#
+# Stage 4's synthetic peer (the game repository's tools/headless_peer/main.cpp, built as
+# swapforce_headless_peer.exe) takes each setting as a word and its value, not --name=value:
+#
+#   --port <n> --script <file> --digest <64 hex digits> [--server <address>]
+#
+# A validated line has each of them at most once and nothing else, no empty value:
+# - `--server` and `--port`: exactly the session address the run names (HOST:PORT); without
+#   `--server` the program joins 127.0.0.1, so a line may leave it out only for a loopback session;
+# - `--script`: the program's own script format (tools/headless_peer/script.cpp: poses, swaps, rows,
+#   no command that names a file), an existing file inside the peer's fresh run folder, UTF-8 without
+#   control characters;
+# - `--digest` (the argument contract): the SHA-256 of the game executable the session's server runs,
+#   which S compares with its own build digest in every Hello before it looks at the synthetic flag.
+#   The run supplies it (the snapshot's game exe locally, the payload record's `game` role on the
+#   second PC) and the line must carry exactly that value. The program's other source of the digest,
+#   `--game <exe>`, names an executable outside the run folder and is refused.
+SYNTHETIC_SETTINGS = ("server", "port", "script", "digest")
+SYNTHETIC_SCRIPT_MAX = 64 * 1024  # the remote agent's request bound; a synthetic script is far smaller
 
 
-def build_synthetic_peer(ctx: RunContext, args: list[str], server: str,
-                         allow: dict[str, str] | None = None) -> list[str]:
-    """The synthetic peer's arguments: an explicit allow list of its own settings, no empty value,
-    `--server` exactly the session address of the run plan, every path inside the run folder.
+def session_address(server: str) -> tuple[str, int]:
+    """A run's session address, HOST:PORT, as (host, port)."""
+    host, sep, port = server.rpartition(":")
+    if not sep or not host or not re.fullmatch(r"\d{1,5}", port) or not 0 < int(port) < 65536 or \
+            any(ord(c) <= 32 for c in host) or host.startswith("-"):
+        raise LaunchError(f"session address {server!r}: HOST:PORT")
+    return host, int(port)
 
-    TODO(stage 4): the program and its settings are stage 4's (online-4.md D4, item 2); until stage 4
-    names them `allow` is empty and every setting but --server and --log_file is refused."""
-    allow = dict(allow or {})
-    allow.setdefault("log_file", "write_path")
-    seen_server = 0
-    for a in args:
-        name, value = split_setting(a)
-        if name == "server":
-            seen_server += 1
-            if value != server:
-                raise LaunchError(f"--server={value}: only the run plan's session address {server}")
-            continue
-        kind = allow.get(name)
-        if kind is None:
-            raise LaunchError(f"--{name} is not on the synthetic peer's allow list (stage 4 names it)")
-        if kind not in ("bool", "string", "write_path", "read_path"):
-            raise LaunchError(f"--{name}: the synthetic peer's allow list takes bool, string or path kinds")
-        check_value(ctx, SettingRule(name, kind), value)
-    if seen_server != 1:
-        raise LaunchError("the synthetic peer needs exactly one --server")
+
+def check_synthetic_script(data: bytes) -> str:
+    """A synthetic peer's script as the program reads it: UTF-8 text, no control character but tab and
+    line breaks, at most SYNTHETIC_SCRIPT_MAX bytes. Its lines are the program's to parse (it ends with
+    an error on a line it does not know); none of them names a file."""
+    if len(data) > SYNTHETIC_SCRIPT_MAX:
+        raise LaunchError(f"synthetic peer script: {len(data)} bytes (at most {SYNTHETIC_SCRIPT_MAX})")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise LaunchError(f"synthetic peer script: not UTF-8 ({e})") from None
+    for ch in text:
+        if ord(ch) < 32 and ch not in "\t\r\n":
+            raise LaunchError(f"synthetic peer script: control character {ord(ch):#04x}")
+    return text
+
+
+def check_synthetic_args(ctx: RunContext, args: list[str], server: str, digest: str) -> list[str]:
+    """The synthetic peer's whole line, however it was assembled: refuses it unless every rule above
+    holds. `server` is the session address (HOST:PORT), `digest` the game executable's SHA-256."""
+    host, port = session_address(server)
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", digest or ""):
+        raise LaunchError("the synthetic peer's digest contract: the run names no SHA-256 of the game executable")
+    if len(args) % 2:
+        raise LaunchError(f"the synthetic peer takes `--name value` pairs ({len(args)} words)")
+    values: dict[str, str] = {}
+    for name_word, value in zip(args[0::2], args[1::2]):
+        if not re.fullmatch(r"--[a-z][a-z0-9_]*", name_word):
+            raise LaunchError(f"refusing {name_word!r}: the synthetic peer takes `--name value` pairs")
+        name = name_word[2:]
+        if name == "game":
+            raise LaunchError("--game names an executable outside the run folder: a validated run passes --digest "
+                              "(the game executable's SHA-256)")
+        if name not in SYNTHETIC_SETTINGS:
+            raise LaunchError(f"--{name} is not on the synthetic peer's allow list ({', '.join(SYNTHETIC_SETTINGS)})")
+        if name in values:
+            raise LaunchError(f"--{name} twice (the program takes the last)")
+        if value == "" or any(ord(c) < 32 for c in value):
+            raise LaunchError(f"refusing an empty or control-character value for --{name}")
+        values[name] = value
+    if values.get("port") != str(port):
+        raise LaunchError(f"--port {values.get('port')!r}: only the session's port {port}")
+    if values.get("server", "127.0.0.1") != host:
+        raise LaunchError(f"--server {values.get('server', '127.0.0.1 (its default)')}: only the session address {host}")
+    if "script" not in values:
+        raise LaunchError("the synthetic peer needs --script (its script in the run folder)")
+    script = contained(ctx, values["script"], "--script", ctx.run_folder, must_exist=True)
+    check_synthetic_script(script.read_bytes())
+    if values.get("digest", "").lower() != digest.lower():
+        raise LaunchError("--digest: only the SHA-256 of the game executable the session's server runs (the "
+                          "build digest S checks in a Hello)")
     return list(args)
+
+
+def build_synthetic_peer(ctx: RunContext, server: str, digest: str, script_text: str,
+                         args: list[str] | None = None) -> list[str]:
+    """Writes the synthetic peer's script into its run folder and returns its line: the session address,
+    the script and the game executable's digest, then `args` (a run plan's own; each of the four
+    settings is already set, so any is refused), all through check_synthetic_args."""
+    data = script_text.encode("utf-8")
+    check_synthetic_script(data)
+    host, port = session_address(server)
+    script = ctx.run_folder / SCRIPT_FILE
+    contained(ctx, str(script), "the synthetic peer's script", ctx.run_folder)
+    script.write_bytes(data)
+    line = ["--server", host, "--port", str(port), "--script", str(script), "--digest", digest, *(args or [])]
+    return check_synthetic_args(ctx, line, server, digest)

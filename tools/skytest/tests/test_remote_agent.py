@@ -310,7 +310,7 @@ class AgentTest(unittest.TestCase):
         c = self.verified()
         self.fixtures(c)
         game = {"role": "game", "peer": "D", "script": "quit"}
-        syn = lambda p: {"role": "synthetic-peer", "peer": p, "args": ["--server=10.0.0.1:5"]}  # noqa: E731
+        syn = lambda p: {"role": "synthetic-peer", "peer": p, "script": "swap 1 Wash 600\n"}  # noqa: E731
         cases = {
             "executable path": self.plan(entries=[{**game, "exe": "C:\\Windows\\System32\\cmd.exe"}]),
             "path key": self.plan(entries=[{**game, "path": "x.exe"}]),
@@ -343,19 +343,47 @@ class AgentTest(unittest.TestCase):
         (self.install / "synthetic_peer.exe").write_bytes(b"MZ peeR")
         plan = self.plan(server="10.0.0.1:5", entries=[{"role": "game", "peer": "D", "script": "quit"},
                                                        {"role": "synthetic-peer", "peer": "P3",
-                                                        "args": ["--server=10.0.0.1:5"]}])
+                                                        "script": "swap 1 Wash 600\n"}])
         r = self.call(c, "start", plan=plan)
         self.assertFalse(r["ok"])
+        self.assertIn("synthetic_peer.exe", r["error"])
 
     def test_synthetic_peer_by_role(self) -> None:
         c = self.verified()
         self.fixtures(c)
         plan = self.plan(server="10.0.0.1:5", entries=[{"role": "game", "peer": "D", "script": "quit"},
                                                        {"role": "synthetic-peer", "peer": "P3",
-                                                        "args": ["--server=10.0.0.1:5"]}])
+                                                        "script": "swap 1 Wash 600\n"}])
         r = self.call(c, "start", plan=plan)
         self.assertTrue(r["ok"], r)
-        self.assertEqual(FakeJob.instances[-1].procs[1].argv[0], str(self.install / "synthetic_peer.exe"))
+        argv = FakeJob.instances[-1].procs[1].argv
+        self.assertEqual(argv[0], str(self.install / "synthetic_peer.exe"))
+        # Stage 4's line: the plan's session address, its script in the peer's run folder, and the digest
+        # contract (the payload record's `game` SHA-256, the build digest S checks in a Hello).
+        script = Path(argv[argv.index("--script") + 1])
+        self.assertEqual(argv[1:5], ["--server", "10.0.0.1", "--port", "5"])
+        self.assertEqual(argv[argv.index("--digest") + 1], sha(b"MZ game"))
+        self.assertEqual(script.name, "script.txt")
+        self.assertEqual(script.parent.name, "P3")
+        self.assertEqual(script.read_text(encoding="utf-8"), "swap 1 Wash 600\n")
+
+    def test_synthetic_peer_line_refusals(self) -> None:
+        c = self.verified()
+        self.fixtures(c)
+        game = {"role": "game", "peer": "D", "script": "quit"}
+        for what, (server, extra) in {
+            "the peer's own --game": ("10.0.0.1:5", {"args": ["--game", "C:\\x.exe"]}),
+            "a second --port": ("10.0.0.1:5", {"args": ["--port", "6"]}),
+            "a name=value setting": ("10.0.0.1:5", {"args": ["--server=10.0.0.1:5"]}),
+            "a control character in its script": ("10.0.0.1:5", {"script": "swap\x00\n"}),
+            "a session address without a port": ("10.0.0.1", {}),
+        }.items():
+            with self.subTest(what=what):
+                syn = {"role": "synthetic-peer", "peer": "P3", "script": "swap 1 Wash 600\n", **extra}
+                r = self.call(c, "start", plan=self.plan(server=server, entries=[game, syn]))
+                self.assertFalse(r["ok"], what)
+                self.assertIsNone(self.agent.run)
+                self.assertFalse((self.store / "run.lock").exists())
 
     def test_fixture_refusals(self) -> None:
         c = self.verified()

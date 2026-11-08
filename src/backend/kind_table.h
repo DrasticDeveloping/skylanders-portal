@@ -22,9 +22,13 @@ enum class Tier : uint8_t { kStructural, kDurableEvent, kEffect };
 // is gone: while S is the only writer it behaved exactly as a current value (Opus Q6).
 enum class StateClass : uint8_t {
   kCurrentValue = 0,  // the newer revision replaces the stored one (a gate, a prop, a count S rewrites)
+  // Stage 4 (docs/online-4.md section 3.5): written by the row's own peer, the key's Player(peer,
+  // peer epoch). S admits a newer revision by owned.h's six checks and relays it as its own write;
+  // S's only write to an owned row is the tomb at the end of the owner's peer epoch.
+  kOwnedValue = 1,
   kEvent = 3,         // once-only: delivered as an obligation, never replaced (a chest's coins)
-  // 1 is reserved for stage 4's client-owned value (PlayerRecord, Q7); 2 for a merge-on-S class
-  // (an add) when a kind needs one. The validator refuses both (V9).
+  // 2 is reserved for a merge-on-S class (an add) when a kind needs one. The validator refuses it
+  // (V9).
 };
 
 enum class InitialPolicy : uint8_t { kUnset, kReadAtSpawn, kAuthoredDefault, kNever };
@@ -106,16 +110,19 @@ const KindSpec* FindKind(std::span<const KindSpec> table, KindId id);
 //   V7  lanes: kFast only for kEffect; an effect is never in a baseline or a manifest
 //   V8  default: kAuthoredDefault has a default of at most max_value_bytes; no other policy has one
 //   V9  sizes: 0 < max_value_bytes <= limits.max_value_bytes; the state class is a known value
-//       (1 and 2, the reserved classes, are refused)
+//       (2, the reserved class, is refused; 1 is stage 4's kOwnedValue)
 //   V10 models: kModelOwnerRun needs `leasable`; kServerOnly takes no kModelOwnerRun;
 //       parent_wait_ms and requires_precondition only on a kind that takes requests (Opus F11)
-//   V11 noisy: `noisy` only on a current value
+//   V11 noisy: `noisy` only on a current value or an owned value (stage 4)
 //   V12 grace: an applied kind read at spawn has pending_grace_ms > 0; so has an applied kind
 //       another kind depends on, so a fence never breaks on its first wait (Sol F2, draft 4)
 //   V13 replicated deps: a replicated kind depends only on replicated kinds (a fenced row must
 //       never wait for a row that is never sent; Sol F2, Opus F5)
 //   V14 urgent: `urgent` only on a replicated kind (an effect rides the fast lane, flushed at every
 //       pump anyway; a server-only row is never sent)
+//   V15 owned (stage 4, section 3.5): a kOwnedValue kind is session scope, not an effect, written
+//       kMirrored or kApplied (never kServerOnly) and takes no request models. That its keys are
+//       kPlayer ids is not in KindSpec; owned.h's check 2 enforces it on every write
 struct ValidationIssue {
   KindId kind = 0;
   std::string_view rule;

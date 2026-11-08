@@ -8,6 +8,8 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <span>
+#include <vector>
 
 #include "portal/portal_device.h"
 
@@ -61,6 +63,17 @@ class SoftwarePortal : public PortalDevice {
       std::function<void(const char* op, int slot, int block, const uint8_t* data, size_t n)>
           callback);
 
+  // Asked before every PlaceFigure (the menu, the input script, the overlay, a restore all go
+  // through it) with the slot, the figure to place and the figures on the other slots (the slot's
+  // own figure, when PlaceFigure replaces it, is not among them). false refuses the placement:
+  // PlaceFigure returns false and changes nothing. A game uses it for a rule that holds only for a
+  // while (Swap Force Online: one player's figures in an online session) and clears it after.
+  // Runs under the portal's lock on PlaceFigure's thread, so it must be cheap and must not call
+  // back into this SoftwarePortal. Pass nullptr to remove it (the default: every placement goes on).
+  void SetPlaceFilter(
+      std::function<bool(int slot, const FigureData& data, std::span<const FigureData> others)>
+          filter);
+
  private:
   enum class SlotState : uint8_t { kEmpty = 0, kReady = 1, kRemoving = 2, kAdded = 3 };
   struct Slot {
@@ -81,6 +94,25 @@ class SoftwarePortal : public PortalDevice {
   uint8_t counter_ = 0;
   std::function<void(int, const FigureData&, const std::optional<std::filesystem::path>&)> on_write_;
   std::function<void(const char*, int, int, const uint8_t*, size_t)> research_log_;
+  std::function<bool(int, const FigureData&, std::span<const FigureData>)> place_filter_;
+};
+
+// A place filter that holds for every SoftwarePortal a game builds, including the ones built later
+// (portal_rex: a live switch back into software mode builds a new SoftwarePortal). Each new portal is
+// attached as it is built and gets the current filter; Set gives every attached portal the new one
+// (nullptr removes it). Portals are never freed in this codebase (portal_rex), so the attached
+// pointers stay valid. Thread-safe; Set and Attach take this lock, then the portal's.
+class PlaceFilterPolicy {
+ public:
+  using Filter = std::function<bool(int slot, const FigureData& data, std::span<const FigureData> others)>;
+  void Set(Filter filter);
+  void Attach(SoftwarePortal* portal);
+  size_t Attached() const;
+
+ private:
+  mutable std::mutex mu_;
+  Filter filter_;
+  std::vector<SoftwarePortal*> portals_;
 };
 
 }  // namespace skylanders::portal

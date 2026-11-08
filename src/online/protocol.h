@@ -45,7 +45,18 @@ constexpr size_t kMaxBackendFrameBytes = 1152;
 // session. 0: no backend (the setting off, the plain 1B path).
 constexpr uint8_t kBackendModeRecordsPilot = 0x01;  // online_records_pilot
 constexpr uint8_t kBackendModeChurn = 0x02;         // dev_backend_churn (the dev.churn kind)
-constexpr uint8_t kBackendModeKnown = kBackendModeRecordsPilot | kBackendModeChurn;
+// Stage 4 (docs/online-4.md D5; cross-stage decision 1): the player records, client puppets and
+// roster (online_records_players), and 1B's request kinds on the generic table
+// (online_requests_generic).
+constexpr uint8_t kBackendModeRecordsPlayers = 0x04;
+constexpr uint8_t kBackendModeRequestsGeneric = 0x08;
+constexpr uint8_t kBackendModeKnown = kBackendModeRecordsPilot | kBackendModeChurn |
+                                      kBackendModeRecordsPlayers | kBackendModeRequestsGeneric;
+// Hello's flags (stage 4 item 2): a trailing byte, so a Hello without it reads as 0. A bit outside
+// kHelloFlagsKnown makes the message invalid.
+constexpr uint8_t kHelloSynthetic = 0x01;  // a synthetic peer (tools/headless_peer); S accepts it
+                                           // only under dev_synthetic_peers
+constexpr uint8_t kHelloFlagsKnown = kHelloSynthetic;
 
 using BuildDigest = std::array<uint8_t, 32>;
 using OwnerToken = std::array<uint8_t, 16>;  // all zero: none
@@ -74,8 +85,11 @@ enum class MessageType : uint16_t {
   kSessionClosed = 20,
   kSceneBarrier = 21,
   kBackendFrame = 22,
+  // Stage 4.
+  kPlayerActionShown = 23,
+  kPlayerPoseShown = 24,
   // Stage 1C's block (50-54, the 24-hour push's number blocks): types outside the contiguous run
-  // 1..kBackendFrame. TypeOf and the decoder map them explicitly.
+  // 1..kLastType (protocol.cpp). TypeOf and the decoder map them explicitly.
   kOwnerFlags = 50,
 };
 
@@ -96,6 +110,7 @@ struct Hello {
   uint16_t figure_variant = 0;
   std::string name;        // UTF-8, at most kMaxNameBytes
   OwnerToken owner_token{};
+  uint8_t flags = 0;       // kHello* bits (stage 4); trailing on the wire
   bool operator==(const Hello&) const = default;
 };
 
@@ -310,6 +325,10 @@ struct CurrentFigure {
   bool operator==(const CurrentFigure&) const = default;
 };
 
+// Stage 4 (docs/online-4.md section 4.3, plan 2.1): the pose's teleport counter, a trailing u16
+// after `elements` (a pose without it reads as 0). The owning client moves it at a teleport, a
+// bounce pad or a fall reset, so S's rate check lets that pose through.
+
 // Client to server, fast lane, about 20 Hz (tests/thresholds.toml players_hz): the hero's pose.
 // `pose_sequence` counts the peer's poses from 1 (0 is never sent: only a scene skip's request
 // carries pose sequence 0, for "needs no pose"). The server drops a pose not newer than the last one it has from that peer in
@@ -321,6 +340,7 @@ struct PlayerPose {
   std::array<float, 3> position{};
   std::array<float, 4> rotation{0, 0, 0, 1};
   CurrentFigure figure;
+  uint16_t teleports = 0;  // stage 4: the teleport counter (above)
   bool operator==(const PlayerPose&) const = default;
 };
 
@@ -539,6 +559,28 @@ struct BackendFrame {
   bool operator==(const BackendFrame&) const = default;
 };
 
+// Stage 4 (docs/online-4.md section 4.4): server to the other clients, gameplay lane (reliable, in
+// order): one attack press or release S took from `peer` (the attack replay's accept), for the
+// puppets' presentation. A release carries its press's sequence and the slot with the release bit
+// (attack_id), so a receiver never orders releases against presses by sequence.
+struct PlayerActionShown {
+  uint16_t peer = 0;
+  uint32_t peer_epoch = 0;
+  uint32_t generation = 0;
+  uint32_t press_sequence = 0;
+  uint32_t attack_id = 0;
+  uint32_t pose_sequence = 0;
+  bool operator==(const PlayerActionShown&) const = default;
+};
+
+// Stage 4 (docs/online-4.md section 4.3, D6): server to the other clients, fast lane: another
+// player's pose as S accepted it (newest only, no distance filter).
+struct PlayerPoseShown {
+  uint16_t peer = 0;
+  PlayerPose pose;
+  bool operator==(const PlayerPoseShown&) const = default;
+};
+
 // Stage 1C (the save spike, item 4; D5, D21): the owner's own HasTakenDamage, HasSwapped and
 // PlayerDied (player keys 1, 2, 5 of CGameState for the owner's player index) and the map game keys
 // 14 (SkylanderDamageTaken) and 15 (SkylandersDefeated), as the owner's game holds them. The owner
@@ -566,6 +608,7 @@ using Message = std::variant<Hello, Welcome, Refuse, Bye, Ping, Pong, LevelReque
                              LevelLoaded, BarrierGo, PlayerList, PlayerPose, PlayerAction,
                              WorldRequest, WorldDecision, AppliedStep, LevelEnd, Reaction,
                              SessionClosing, SessionClosed, SceneBarrier, BackendFrame,
+                             PlayerActionShown, PlayerPoseShown,
                              OwnerFlags>;
 MessageType TypeOf(const Message& message);
 

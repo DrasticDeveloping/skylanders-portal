@@ -1703,6 +1703,42 @@ void PoseOrder() {
   EndAndCheck(h);
 }
 
+// Stage 4 (Sol F1): receiving a pose and accepting it are two steps (S's rate check sits between
+// them). With pose N-1 accepted and N received but rate-dropped, a key needing N waits until a
+// later pose is accepted; the received N meets nothing.
+void RateDroppedPoseMeetsNoPrecondition() {
+  H h;
+  CHECK(h.table.OnPoseReceived(kPeer, h.gen, 4));
+  CHECK(h.table.OnPoseAccepted(kPeer, h.gen, 4));    // N-1: accepted
+  CHECK(h.table.OnPoseReceived(kPeer, h.gen, 5));    // N: received, then rate-dropped (no accept)
+  CHECK(!h.table.OnPoseReceived(kPeer, h.gen, 5));   // its duplicate is still dropped as received
+  const WorldRequest r = Make(K::kEnter, h.gen, 1, 5);
+  h.Send(r);
+  h.Wait(kPoseWait / 2);
+  CHECK(h.State(r) == RS::kPending && h.Evaluations(r.key) == 0);
+  CHECK(!h.table.OnPoseAccepted(kPeer, h.gen, 6));   // never received: not accepted
+  CHECK(h.table.OnPoseReceived(kPeer, h.gen, 6));    // an acceptable pose that meets N
+  h.Service();
+  CHECK(h.State(r) == RS::kPending && h.Evaluations(r.key) == 0);  // received is not accepted
+  CHECK(h.table.OnPoseAccepted(kPeer, h.gen, 6));
+  CHECK(!h.table.OnPoseAccepted(kPeer, h.gen, 6));   // not newer than the last accepted
+  CHECK(!h.table.OnPoseAccepted(kPeer, h.gen, 5));
+  h.Service();
+  CHECK(h.State(r) == RS::kApplied && h.Evaluations(r.key) == 1);
+  // An accept of another generation, or one still on its way when its peer left, finds nothing; a
+  // returning peer's fresh sequences never meet the old one.
+  CHECK(!h.table.OnPoseAccepted(kPeer, h.gen + 1, 7));
+  CHECK(h.table.OnPoseReceived(kOther, h.gen, 3));
+  h.table.ForgetPeer(kOther);
+  CHECK(!h.table.OnPoseAccepted(kOther, h.gen, 3));
+  CHECK(h.table.OnPoseReceived(kOther, h.gen, 1));
+  CHECK(!h.table.OnPoseAccepted(kOther, h.gen, 3));
+  CHECK(h.table.OnPoseAccepted(kOther, h.gen, 1));
+  h.NewGeneration();
+  CHECK(!h.table.OnPoseAccepted(kPeer, h.gen, 6));   // the new generation received nothing yet
+  EndAndCheck(h);
+}
+
 // A retried enter: one apply, then "already applied"; a lost decision and its retry the same.
 void RetriedEnterOneApply() {
   H h;
@@ -2072,6 +2108,7 @@ int main() {
   // Section 5.
   RequestBeforeItsPose();
   PoseOrder();
+  RateDroppedPoseMeetsNoPrecondition();
   RetriedEnterOneApply();
   EnterAndExitTwoKeys();
   PendingEnterPoseNeverArrives();

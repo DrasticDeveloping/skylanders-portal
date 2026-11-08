@@ -211,8 +211,9 @@ void ServerSession::HandleMessage(Peer& peer, const Message& message, Lane lane,
     DropPeer(peer, LeaveReason::kBye, now);
   } else if (const auto* pose = std::get_if<PlayerPose>(&message)) {
     // An older pose (the fast lane drops only datagrams older than the newest, not stale content)
-    // or one of another generation is dropped here.
-    if (!requests_.OnPose(peer.id, pose->generation, pose->pose_sequence)) return;
+    // or one of another generation is dropped here. Received is not accepted: pending keys see
+    // it only after the host's AcceptPose (stage 4: S's rate check sits in between).
+    if (!requests_.OnPoseReceived(peer.id, pose->generation, pose->pose_sequence)) return;
     ServerEvent e;
     e.type = ServerEvent::Type::kPlayerPose;
     e.peer_id = peer.id;
@@ -286,6 +287,16 @@ void ServerSession::HandleHello(Peer& peer, const Hello& hello, TimePoint now) {
     SendRefuse(peer, RefuseReason::kNotOwner, "the owner token does not match", now, true);
     return;
   }
+  if ((hello.flags & kHelloSynthetic) != 0 && !settings_.allow_synthetic) {  // stage 4 item 2
+    SendRefuse(peer, RefuseReason::kOther, "synthetic peers are off", now, true);
+    return;
+  }
+  // A synthetic peer is a dev tool on this machine (tools/headless_peer): one from another address
+  // is refused even with allow_synthetic on (Opus 4 B6).
+  if ((hello.flags & kHelloSynthetic) != 0 && !netplay::IsLoopback(peer.endpoint.address)) {
+    SendRefuse(peer, RefuseReason::kOther, "synthetic peers only on loopback", now, true);
+    return;
+  }
   if (requests_.Closing()) {
     // End session's drain: a client welcomed now would never get SessionClosing nor be awaited.
     SendRefuse(peer, RefuseReason::kOther, "the session is ending", now, true);
@@ -332,6 +343,7 @@ void ServerSession::HandleHello(Peer& peer, const Hello& hello, TimePoint now) {
   e.figure_id = hello.figure_id;
   e.figure_variant = hello.figure_variant;
   e.endpoint = peer.endpoint;
+  e.synthetic = (hello.flags & kHelloSynthetic) != 0;
   events_.push_back(std::move(e));
   BroadcastPlayerList(now);
 }
@@ -528,6 +540,11 @@ bool ServerSession::SubmitEvaluation(const RequestKey& key, const EvaluationResu
   return taken;
 }
 
+bool ServerSession::AcceptPose(uint16_t peer, const PlayerPose& pose) {
+  if (!transport_) return false;
+  return requests_.OnPoseAccepted(peer, pose.generation, pose.pose_sequence);
+}
+
 bool ServerSession::SendAppliedStep(const AppliedStep& step, TimePoint now) {
   const std::vector<uint8_t> bytes = Encoded(step);
   if (!transport_ || bytes.empty()) return false;
@@ -545,6 +562,25 @@ bool ServerSession::SendLevelEnd(uint16_t peer, const LevelEnd& end, TimePoint n
 bool ServerSession::SendReaction(uint16_t peer, const Reaction& reaction, TimePoint now) {
   Peer* p = FindById(peer);
   return p && Post(*p, Lane::kGameplay, reaction, now);
+}
+
+// Stage 4: to every welcomed client but the one the action or pose came from.
+bool ServerSession::SendPlayerActionShown(const PlayerActionShown& shown, TimePoint now) {
+  const std::vector<uint8_t> bytes = Encoded(shown);
+  if (!transport_ || bytes.empty()) return false;
+  for (auto& [endpoint, peer] : peers_) {
+    if (peer->state == PeerState::kWelcomed && peer->id != shown.peer) peer->conn->Send(Lane::kGameplay, bytes, now);
+  }
+  return true;
+}
+
+bool ServerSession::SendPlayerPoseShown(const PlayerPoseShown& shown, TimePoint now) {
+  const std::vector<uint8_t> bytes = Encoded(shown);
+  if (!transport_ || bytes.empty()) return false;
+  for (auto& [endpoint, peer] : peers_) {
+    if (peer->state == PeerState::kWelcomed && peer->id != shown.peer) peer->conn->Send(Lane::kFast, bytes, now);
+  }
+  return true;
 }
 
 bool ServerSession::SendSceneBarrier(const SceneBarrier& scene, TimePoint now) {
@@ -821,6 +857,16 @@ void ClientSession::HandleMessage(const Message& message, Lane lane, TimePoint n
     ClientEvent e;
     e.type = ClientEvent::Type::kReaction;
     e.reaction = *reaction;
+    events_.push_back(std::move(e));
+  } else if (const auto* shown = std::get_if<PlayerActionShown>(&message)) {  // stage 4
+    ClientEvent e;
+    e.type = ClientEvent::Type::kPlayerActionShown;
+    e.action_shown = *shown;
+    events_.push_back(std::move(e));
+  } else if (const auto* pose_shown = std::get_if<PlayerPoseShown>(&message)) {  // stage 4
+    ClientEvent e;
+    e.type = ClientEvent::Type::kPlayerPoseShown;
+    e.pose_shown = *pose_shown;
     events_.push_back(std::move(e));
   } else if (const auto* frame = std::get_if<BackendFrame>(&message)) {
     ClientEvent e;

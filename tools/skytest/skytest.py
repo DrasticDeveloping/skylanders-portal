@@ -65,6 +65,10 @@ Layouts (the game repository's docs/testing-guide.md has the details):
 
     solo        H alone: the plain game, offline (reference measurements)
     server+N    the server peer S and N clients H, D, E, F (N = 1..4); H is the owner's client
+    server+N+hK S, N clients and K synthetic peers h1, h2 (K = 1..2; a hosted server only): a
+                game-free program the game repository names in tests/skytest.toml [synthetic],
+                started in the case's job object once its [synthetic.<h>] start condition shows in
+                a peer's log, graded on its own output; never a game, never counted as one
     unit        no game: a unit test binary from the build (copied into a snapshot first), graded by
                 its exit code and its pass line, and the ctests the case names (stage 2's
                 skylanders_backend_test and backend.include_rule)
@@ -113,10 +117,28 @@ import winjob  # noqa: E402
 import backend_grades  # noqa: E402  (stage 3's backend grades: compare, faults, memory)
 import launch_args as la  # noqa: E402
 import remote_agent  # noqa: E402
+import remote_swap_grade  # noqa: E402  (stage 4's remote_swap grade over swap_pairs.py, the ordered form)
+import exclusive_grade  # noqa: E402  (stage 4's exclusive grade: a race exactly one client wins)
+import swap_pairs  # noqa: E402
 
 STORE = ".replication-tests"
 CLIENTS = ["H", "D", "E", "F"]
-LAYOUT = re.compile(r"^(solo|server\+([1-4]))$")
+LAYOUT = re.compile(r"^(solo|server\+([1-4])(?:\+h([1-2]))?)$")
+# Synthetic peers (`server+N+hK`; Swap Force Online stage 4 item 2, its docs/online-4.md section 4.2):
+# a game-free program that joins the hosted server over loopback with a scripted pose and player
+# rows. Named h1, h2 in a spec's [synthetic.<name>] tables; started once the start peer's log has a
+# line matching `start_after` (a condition, not a sleep); must say it connected; must end by itself
+# within SYNTHETIC_EXIT_GRACE seconds of the games' end (End session drains it), else it is ended
+# and fails.
+SYNTHETIC = ["h1", "h2"]
+SYNTHETIC_START_AFTER = r"Online: the server is in its hub"
+SYNTHETIC_CONNECTED = re.compile(r"Online: synthetic peer (\d+) connected")
+SYNTHETIC_FATAL = [r"Online: synthetic peer (could not connect|script |refused|leaves: no player records)"]
+SYNTHETIC_EXIT_GRACE = 20.0
+SYNTHETIC_ARG_PLACEHOLDERS = ("{port}", "{script}", "{digest}", "{server}", "{peer}")
+SYNTHETIC_KEYS = ("script", "start_after", "start_peer", "expect", "forbid", "expect_count", "expect_order")
+# A game client's peer id in its log (the session's Welcome), for the cross-client grades.
+CONNECTED_AS = re.compile(r"Online: connected as peer (\d+)")
 # A case that runs a unit test binary and ctests from the build instead of games (stage 2 item 7).
 UNIT = "unit"
 PEER_DIRS = ("data", "figures", "cache")
@@ -136,7 +158,7 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
 # Where a hosted server (`server = "host"`) writes its log: the owner's session folder.
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
 GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
-          "symmetry", "route", "bandwidth") + backend_grades.NAMES
+          "symmetry", "route", "bandwidth", "remote_swap", "exclusive") + backend_grades.NAMES
 # The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
 # online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
 # for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
@@ -387,6 +409,14 @@ class Config:
     # `test --remote HOST:PORT`: the remote agent that runs a spec's `kind = "remote"` peer on the second
     # PC (RemoteTarget). None: such a case is a capacity result (it needs the second PC).
     remote: "RemoteTarget | None" = None
+    # [synthetic] (server+N+hK): the synthetic peer's exe in the build folder (copied into the snapshot
+    # with the game), its argument template (SYNTHETIC_ARG_PLACEHOLDERS), the server setting the runner
+    # turns on in the owner's game H for such a case (Host passes it to its server), and a command put
+    # in front of it (only the runner's own tests set that one).
+    synthetic_exe: str = ""
+    synthetic_args: list[str] = field(default_factory=list)
+    synthetic_setting: str = ""
+    synthetic_launcher: list[str] = field(default_factory=list)
 
 
 def main_store(repo: Path) -> Path:
@@ -437,6 +467,14 @@ def load_config(repo: Path) -> Config:
     if not isinstance(machine, int) or isinstance(machine, bool) or not 1 <= machine <= MACHINE_SLOT_FILES:
         raise SystemExit(f"{f}: [defaults] machine_games is a whole number from 1 to {MACHINE_SLOT_FILES} (the games"
                          " all runners on the machine share)")
+    syn = c.get("synthetic", {})
+    syn_args = syn.get("args", [])
+    if not isinstance(syn_args, list) or not all(isinstance(x, str) and x.strip() for x in syn_args):
+        raise SystemExit(f"{f}: [synthetic] args is a list of non-empty strings")
+    for x in syn_args:
+        for ph in ARG_PLACEHOLDER.findall(x):
+            if ph not in SYNTHETIC_ARG_PLACEHOLDERS:
+                raise SystemExit(f"{f}: [synthetic] args: {ph} is not one of {', '.join(SYNTHETIC_ARG_PLACEHOLDERS)}")
     return Config(
         repo=repo,
         store=repo / STORE,
@@ -466,6 +504,10 @@ def load_config(repo: Path) -> Config:
         unit_launcher=[os.path.expandvars(x) for x in g.get("unit_launcher", [])],
         launch_allow=repo / c.get("launch_allow", "tests/launch_allow.toml"),
         script_commands=repo / c.get("script_commands", "tests/script_commands.toml"),
+        synthetic_exe=str(syn.get("exe", "")),
+        synthetic_args=list(syn_args),
+        synthetic_setting=str(syn.get("server_setting", "")),
+        synthetic_launcher=[os.path.expandvars(x) for x in syn.get("launcher", [])],
     )
 
 
@@ -547,6 +589,21 @@ class PeerSpec:
 
 
 @dataclass
+class SyntheticSpec:
+    """A synthetic peer of a server+N+hK case ([synthetic.<name>]): its own script (the game's
+    synthetic-peer format, written to its folder as script.txt), when it starts (the first line of
+    `start_peer`'s log matching `start_after`), and what its output must show."""
+    name: str
+    script: str
+    start_after: str = SYNTHETIC_START_AFTER
+    start_peer: str = "S"
+    expect: list[str] = field(default_factory=list)
+    forbid: list[str] = field(default_factory=list)
+    expect_count: dict[str, int] = field(default_factory=dict)
+    expect_order: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Spec:
     name: str
     path: Path
@@ -592,6 +649,8 @@ class Spec:
     sha256: str = ""
     # [unit]: a unit case's test binary, its pass line and ctests (load_unit_spec).
     unit: dict = field(default_factory=dict)
+    # server+N+hK: the synthetic peers by name (h1, h2), never games (load_synthetic).
+    synthetic: dict[str, SyntheticSpec] = field(default_factory=dict)
 
 
 PEER_KINDS = ("local", "remote")
@@ -630,12 +689,67 @@ def check_remote_peers(spec_name: str, peers: dict[str, "PeerSpec"], grades: dic
 
 
 def peers_of(layout: str) -> list[str]:
+    """The games of a layout (S and the clients); a server+N+hK layout's synthetic peers are not games
+    (synthetic_of)."""
     m = LAYOUT.match(layout)
     if not m:
-        raise SpecError(f"unknown layout {layout!r} (solo, server+1 .. server+4, unit)")
+        raise SpecError(f"unknown layout {layout!r} (solo, server+1 .. server+4, server+N+h1/h2, unit)")
     if layout == "solo":
         return ["H"]
     return ["S"] + CLIENTS[: int(m.group(2))]
+
+
+def synthetic_of(layout: str) -> list[str]:
+    """A server+N+hK layout's synthetic peers (h1 .. hK); none for any other layout."""
+    m = LAYOUT.match(layout)
+    return SYNTHETIC[: int(m.group(3))] if m and m.group(3) else []
+
+
+def load_synthetic(name: str, d: dict, games: list[str], server: str) -> dict[str, SyntheticSpec]:
+    """The [synthetic.<h>] tables of a spec: exactly one per synthetic peer of its layout, each with a
+    script; a hosted server (`server = "host"`: the peer joins the port the runner gave the owner's
+    game); `start_peer` one of the games; the patterns compile."""
+    want = synthetic_of(d["layout"])
+    table = d.get("synthetic", {})
+    if not isinstance(table, dict):
+        raise SpecError(f"{name}: [synthetic] is a table of synthetic peers ({', '.join(SYNTHETIC)})")
+    if not want:
+        if table:
+            raise SpecError(f"{name}: [synthetic] needs a server+N+hK layout (not {d['layout']})")
+        return {}
+    if server != "host":
+        raise SpecError(f"{name}: synthetic peers join a hosted server: say server = \"host\"")
+    if sorted(table) != sorted(want):
+        raise SpecError(f"{name}: layout {d['layout']} has synthetic peers {want}; the spec names {sorted(table)}")
+    out: dict[str, SyntheticSpec] = {}
+    for h in want:
+        t = table[h]
+        if not isinstance(t, dict):
+            raise SpecError(f"{name}: [synthetic.{h}] must be a table")
+        unknown = sorted(set(t) - set(SYNTHETIC_KEYS))
+        if unknown:
+            raise SpecError(f"{name}: [synthetic.{h}] does not know {', '.join(unknown)} ({', '.join(SYNTHETIC_KEYS)})")
+        script = t.get("script", "")
+        if not isinstance(script, str) or not script.strip():
+            raise SpecError(f"{name}: synthetic peer {h} has no script")
+        start_peer = t.get("start_peer", "S")
+        if start_peer not in games:
+            raise SpecError(f"{name}: synthetic peer {h}: start_peer {start_peer!r} is not one of {games}")
+        if not isinstance(t.get("expect_count", {}), dict) or not isinstance(t.get("expect_order", []), list):
+            raise SpecError(f"{name}: synthetic peer {h}: expect_count is a table, expect_order a list")
+        s = SyntheticSpec(name=h, script=script, start_after=str(t.get("start_after", SYNTHETIC_START_AFTER)),
+                          start_peer=start_peer, expect=list(t.get("expect", [])), forbid=list(t.get("forbid", [])),
+                          expect_count=dict(t.get("expect_count", {})), expect_order=list(t.get("expect_order", [])))
+        for rx, count in s.expect_count.items():
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                raise SpecError(f"{name}: synthetic peer {h}: expect_count /{rx}/ must be a whole number >= 0")
+        for rx in [s.start_after] + s.expect + s.forbid + list(s.expect_count) + s.expect_order:
+            try:
+                re.compile(rx)
+            except (re.error, TypeError) as e:
+                raise SpecError(f"{name}: synthetic peer {h}: bad pattern {rx!r}: {e}") from e
+        out[h] = s
+    return out
 
 
 def spec_readiness(path: Path, d: dict, text: str) -> str:
@@ -801,10 +915,14 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
     if server == "host" and "S" in peers and peers["S"].save_slots:
         raise SpecError(f"{path.name}: save_slots: a hosted server has no data folder of its own (Host copies the"
                         " owner's slot into its session folder)")
+    synthetic = load_synthetic(path.name, d, names, server)
     grades = d.get("grade", {})
     for gname, g in grades.items():
         if gname not in GRADES:
             raise SpecError(f"{path.name}: grade {gname} is not one of {', '.join(GRADES)}")
+        if gname == "remote_swap" and not remote_swap_ordered(g):
+            check_remote_swap(path.name, g, names, list(synthetic))
+            continue
         if gname == "save_copy":
             check_save_copy(path.name, g, names, server)
             continue
@@ -824,6 +942,18 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             try:
                 backend_grades.check(path.name, gname, g, names)
             except (backend_grades.GradeSpecError, re.error) as e:
+                raise SpecError(str(e)) from e
+            continue
+        if gname == "remote_swap":
+            try:
+                remote_swap_grade.check_remote_swap(path.name, g, names)
+            except remote_swap_grade.RemoteSwapSpecError as e:
+                raise SpecError(str(e)) from e
+            continue
+        if gname == "exclusive":
+            try:
+                exclusive_grade.check_exclusive(path.name, g, names)
+            except exclusive_grade.ExclusiveSpecError as e:
                 raise SpecError(str(e)) from e
             continue
         if not isinstance(g, dict) or g.get("peer", "S" if gname == "server_frame_time" else "H") not in names:
@@ -900,6 +1030,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         server=server, grades=grades, compare=compare, fail_fast=fail_fast, show_server_window=show,
         exclusive=exclusive, tolerate=list(tolerate), not_ready=not_ready, scenes=scenes,
         scenes_reason=scenes_reason.strip(), breaker=breaker, sha256=hashlib.sha256(data).hexdigest(),
+        synthetic=synthetic,
     )
 
 
@@ -1729,6 +1860,104 @@ def grade_bandwidth(lines: list[tuple[float | None, str]], g: dict, thresholds: 
     return graded, reasons
 
 
+def remote_swap_ordered(g: object) -> bool:
+    """remote_swap has two forms behind one name. The ordered form (remote_swap_grade.py: `swaps` per
+    swapper, `swappers` required, `peer` carries the result, default S) is chosen by its `swaps` or
+    `peer` key; every other table is the min_swaps form below (synthetic swappers, `on` carries the
+    result, default H)."""
+    return isinstance(g, dict) and ("swaps" in g or "peer" in g)
+
+
+def check_remote_swap(spec_name: str, g: object, names: list[str], synthetic: list[str]) -> None:
+    """A remote_swap grade's options: `receivers` (game clients whose puppets are graded; default every
+    client), `swappers` (clients and synthetic peers whose swaps are keys; default all of them), `on`
+    (the client whose result carries the grade; default H), `min_swaps` (the swaps the spec orders, a
+    whole number >= 1; default 1), `max_ms` (default tests/thresholds.toml [remote_swap] max_ms) and
+    `hz` (the session's tick rate; default 60). A synthetic peer is never a receiver (it has no game)."""
+    if not isinstance(g, dict):
+        raise SpecError(f"{spec_name}: grade remote_swap must be a table")
+    clients = [n for n in names if n != "S"]
+    receivers = g.get("receivers", clients)
+    if not isinstance(receivers, list) or not receivers or any(p not in clients for p in receivers):
+        raise SpecError(f"{spec_name}: grade remote_swap: receivers must be clients of {clients} (a synthetic peer"
+                        " has no game to receive on)")
+    swappers = g.get("swappers", clients + synthetic)
+    if not isinstance(swappers, list) or not swappers or any(p not in clients + synthetic for p in swappers):
+        raise SpecError(f"{spec_name}: grade remote_swap: swappers must be among {clients + synthetic}")
+    if g.get("on", "H") not in clients:
+        raise SpecError(f"{spec_name}: grade remote_swap: `on` must be a client of {clients}")
+    n = g.get("min_swaps", 1)
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+        raise SpecError(f"{spec_name}: grade remote_swap: min_swaps must be a whole number >= 1")
+    for key in ("max_ms", "hz"):
+        v = g.get(key)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0):
+            raise SpecError(f"{spec_name}: grade remote_swap: {key} must be a number > 0")
+
+
+def peer_id_in(text: str) -> int | None:
+    """A client's or synthetic peer's session peer id: its first `connected as peer <n>` (a game) or
+    `synthetic peer <n> connected` line; None when it never connected."""
+    for rx in (CONNECTED_AS, SYNTHETIC_CONNECTED):
+        if m := rx.search(text):
+            return int(m.group(1))
+    return None
+
+
+def grade_remote_swap(texts: dict[str, str], g: dict, thresholds: dict, names: list[str],
+                      synthetic: list[str]) -> tuple[dict, list[str]]:
+    """remote_swap (stage 4 item 5, D16; swap_pairs.py): every swap of every swapper is a key, every
+    other receiver a pair graded against max_ms on the shared tick; a missing, duplicate or wrong-body
+    completion fails, and so do fewer swaps than `min_swaps` ("not reached"). Peer ids come from each
+    log's connected line; a peer that never connected is "not reached"."""
+    clients = [n for n in names if n != "S"]
+    receivers = list(g.get("receivers", clients))
+    swappers = list(g.get("swappers", clients + synthetic))
+    max_ms = float(g.get("max_ms", thresholds.get("remote_swap", {}).get("max_ms", 500.0)))
+    hz = int(g.get("hz", 60))
+    reasons: list[str] = []
+    ids: dict[str, int] = {}
+    for n in dict.fromkeys(receivers + swappers):
+        pid = peer_id_in(texts.get(n, ""))
+        if pid is None:
+            reasons.append(f"grade remote_swap: not reached ({n} never logged its peer id)")
+        else:
+            ids[n] = pid
+    logs = {ids[n]: texts.get(n, "") for n in ids}
+    rec_ids = sorted({ids[n] for n in receivers if n in ids})
+    # This form orders a minimum, not a count per swapper: the swaps each swapper logged (one per key)
+    # become the case's order for swap_pairs.py, whose rules then hold for every one of them (every
+    # pair graded, a slot-free line only on a pressure pair the case names). A swapper with no swap or
+    # no receiver other than itself has no pairs; `min_swaps` holds the total.
+    counts: dict[int, int] = {}
+    for n in swappers:
+        if n in ids:
+            counts[ids[n]] = len({(m.group(1), m.group(3), m.group(4)) for line in texts.get(n, "").splitlines()
+                                  if (m := swap_pairs.SWAP_RE.search(line))})
+    swaps = sum(counts.values())
+    ordered = {p: c for p, c in counts.items() if c and any(r != p for r in rec_ids)}
+    res = swap_pairs.Result()
+    if ordered:
+        try:
+            res = swap_pairs.grade_swap_pairs(logs, ordered, rec_ids, max_ms=max_ms, hz=hz, swappers=set(ordered))
+        except ValueError as e:
+            reasons.append(f"grade remote_swap: {e}")
+    graded = {"max_ms": max_ms, "swaps": swaps, "expected_pairs": res.expected, "graded_pairs": res.graded,
+              "pressure_pairs": res.pressure_pairs, "max_lag_ms": round(res.max_lag_ms, 1),
+              "peers": {n: ids.get(n) for n in dict.fromkeys(receivers + swappers)}}
+    min_swaps = int(g.get("min_swaps", 1))
+    if swaps < min_swaps:
+        reasons.append(f"grade remote_swap: not reached ({swaps} swap(s), the spec orders {min_swaps})")
+    if res.failures:
+        graded["violation"] = True
+        reasons += [f"grade remote_swap: {f}" for f in res.failures[:12]]
+        if len(res.failures) > 12:
+            reasons.append(f"grade remote_swap: and {len(res.failures) - 12} more")
+    elif res.graded != res.expected:
+        reasons.append(f"grade remote_swap: {res.graded} of {res.expected} pairs graded")
+    return graded, reasons
+
+
 def grade_cross_peer(spec: Spec, r: PeerResult, texts: dict[str, str], repo: Path | None = None,
                      thresholds: dict | None = None) -> list[str]:
     """The grades a peer's result carries across peers: requests_answered on each peer it names (S's
@@ -1759,6 +1988,18 @@ def grade_cross_peer(spec: Spec, r: PeerResult, texts: dict[str, str], repo: Pat
             # Stage 3 (backend_grades.py): compare joins every peer's local lines; faults and memory
             # read their peer's log.
             r.graded[gname], why = backend_grades.grade(gname, texts, g, r.peer)
+            reasons += why
+        elif gname == "remote_swap" and remote_swap_ordered(g) and g.get("peer", "S") == r.peer:
+            # The ordered form (remote_swap_grade.py): every ordered swap on every named receiver, max_ms each.
+            r.graded[gname], why = remote_swap_grade.grade_remote_swap(texts, g, thresholds or {}, list(spec.peers))
+            reasons += why
+        elif gname == "remote_swap" and not remote_swap_ordered(g) and g.get("on", "H") == r.peer:
+            # `texts` holds the synthetic peers' output too (run_case), under their names.
+            r.graded[gname], why = grade_remote_swap(texts, g, thresholds or {}, list(spec.peers), list(spec.synthetic))
+            reasons += why
+        elif gname == "exclusive" and g.get("peer", "S") == r.peer:
+            # exclusive_grade.py: exactly one of the named clients won the race, every other lost.
+            r.graded[gname], why = exclusive_grade.grade_exclusive(texts, g)
             reasons += why
     return reasons
 
@@ -1899,11 +2140,14 @@ def check_disc(cfg: Config) -> None:
 def build_files(cfg: Config) -> list[Path]:
     """The build's exe and DLLs and its online play files, routes/*.toml (what a snapshot copies; a
     game whose Host requires routes/unsupported.toml beside the exe, Swap Force Online stage 8 item
-    5); empty when the build folder has no exe."""
+    5), and the synthetic peer's exe when the game names one ([synthetic] exe) and the build has it;
+    empty when the build folder has no exe."""
     exe = cfg.build / cfg.exe
     if not exe.is_file():
         return []
-    return [exe] + sorted(cfg.build.glob("*.dll")) + sorted((cfg.build / "routes").glob("*.toml"))
+    syn = cfg.build / cfg.synthetic_exe if cfg.synthetic_exe else None
+    return [exe] + sorted(cfg.build.glob("*.dll")) + sorted((cfg.build / "routes").glob("*.toml")) + \
+        ([syn] if syn is not None and syn.is_file() else [])
 
 
 def build_rel(cfg: Config, f: Path) -> Path:
@@ -2924,7 +3168,8 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -
         ctx = launch_context(cfg, d, tables)
         script = peer_script(spec, peer, ctx.figures, f"127.0.0.1:{port}" if port else "")
         runner = [*cfg.default_args, *scene_args(cfg, spec), *show_server_args(cfg, spec, peer),
-                  *([f"--online_port={port}"] if port and peer == "H" else [])]
+                  *([f"--online_port={port}"] if port and peer == "H" else []),
+                  *synthetic_server_args(cfg, spec, peer)]
         args = la.build_game(ctx, peer_args(cfg, spec.peers[peer].args), script, fixtures=(saves, figures),
                              runner_args=runner)
     except la.LaunchError as e:
@@ -3209,6 +3454,92 @@ def start_remote(cfg: Config, spec: Spec, peer: str, run: Path, port: int) -> Re
     return rp
 
 
+def synthetic_server_args(cfg: Config, spec: Spec, peer: str) -> list[str]:
+    """A server+N+hK case's owner H gets the game's synthetic-peer server setting ([synthetic]
+    server_setting) turned on, which Host passes to its server; a spec may not set it itself (the
+    runner owns it, as the port). Nothing for any other case or peer."""
+    setting = cfg.synthetic_setting
+    if setting and any(setting_values(p.args, setting) for p in spec.peers.values()):
+        raise SpecError(f"{spec.path.name}: a peer sets --{setting}; the runner sets it for a server+N+hK case")
+    if not spec.synthetic or peer != "H":
+        return []
+    if not setting:
+        raise SpecError(f"{spec.path.name}: synthetic peers need tests/skytest.toml [synthetic] server_setting (the"
+                        " server setting that lets them join)")
+    return [f"--{setting}=true"]
+
+
+def prepare_synthetic(cfg: Config, spec: Spec, name: str, run: Path, snap: Path, port: int) -> tuple[Path, list[str]]:
+    """A synthetic peer's folder (its script.txt) and its command: [synthetic] exe from the snapshot
+    (or the tests' launcher) and the args template with {port} (the hosted server's), {script},
+    {digest} (the SHA-256 of the snapshot's game exe: the build digest the server checks in a Hello),
+    {server} (127.0.0.1: loopback only) and {peer}. Every argument is non-empty, and the line passes
+    the launch builder's synthetic-peer rules (launch_args.check_synthetic_args: the session address,
+    the script inside the peer's fresh run folder, the digest contract); a refusal is a spec error."""
+    if not cfg.synthetic_exe and not cfg.synthetic_launcher:
+        raise SpecError(f"{spec.path.name}: synthetic peers need tests/skytest.toml [synthetic] exe")
+    if not port:
+        raise SpecError(f"{spec.path.name}: synthetic peers need a hosted server's port")
+    check_output_path(cfg, run / name)
+    try:
+        d = la.make_run_folder(run.resolve(), name)
+        ctx = launch_context(cfg, d, launch_tables(cfg))
+        la.check_synthetic_script(spec.synthetic[name].script.encode("utf-8"))
+    except la.LaunchError as e:
+        raise SpecError(f"synthetic peer {name}: {e}") from None
+    script = d / la.SCRIPT_FILE
+    script.write_text(spec.synthetic[name].script, encoding="utf-8")
+    exe = snap / cfg.synthetic_exe if cfg.synthetic_exe else None
+    if not cfg.synthetic_launcher and (exe is None or not exe.is_file()):
+        raise SpecError(f"no synthetic peer at {cfg.build / cfg.synthetic_exe}: build it first")
+    game = snap / cfg.exe
+    digest = file_sha256(game) if game.is_file() else ""
+    subs = {"{port}": str(port), "{script}": str(script), "{server}": "127.0.0.1", "{peer}": name,
+            "{digest}": digest}
+    args = []
+    for a in cfg.synthetic_args:
+        for ph, value in subs.items():
+            a = a.replace(ph, value)
+        if not a.strip():
+            raise SpecError(f"{spec.path.name}: synthetic peer {name}: an argument came out empty")
+        args.append(a)
+    try:
+        la.check_synthetic_args(ctx, args, f"127.0.0.1:{port}", digest)
+    except la.LaunchError as e:
+        raise SpecError(f"{spec.path.name}: synthetic peer {name}: {e}") from None
+    cmd = [*cfg.synthetic_launcher, *args] if cfg.synthetic_launcher else [str(exe), *args]
+    return d, cmd
+
+
+def grade_synthetic(spec: Spec, r: PeerResult, text: str, started: bool) -> None:
+    """A synthetic peer's grade: it started (its start condition showed), said it connected, ended by
+    itself with exit code 0, logged none of its `forbid` lines nor SYNTHETIC_FATAL, and every `expect`,
+    `expect_count` and `expect_order` of its table holds."""
+    s = spec.synthetic[r.peer]
+    reasons = []
+    if not started:
+        reasons.append(f"never started: {s.start_peer} never logged /{s.start_after}/")
+    else:
+        if r.ended_by_runner:
+            reasons.append(r.stopped_by or f"did not end within {SYNTHETIC_EXIT_GRACE:.0f} s of the games' end; ended by"
+                           " the runner")
+        elif r.exit_code not in (0, None):
+            reasons.append(f"exit code {r.exit_code}")
+        if not SYNTHETIC_CONNECTED.search(text):
+            reasons.append(f"log lacks /{SYNTHETIC_CONNECTED.pattern}/ (it never joined)")
+        for rx in s.expect:
+            if not re.search(rx, text, re.M):
+                reasons.append(f"log lacks /{rx}/")
+        reasons += check_count_and_order(text, s)  # type: ignore[arg-type]  (the same two fields)
+        for rx in s.forbid + SYNTHETIC_FATAL:
+            if m := re.search(rx, text, re.M):
+                start = text.rfind("\n", 0, m.start()) + 1
+                end = text.find("\n", m.end())
+                reasons.append(f"log has forbidden /{rx}/: {text[start:end if end != -1 else len(text)].strip()[:160]}")
+    r.reasons = reasons
+    r.status = "pass" if not reasons else "fail"
+
+
 def parse_log(text: str) -> dict:
     out = {"levels": [], "fps": [], "longest": [], "private": 0, "working": 0, "errors": 0, "build": "",
            "lines": [], "frame_p95": [], "video": 0}
@@ -3301,7 +3632,7 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
     """Plan 5.5 against tests/thresholds.toml, for the grades the spec names for this peer."""
     reasons = []
     for gname, g in spec.grades.items():
-        if gname in ("requests_answered", "symmetry", "save_copy", "route", "bandwidth"):
+        if gname in ("requests_answered", "symmetry", "save_copy", "route", "bandwidth", "remote_swap", "exclusive"):
             continue  # graded across peers (grade_cross_peer, grade_save_copy)
         if g.get("peer", "S" if gname == "server_frame_time" else "H") != r.peer:
             continue
@@ -3511,7 +3842,9 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
     exe = snap / cfg.exe
     t_start = time.monotonic()
     procs: dict[str, subprocess.Popen] = {}
-    results = {n: PeerResult(peer=n) for n in names}
+    results = {n: PeerResult(peer=n) for n in names + list(spec.synthetic)}
+    syn_procs: dict[str, subprocess.Popen] = {}  # server+N+hK: the synthetic peers started so far
+    syn_started: dict[str, float] = {}
     save_grade = spec.grades.get("save_copy")
     save_title = str(save_grade.get("title", cfg.title_id)) if save_grade is not None else ""
     saves_before: dict[str, dict[str, str]] = {}
@@ -3521,6 +3854,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         # a spec error in a later peer starts no game at all.
         port = free_loopback_port() if hosted else 0
         prepared = {n: prepare_peer(cfg, spec, n, run, port) for n in starts if n not in remote}
+        # server+N+hK: each synthetic peer's folder and command, before any game starts.
+        syn_prepared = {n: prepare_synthetic(cfg, spec, n, run, snap, port) for n in spec.synthetic}
         # save_copy: each named peer's save copy as it is before any game starts.
         if save_grade is not None:
             saves_before = {n: save_state(run / n / "data", save_title) for n in save_copy_peers(save_grade, names)}
@@ -3581,16 +3916,47 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                 started[n] = time.monotonic()
                 results[n].started_after_s = round(started[n] - t_start, 1)
             deadline = time.monotonic() + spec.timeout
+            # server+N+hK: each synthetic peer waits for its start condition in its start peer's log.
+            syn_waits = {n: (LogTail(peer_log_path(run, s.start_peer, hosted)), re.compile(s.start_after))
+                         for n, s in spec.synthetic.items()}
+            syn_logs = {n: run / n / "peer.log" for n in spec.synthetic}
+
+            def start_synthetic() -> None:
+                for sn, (tail, rx) in list(syn_waits.items()):
+                    if not any(rx.search(line) for line in tail.new_lines()):
+                        continue
+                    del syn_waits[sn]
+                    sd, scmd = syn_prepared[sn]
+                    results[sn].command = scmd
+                    with open(syn_logs[sn], "wb") as out:
+                        sp = subprocess.Popen(scmd, cwd=str(sd), stdout=out, stderr=subprocess.STDOUT,
+                                              stdin=subprocess.DEVNULL, creationflags=winjob.SUSPENDED_START)
+                    try:
+                        job.add(sp)
+                        winjob.resume(sp)
+                    except BaseException:
+                        sp.kill()
+                        sp.wait(timeout=30)
+                        raise
+                    syn_procs[sn] = sp
+                    syn_started[sn] = time.monotonic()
+                    results[sn].started_after_s = round(syn_started[sn] - t_start, 1)
+
             # Fail fast: the first fatal line (or crash exit) moves the stop to a grace after it.
-            watch = FailFast({n: peer_log_path(run, n, hosted) for n in names},
-                             {n: fail_fast_patterns(spec, n) for n in names}) if spec.fail_fast else None
+            watch = FailFast({**{n: peer_log_path(run, n, hosted) for n in names}, **syn_logs},
+                             {**{n: fail_fast_patterns(spec, n) for n in names},
+                              **{n: s.forbid + SYNTHETIC_FATAL for n, s in spec.synthetic.items()}}) \
+                if spec.fail_fast else None
             stop_at, next_check, early = deadline, 0.0, False
             while len(ended) < len(procs) and time.monotonic() < stop_at:
                 note_ends()
+                if syn_waits:
+                    start_synthetic()
                 if watch is not None and time.monotonic() >= next_check:
                     next_check = time.monotonic() + FAIL_FAST_POLL
                     # Checked through the grace too: a hit whose log was replaced meanwhile is dropped.
-                    stop_at = min(deadline, watch.hit_at + cfg.fail_fast_grace) if watch.check(procs) else deadline
+                    stop_at = min(deadline, watch.hit_at + cfg.fail_fast_grace) \
+                        if watch.check({**procs, **syn_procs}) else deadline
                     early = stop_at < deadline  # else the timeout comes first: a timeout as before
                 time.sleep(min(0.5, max(0.0, stop_at - time.monotonic())))
             stopped = ""
@@ -3608,6 +3974,22 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                     pass
                 results[n].exit_code = p.returncode
                 results[n].seconds = round(ended.get(n, time.monotonic()) - started[n], 1)
+            # The synthetic peers end by themselves (End session drains them, or their script leaves)
+            # within SYNTHETIC_EXIT_GRACE of the games' end; one still running then is ended and fails.
+            syn_deadline = time.monotonic() + (0.0 if stopped else SYNTHETIC_EXIT_GRACE)
+            for sn, sp in syn_procs.items():
+                try:
+                    sp.wait(timeout=max(0.0, syn_deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    sp.kill()
+                    results[sn].ended_by_runner = True
+                    results[sn].stopped_by = stopped
+                    try:
+                        sp.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        pass
+                results[sn].exit_code = sp.returncode
+                results[sn].seconds = round(time.monotonic() - syn_started[sn], 1)
             res.leftover_processes = job.active()
             if res.leftover_processes:
                 job.terminate()
@@ -3626,6 +4008,11 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
     saves_after = {n: save_state(run / n / "data", save_title) for n in saves_before}
     res.seconds = round(time.monotonic() - t_start, 1)
     texts = {n: read_peer_log(run, n, hosted) for n in names}
+    # The synthetic peers' output, graded on its own and read by the cross-client grades (remote_swap).
+    syn_texts = {n: (run / n / "peer.log").read_text(encoding="utf-8", errors="replace")
+                 if (run / n / "peer.log").is_file() else "" for n in spec.synthetic}
+    for n in spec.synthetic:
+        grade_synthetic(spec, results[n], syn_texts[n], n in syn_started)
     for n in names:
         text = texts[n]
         parsed = parse_log(text)
@@ -3643,7 +4030,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             extra = grade_thresholds(spec, r, parsed, thresholds or {}, limit, baseline)
             if n in saves_before:
                 extra += grade_save_copy(r, saves_before[n], saves_after[n], save_title)
-            extra += grade_cross_peer(spec, r, texts, cfg.repo, thresholds or {})
+            extra += grade_cross_peer(spec, r, {**texts, **syn_texts}, cfg.repo, thresholds or {})
             # A grade the manifest accepts for this case (plan 5.4: accepted failures with a reason)
             # is recorded, not failed on; everything else still has to pass.
             # Only a measured violation is accepted: a missing measurement or baseline still fails.
@@ -3656,7 +4043,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             if extra:
                 r.reasons += extra
                 r.status = "fail"
-    res.peers = [results[n] for n in names]
+    res.peers = [results[n] for n in names + list(spec.synthetic)]
     failed = [r.peer for r in res.peers if r.status != "pass"]
     if res.stopped_early:
         res.reasons.append(res.stopped_early)
@@ -4373,6 +4760,10 @@ def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: l
             continue
         elif r.status != "pass":  # `not ready` (PS2) too, with its reason
             open_cases.append(f"{c['id']} ({r.status}" + (f": {r.not_ready}" if r.not_ready else "") + ")")
+        elif c.get("amendment") and not c.get("amendment_accepted"):
+            # A frozen case run on a reduced layout (stage 4's synthetic peers) counts as met only once the
+            # owner accepted the scope amendment that layout rests on (docs/online-4.md section 7.3).
+            open_cases.append(f"{c['id']} (passes on {c.get('layout')}; met only with {c['amendment']})")
     open_cases = list(dict.fromkeys(open_cases))
     line = f"checkpoint {stage}: met" if not open_cases else f"checkpoint {stage}: NOT met: {', '.join(open_cases)}"
     if accepted:
@@ -4934,7 +5325,7 @@ JOBS_OWNED_ARGS = {
 # (lint), since beside another case the machine's load is not the case's own. The scheduler runs such
 # a spec alone even when the mark is missing (runs_alone), so a spec that skipped lint never measures
 # another case's load.
-TIMED_GRADES = ("server_frame_time", "client_fps", "level_load", "press_to_reaction", "bandwidth")
+TIMED_GRADES = ("server_frame_time", "client_fps", "level_load", "press_to_reaction", "bandwidth", "remote_swap")
 
 
 def timed_grades(spec: Spec) -> list[str]:
@@ -6415,6 +6806,9 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
                 problems.append(f"{p.name}: grades time or load ({', '.join(timed_grades(s))}) but is not"
                                 " `exclusive = true`: beside another case (test --jobs) it would measure that load too")
             problems += scene_problems(cfg, s)
+            if s.synthetic and not ((cfg.synthetic_exe or cfg.synthetic_launcher) and cfg.synthetic_setting):
+                problems.append(f"{p.name}: synthetic peers, but tests/skytest.toml [synthetic] lacks exe or"
+                                " server_setting")
             specs[s.name] = s
         except SpecError as e:
             problems.append(str(e))
@@ -6448,6 +6842,10 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
             problems.append(f"manifest: {c.get('id')}: unknown layout {c['layout']}")
         if c.get("kind") in ("accepted-failure", "unsupported") and not c.get("reason"):
             problems.append(f"manifest: {c.get('id')}: an {c['kind']} case needs a reason")
+        if "amendment" in c and (not isinstance(c["amendment"], str) or not c["amendment"].strip()
+                                 or not isinstance(c.get("amendment_accepted", False), bool)):
+            problems.append(f"manifest: {c.get('id')}: amendment names the scope amendment (a string) and"
+                            " amendment_accepted is true or false")
         if c.get("spec") and c.get("id") not in specs:
             problems.append(f"manifest: {c.get('id')}: spec = true but tests/runtime has no such case")
         if c.get("id") in specs and not c.get("spec"):

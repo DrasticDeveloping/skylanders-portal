@@ -283,14 +283,16 @@ void Version2Item11() {
   // The wire: the six ids, then the elements, last (header, sequence, generation, 3 + 4 floats).
   {
     const auto b = EncodeMessage(pose);
-    REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 4 + 4 + 28 + 12 + 2);
-    CHECK(b[b.size() - 2] == uint8_t(pose.figure.elements) && b[b.size() - 1] == uint8_t(pose.figure.elements >> 8));
+    // Stage 4 appends the teleport counter (2 bytes) after the elements.
+    REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 4 + 4 + 28 + 12 + 2 + 2);
+    CHECK(b[b.size() - 4] == uint8_t(pose.figure.elements) && b[b.size() - 3] == uint8_t(pose.figure.elements >> 8));
   }
-  // A pose written before item 11 (no trailing field) reads as 0, not read.
+  // A pose written before item 11 (no trailing fields: neither elements nor stage 4's teleport
+  // counter) reads as 0, not read.
   {
     std::vector<uint8_t> b = EncodeMessage(pose);
-    REQUIRE_OR_RETURN_VOID(b.size() > kMessageHeaderSize + 2);
-    b.resize(b.size() - 2);
+    REQUIRE_OR_RETURN_VOID(b.size() > kMessageHeaderSize + 4);
+    b.resize(b.size() - 4);
     b[2] = uint8_t(b.size() - kMessageHeaderSize);
     b[3] = 0;
     auto back = DecodeMessages(b);
@@ -301,10 +303,12 @@ void Version2Item11() {
     want.figure.elements = 0;
     CHECK(*got == want);
   }
-  // Half a trailing field is a cut message.
-  {
+  // Half a trailing field is a cut message: half the teleport counter, or the elements' low byte
+  // with no counter after it.
+  for (size_t cut : {size_t(1), size_t(3)}) {
     std::vector<uint8_t> b = EncodeMessage(pose);
-    b.pop_back();
+    REQUIRE_OR_RETURN_VOID(b.size() > kMessageHeaderSize + cut);
+    b.resize(b.size() - cut);
     b[2] = uint8_t(b.size() - kMessageHeaderSize);
     CHECK(!DecodeMessages(b));
   }
@@ -316,14 +320,17 @@ void Version2Item11() {
     p.figure.elements = uint16_t(kElementsKnown | (1u << 9));
     CHECK(EncodeMessage(p).empty());
     std::vector<uint8_t> b = EncodeMessage(pose);
-    REQUIRE_OR_RETURN_VOID(!b.empty());
-    b[b.size() - 1] = 0x02;  // bit 9
+    REQUIRE_OR_RETURN_VOID(b.size() > kMessageHeaderSize + 4);
+    // The elements (u16, little-endian) sit before stage 4's 2-byte teleport counter.
+    const size_t lo = b.size() - 4, hi = b.size() - 3;
+    REQUIRE_OR_RETURN_VOID(b[lo] == uint8_t(pose.figure.elements) && b[hi] == uint8_t(pose.figure.elements >> 8));
+    b[hi] = 0x02;  // bit 9
     CHECK(!DecodeMessages(b));
-    b[b.size() - 1] = 0;
-    b[b.size() - 2] = 0x08;  // bit 3 without kElementsKnown
+    b[hi] = 0;
+    b[lo] = 0x08;  // bit 3 without kElementsKnown
     CHECK(!DecodeMessages(b));
   }
-  // A later field after the elements is ignored, as for any message.
+  // A later field after the teleport counter is ignored, as for any message.
   {
     std::vector<uint8_t> b = EncodeMessage(pose);
     b.push_back(0x5A);
@@ -802,7 +809,7 @@ void Version3() {
     CHECK(RoundTrip(w));
     const std::vector<uint8_t> good = EncodeMessage(w);
     REQUIRE_OR_RETURN_VOID(good.size() > 9);
-    w.backend_mode = 0x04;
+    w.backend_mode = 0x10;  // bits 2 and 3 are stage 4's; bit 4 is not known yet
     CHECK(EncodeMessage(w).empty());
     std::vector<uint8_t> bad = good;
     bad[bad.size() - 9] = 0x80;  // the mode byte
@@ -815,6 +822,75 @@ void Version3() {
     CHECK(!DecodeMessages(v2).has_value());
   }
   CHECK(kProtocolVersion == 3);
+}
+
+// Stage 4 (docs/online-4.md D5, sections 4.2 to 4.4): the two mode bits, Hello's trailing flags,
+// the pose's teleport counter, PlayerActionShown and PlayerPoseShown.
+void Stage4() {
+  {
+    Welcome w{3, 1, 60, 2, 7, "levels/zone_hub"};
+    w.backend_mode = kBackendModeRecordsPilot | kBackendModeRecordsPlayers | kBackendModeRequestsGeneric;
+    CHECK(RoundTrip(w));
+    CHECK(kBackendModeRecordsPlayers == 0x04 && kBackendModeRequestsGeneric == 0x08);
+  }
+  // Hello's flags: round-trip; an unknown bit is invalid both ways; a Hello without the byte (an
+  // earlier build's) reads as 0.
+  {
+    Hello h;
+    h.name = "synthetic 3";
+    h.flags = kHelloSynthetic;
+    CHECK(RoundTrip(h));
+    std::vector<uint8_t> b = EncodeMessage(h);
+    REQUIRE_OR_RETURN_VOID(!b.empty());
+    std::vector<uint8_t> bad = b;
+    bad.back() = 0x02;
+    CHECK(!DecodeMessages(bad).has_value());
+    h.flags = 0x80;
+    CHECK(EncodeMessage(h).empty());
+    b.pop_back();
+    const uint16_t len = uint16_t(b.size() - kMessageHeaderSize);
+    b[2] = uint8_t(len & 0xFF);
+    b[3] = uint8_t(len >> 8);
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<Hello>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    CHECK(got->flags == 0 && got->name == "synthetic 3");
+  }
+  // The teleport counter; a pose with elements but no counter reads the counter as 0.
+  {
+    PlayerPose p;
+    p.pose_sequence = 9;
+    p.generation = 2;
+    p.figure.elements = uint16_t(kElementsKnown | (1u << 2));
+    p.teleports = 513;
+    CHECK(RoundTrip(p));
+    std::vector<uint8_t> b = EncodeMessage(p);
+    b.resize(b.size() - 2);
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);
+    b[3] = 0;
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<PlayerPose>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    CHECK(got->teleports == 0 && got->figure.elements == p.figure.elements);
+  }
+  // The two relays round-trip; the shown pose keeps its trailing fields; a cut one is invalid.
+  {
+    CHECK(RoundTrip(PlayerActionShown{3, 2, 7, 41, 0x80000002u, 900}));
+    PlayerPoseShown s;
+    s.peer = 4;
+    s.pose.pose_sequence = 12;
+    s.pose.generation = 7;
+    s.pose.position = {1.5f, -2.0f, 3.0f};
+    s.pose.figure.elements = uint16_t(kElementsKnown | (1u << 5));
+    s.pose.teleports = 3;
+    CHECK(RoundTrip(s));
+    std::vector<uint8_t> b = EncodeMessage(PlayerActionShown{3, 2, 7, 41, 1, 900});
+    b.pop_back();
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);
+    CHECK(!DecodeMessages(b).has_value());
+  }
 }
 
 }  // namespace
@@ -845,8 +921,16 @@ int main() {
     auto b = EncodeMessage(LevelLoaded{0x01020304});
     const std::vector<uint8_t> want = {9, 0, 4, 0, 4, 3, 2, 1};
     CHECK(b == want);
+    // Hello: version, digest, figure id and variant, name (length byte and bytes), owner token,
+    // and stage 4's trailing flags byte, written even when 0.
     auto h = EncodeMessage(SampleHello());
-    CHECK(h.size() == kMessageHeaderSize + 2 + 32 + 2 + 2 + 1 + SampleHello().name.size() + 16);
+    CHECK(h.size() == kMessageHeaderSize + 2 + 32 + 2 + 2 + 1 + SampleHello().name.size() + 16 + 1);
+    REQUIRE_OR_RETURN(!h.empty());
+    CHECK(h.back() == 0);
+    Hello synthetic = SampleHello();
+    synthetic.flags = kHelloSynthetic;
+    const auto s = EncodeMessage(synthetic);
+    CHECK(s.size() == h.size() && !s.empty() && s.back() == kHelloSynthetic);
   }
 
   // Limits: a name over 32 bytes, a zone over 128, bad UTF-8, too many players: not encoded.
@@ -974,6 +1058,7 @@ int main() {
   Version2Scenes();
   Version3();
   OwnerFlagsMessage();
+  Stage4();
 
   return Finish("online_protocol");
 }

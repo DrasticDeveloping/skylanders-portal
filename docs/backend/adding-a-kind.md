@@ -110,6 +110,7 @@ avoid them up front:
 | V12 grace | an applied kind read at spawn has `pending_grace_ms` > 0; so has an applied kind another kind depends on |
 | V13 replicated deps | a replicated kind depends only on replicated kinds |
 | V14 urgent | `urgent` only on a replicated kind |
+| V15 owned | an owned value kind (`kOwnedValue`) is session scope, not an effect, mirrored or applied, and takes no request models |
 
 Changing any data field of a kind changes `TableDigest`, which S and every client compare in
 `StateHello`: two builds with different tables refuse each other.

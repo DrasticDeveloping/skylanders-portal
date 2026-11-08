@@ -1,5 +1,5 @@
 // The validator tests (design section 10, VA1 to VA15 with VA12b and VA13b): one crafted table per
-// rule V1 to V14, each hitting exactly its rule; the test table; the table digest; Replicated and
+// rule V1 to V15, each hitting exactly its rule; the test table; the table digest; Replicated and
 // Fenced, and the parts that use them.
 
 #include <algorithm>
@@ -190,11 +190,11 @@ BACKEND_TEST("VA9", ValidatorSizes) {
   Limits small;
   small.max_value_bytes = 256;  // a game's lower limit
   CHECK(OnlyRule(std::array{s}, "V9 sizes", small));
-  // The reserved classes: 1 (client-owned value, stage 4) and 2 (merge on S).
+  // The reserved class 2 (merge on S); class 1 is stage 4's owned value, which V9 accepts (VA14).
   s = Spec(1, "a");
-  s.state_class = StateClass(1);
-  CHECK(OnlyRule(std::array{s}, "V9 sizes"));
   s.state_class = StateClass(2);
+  CHECK(OnlyRule(std::array{s}, "V9 sizes"));
+  s.state_class = StateClass(4);
   CHECK(OnlyRule(std::array{s}, "V9 sizes"));
 }
 
@@ -227,6 +227,35 @@ BACKEND_TEST("VA11", ValidatorNoisy) {
   s = Spec(1, "a");
   s.noisy = true;  // a noisy current value
   CHECK(Passes(std::array{s}));
+  // Stage 4: a noisy owned value (player_vitals) passes V11.
+  s.scope = Scope::kSession;
+  s.state_class = StateClass::kOwnedValue;
+  CHECK(Passes(std::array{s}));
+}
+
+// Stage 4 (docs/online-4.md section 3.5): V9 accepts class 1; V15 holds an owned kind to a
+// session row of one player, mirrored or applied, never server-only, an effect or a request's
+// subject.
+BACKEND_TEST("VA14", ValidatorOwned) {
+  KindSpec s = Spec(1, "player");
+  s.scope = Scope::kSession;
+  s.state_class = StateClass::kOwnedValue;
+  CHECK(Passes(std::array{s}));
+  s.write = WriteMode::kApplied;
+  s.pending_grace_ms = 2000;  // V12: applied and read at spawn
+  CHECK(Passes(std::array{s}));
+  s = Spec(1, "player");
+  s.state_class = StateClass::kOwnedValue;  // level scope
+  CHECK(OnlyRule(std::array{s}, "V15 owned"));
+  s.scope = Scope::kSession;
+  s.write = WriteMode::kServerOnly;
+  CHECK(OnlyRule(std::array{s}, "V15 owned"));
+  s.write = WriteMode::kMirrored;
+  s.models = kModelCommit;
+  CHECK(OnlyRule(std::array{s}, "V15 owned"));
+  s.models = 0;
+  s.tier = Tier::kEffect;  // an effect may not be owned (V7 lets an effect ride state)
+  CHECK(OnlyRule(std::array{s}, "V15 owned"));
 }
 
 BACKEND_TEST("VA12", ValidatorGrace) {

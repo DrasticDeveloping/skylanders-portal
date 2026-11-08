@@ -60,6 +60,7 @@ void RequestTable::Reset(uint32_t generation) {
   held_.clear();
   stored_.clear();
   last_pose_.clear();
+  last_received_.clear();
   close_wait_.clear();
   generation_ = generation;
   previous_generation_ = generation;
@@ -449,6 +450,24 @@ bool RequestTable::OnPose(uint16_t peer, uint32_t generation, uint32_t pose_sequ
   return true;
 }
 
+bool RequestTable::OnPoseReceived(uint16_t peer, uint32_t generation, uint32_t pose_sequence) {
+  if (generation != generation_ || pose_sequence == 0) return false;
+  auto [it, inserted] = last_received_.try_emplace(peer, pose_sequence);
+  if (inserted) return true;
+  if (pose_sequence <= it->second) return false;  // older than (or the same as) the last one
+  it->second = pose_sequence;
+  return true;
+}
+
+bool RequestTable::OnPoseAccepted(uint16_t peer, uint32_t generation, uint32_t pose_sequence) {
+  // Only a pose this peer's link passed in this generation: after ForgetPeer (or a generation
+  // change) an accept still on its way from the host finds nothing, so a returning peer's fresh
+  // sequences never meet the old one.
+  auto r = last_received_.find(peer);
+  if (r == last_received_.end() || pose_sequence > r->second) return false;
+  return OnPose(peer, generation, pose_sequence);
+}
+
 void RequestTable::Service(TimePoint now) {
   if (closing_) {
     // The queues are cancelled; only the gone timeout runs.
@@ -540,6 +559,7 @@ void RequestTable::OnGenerationChange(uint32_t generation) {
   previous_generation_ = generation_;
   generation_ = generation;
   last_pose_.clear();
+  last_received_.clear();
 }
 
 // Tombs stay through End session (the design drops them "at End session"): a duplicate of a
@@ -584,6 +604,7 @@ void RequestTable::ForgetPeer(uint16_t peer) {
   std::erase_if(held_, [&](const Slot& s) { return s.second.peer == peer; });
   stored_.erase(peer);
   last_pose_.erase(peer);
+  last_received_.erase(peer);
   close_wait_.erase(peer);
 }
 

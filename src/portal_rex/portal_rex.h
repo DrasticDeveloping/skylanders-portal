@@ -100,6 +100,13 @@ bool CreateAndPlaceVillainTrap(int slot, const portal::TrapVillain& villain);
 // nullptr if portal_mode is not "software".
 portal::SoftwarePortal* GetSoftwarePortal();
 
+// A game's place filter for every software portal (SoftwarePortal::SetPlaceFilter's contract): the
+// active one now and every one a later switch into software or hybrid mode builds. nullptr removes
+// it. Any thread.
+void SetSoftwarePortalPlaceFilter(
+    std::function<bool(int slot, const portal::FigureData& data, std::span<const portal::FigureData> others)>
+        filter);
+
 // How loud the portal speaker plays on the PC right now, 0..1 (software mode with portal_audio on;
 // 0 otherwise), for speaker_overlay.h.
 float PortalSpeakerLevel();

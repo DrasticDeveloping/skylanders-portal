@@ -47,10 +47,14 @@ add_library(skylanders_online STATIC
     src/netplay/lanes.cpp
     src/netplay/port_mapping.cpp
     src/netplay/udp_socket.cpp
+    src/online/action_relay.cpp
+    src/online/body_slots.cpp
     src/online/hello_guard.cpp
     src/online/join_code.cpp
+    src/online/pose_rate.cpp
     src/online/protocol.cpp
     src/online/requests.cpp
+    src/online/roster.cpp
     src/online/session.cpp
     src/online/tick.cpp
 )
@@ -143,7 +147,7 @@ if(SKYLANDERS_PORTAL_TESTS)
     foreach(t netplay_datagram_test netplay_lanes_test netplay_port_mapping_test netplay_udp_socket_test
               online_protocol_test
               online_join_code_test online_tick_test online_session_test online_requests_test
-              online_hello_guard_test)
+              online_hello_guard_test online_players_test)
         add_executable(skylanders_${t} tests/${t}.cpp)
         target_include_directories(skylanders_${t} PRIVATE tests)
         target_link_libraries(skylanders_${t} PRIVATE skylanders_online)

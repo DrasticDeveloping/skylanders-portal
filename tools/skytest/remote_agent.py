@@ -531,8 +531,12 @@ def launch_plan(mach: Machine, m: Manifest, plan: dict, lock: RunLock, now: floa
                 args = la.build_game(ctx, list(e.get("args", [])), e.get("script", ""),
                                      fixtures=(fixtures / "saves", fixtures / "figures"), runner_args=runner)
             else:
-                # TODO(stage 4): the synthetic peer's own allow list and script rules (online-4.md D4).
-                args = la.build_synthetic_peer(ctx, list(e.get("args", [])), plan["server"])
+                # Stage 4's synthetic peer: the builder writes its script into the run folder and makes
+                # its line from the plan's session address and the digest contract, the SHA-256 the
+                # payload record gives the `game` role (the build digest S checks in its Hello; check_plan
+                # made sure the plan has its one game and the record that role).
+                args = la.build_synthetic_peer(ctx, plan["server"], m.roles["game"]["sha256"], e.get("script", ""),
+                                               list(e.get("args", [])))
             lines.append(([str(mach.install / m.roles[e["role"]]["name"]), *args], folder))
         job = mach.job_factory()
         procs = [mach.launcher(argv, cwd, job) for argv, cwd in lines]
@@ -927,11 +931,14 @@ class Agent:
         m = self._need_verified()
         plan = check_plan(req.get("plan"), m)
         for e in plan["entries"]:  # the scripts' grammar and table now; their paths again at run-local
-            if e["role"] == "game":
-                try:
+            try:
+                if e["role"] == "game":
                     la.parse_script(e.get("script", ""), self.mach.commands)
-                except la.LaunchError as err:
-                    raise Refused(str(err)) from None
+                else:
+                    la.check_synthetic_script(e.get("script", "").encode("utf-8"))
+                    la.session_address(plan["server"])
+            except la.LaunchError as err:
+                raise Refused(str(err)) from None
         in_store(self.mach.store, "staged").mkdir(exist_ok=True)
         write_in_store(self.mach.store, f"staged/{plan['name']}.json", json.dumps(plan).encode("utf-8"))
         return {"staged": plan["name"]}

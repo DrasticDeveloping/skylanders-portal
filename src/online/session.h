@@ -55,6 +55,10 @@ struct ServerSettings {
   // the session; 0 (no backend) unless the game sets it.
   uint8_t backend_mode = 0;
   uint64_t backend_table_digest = 0;
+  // Stage 4 item 2: a Hello flagged kHelloSynthetic is welcomed only when this is set (the game's
+  // dev_synthetic_peers, off by default) and it comes from a loopback address (127.x); otherwise
+  // it is refused kOther.
+  bool allow_synthetic = false;
 };
 
 // What SendBackend did with a frame (stage 3 section 3.2). kFull: the lane's window holds
@@ -78,7 +82,9 @@ struct ServerEvent {
     kBarrierReleased,  // generation, tick (the start tick sent in BarrierGo)
     kRefusalSent,      // refuse_reason, text, name (from the Hello, if any), endpoint, peer_id
     // Version 2 (stage 1B).
-    kPlayerPose,       // peer_id, pose: only a pose newer than the last from that peer this generation
+    kPlayerPose,       // peer_id, pose: only a pose newer than the last from that peer this generation;
+                       // it meets that peer's pose preconditions only once the host gives it to
+                       // AcceptPose (stage 4: a rate-dropped pose never is)
     kPlayerAction,     // peer_id, action
     kRequestReceived,  // peer_id, request (its key's peer set to the sender), before it is decided
     kEvaluateRequest,  // peer_id, request, generation (the key's): evaluate it on the game thread
@@ -131,6 +137,7 @@ struct ServerEvent {
   netplay::Lane lane = netplay::Lane::kGameplay;  // kBackendFrame
   std::vector<uint8_t> frame;                     // kBackendFrame
   OwnerFlags owner_flags;  // kOwnerFlags
+  bool synthetic = false;                         // kPeerJoined (stage 4): a synthetic peer
 };
 
 struct PeerInfo {
@@ -217,6 +224,12 @@ class ServerSession {
   bool SubmitEvaluation(const RequestKey& key, const EvaluationResult& result,
                         TimePoint now = Clock::now());
   const RequestTable& Requests() const { return requests_; }
+  // Stage 4: the host accepted a kPlayerPose of `peer` (S's rate check passed it, or there is
+  // none): that peer's pending requests whose pose precondition it meets go on at the next Pump.
+  // A pose the host drops is never given here, so a request naming it waits for a later accepted
+  // one (or its pose wait ends). false if it is dropped: another generation, its peer left since,
+  // or not newer than the last accepted one.
+  bool AcceptPose(uint16_t peer, const PlayerPose& pose);
   // To every client: the steps S applied for one request, or one of its late steps (`late_step`,
   // stage 1B amendment w). false if it cannot be encoded.
   bool SendAppliedStep(const AppliedStep& step, TimePoint now = Clock::now());
@@ -232,6 +245,11 @@ class ServerSession {
   // kMaxBackendFrameBytes, kGone when `peer` is not a welcomed client.
   BackendSend SendBackend(uint16_t peer, netplay::Lane lane, std::span<const uint8_t> frame,
                           TimePoint now = Clock::now());
+  // Stage 4 (docs/online-4.md sections 4.3, 4.4): to every welcomed client but `shown.peer`, an
+  // attack press or release S took from that peer (gameplay lane), or its accepted pose (fast
+  // lane). false if it cannot be encoded.
+  bool SendPlayerActionShown(const PlayerActionShown& shown, TimePoint now = Clock::now());
+  bool SendPlayerPoseShown(const PlayerPoseShown& shown, TimePoint now = Clock::now());
   // Datagrams sent to `peer` on `lane` and not yet acked (netplay's Connection::Unacked: every
   // message on that lane counts, the session's own included); 0 for a peer that is not welcomed.
   size_t BackendUnacked(uint16_t peer, netplay::Lane lane) const;
@@ -330,6 +348,9 @@ struct ClientEvent {
     kSceneBarrier,    // scene: S opened, released or ended a scene occurrence (never kAck)
     // Version 3 (stage 3).
     kBackendFrame,    // lane, frame: one backend frame from S, in its lane's order
+    // Stage 4.
+    kPlayerActionShown,  // action_shown: another player's attack press or release
+    kPlayerPoseShown,    // pose_shown: another player's pose
   };
   Type type = Type::kConnected;
   uint16_t peer_id = 0;
@@ -350,6 +371,8 @@ struct ClientEvent {
   uint64_t backend_table_digest = 0;
   netplay::Lane lane = netplay::Lane::kGameplay;  // kBackendFrame
   std::vector<uint8_t> frame;                     // kBackendFrame
+  PlayerActionShown action_shown;                 // kPlayerActionShown (stage 4)
+  PlayerPoseShown pose_shown;                     // kPlayerPoseShown (stage 4)
 };
 
 // The client side: one server, a ping every kPingInterval for the tick estimate and liveness.
