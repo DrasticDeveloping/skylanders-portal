@@ -1893,9 +1893,21 @@ def check_disc(cfg: Config) -> None:
 
 
 def build_files(cfg: Config) -> list[Path]:
-    """The build's exe and DLLs (what a snapshot copies); empty when the build folder has no exe."""
+    """The build's exe and DLLs and its online play files, routes/*.toml (what a snapshot copies; a
+    game whose Host requires routes/unsupported.toml beside the exe, Swap Force Online stage 8 item
+    5); empty when the build folder has no exe."""
     exe = cfg.build / cfg.exe
-    return [exe] + sorted(cfg.build.glob("*.dll")) if exe.is_file() else []
+    if not exe.is_file():
+        return []
+    return [exe] + sorted(cfg.build.glob("*.dll")) + sorted((cfg.build / "routes").glob("*.toml"))
+
+
+def build_rel(cfg: Config, f: Path) -> Path:
+    """A build file's place in the build folder and so in its snapshot (routes/x.toml stays there)."""
+    try:
+        return f.relative_to(cfg.build)
+    except ValueError:
+        return Path(f.name)
 
 
 def build_hash(cfg: Config, files: list[Path] | None = None) -> str:
@@ -1908,7 +1920,7 @@ def build_hash(cfg: Config, files: list[Path] | None = None) -> str:
     h = hashlib.sha256()
     for f in files:
         st = f.stat()
-        h.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns}\n".encode())
+        h.update(f"{build_rel(cfg, f).as_posix()}:{st.st_size}:{st.st_mtime_ns}\n".encode())
     return h.hexdigest()[:12]
 
 
@@ -1920,7 +1932,7 @@ def snapshot_build(cfg: Config) -> Path:
         raise SystemExit(f"no build at {cfg.build / cfg.exe}: build the release first (`just build-release`)")
     snap = cfg.store / "snapshots" / build_hash(cfg, files)
     check_output_path(cfg, snap)
-    if snapshot_complete(snap, files):
+    if snapshot_complete(snap, files, cfg):
         return snap
     # Each runner copies into its own partial folder (PS11: three lanes started on a new build in the
     # same second shared one `<hash>.partial`, deleted and renamed it under each other, and one failed
@@ -1932,11 +1944,12 @@ def snapshot_build(cfg: Config) -> Path:
     try:
         tmp.mkdir(parents=True)
         for f in files:
-            shutil.copy2(f, tmp / f.name)
+            (tmp / build_rel(cfg, f)).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, tmp / build_rel(cfg, f))
         try:
             tmp.rename(snap)
         except OSError as e:
-            if not snapshot_complete(snap, files):
+            if not snapshot_complete(snap, files, cfg):
                 raise SystemExit(f"could not put the snapshot in place at {snap} ({e}), and no complete one is"
                                  " there") from e
     finally:
@@ -1944,10 +1957,12 @@ def snapshot_build(cfg: Config) -> Path:
     return snap
 
 
-def snapshot_complete(snap: Path, files: list[Path]) -> bool:
+def snapshot_complete(snap: Path, files: list[Path], cfg: Config | None = None) -> bool:
     """A snapshot folder with every file of the build at its size (a rename puts a whole one in place)."""
+    def rel(f: Path) -> Path:
+        return build_rel(cfg, f) if cfg is not None else Path(f.name)
     try:
-        return all((snap / f.name).is_file() and (snap / f.name).stat().st_size == f.stat().st_size for f in files)
+        return all((snap / rel(f)).is_file() and (snap / rel(f)).stat().st_size == f.stat().st_size for f in files)
     except OSError:
         return False
 

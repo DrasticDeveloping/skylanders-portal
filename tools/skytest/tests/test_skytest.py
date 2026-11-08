@@ -789,6 +789,20 @@ quit
         self.assertTrue((a / "game.exe").is_file() and (a / "runtime.dll").is_file())
         self.assertTrue(skytest.inside(a, self.cfg.store))
 
+    def test_the_snapshot_carries_the_routes_folder(self) -> None:
+        # Swap Force Online stage 8 item 5: Host refuses a session without routes/unsupported.toml
+        # beside the exe, so a snapshot keeps the build's routes folder; a changed policy is a new build.
+        routes = self.cfg.build / "routes"
+        routes.mkdir()
+        (routes / "unsupported.toml").write_text("[policy]\nformat = 1\nentries = 0\n", encoding="utf-8")
+        before = skytest.build_hash(self.cfg)
+        snap = skytest.snapshot_build(self.cfg)
+        self.assertTrue((snap / "routes" / "unsupported.toml").is_file())
+        self.assertFalse((snap / "unsupported.toml").exists())
+        self.assertTrue(skytest.snapshot_complete(snap, skytest.build_files(self.cfg), self.cfg))
+        (routes / "unsupported.toml").write_text("[policy]\nformat = 1\nentries = 00\n", encoding="utf-8")
+        self.assertNotEqual(skytest.build_hash(self.cfg), before)
+
     def test_refusals(self) -> None:
         # Every game's line comes from the launch builder (launch_args.build_game): a refused setting or
         # script command is a spec error, and no game starts.
