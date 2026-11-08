@@ -630,7 +630,9 @@ def spec_readiness(path: Path, d: dict, text: str) -> str:
 
 def parse_save_slots(spec_name: str, peer: str, value: object) -> dict[int, int]:
     """A peer's `save_slots` table: one-based slot numbers as strings, each to the one-based fixture slot
-    whose save it gets (SAVE_SLOT_MAX at most), never a slot to itself."""
+    whose save it gets (SAVE_SLOT_MAX at most), never a slot to itself, and never a slot that is filled
+    and also copied from (fill_save_slots copies one after another in the peer's own copy, so the later
+    copy would take the filled slot's new save, not the fixture's)."""
     if not isinstance(value, dict):
         raise SpecError(f"{spec_name}: peer {peer}: save_slots is a table (\"<slot>\" = <fixture slot>)")
     out: dict[int, int] = {}
@@ -643,6 +645,8 @@ def parse_save_slots(spec_name: str, peer: str, value: object) -> dict[int, int]
         if src == int(key):
             raise SpecError(f"{spec_name}: peer {peer}: save_slots: slot {key} from itself")
         out[int(key)] = src
+    for slot in sorted(set(out) & set(out.values())):
+        raise SpecError(f"{spec_name}: peer {peer}: save_slots: slot {slot} is filled and copied from")
     return out
 
 
@@ -5914,9 +5918,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         janitor.stop()
     guard = [{"folder": k, "before": before_state[k], "after": after_state[k],
               "unchanged": before_state[k] == after_state[k]} for k in guarded]
-    # Required cases of the stages run here that have no spec yet: named, never skipped silently.
+    # Required cases of the stages run here that have no spec yet: named, never skipped silently. A met_by
+    # case with no spec of its own needs none (checkpoint_verdict grades its parts).
     unwritten = [c["id"] for c in manifest.get("case", [])
-                 if c.get("kind") == "required" and not c.get("spec")
+                 if c.get("kind") == "required" and not c.get("spec") and not c.get("met_by")
                  and (stages is None or str(c.get("stage")) in stages)] if (a.cases in ([], ["all"])
                                                                               and queue is None) else []
     if gate is not None:

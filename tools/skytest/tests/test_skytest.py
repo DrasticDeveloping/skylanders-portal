@@ -454,7 +454,10 @@ quit
     def test_save_slots_are_refused_when_they_cannot_be_made_right(self) -> None:
         body = 'layout = "server+1"\nstage = "3"\n[peer.H]\nscript = "quit\\n"\nsave_slots = '
         for value, why in (('{ "4" = 1 }', "slot '4' is not 1 to 3"), ('{ "2" = 2 }', "slot 2 from itself"),
-                           ('{ "2" = true }', "takes a fixture slot 1 to 3"), ('[2]', "save_slots is a table")):
+                           ('{ "2" = true }', "takes a fixture slot 1 to 3"), ('[2]', "save_slots is a table"),
+                           # copied one after another: slot 3 would get slot 2's new save, not the fixture's
+                           ('{ "2" = 1, "3" = 2 }', "slot 2 is filled and copied from"),
+                           ('{ "1" = 2, "2" = 1 }', "slot 1 is filled and copied from")):
             with self.assertRaisesRegex(skytest.SpecError, why):
                 skytest.load_spec(self.spec("bad", body + value + "\n"), 20)
         hosted = 'layout = "server+1"\nstage = "3"\nserver = "host"\n[peer.H]\nscript = "quit\\n"\n[peer.S]\nsave_slots = { "2" = 1 }\n'
@@ -999,7 +1002,9 @@ quit
         self.spec("one", 'layout = "solo"\nstage = "1A"\n[peer.H]\nscript = "quit\\n"\n')
         self.manifest('[[case]]\nid = "zero"\nstage = "0"\nlayout = "solo"\nkind = "required"\nspec = true\n'
                       '[[case]]\nid = "one"\nstage = "1A"\nlayout = "solo"\nkind = "required"\nspec = true\n'
-                      '[[case]]\nid = "later"\nstage = "1A"\nlayout = "server+1"\nkind = "required"\n')
+                      '[[case]]\nid = "later"\nstage = "1A"\nlayout = "server+1"\nkind = "required"\n'
+                      # A met_by case with no spec of its own (stage 3, D14) is not one still to write.
+                      '[[case]]\nid = "joined"\nstage = "1A"\nlayout = "solo"\nkind = "required"\nmet_by = ["one"]\n')
         a = argparse.Namespace(cases=[], stage="1A", max_games=5)
         with contextlib.redirect_stdout(io.StringIO()) as out:
             skytest.cmd_test(self.cfg, a)
