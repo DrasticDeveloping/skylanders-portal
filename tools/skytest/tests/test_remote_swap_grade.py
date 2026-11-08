@@ -76,6 +76,50 @@ class RemoteSwapGrade(unittest.TestCase):
         _, why = run(texts, {"swappers": ["H"], "swaps": 1, "receivers": ["D"]})
         self.assertTrue(any("max 500" in w for w in why))
 
+    def test_asymmetric_receivers_pass(self) -> None:
+        # H and D swap, only D receives: H is never asked to show D's swaps (it logs no body line).
+        texts = {
+            "S": "",
+            "H": "\n".join([connected(1), swap(1, "Wash Buckler", 600)]),
+            "D": "\n".join([connected(2), swap(1, "Boom Jet", 700), body(1, "Wash Buckler", 1, 610)]),
+        }
+        graded, why = run(texts, {"swappers": ["H", "D"], "swaps": 1, "receivers": ["D"]})
+        self.assertEqual(why, [])
+        self.assertEqual(graded["expected"], 1)
+        self.assertEqual(graded["graded"], 1)
+
+    def test_receiver_only_swap_is_not_graded(self) -> None:
+        # D only receives; its own unrelated swap is no key, so H's missing body line for it is no failure.
+        texts = {
+            "S": "",
+            "H": "\n".join([connected(1), swap(1, "Wash Buckler", 600)]),
+            "D": "\n".join([connected(2), swap(1, "Boom Jet", 700), body(1, "Wash Buckler", 1, 610)]),
+        }
+        graded, why = run(texts, {"swappers": ["H"], "swaps": 1, "receivers": ["D"]})
+        self.assertEqual(why, [])
+        self.assertEqual(graded["expected"], 1)
+
+    def test_all_swaps_from_one_peer_fail(self) -> None:
+        # Four swaps by H, all shown on D, and none by D: the total (4) covers 2 x 2, the per-swapper
+        # count does not (remote-swap-500ms orders ten by H and ten by D).
+        h = [connected(1)] + [swap(n, "Wash Buckler", 600 * n) for n in range(1, 5)]
+        d = [connected(2)] + [body(1, "Wash Buckler", n, 600 * n + 10) for n in range(1, 5)]
+        texts = {"S": "", "H": "\n".join(h), "D": "\n".join(d)}
+        _, why = run(texts, {"swappers": ["H", "D"], "swaps": 2, "receivers": ["H", "D"]})
+        self.assertTrue(any("D logged 0 swap(s), the spec orders 2" in w for w in why), why)
+        self.assertFalse(any("H logged" in w for w in why), why)
+
+    def test_both_directions_pass(self) -> None:
+        texts = {
+            "S": "",
+            "H": "\n".join([connected(1), swap(1, "Wash Buckler", 600), body(2, "Boom Jet", 1, 1210)]),
+            "D": "\n".join([connected(2), swap(1, "Boom Jet", 1200), body(1, "Wash Buckler", 1, 610)]),
+        }
+        graded, why = run(texts, {"swappers": ["H", "D"], "swaps": 1, "receivers": ["H", "D"]})
+        self.assertEqual(why, [])
+        self.assertEqual(graded["expected"], 2)
+        self.assertEqual(graded["graded"], 2)
+
     def test_spec_checks(self) -> None:
         for bad in ({"swaps": 1}, {"swappers": ["S"], "swaps": 1}, {"swappers": ["H"], "swaps": 0},
                     {"swappers": ["H"], "swaps": 1, "receivers": ["H"]}, {"swappers": ["H"], "swaps": 1, "x": 1},
