@@ -1,0 +1,10 @@
+map S head 8 prefix 8 epoch 1 rows 5 bytes 7 table c1ff1df2e76b85c6
+row md.count p1/1 slot 0 rev 1 lsn 4 epoch 0 writer 0 value 0500 digest 08218a07b4dd0020
+row md.count p1/1 slot 1 rev 1 lsn 5 epoch 0 writer 0 value 0700 digest 08285607b4e2c672
+row md.gate a00000010.c17d6562.968d3732@1 slot 0 rev 2 lsn 7 epoch 1 writer 0 value 02 digest af63bf4c8601bb45
+row md.gate a00000011.c07d63cf.968d3732@1 slot 0 rev 2 lsn 8 epoch 1 writer 0 tomb value - digest cbf29ce484222325
+row md.secret a00000020.45496baf.d432914f@1 slot 0 rev 1 lsn 6 epoch 1 writer 0 server-only value abcd digest 09979b07b61b0365
+obligation 1 to 1 md.gate a00000010.c17d6562.968d3732@1 lsn 9 sent
+lease 1 md.gate a00000010.c17d6562.968d3732@1 holder 1 granted left 2000
+peer 1 cursor 8 prefix 8 unacked 0 baseline - - since 4 1 credit 0 waiting 0
+peer 2 cursor 3 prefix 2 unacked 4 baseline 2 join since 2 - credit 1 waiting 2

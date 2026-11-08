@@ -61,6 +61,9 @@ Layouts (the game repository's docs/testing-guide.md has the details):
 
     solo        H alone: the plain game, offline (reference measurements)
     server+N    the server peer S and N clients H, D, E, F (N = 1..4); H is the owner's client
+    unit        no game: a unit test binary from the build (copied into a snapshot first), graded by
+                its exit code and its pass line, and the ctests the case names (stage 2's
+                skylanders_backend_test and backend.include_rule)
 
 Until stage 1A gives the game a server role, S is a plain game instance with the runner's own
 lifecycle script (it boots hidden and quits); it runs no case script.
@@ -101,9 +104,11 @@ import winjob  # noqa: E402
 STORE = ".replication-tests"
 CLIENTS = ["H", "D", "E", "F"]
 LAYOUT = re.compile(r"^(solo|server\+([1-4]))$")
+# A case that runs a unit test binary and ctests from the build instead of games (stage 2 item 7).
+UNIT = "unit"
 PEER_DIRS = ("data", "figures", "cache")
-# Layouts the manifest may name that one PC cannot run: a second PC, other networks, a test binary.
-MANIFEST_ONLY_LAYOUTS = ("server+3+LAN", "internet+2", "unit")
+# Layouts the manifest may name that one PC cannot run: a second PC, other networks.
+MANIFEST_ONLY_LAYOUTS = ("server+3+LAN", "internet+2")
 
 # Log lines the game writes (skylanders-portal src/dev, the game's where hook).
 TS = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})\]")
@@ -346,6 +351,10 @@ class Config:
     # worktree; machine_slots_dir). Missing key: MACHINE_GAMES.
     machine_games: int = 4
     slots: Path | None = None
+    # A unit case's ctest command (default: `ctest` on PATH, as the build prompt has it), and a
+    # command put in front of its test binary (only the runner's own tests set that one).
+    ctest: list[str] = field(default_factory=list)
+    unit_launcher: list[str] = field(default_factory=list)
 
 
 def main_store(repo: Path) -> Path:
@@ -420,6 +429,8 @@ def load_config(repo: Path) -> Config:
         movies_skip=movies,
         machine_games=machine,
         slots=main_store(repo) / "slots",
+        ctest=[os.path.expandvars(x) for x in g.get("ctest", [])],
+        unit_launcher=[os.path.expandvars(x) for x in g.get("unit_launcher", [])],
     )
 
 
@@ -569,12 +580,14 @@ class Spec:
     # PS12: the sha256 of the spec text load_spec read (provenance records it, not the file's later
     # state: a queue lane or another workflow may edit the file while the run goes on).
     sha256: str = ""
+    # [unit]: a unit case's test binary, its pass line and ctests (load_unit_spec).
+    unit: dict = field(default_factory=dict)
 
 
 def peers_of(layout: str) -> list[str]:
     m = LAYOUT.match(layout)
     if not m:
-        raise SpecError(f"unknown layout {layout!r} (solo, server+1 .. server+4)")
+        raise SpecError(f"unknown layout {layout!r} (solo, server+1 .. server+4, unit)")
     if layout == "solo":
         return ["H"]
     return ["S"] + CLIENTS[: int(m.group(2))]
@@ -609,6 +622,8 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
     for key in ("name", "layout", "stage"):
         if key not in d:
             raise SpecError(f"{path.name}: `{key}` is missing")
+    if d["layout"] == UNIT:
+        return load_unit_spec(path, d, default_timeout, text, hashlib.sha256(data).hexdigest())
     names = peers_of(d["layout"])
     table = d.get("peer", {})
     unknown = set(table) - set(names) - {"all"}
@@ -755,6 +770,85 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         server=server, grades=grades, compare=compare, fail_fast=fail_fast, show_server_window=show,
         exclusive=exclusive, tolerate=list(tolerate), not_ready=not_ready, scenes=scenes,
         scenes_reason=scenes_reason.strip(), breaker=breaker, sha256=hashlib.sha256(data).hexdigest(),
+    )
+
+
+# A unit case (stage 2 item 7; the stage 2 design section 9): no game runs. The [unit] table names
+#   binary       the test binary, relative to the game's build folder; it and the DLLs beside it are
+#                copied into a snapshot of their own and run from there, never from the build folder
+#   pass_line    the line the binary prints when every test passed ("all backend tests passed");
+#                the case passes on exit code 0 and that line, both
+#   args         its arguments (optional); never one that writes into the source tree or does another
+#                job than the suite (UNIT_REFUSED_ARGS)
+#   ctest        ctest names run after it (optional), each alone and by its exact name, from
+#   ctest_dir    the build folder's subfolder that registered them (relative to the build folder);
+#   ctest_config the configuration for a multi-config build (optional, ctest -C)
+UNIT_KEYS = ("binary", "pass_line", "args", "ctest", "ctest_dir", "ctest_config")
+# --update-golden rewrites the golden files in the source tree; --diff and --list run no test.
+UNIT_REFUSED_ARGS = ("--update-golden", "--diff", "--list")
+CTEST_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+# The binary's summary line (the portal's tests/backend_main.cpp): "<n> <suite> tests, <m> failed, <ms> ms".
+UNIT_SUMMARY = re.compile(r"^(\d+) (\w+) tests, (\d+) failed, (\d+) ms")
+# The keys that say how games run or are graded (a unit case starts none). `breaker` among them: a unit
+# case never counts toward the circuit breaker nor is stopped by it (C7 guards the build's games).
+GAME_ONLY_KEYS = ("peer", "grade", "measure", "compare", "server", "standin_seconds", "fail_fast",
+                  "show_server_window", "tolerate", "scenes", "scenes_reason", "breaker")
+
+
+def build_relative(name: str, what: str, value: object) -> str:
+    """A path inside the build folder: relative, and never climbing out of it."""
+    if not isinstance(value, str) or not value.strip():
+        raise SpecError(f"{name}: [unit] {what} must be a path inside the build folder")
+    pp = Path(value)
+    if pp.is_absolute() or pp.drive or pp.root or ".." in pp.parts:
+        raise SpecError(f"{name}: [unit] {what} {value!r} must be relative to the build folder, inside it")
+    return value
+
+
+def load_unit_spec(path: Path, d: dict, default_timeout: float, text: str = "", sha256: str = "") -> Spec:
+    """A unit case's spec. Of the 1B keys it takes `ready`/`reason` and PLACEHOLDER (PS2), `exclusive`
+    (it runs alone in `test --jobs N`, still without a machine slot) and the text's sha256 (PS12)."""
+    name = path.name
+    game_only = [k for k in GAME_ONLY_KEYS if k in d]
+    if game_only:
+        raise SpecError(f"{name}: a unit case runs no game; {', '.join(game_only)} do not apply")
+    u = d.get("unit")
+    if not isinstance(u, dict):
+        raise SpecError(f"{name}: a unit case needs a [unit] table (binary, pass_line)")
+    unknown = sorted(set(u) - set(UNIT_KEYS))
+    if unknown:
+        raise SpecError(f"{name}: [unit] does not know {', '.join(unknown)} ({', '.join(UNIT_KEYS)})")
+    build_relative(name, "binary", u.get("binary"))
+    if not isinstance(u.get("pass_line"), str) or not u["pass_line"].strip():
+        raise SpecError(f"{name}: [unit] pass_line (the line the binary prints when every test passed) is missing")
+    args = u.get("args", [])
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        raise SpecError(f"{name}: [unit] args is a list of strings")
+    for a in args:
+        if not a.strip() or (a.startswith("--") and a.endswith("=")):
+            raise SpecError(f"{name}: [unit] refusing an empty argument {a!r}")
+        if any(a == r or a.startswith(r + "=") for r in UNIT_REFUSED_ARGS):
+            raise SpecError(f"{name}: [unit] refusing {a}: it writes into the source tree or runs no test")
+    tests = u.get("ctest", [])
+    if not isinstance(tests, list) or not all(isinstance(t, str) and CTEST_NAME.match(t) for t in tests):
+        raise SpecError(f"{name}: [unit] ctest is a list of test names (letters, digits, '_', '.', '-')")
+    if len(set(tests)) != len(tests):
+        raise SpecError(f"{name}: [unit] ctest names a test twice")
+    if tests:
+        build_relative(name, "ctest_dir", u.get("ctest_dir"))
+    elif "ctest_dir" in u or "ctest_config" in u:
+        raise SpecError(f"{name}: [unit] ctest_dir and ctest_config need ctest names")
+    if "ctest_config" in u and (not isinstance(u["ctest_config"], str) or not u["ctest_config"].strip()):
+        raise SpecError(f"{name}: [unit] ctest_config must be a configuration name")
+    exclusive = d.get("exclusive", False)
+    if not isinstance(exclusive, bool):
+        raise SpecError(f"{name}: exclusive is true or false")
+    return Spec(
+        name=d["name"], path=path, layout=UNIT, stage=str(d["stage"]), description=d.get("description", ""),
+        timeout=float(d.get("timeout", default_timeout)), peers={}, measures={}, standin_seconds=0.0,
+        unit={"binary": u["binary"], "pass_line": u["pass_line"].strip(), "args": list(args), "ctest": list(tests),
+              "ctest_dir": u.get("ctest_dir", ""), "ctest_config": u.get("ctest_config", "")},
+        exclusive=exclusive, not_ready=spec_readiness(path, d, text), breaker=False, sha256=sha256,
     )
 
 
@@ -1727,6 +1821,42 @@ def snapshot_complete(snap: Path, files: list[Path]) -> bool:
         return False
 
 
+def snapshot_unit(cfg: Config, binary: str) -> Path:
+    """A unit case's test binary and the DLLs beside it, copied into a snapshot of their own (keyed
+    by the files, as the game's is), so a rebuild during the run changes nothing. Returns the
+    copied binary."""
+    src = cfg.build / binary
+    if not src.is_file():
+        raise SpecError(f"no unit test binary at {src}: build it first")
+    files = [src] + sorted(f for f in src.parent.glob("*.dll") if f != src)
+    h = hashlib.sha256(f"unit:{binary}\n".encode())
+    for f in files:
+        st = f.stat()
+        h.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns}\n".encode())
+    snap = cfg.store / "snapshots" / f"unit-{h.hexdigest()[:12]}"
+    check_output_path(cfg, snap)
+    if snapshot_complete(snap, files):
+        return snap / src.name
+    # As snapshot_build (PS11): each runner and each case thread copies into its own partial folder and
+    # renames it into place; a rename that loses to another one's complete snapshot uses that one.
+    tmp = snap.with_name(f"{snap.name}.partial-{os.getpid()}-{threading.get_ident()}")
+    check_output_path(cfg, tmp)
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        tmp.mkdir(parents=True)
+        for f in files:
+            shutil.copy2(f, tmp / f.name)
+        try:
+            tmp.rename(snap)
+        except OSError as e:
+            if not snapshot_complete(snap, files):
+                raise SpecError(f"could not put the unit snapshot in place at {snap} ({e}), and no complete one"
+                                " is there") from e
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return snap / src.name
+
+
 def fixture_dirs(cfg: Config) -> tuple[Path, Path]:
     return cfg.store / "store" / "saves", cfg.store / "store" / "figures"
 
@@ -2569,6 +2699,8 @@ def scene_args(cfg: Config, spec: Spec) -> list[str]:
     no setting: which policy it means is unknown, and a scene case run with the skip would test the
     wrong thing), a [defaults].args value that differs from the key (it would reach a play spec), or a
     movies spec the game cannot run (Config.movies_skip)."""
+    if spec.layout == UNIT:
+        return []  # no game: no scene policy (GAME_ONLY_KEYS refuses the key)
     defaults = setting_values(cfg.default_args, SCENE_SETTING)
     if not spec.scenes:
         if spec_sets_scenes(spec) or defaults:
@@ -2592,6 +2724,8 @@ def scene_args(cfg: Config, spec: Spec) -> list[str]:
 def scene_policy(cfg: Config, spec: Spec) -> str:
     """The scene policy a case ran with, for its result and report: the key, else where the setting
     came from."""
+    if spec.layout == UNIT:
+        return "none (a unit case starts no game)"
     if spec.scenes:
         return spec.scenes + (f" ({spec.scenes_reason})" if spec.scenes_reason else "")
     if spec_sets_scenes(spec):
@@ -3069,6 +3203,124 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
     res.status = "pass" if not failed and not res.leftover_processes else "fail"
     if res.status != "pass":  # C7: what the circuit breaker counts
         res.signature = case_signature(spec, texts)
+    return res
+
+
+# --- a unit case ----------------------------------------------------------------------------------
+
+
+def run_tool(cmd: list[str], cwd: Path, out: Path, timeout: float) -> tuple[int | None, bool, float]:
+    """One unit step (the test binary or one ctest), in a job object as every game is, its stdout
+    and stderr into `out`. Returns the exit code, whether the runner ended it, and its seconds."""
+    t0 = time.monotonic()
+    ended = False
+    with open(out, "wb") as f, winjob.Job() as job:
+        p = subprocess.Popen(cmd, cwd=str(cwd), stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             creationflags=winjob.SUSPENDED_START)
+        try:
+            job.add(p)
+            winjob.resume(p)
+        except BaseException:
+            p.kill()
+            p.wait(timeout=30)
+            raise
+        try:
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            ended = True
+            p.kill()
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+            job.terminate()
+    return p.returncode, ended, round(time.monotonic() - t0, 1)
+
+
+def ctest_command(cfg: Config) -> list[str]:
+    if cfg.ctest:
+        return list(cfg.ctest)
+    found = shutil.which("ctest")
+    if not found:
+        raise SpecError("no ctest on PATH (run from the build prompt, or set [game] ctest in tests/skytest.toml)")
+    return [found]
+
+
+def ctest_regex(name: str) -> str:
+    """An exact-name ctest -R pattern (CTEST_NAME allows only '.' as a regex character)."""
+    return "^" + name.replace(".", "\\.") + "$"
+
+
+def failure_lines(text: str, limit: int = 8) -> list[str]:
+    lines = [x.strip() for x in text.splitlines() if x.strip().startswith("FAIL")]
+    return lines[:limit] + ([f"... and {len(lines) - limit} more FAIL lines"] if len(lines) > limit else [])
+
+
+def run_unit_case(cfg: Config, spec: Spec, snap: Path | None, max_games: int, stamp: str,
+                  thresholds: dict | None = None, baseline: dict | None = None,
+                  accepted_grades: tuple[str, ...] = (), folder: Path | None = None,
+                  pacer: StartPacer | None = None) -> CaseResult:
+    """A unit case: the test binary from its snapshot, graded by its exit code and its pass line,
+    then each named ctest alone. Starts no game, so it needs no capacity, disc, fixtures, machine slot
+    or start gap (`pacer` is taken as run_case's and not used). One result row per step: `test` for
+    the binary, `ctest <name>` for each ctest."""
+    u = spec.unit
+    res = CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage, started=stamp)
+    # make_run_dir: two cases of one `test --jobs N` (or two runners) may start in the same second.
+    run = make_run_dir(cfg, folder if folder is not None else cfg.store / "runs" / f"{stamp}-{spec.name}")
+    res.folder = str(run)
+    t_start = time.monotonic()
+    steps: list[PeerResult] = []
+    try:
+        exe = snapshot_unit(cfg, u["binary"])
+        r = PeerResult(peer="test")
+        r.command = [*cfg.unit_launcher, str(exe), *u["args"]]
+        out = run / "test.txt"
+        r.exit_code, r.ended_by_runner, r.seconds = run_tool(r.command, run, out, spec.timeout)
+        text = out.read_text(encoding="utf-8", errors="replace")
+        lines = [x.strip() for x in text.splitlines()]
+        summary = next((m for m in (UNIT_SUMMARY.match(x) for x in lines) if m), None)
+        r.graded["unit"] = {"pass_line": u["pass_line"] in lines,
+                            "tests": int(summary[1]) if summary else None,
+                            "failed": int(summary[3]) if summary else None,
+                            "ms": int(summary[4]) if summary else None}
+        if r.ended_by_runner:
+            r.reasons.append(f"did not end within {spec.timeout:.0f} s; ended")
+        elif r.exit_code != 0:
+            r.reasons.append(f"exit code {r.exit_code}")
+            r.reasons += failure_lines(text)
+        if not r.graded["unit"]["pass_line"]:
+            r.reasons.append(f"no '{u['pass_line']}' line")
+        r.status = "pass" if not r.reasons else "fail"
+        steps.append(r)
+        if u["ctest"]:
+            ctest = ctest_command(cfg)
+            test_dir = cfg.build / u["ctest_dir"]
+            if not test_dir.is_dir():
+                raise SpecError(f"no ctest folder {test_dir}: configure the build first")
+            for name in u["ctest"]:
+                c = PeerResult(peer=f"ctest {name}")
+                c.command = [*ctest, "--test-dir", str(test_dir), "-R", ctest_regex(name), "--no-tests=error",
+                             "--output-on-failure", *(["-C", u["ctest_config"]] if u["ctest_config"] else [])]
+                out = run / f"ctest-{name}.txt"
+                c.exit_code, c.ended_by_runner, c.seconds = run_tool(c.command, run, out, spec.timeout)
+                if c.ended_by_runner:
+                    c.reasons.append(f"did not end within {spec.timeout:.0f} s; ended")
+                elif c.exit_code != 0:
+                    c.reasons.append(f"exit code {c.exit_code} (no such test, or it failed: {out.name})")
+                c.status = "pass" if not c.reasons else "fail"
+                steps.append(c)
+    except (SpecError, OSError) as e:
+        res.peers = steps
+        res.status, res.reasons = "error", [str(e)]
+        res.seconds = round(time.monotonic() - t_start, 1)
+        return res
+    res.peers = steps
+    res.seconds = round(time.monotonic() - t_start, 1)
+    failed = [r.peer for r in steps if r.status != "pass"]
+    if failed:
+        res.reasons.append(f"failed: {', '.join(failed)}")
+    res.status = "pass" if not failed else "fail"
     return res
 
 
@@ -5355,7 +5607,15 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     # Before anything is copied or started: a restricted token is refused unless --allow-restricted.
     token = token_preflight(bool(getattr(a, "allow_restricted", False)))
     gate_started = time.monotonic()
-    check_disc(cfg)
+
+    def starts_games(sp: Spec) -> bool:
+        """A case that starts games: not a unit case, nor one reported `not ready` (PS2)."""
+        return sp.layout != UNIT and (run_not_ready or not sp.not_ready)
+
+    # The disc and the game's snapshot only when a selected case starts games (a run of unit cases needs
+    # neither); a game case the queue adds later takes them as it starts (game_snapshot).
+    if any(starts_games(sp) for sp in specs):
+        check_disc(cfg)
     max_games = a.max_games or default_max_games()
     jobs = getattr(a, "jobs", None)
     jobs = 1 if jobs is None else int(jobs)
@@ -5396,7 +5656,23 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     else:
         janitor.start(budget)  # beside the cases: nothing measured runs first
     try:
-        snap = snapshot_build(cfg)
+        snap: Path | None = None
+        breaker: CircuitBreaker | None = None
+        snapshot_lock = threading.Lock()
+
+        def game_snapshot() -> Path:
+            """The game's build snapshot and its circuit breaker (C7: keyed by the snapshot), taken once,
+            by the first case that starts games."""
+            nonlocal snap, breaker
+            with snapshot_lock:
+                if snap is None:
+                    check_disc(cfg)
+                    snap = snapshot_build(cfg)
+                    breaker = CircuitBreaker(budget, snap.name) if budget is not None else None
+                return snap
+
+        if any(starts_games(sp) for sp in runnable):
+            game_snapshot()
         guarded = guarded_folders(cfg)
         before_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -5411,8 +5687,8 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         if budget is not None:
             budget.owner = f"skytest pid {os.getpid()}, {out.name}"
         pacer = StartPacer(cfg.start_gap, budget)
-        # C7: the circuit breaker of this build snapshot, shared with every runner on the machine.
-        breaker = CircuitBreaker(budget, snap.name) if budget is not None else None
+        # C7: the circuit breaker of this build snapshot (game_snapshot), shared with every runner on the
+        # machine; None while no case has started games. A unit case's spec.breaker is False.
         breaker_stops = not getattr(a, "no_breaker", False)
         breaker_told: list[str] = []
 
@@ -5433,16 +5709,20 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
 
         def run_one(spec: Spec) -> CaseResult:
             entry = next((c for c in manifest.get("case", []) if c.get("id") == spec.name), {})
-            run = run_compare_case if spec.compare else run_case
+            # A unit case (stage 2 item 7) starts no game: no game snapshot, no machine slots (its
+            # case_games is 0, so it fits beside any case), no boot token; an exclusive one still runs alone.
+            unit = spec.layout == UNIT
+            run = run_unit_case if unit else run_compare_case if spec.compare else run_case
             r: CaseResult | None = None
             lease: Lease | None = None
             case_waits()  # ran_with counts from case_begins(): the slots' wait is not running beside others
             if spec.sha256 and file_sha256(spec.path) not in ("", spec.sha256):
                 print(f"{spec.name}: {spec.path.name} changed since it was read; the case runs the text read before"
                       " (provenance records that text's sha256)", flush=True)
+            game = None if unit else game_snapshot()
             if (t := tripped(spec)) is not None:
                 r = breaker_result(spec, t)
-            elif budget is not None and len(spec.peers) <= max_games:
+            elif budget is not None and not unit and len(spec.peers) <= max_games:
                 need = machine_need(spec, budget.games)
                 if runs_alone(spec):
                     janitor.stop("a case that runs alone started")  # PS1: never beside a measured case
@@ -5461,7 +5741,7 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                     # PS12: the load beside the case, sampled while it runs, and what ran.
                     sampler = LoadSampler(cfg.exe).start()
                     try:
-                        r = run(cfg, spec, snap, max_games, time.strftime("%Y%m%d-%H%M%S"), thresholds, baseline,
+                        r = run(cfg, spec, game, max_games, time.strftime("%Y%m%d-%H%M%S"), thresholds, baseline,
                                 tuple(entry.get("accepted_grades", [])), pacer=pacer)
                     finally:
                         load = sampler.summary()
@@ -5493,7 +5773,7 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             done_now = finished()
             note = f"{len(done_now)} of {len(order)} case(s) ended" + (", more may come from the queue"
                                                                        if queue is not None else "")
-            payload = {"in_progress": note, "snapshot": str(snap), "max_games": max_games, "jobs": jobs,
+            payload = {"in_progress": note, "snapshot": str(snap) if snap else "", "max_games": max_games, "jobs": jobs,
                        "machine": machine_info, "stages": stages, "restricted_token": token["restricted"],
                        "restricted_token_cause": token["cause"], "runner": runner_version(),
                        "cases": [asdict(r) for r in done_now]}
@@ -5544,7 +5824,7 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     # A gate run is a subset: never a checkpoint; nor is a queue's run (its cases are the lane's).
     full_run = a.cases in ([], ["all"]) and gate is None and queue is None
     checkpoint = checkpoint_verdict(manifest, a.stage, stages, results, touched, before) if a.stage and full_run else None
-    payload = {"snapshot": str(snap), "max_games": max_games, "jobs": jobs, "machine": machine_info,
+    payload = {"snapshot": str(snap) if snap else "", "max_games": max_games, "jobs": jobs, "machine": machine_info,
                "breaker": tripped_now, "stages": stages, "thresholds": thresholds,
                "guarded_folders": guard, "required_without_spec": unwritten, "checkpoint": checkpoint,
                "restricted_token": token["restricted"], "restricted_token_cause": token["cause"],
@@ -5555,8 +5835,8 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         gate["actual_minutes"] = round((time.monotonic() - gate_started) / 60, 1)
         gate["case_minutes"] = round(sum(r.seconds for r in results) / 60, 1)
         if gate.get("per_build"):  # read again now: an idle slot's --per-build run may have ended meanwhile
-            gate["build"] = snap.name
-            states = per_build_states(cfg, gate["per_build"], every_spec, snap.name, out)
+            gate["build"] = snap.name if snap else build_hash(cfg)  # no game started: the build as it is
+            states = per_build_states(cfg, gate["per_build"], every_spec, gate["build"], out)
             for row, state in zip(gate["per_build"], states):
                 row["state"] = state
         gate["verdict"] = gate_verdict(gate, results, {r["case"]: r.get("state") for r in gate.get("per_build", [])})
@@ -5686,7 +5966,8 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
                             f" (not {c['gate']!r})")
         if c.get("kind") not in ("required", "unsupported", "accepted-failure"):
             problems.append(f"manifest: {c.get('id')}: kind must be required, unsupported or accepted-failure")
-        if c.get("layout") and not LAYOUT.match(c["layout"]) and c["layout"] not in MANIFEST_ONLY_LAYOUTS:
+        if (c.get("layout") and not LAYOUT.match(c["layout"]) and c["layout"] != UNIT
+                and c["layout"] not in MANIFEST_ONLY_LAYOUTS):
             problems.append(f"manifest: {c.get('id')}: unknown layout {c['layout']}")
         if c.get("kind") in ("accepted-failure", "unsupported") and not c.get("reason"):
             problems.append(f"manifest: {c.get('id')}: an {c['kind']} case needs a reason")

@@ -67,6 +67,13 @@ add_library(skylanders_nav STATIC
 target_include_directories(skylanders_nav PUBLIC src)
 target_compile_features(skylanders_nav PUBLIC cxx_std_23)
 
+# skylanders_backend: Swap Force Online's backend core and its tests (stage 2, src/backend), off
+# until stage 2 is the current stage.
+option(SKYLANDERS_BACKEND "Build the online backend core (stage 2) and its tests" OFF)
+if(SKYLANDERS_BACKEND)
+    add_subdirectory(src/backend)
+endif()
+
 # skylanders_portal_figures: only the figure files (catalog, names, elements, stats), for programs
 # without the SDK such as the Core of Light launcher. On Windows it needs no SDK tree: AES and MD5
 # come from Windows (CNG). Built whenever REXSDK_DIR isn't set.
