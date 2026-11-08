@@ -924,4 +924,8 @@ PeerStats Server::Stats(uint16_t peer) const {
   return s;
 }
 
+// Stage 4 (owned.h).
+void Server::SetOwnedSchema(OwnedSchemaCheck schema) { impl_->owned.SetSchema(schema); }
+const OwnedAdmission& Server::Owned() const { return impl_->owned; }
+
 }  // namespace skylanders::backend

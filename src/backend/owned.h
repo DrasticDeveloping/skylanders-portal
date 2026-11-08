@@ -69,6 +69,7 @@ class OwnedAdmission {
   bool ShouldLog(uint16_t peer, KindId kind, OwnedVerdict v, TimePoint now);
 
   uint64_t Count(OwnedVerdict v) const { return counts_[size_t(v)]; }
+  void SetSchema(OwnedSchemaCheck schema) { schema_ = schema; }
   size_t KeysHeld() const { return rows_.size(); }
 
  private:
