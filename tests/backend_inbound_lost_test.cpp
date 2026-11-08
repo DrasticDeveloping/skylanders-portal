@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <span>
 #include <utility>
 #include <variant>
@@ -16,9 +17,12 @@
 
 #include "backend/adapter.h"
 #include "backend/client.h"
+#include "backend/fake_network.h"
 #include "backend/kind_table.h"
 #include "backend/lanes.h"
+#include "backend/server.h"
 #include "backend/world_state.h"
+#include "backend_lanes_harness.h"
 #include "backend_test.h"
 #include "backend_test_kinds.h"
 
@@ -109,6 +113,46 @@ uint32_t RevisionOf(const Client& c) {
   return r ? r->revision : 0;
 }
 
+// The client's end of a real link with the bridge's discard in front: while `drop` holds, a frame
+// whose messages are all recoverable state is removed before the client reads it.
+class LossyLink final : public PeerLink {
+ public:
+  explicit LossyLink(PeerLink& inner) : inner_(inner) {}
+  LinkSend Send(netplay::Lane lane, std::span<const uint8_t> frame) override {
+    return inner_.Send(lane, frame);
+  }
+  bool Receive(netplay::Lane& lane, std::vector<uint8_t>& frame) override {
+    while (inner_.Receive(lane, frame)) {
+      if (!drop || !AllRecoverable(frame)) return true;
+      ++dropped;
+    }
+    return false;
+  }
+  size_t UnackedFrames(netplay::Lane lane) const override { return inner_.UnackedFrames(lane); }
+  std::chrono::microseconds Rtt() const override { return inner_.Rtt(); }
+  bool Connected() const override { return inner_.Connected(); }
+
+  bool drop = false;
+  size_t dropped = 0;
+
+ private:
+  static bool AllRecoverable(std::span<const uint8_t> frame) {
+    std::vector<Message> ms;
+    if (!DecodeFrame(frame, ms) || ms.empty()) return false;
+    for (const Message& m : ms) {
+      const bool recoverable =
+          std::holds_alternative<msg::Delta>(m) || std::holds_alternative<msg::Tomb>(m) ||
+          std::holds_alternative<msg::Through>(m) || std::holds_alternative<msg::Manifest>(m) ||
+          std::holds_alternative<msg::BaselineBegin>(m) ||
+          std::holds_alternative<msg::BaselineRows>(m) ||
+          std::holds_alternative<msg::BaselineEnd>(m);
+      if (!recoverable) return false;
+    }
+    return true;
+  }
+  PeerLink& inner_;
+};
+
 size_t CountEvents(Client& c, ClientEvent::Type type) {
   size_t n = 0;
   ClientEvent e;
@@ -148,6 +192,7 @@ BACKEND_TEST("S3-IL1", InboundLostSkipsUntilNewBaseline) {
   auto mismatches = link.Mismatches();
   REQUIRE_OR_RETURN_VOID(mismatches.size() == 1);
   CHECK(mismatches[0].lsn == 2 && mismatches[0].bucket_mask == 0);
+  CHECK(mismatches[0].lost);  // forced: S never counts a running baseline as its answer (F1)
   CHECK(CountEvents(c, ClientEvent::Type::kInboundLost) == 1);
 
   // What S sent before it read the Mismatch: discarded (a delta, a Through, a manifest that
@@ -228,6 +273,93 @@ BACKEND_TEST("S3-IL2", InboundLostTwiceKeepsFloor) {
   c.Pump(kT0 + 4ms);
   CHECK(!c.AwaitingRepairBaseline());
   CHECK(RevisionOf(c) == 3);
+}
+
+BACKEND_TEST("S3-IL4", InboundLostDuringRunningBaselineRealServer) {
+  // Sol code review r1 F1, with a real Server: the loss comes while S's full baseline runs (its
+  // BaselineBegin read, its rest discarded), the head never moves after it and a manifest proof
+  // at that head keeps S's silence rule quiet. Before the fix S counted the running baseline as
+  // the answer to the Mismatch (its `at` and scopes cover the prefix), the client discarded its
+  // rest and every manifest while waiting for a later baseline, and stayed in discard mode for
+  // good. Now the Mismatch is forced: S begins a fresh full baseline after the running one.
+  namespace tl = test::lanes;
+  TimePoint now = tl::kStart;
+  tl::Authorities authorities;
+  tl::TestWorld world;
+  Server server(tl::kLanesTable, authorities.set, Limits{});
+  Client client(tl::kLanesTable, world.Adapters(), Limits{});
+  auto [s_end, c_end] = MemoryLink::Pair(&now);
+  LossyLink lossy(*c_end);
+  // Enough session rows that one baseline spans many pumps at the pacer's 40 KiB/s (about 2 s).
+  constexpr uint32_t kRows = 1000;
+  for (uint32_t n = 1; n <= kRows; ++n) {
+    CHECK(server.State().Put(tl::Key(test::kTracker, SessionObject(n)), tl::Val(n, 32), now) ==
+          PutResult::kWritten);
+  }
+  server.AddPeer(1, PeerRole::kOwner, *s_end, now);
+  client.Attach(lossy, now);
+  std::map<BaselineReason, size_t> begun;
+  size_t ended = 0;
+  auto step = [&] {
+    server.Pump(now);
+    client.Pump(now);
+    ServerEvent e;
+    while (server.PollEvent(e)) {
+      if (e.type == ServerEvent::Type::kBaselineBegun) ++begun[e.why];
+      if (e.type == ServerEvent::Type::kBaselineEnded) ++ended;
+    }
+    ClientEvent ce;
+    while (client.PollEvent(ce)) {
+    }
+    now += 50ms;
+  };
+  auto run = [&](Duration d) {
+    const TimePoint until = now + d;
+    while (now < until) step();
+  };
+
+  // Joined, and the head proven by a manifest: nothing repairs in a quiet session from here.
+  run(15s);
+  const uint64_t head = server.State().Head();
+  CHECK(head == kRows);
+  CHECK(begun[BaselineReason::kJoin] == 1);
+  CHECK(client.State().Staging() == 0);
+  CHECK(client.State().Completes(Scope::kSession, head));
+  CHECK(server.Stats(1).manifest_ok == head);
+
+  // A full repair baseline (a first InboundLost with nothing lost asks for one): its BaselineBegin
+  // read, the client stages it and has left discard mode.
+  client.InboundLost(now);
+  for (int i = 0; i < 40 && (client.AwaitingRepairBaseline() || client.State().Staging() == 0);
+       ++i) {
+    step();
+  }
+  REQUIRE_OR_RETURN_VOID(!client.AwaitingRepairBaseline());
+  CHECK(client.State().Staging() == kScopeSession);
+  CHECK(begun[BaselineReason::kDigestMismatch] == 1);
+  const size_t ended_before = ended;
+
+  // The loss: the rest of that baseline (rows, end) is discarded below the client and the mark is
+  // read. S reads the Mismatch while the baseline still runs.
+  lossy.drop = true;
+  client.InboundLost(now);
+  CHECK(client.AwaitingRepairBaseline());
+  step();
+  CHECK(ended == ended_before);  // the baseline was still running when S read the Mismatch
+  for (int i = 0; i < 200 && ended == ended_before; ++i) step();
+  CHECK(ended == ended_before + 1);
+  CHECK(lossy.dropped > 0);
+  lossy.drop = false;
+
+  // A fresh full baseline after it: the client takes it, leaves discard mode and holds S's rows.
+  run(10s);
+  CHECK(server.State().Head() == head);
+  CHECK(begun[BaselineReason::kDigestMismatch] == 2);
+  CHECK(!client.AwaitingRepairBaseline());
+  CHECK(client.State().Staging() == 0);
+  CHECK(client.State().Completes(Scope::kSession, head));
+  const Record* row = client.State().Get(tl::Key(test::kTracker, SessionObject(kRows)));
+  CHECK(row && row->value == tl::Val(kRows, 32));
 }
 
 BACKEND_TEST("S3-IL3", InboundLostBeforeHelloDoesNothing) {

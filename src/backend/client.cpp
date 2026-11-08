@@ -143,7 +143,10 @@ struct Client::Impl {
   // newest needs to go.
   void SendMismatch(const msg::Mismatch& m) {
     if (Held(netplay::Lane::kState) || mismatch) {
+      // A newer one replaces the waiting one, but an InboundLost repair stays forced (F1).
+      const bool lost = m.lost || (mismatch && mismatch->lost);
       mismatch = m;
+      mismatch->lost = lost;
       return;
     }
     Push(m);
@@ -669,7 +672,9 @@ void Client::InboundLost(TimePoint now) {
   c.repair_above = c.last_baseline;
   c.discarded = 0;
   const uint64_t prefix = c.replica.Prefix();
-  c.SendMismatch(msg::Mismatch{prefix, 0});
+  // Forced (Sol code review r1 F1): S must not count a running baseline as the answer, since its
+  // rest is discarded here.
+  c.SendMismatch(msg::Mismatch{prefix, 0, /*lost=*/true});
   ClientEvent& e = c.Event(ClientEvent::Type::kInboundLost);
   e.lsn = prefix;
   c.Flush();

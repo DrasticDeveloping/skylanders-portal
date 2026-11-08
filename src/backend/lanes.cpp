@@ -226,6 +226,7 @@ struct FieldWriter {
   void operator()(const msg::Mismatch& m) {
     w.U64(m.lsn);
     w.U64(m.bucket_mask);
+    if (m.lost) w.U8(1);
   }
   // On the wire: generation and sequence only; S stamps peer and peer epoch from the link (Sol F3).
   // The parent is the same peer, peer epoch and generation, so only its sequence goes.
@@ -403,6 +404,7 @@ std::optional<Message> ReadFields(MessageType type, Reader& r) {
       msg::Mismatch m;
       m.lsn = r.U64();
       m.bucket_mask = r.U64();
+      if (r.Ok() && r.Remaining() > 0) m.lost = r.U8() != 0;
       if (!r.Ok()) return std::nullopt;
       return m;
     }

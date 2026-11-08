@@ -119,7 +119,9 @@ class Client {
   // BaselineRows, BaselineEnd) because its inbound budget was spent, and its receive reached the
   // loss mark: every message before the mark has been read, none after it. Drops staging as a
   // failed baseline digest does (the active replica and the apply queue untouched), sends
-  // Mismatch{prefix, 0}, and from now on discards recoverable state messages until the
+  // Mismatch{prefix, 0, lost} (lost: S answers with a fresh full baseline even while one whose
+  // `at` covers the prefix runs, since its rest is discarded here; Sol code review r1 F1), and
+  // from now on discards recoverable state messages until the
   // BaselineBegin of a baseline with an id above the last one read before the mark (a baseline S
   // began after the loss; S numbers each peer's baselines upward). Control messages (StateHello,
   // EpochBegin, Obligation, ObligationAck, Decision, LeaseEnd) are never discarded here. Safe on

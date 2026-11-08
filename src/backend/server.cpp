@@ -294,10 +294,13 @@ struct Server::Impl {
   // Baselines (section 3.5 step 1, D5).
 
   // A reason that comes while a baseline runs: dropped if it came at or before the running one's
-  // `at` (that baseline answers it), else kept for when it ends.
-  void AskBaseline(Peer& p, BaselineReason why, ScopeMask scopes, uint64_t lsn) {
+  // `at` (that baseline answers it), else kept for when it ends. `force` (a Mismatch from
+  // Client::InboundLost, Sol code review r1 F1) is never dropped: that client discards the rest of
+  // the running baseline, so only one begun after it answers.
+  void AskBaseline(Peer& p, BaselineReason why, ScopeMask scopes, uint64_t lsn,
+                   bool force = false) {
     const bool repair = IsRepair(why);
-    if (p.baseline && lsn <= p.baseline->at) {
+    if (p.baseline && lsn <= p.baseline->at && !force) {
       const ScopeMask wanted = repair ? p.sub.scopes : scopes;
       if ((wanted & ~p.baseline->scopes) == 0) return;
     }
@@ -567,7 +570,7 @@ struct Server::Impl {
       AskBaseline(p,
                   mismatch->bucket_mask == 0 ? BaselineReason::kDigestMismatch
                                              : BaselineReason::kManifestMismatch,
-                  0, mismatch->lsn);
+                  0, mismatch->lsn, mismatch->lost);
     } else if (auto* request = std::get_if<msg::Request>(&m)) {
       Request r = std::move(request->request);
       // S stamps peer and peer epoch from the link, never from the client's bytes (Sol F3).
