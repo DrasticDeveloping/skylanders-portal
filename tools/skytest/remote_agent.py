@@ -43,6 +43,7 @@ import secrets
 import selectors
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -86,6 +87,148 @@ PLAN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
 
 class Refused(Exception):
     """A request the agent refuses; the reply names the reason."""
+
+
+# --- the store ------------------------------------------------------------------------------------
+# The agent writes only inside its store: manifest.json, run.lock, fixtures\, fixtures-incoming\,
+# staged\, runs\ and the collection records. The store is admitted once, before the first write
+# (admit_store), and every path the agent opens, replaces or deletes there is checked again right
+# before it does (in_store): the store still resolves to the admitted folder, and no component from
+# the store down is a junction, link or other reparse point.
+
+DRIVE_FIXED = 3
+
+
+def drive_type(root: str) -> int:
+    """The drive's type by GetDriveTypeW (3: a fixed local disk). A module function so tests can
+    stand in another drive."""
+    if os.name != "nt":
+        return DRIVE_FIXED
+    import ctypes
+
+    return ctypes.WinDLL("kernel32", use_last_error=True).GetDriveTypeW(root)
+
+
+def _resolved(p: Path | str, what: str, strict: bool) -> Path:
+    """The real path, following junctions and links; an error refuses (fail closed)."""
+    try:
+        return Path(os.path.realpath(p, strict=strict))
+    except (OSError, ValueError) as e:
+        raise Refused(f"{what} {p}: cannot be resolved ({e})") from None
+
+
+def _reparse(p: Path) -> bool:
+    """Whether p is a junction, link or other reparse point. A missing p is not; any other error
+    refuses (fail closed)."""
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        raise Refused(f"{p} cannot be checked ({e})") from None
+    return bool(getattr(st, "st_file_attributes", 0) & la.FILE_ATTRIBUTE_REPARSE_POINT) or stat.S_ISLNK(st.st_mode)
+
+
+def admit_store(store: Path | str, install: Path | str, owner_roots: list[Path] | None = None) -> tuple[Path, Path]:
+    """The store and the install the agent works with, both resolved (junctions and links followed).
+    Refuses a store spelled as a device, stream or UNC path, one that does not resolve, one that is
+    not on a fixed local drive (removable, network, optical), and one that is, lies inside or contains
+    an owner data folder (the real ones and `owner_roots`), the install or its rom\\, each compared
+    both as spelled and as resolved."""
+    text = str(store)
+    try:
+        la.check_path_text(text, "the store")
+    except la.LaunchError as e:
+        raise Refused(str(e)) from None
+    given = Path(os.path.abspath(text))
+    real = _resolved(given, "the store", strict=True)
+    if str(real).startswith(("\\\\", "//")):
+        raise Refused(f"the store {given} resolves to {real}: a network or device path")
+    if not real.is_dir():
+        raise Refused(f"the store {real} is not a folder")
+    if os.name == "nt":
+        kind = drive_type(real.anchor)
+        if kind != DRIVE_FIXED:
+            raise Refused(f"the store {real} is not on a fixed local drive (drive type {kind})")
+    inst_given = Path(os.path.abspath(str(install)))
+    inst = _resolved(inst_given, "the install", strict=True)
+    if not inst.is_dir():
+        raise Refused(f"the install {inst} is not a folder")
+    guarded: list[tuple[str, Path]] = []
+    for r in [*la.owner_data_roots(), *(owner_roots or [])]:
+        guarded += [("the owner's data folder", Path(r)),
+                    ("the owner's data folder", _resolved(r, "the owner's data folder", strict=False))]
+    guarded += [("the install", inst_given), ("the install", inst), ("the disc", inst_given / "rom"),
+                ("the disc", inst / "rom"), ("the disc", _resolved(inst / "rom", "the disc", strict=False))]
+    for spelling in (given, real):
+        for what, g in guarded:
+            if la.within(spelling, g) or la.within(g, spelling):
+                raise Refused(f"the store {spelling} is, lies inside or contains {what} {g}")
+    return real, inst
+
+
+def in_store(store: Path, *parts: str) -> Path:
+    """A path the agent is about to open, replace or delete: `parts` (plain names, '/' or '\\' between
+    them) under the admitted store, refused unless the store still resolves to itself, no component
+    from the store down is a reparse point and the whole resolves inside the store."""
+    now = _resolved(store, "the store", strict=True)
+    if not (la.within(now, store) and la.within(store, now)) or _reparse(store):
+        raise Refused(f"the store {store} is no longer the admitted folder (it resolves to {now})")
+    p = store
+    for part in parts:
+        for sub in re.split(r"[\\/]+", str(part)):
+            if not sub or sub in (".", "..") or ":" in sub:
+                raise Refused(f"{part!r} is not a plain name inside the store")
+            p = p / sub
+            if _reparse(p):
+                raise Refused(f"{p} is a junction, link or other reparse point: the agent writes only "
+                              "inside its store")
+    if not la.within(_resolved(p, "a store path", strict=False), store):
+        raise Refused(f"{p} resolves outside the store {store}")
+    return p
+
+
+def write_in_store(store: Path, rel: str, data: bytes) -> Path:
+    """A whole file the agent owns, written to a fresh name and moved over the old one: a hard link at
+    the name is replaced, never written through. Checked before the write and again before the move."""
+    p = in_store(store, rel)
+    tmp = in_store(store, f"{rel}.tmp-{secrets.token_hex(4)}")
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, in_store(store, rel))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return p
+
+
+def append_in_store(store: Path, rel: str, data: bytes) -> Path:
+    """Appends to a file the agent made (a fixture arriving in chunks), its folders made as needed;
+    a file with another hard link is refused."""
+    p = in_store(store, rel)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p = in_store(store, rel)
+    if os.path.lexists(p) and os.lstat(p).st_nlink > 1:
+        raise Refused(f"{p} has another hard link: the agent writes only its own files")
+    with open(p, "ab") as fh:
+        fh.write(data)
+    return p
+
+
+def remove_in_store(store: Path, rel: str) -> None:
+    """Deletes a folder or file the agent owns, after the check (shutil.rmtree does not follow the
+    junctions inside it)."""
+    p = in_store(store, rel)
+    if os.path.lexists(p):
+        if p.is_dir():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
 
 
 # --- frames ---------------------------------------------------------------------------------------
@@ -196,6 +339,7 @@ class RunLock:
     """One run at a time on the machine: the agent's and `run-local`'s runs take the same file."""
 
     def __init__(self, store: Path) -> None:
+        self.store = store
         self.path = store / "run.lock"
         self.held = False
         self._fd: int | None = None
@@ -203,7 +347,7 @@ class RunLock:
     def acquire(self, who: str) -> None:
         for _ in range(2):
             try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                fd = os.open(in_store(self.store, "run.lock"), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
                 try:
                     pid = int(self.path.read_text(encoding="utf-8").split()[0])
@@ -257,6 +401,7 @@ class Run:
     last_heartbeat: float
     state: str = "running"
     sent: int = 0
+    store: Path | None = None
 
 
 def check_plan(plan: object, m: Manifest) -> dict:
@@ -328,10 +473,13 @@ class Machine:
     job_factory: object = winjob.Job
     owner_roots: list[Path] | None = None
 
+    def __post_init__(self) -> None:
+        # Before anything is written: the store and the install, resolved and admitted (admit_store).
+        self.store, self.install = admit_store(self.store, self.install, self.owner_roots)
+
     def runs(self) -> Path:
-        p = self.store / "runs"
-        p.mkdir(exist_ok=True)
-        return p
+        in_store(self.store, "runs").mkdir(exist_ok=True)
+        return in_store(self.store, "runs")
 
 
 def launch_plan(mach: Machine, m: Manifest, plan: dict, lock: RunLock, now: float, who: str) -> Run:
@@ -352,7 +500,7 @@ def launch_plan(mach: Machine, m: Manifest, plan: dict, lock: RunLock, now: floa
         stamp = time.strftime("%Y%m%d-%H%M%S")
         run_folder = la.make_run_folder(mach.runs(), f"{plan['name']}-{stamp}-{secrets.token_hex(2)}",
                                         mach.owner_roots)
-        fixtures = mach.store / "fixtures"
+        fixtures = in_store(mach.store, "fixtures")
         lines = []
         for e in plan["entries"]:
             folder = la.make_run_folder(run_folder, e["peer"], mach.owner_roots)
@@ -374,7 +522,8 @@ def launch_plan(mach: Machine, m: Manifest, plan: dict, lock: RunLock, now: floa
             lines.append(([str(mach.install / m.roles[e["role"]]["name"]), *args], folder))
         job = mach.job_factory()
         procs = [mach.launcher(argv, cwd, job) for argv, cwd in lines]
-        return Run(plan["name"], run_folder, job, procs, now, float(plan.get("timeout_s", 600)), now)
+        return Run(plan["name"], run_folder, job, procs, now, float(plan.get("timeout_s", 600)), now,
+                   store=mach.store)
     except la.LaunchError as e:
         if job is not None:
             job.terminate()
@@ -395,10 +544,13 @@ def end_run(run: Run, lock: RunLock, state: str) -> None:
     if run.state == "running":
         run.job.terminate()
         run.job.close()
+        record = json.dumps({"state": state, "codes": [p.poll() for p in run.procs]}).encode("utf-8")
         try:
-            (run.folder / "exit.json").write_text(json.dumps({"state": state, "codes": [p.poll() for p in run.procs]}),
-                                                  encoding="utf-8")
-        except OSError:
+            if run.store is not None:
+                write_in_store(run.store, f"{run.folder.relative_to(run.store).as_posix()}/exit.json", record)
+            else:
+                (run.folder / "exit.json").write_bytes(record)
+        except (OSError, ValueError, Refused):
             pass
         lock.release()
         run.state = state
@@ -632,7 +784,7 @@ class Agent:
         if bad:
             self.verified = False
             raise Refused("the install does not match the payload record: " + "; ".join(bad[:8]))
-        (self.mach.store / "manifest.json").write_text(text, encoding="utf-8")
+        write_in_store(self.mach.store, "manifest.json", text.encode("utf-8"))
         self.manifest, self.verified = m, True
         return {"verified": True}
 
@@ -640,7 +792,7 @@ class Agent:
         if self._running() or self.lock.busy():
             raise Refused("no fixture changes while a peer runs")
         act = req.get("action")
-        incoming = self.mach.store / "fixtures-incoming"
+        store = self.mach.store
         if act == "begin":
             files = req.get("files")
             if not isinstance(files, list) or not files:
@@ -657,9 +809,8 @@ class Agent:
                 total += size
             if total > FIXTURE_LIMIT:
                 raise Refused("fixtures are at most 64 MiB in all")
-            if incoming.exists():
-                shutil.rmtree(incoming)
-            incoming.mkdir()
+            remove_in_store(store, "fixtures-incoming")
+            in_store(store, "fixtures-incoming").mkdir()
             self.incoming = {"files": files, "got": [0] * len(files)}
             return {"files": len(files)}
         if self.incoming is None:
@@ -672,35 +823,31 @@ class Agent:
             data = base64.b64decode(req.get("data", ""), validate=True)
             if off == 0 and data[:2] == b"MZ":
                 self.incoming = None
-                shutil.rmtree(incoming, ignore_errors=True)
+                remove_in_store(store, "fixtures-incoming")
                 raise Refused(f"fixture {files[i]['path']} starts with an executable header")
             if off + len(data) > files[i]["size"]:
                 raise Refused("chunk beyond the declared size")
-            p = incoming / files[i]["path"]
-            p.parent.mkdir(parents=True, exist_ok=True)
-            with open(p, "ab") as fh:
-                fh.write(data)
+            append_in_store(store, f"fixtures-incoming/{files[i]['path']}", data)
             self.incoming["got"][i] += len(data)
             return {"got": self.incoming["got"][i]}
         if act == "end":
             for f, got in zip(self.incoming["files"], self.incoming["got"]):
-                p = incoming / f["path"]
-                if f["size"] == 0 and not p.exists():
-                    p.parent.mkdir(parents=True, exist_ok=True)
-                    p.write_bytes(b"")
+                rel = f"fixtures-incoming/{f['path']}"
+                if f["size"] == 0 and not os.path.lexists(in_store(store, rel)):
+                    append_in_store(store, rel, b"")
+                p = in_store(store, rel)
                 if got != f["size"] or sha256_file(p) != f["sha256"]:
                     raise Refused(f"fixture {f['path']} does not match its size and SHA-256")
                 with open(p, "rb") as fh:
-                    if fh.read(2) == b"MZ":  # also when the first chunk carried only "M"
-                        self.incoming = None
-                        shutil.rmtree(incoming, ignore_errors=True)
-                        raise Refused(f"fixture {f['path']} starts with an executable header")
-            final = self.mach.store / "fixtures"
-            if final.exists():
-                shutil.rmtree(final)
+                    mz = fh.read(2) == b"MZ"  # also when the first chunk carried only "M"
+                if mz:
+                    self.incoming = None
+                    remove_in_store(store, "fixtures-incoming")
+                    raise Refused(f"fixture {f['path']} starts with an executable header")
+            remove_in_store(store, "fixtures")
             for sub in ("saves", "figures"):
-                (incoming / sub).mkdir(exist_ok=True)
-            incoming.rename(final)
+                in_store(store, "fixtures-incoming", sub).mkdir(exist_ok=True)
+            in_store(store, "fixtures-incoming").rename(in_store(store, "fixtures"))
             self.incoming = None
             return {"stored": True}
         raise Refused("fixtures action: begin, chunk or end")
@@ -719,9 +866,8 @@ class Agent:
                     la.parse_script(e.get("script", ""), self.mach.commands)
                 except la.LaunchError as err:
                     raise Refused(str(err)) from None
-        d = self.mach.store / "staged"
-        d.mkdir(exist_ok=True)
-        (d / f"{plan['name']}.json").write_text(json.dumps(plan), encoding="utf-8")
+        in_store(self.mach.store, "staged").mkdir(exist_ok=True)
+        write_in_store(self.mach.store, f"staged/{plan['name']}.json", json.dumps(plan).encode("utf-8"))
         return {"staged": plan["name"]}
 
     def op_start(self, req: dict, now: float) -> dict:
@@ -781,7 +927,7 @@ class Agent:
         sent = self.run.sent if self.run is not None and self.run.folder == folder else 0
         if sent >= COLLECT_LIMIT:
             raise Refused("2 GiB of this run's files are sent already")
-        with open(p, "rb") as f:
+        with open(in_store(self.mach.store, p.relative_to(self.mach.store).as_posix()), "rb") as f:
             f.seek(off)
             data = f.read(min(CHUNK, COLLECT_LIMIT - sent))
         if self.run is not None and self.run.folder == folder:
@@ -801,14 +947,13 @@ class Agent:
                 continue
             if not la.within(p, runs) or la.is_reparse_point(p):
                 raise Refused(f"refusing to delete {p}: not a plain run folder of the store")
-            shutil.rmtree(p)
+            remove_in_store(self.mach.store, f"runs/{p.name}")
             removed.append(p.name)
         if req.get("fixtures"):
             if self._running():
                 raise Refused("no fixture changes while a peer runs")
             for sub in ("fixtures", "fixtures-incoming", "staged"):
-                if (self.mach.store / sub).exists():
-                    shutil.rmtree(self.mach.store / sub)
+                remove_in_store(self.mach.store, sub)
         return {"removed": removed}
 
 
@@ -856,14 +1001,14 @@ def run_local(mach: Machine, staged: str, manifest_sha256: str, poll_s: float = 
     the run-time limit; Ctrl+C or a closed console ends the job. Returns the exit record."""
     if not NAME.fullmatch(staged):
         raise Refused("staged run name")
-    text = (mach.store / "manifest.json").read_text(encoding="utf-8")
+    text = in_store(mach.store, "manifest.json").read_text(encoding="utf-8")
     m = Manifest.parse(text)
     if m.sha256 != manifest_sha256:
         raise Refused("the stored payload record has another hash than the one typed")
     bad = verify_install(mach.install, m)
     if bad:
         raise Refused("the install does not match the payload record: " + "; ".join(bad[:8]))
-    plan = json.loads((mach.store / "staged" / f"{staged}.json").read_text(encoding="utf-8"))
+    plan = json.loads(in_store(mach.store, "staged", f"{staged}.json").read_text(encoding="utf-8"))
     lock = RunLock(mach.store)
     run = launch_plan(mach, m, plan, lock, time.monotonic(), "run-local")
     state = "exited"
@@ -885,12 +1030,13 @@ def run_local(mach: Machine, staged: str, manifest_sha256: str, poll_s: float = 
 
 
 def machine_from(a: argparse.Namespace) -> Machine:
-    store = Path(a.store).resolve()
-    install = Path(a.install).resolve()
-    for p in (store, install):
-        if not p.is_dir():
-            raise SystemExit(f"{p} is not a folder")
-    return Machine(store, install, la.AllowList.load(Path(a.allow_list)), la.CommandTable.load(Path(a.command_table)))
+    """The store as typed goes to admit_store unresolved: it is checked as spelled and as resolved
+    before the agent writes anything."""
+    allow, commands = la.AllowList.load(Path(a.allow_list)), la.CommandTable.load(Path(a.command_table))
+    try:
+        return Machine(Path(a.store), Path(a.install), allow, commands)
+    except Refused as e:
+        raise SystemExit(f"refused: {e}") from None
 
 
 def main(argv: list[str] | None = None) -> int:

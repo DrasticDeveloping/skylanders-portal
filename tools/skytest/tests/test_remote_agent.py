@@ -23,7 +23,15 @@ sys.path.insert(0, str(HERE.parent))
 import launch_args as la  # noqa: E402
 import remote_agent as ra  # noqa: E402
 
-from test_launch_args import ALLOW, COMMANDS  # noqa: E402
+from test_launch_args import ALLOW, COMMANDS, junction  # noqa: E402
+
+
+def unlink_junction(p: Path) -> None:
+    """Removes the link itself, never what it points at."""
+    if os.path.islink(p):
+        os.unlink(p)
+    else:
+        os.rmdir(p)
 
 
 class FakeProc:
@@ -415,6 +423,36 @@ class AgentTest(unittest.TestCase):
         self.assertFalse((self.store / "run.lock").exists())
         self.assertTrue((self.store / "runs" / done["run"] / "exit.json").is_file())
 
+    # --- the agent's own writes stay in its store (Sol r1 F1) ----------------------------------------
+
+    def test_a_staged_junction_to_an_owner_folder(self) -> None:
+        sentinel = self.owner / "sentinel.txt"
+        sentinel.write_bytes(b"owner")
+        c = self.verified()
+        junction(self.store / "staged", self.owner)
+        r = self.call(c, "stage", plan=self.plan(name="local1"))
+        self.assertFalse(r["ok"])
+        self.assertIn("reparse point", r["error"])
+        with self.assertRaises(ra.Refused):  # run-local does not read a plan through it either
+            ra.run_local(self.mach, "sentinel", self.msha)
+        unlink_junction(self.store / "staged")
+        # The fixtures' incoming folder as a junction: never emptied, never written through.
+        junction(self.store / "fixtures-incoming", self.owner)
+        r = self.fixtures(c)
+        self.assertFalse(r["ok"])
+        self.assertIn("reparse point", r["error"])
+        unlink_junction(self.store / "fixtures-incoming")
+        self.assertEqual(sorted(os.listdir(self.owner)), ["sentinel.txt"])
+        self.assertEqual(sentinel.read_bytes(), b"owner")
+
+    def test_a_hard_linked_manifest_is_replaced_not_written_through(self) -> None:
+        owner_file = self.owner / "profile.sav"
+        owner_file.write_bytes(b"owner")
+        os.link(owner_file, self.store / "manifest.json")
+        self.verified()
+        self.assertEqual(owner_file.read_bytes(), b"owner")
+        self.assertEqual((self.store / "manifest.json").read_text(encoding="utf-8"), self.manifest)
+
     def test_run_local_refuses_a_changed_install(self) -> None:
         c = self.verified()
         self.fixtures(c)
@@ -424,9 +462,95 @@ class AgentTest(unittest.TestCase):
             ra.run_local(self.mach, "local2", self.msha)
 
 
+class StoreTest(unittest.TestCase):
+    """The store is admitted before the agent writes anything (Sol r1 F1): stand-in owner folders and a
+    stand-in install, each with a sentinel file that must stay as it was."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.owner = self.root / "Owner" / "Skylanders"
+        (self.owner / "Swap Force").mkdir(parents=True)
+        self.install = self.root / "Install"
+        (self.install / "rom").mkdir(parents=True)
+        self.sentinels = {self.owner / "sentinel.txt": b"owner", self.install / "rom" / "sentinel.txt": b"disc",
+                          self.install / "settings_template.toml": b"[General]\n"}
+        for p, data in self.sentinels.items():
+            p.write_bytes(data)
+        self.saved_drive_type = ra.drive_type
+
+    def tearDown(self) -> None:
+        ra.drive_type = self.saved_drive_type
+        for p, data in self.sentinels.items():
+            self.assertEqual(p.read_bytes(), data, p)
+        self.assertEqual(sorted(os.listdir(self.owner)), ["Swap Force", "sentinel.txt"])
+        self.assertEqual(os.listdir(self.owner / "Swap Force"), [])
+        self.tmp.cleanup()
+
+    def machine(self, store: Path) -> ra.Machine:
+        return ra.Machine(store, self.install, la.AllowList.parse(ALLOW), la.CommandTable.parse(COMMANDS),
+                          launcher=fake_launcher, job_factory=FakeJob, owner_roots=[self.owner])
+
+    def refused(self, store: Path, why: str) -> None:
+        with self.assertRaises(ra.Refused) as cm:
+            self.machine(store)
+        self.assertIn(why, str(cm.exception))
+
+    def test_an_owner_folder_store_is_refused(self) -> None:
+        self.refused(self.owner, "owner's data folder")                 # is
+        self.refused(self.owner / "Swap Force", "owner's data folder")  # lies inside
+        self.refused(self.owner.parent, "owner's data folder")          # contains
+        junction(self.root / "alias", self.owner)                       # resolves to it
+        self.refused(self.root / "alias", "owner's data folder")
+
+    def test_an_install_store_is_refused(self) -> None:
+        self.refused(self.install, "the install")
+        self.refused(self.install / "rom", "the install")
+        (self.root / "Games").mkdir()
+        self.refused(self.root, "contains")
+        # A rom\ that is a junction elsewhere: a store at its target is the disc too.
+        disc = self.root / "Disc"
+        disc.mkdir()
+        other = self.root / "Install2"
+        other.mkdir()
+        junction(other / "rom", disc)
+        with self.assertRaises(ra.Refused) as cm:
+            ra.admit_store(disc, other, [self.owner])
+        self.assertIn("the disc", str(cm.exception))
+
+    def test_a_store_on_another_kind_of_drive_is_refused(self) -> None:
+        store = self.root / "store"
+        store.mkdir()
+        ra.drive_type = lambda root: 2  # removable
+        self.refused(store, "fixed local drive")
+        ra.drive_type = lambda root: 4  # network
+        self.refused(store, "fixed local drive")
+        self.refused(self.root / "missing", "cannot be resolved")
+        self.refused(Path("\\\\server\\share\\store"), "UNC")
+
+    def test_an_ordinary_store_is_admitted_resolved(self) -> None:
+        store = self.root / "store"
+        store.mkdir()
+        self.assertEqual(self.machine(store).store, store)
+        junction(self.root / "storelink", store)
+        m = self.machine(self.root / "storelink")
+        self.assertEqual(m.store, store)  # the junction followed: every later check is against the target
+        self.assertTrue(m.runs().is_dir())
+
+    def test_the_command_line_refuses_before_writing(self) -> None:
+        allow, cmds = self.root / "allow.toml", self.root / "commands.toml"
+        allow.write_text(ALLOW, encoding="utf-8")
+        cmds.write_text(COMMANDS, encoding="utf-8")
+        with self.assertRaises(SystemExit) as cm:
+            ra.main(["run-local", "x", "--store", str(self.install), "--install", str(self.install),
+                     "--manifest-sha256", "0" * 64, "--allow-list", str(allow), "--command-table", str(cmds)])
+        self.assertIn("refused", str(cm.exception))
+
+
 class LockTest(unittest.TestCase):
     def test_stale_lock_is_taken_over_and_a_live_one_refuses(self) -> None:
         with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
             lock = ra.RunLock(Path(d))
             (Path(d) / "run.lock").write_text("999999999 agent\n", encoding="utf-8")
             lock.acquire("test")
@@ -439,6 +563,7 @@ class LockTest(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows refuses to delete an open file")
     def test_a_held_lock_is_never_taken_over(self) -> None:
         with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
             lock = ra.RunLock(Path(d))
             lock.acquire("test")
             # As a holder looks before it wrote its pid, or after its pid was reused: no live pid.
