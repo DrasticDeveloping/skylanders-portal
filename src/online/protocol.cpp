@@ -14,7 +14,7 @@ using netplay::ByteWriter;
 // The variant's order is the type numbering (Hello = 1 ...), which TypeOf relies on, for the
 // contiguous run 1..kLastType; the number-block types after it (stage 1C's OwnerFlags = 50) are
 // mapped explicitly (TypeOf, IsKnown).
-static_assert(std::variant_size_v<Message> == 25);
+static_assert(std::variant_size_v<Message> == 27);
 static_assert(std::is_same_v<std::variant_alternative_t<0, Message>, Hello>);
 static_assert(std::is_same_v<std::variant_alternative_t<10, Message>, PlayerList>);
 static_assert(std::is_same_v<std::variant_alternative_t<11, Message>, PlayerPose>);
@@ -23,8 +23,10 @@ static_assert(std::is_same_v<std::variant_alternative_t<19, Message>, SessionClo
 static_assert(std::is_same_v<std::variant_alternative_t<20, Message>, SceneBarrier>);
 static_assert(std::is_same_v<std::variant_alternative_t<21, Message>, BackendFrame>);
 static_assert(std::is_same_v<std::variant_alternative_t<23, Message>, PlayerPoseShown>);
-constexpr uint16_t kLastType = uint16_t(MessageType::kPlayerPoseShown);
-static_assert(std::is_same_v<std::variant_alternative_t<24, Message>, OwnerFlags>);
+static_assert(std::is_same_v<std::variant_alternative_t<24, Message>, OccurrenceAccept>);
+static_assert(std::is_same_v<std::variant_alternative_t<25, Message>, AttackPress>);
+constexpr uint16_t kLastType = uint16_t(MessageType::kAttackPress);
+static_assert(std::is_same_v<std::variant_alternative_t<26, Message>, OwnerFlags>);
 constexpr size_t kBlockTypes = 1;  // OwnerFlags
 static_assert(kLastType + kBlockTypes == std::variant_size_v<Message>);
 
@@ -490,6 +492,23 @@ bool Fields(ByteWriter& w, const PlayerPoseShown& m) {
   w.U16(m.peer);
   return Fields(w, m.pose);
 }
+bool Fields(ByteWriter& w, const OccurrenceAccept& m) {
+  if (m.keys.empty() || m.keys.size() > kMaxOccurrenceKeys) return false;
+  w.U32(m.generation);
+  w.U8(uint8_t(m.keys.size()));
+  for (const OccurrenceKeyBytes& k : m.keys) w.Bytes(k);
+  return true;
+}
+bool Fields(ByteWriter& w, const AttackPress& m) {
+  if (m.slot > kMaxAttackSlot) return false;
+  w.U32(m.press_sequence);
+  w.U32(m.generation);
+  w.U8(m.slot);
+  w.U8(m.release ? 1 : 0);
+  w.U32(m.pose_sequence);
+  w.U64(m.press_tick);
+  return true;
+}
 bool Fields(ByteWriter& w, const PlayerAction& m) {
   w.U32(m.press_sequence);
   w.U32(m.generation);
@@ -814,6 +833,29 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
       PlayerPoseShown m;
       m.peer = r.U16();
       ok = r.Ok() && ReadPose(r, m.pose);
+      result = m;
+      break;
+    }
+    case MessageType::kOccurrenceAccept: {
+      OccurrenceAccept m;
+      m.generation = r.U32();
+      const uint8_t n = r.U8();
+      if (!r.Ok() || n == 0 || n > kMaxOccurrenceKeys) return std::nullopt;
+      m.keys.resize(n);
+      for (OccurrenceKeyBytes& k : m.keys) GetArray(r, k);
+      result = std::move(m);
+      break;
+    }
+    case MessageType::kAttackPress: {
+      AttackPress m;
+      m.press_sequence = r.U32();
+      m.generation = r.U32();
+      m.slot = r.U8();
+      const uint8_t release = r.U8();
+      m.pose_sequence = r.U32();
+      m.press_tick = r.U64();
+      if (r.Ok() && (m.slot > kMaxAttackSlot || release > 1)) return std::nullopt;
+      m.release = release != 0;
       result = m;
       break;
     }

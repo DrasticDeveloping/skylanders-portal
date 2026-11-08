@@ -893,6 +893,68 @@ void Stage4() {
   }
 }
 
+// Stage 5 (future/online-5.md sections 3.4, 3.6, D16, D28): the records_enemies bit, the accepted
+// occurrence keys and the attack press outside replay.
+void Stage5() {
+  {
+    Welcome w{3, 1, 60, 2, 7, "levels/zone_hub"};
+    w.backend_mode = kBackendModeRecordsPilot | kBackendModeRecordsEnemies;
+    CHECK(RoundTrip(w));
+    CHECK(kBackendModeRecordsEnemies == 0x10);
+    CHECK((kBackendModeKnown & kBackendModeRecordsEnemies) != 0);
+    // A bit above stage 5's is still unknown, so the Welcome is not encoded.
+    w.backend_mode = 0x20;
+    CHECK(EncodeMessage(w).empty());
+  }
+  // OccurrenceAccept: one key and the most keys round-trip; empty and over the limit are not
+  // encoded; a count byte of 0 or above the limit, and a cut key, are invalid.
+  {
+    OccurrenceAccept a;
+    a.generation = 9;
+    OccurrenceKeyBytes k{};
+    for (size_t i = 0; i < k.size(); ++i) k[i] = uint8_t(i * 5 + 1);
+    a.keys.push_back(k);
+    CHECK(RoundTrip(a));
+    const std::vector<uint8_t> one = EncodeMessage(a);
+    CHECK(one.size() == kMessageHeaderSize + 4 + 1 + kOccurrenceKeyBytes);
+    while (a.keys.size() < kMaxOccurrenceKeys) {
+      k[0] = uint8_t(a.keys.size());
+      a.keys.push_back(k);
+    }
+    CHECK(RoundTrip(a));
+    CHECK(EncodeMessage(a).size() <= 1174);  // one datagram's payload
+    a.keys.push_back(k);
+    CHECK(EncodeMessage(a).empty());
+    CHECK(EncodeMessage(OccurrenceAccept{9, {}}).empty());
+    std::vector<uint8_t> bad = one;
+    bad[kMessageHeaderSize + 4] = 0;  // count 0
+    CHECK(!DecodeMessages(bad).has_value());
+    bad = one;
+    bad[kMessageHeaderSize + 4] = 2;  // count 2, one key's bytes
+    CHECK(!DecodeMessages(bad).has_value());
+    bad = one;
+    bad.pop_back();
+    bad[2] = uint8_t(bad.size() - kMessageHeaderSize);
+    CHECK(!DecodeMessages(bad).has_value());
+  }
+  // AttackPress: press and release round-trip; slot 4 and a release byte of 2 are invalid.
+  {
+    CHECK(RoundTrip(AttackPress{41, 3, 2, false, 900, 0x0102030405ull}));
+    CHECK(RoundTrip(AttackPress{41, 3, 2, true, 950, 0x0102030505ull}));
+    CHECK(EncodeMessage(AttackPress{1, 1, 4, false, 1, 1}).empty());
+    std::vector<uint8_t> b = EncodeMessage(AttackPress{1, 1, 3, false, 1, 1});
+    REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 4 + 4 + 1 + 1 + 4 + 8);
+    std::vector<uint8_t> bad = b;
+    bad[kMessageHeaderSize + 8] = 4;
+    CHECK(!DecodeMessages(bad).has_value());
+    bad = b;
+    bad[kMessageHeaderSize + 9] = 2;
+    CHECK(!DecodeMessages(bad).has_value());
+    CHECK((TypeOf(Message{AttackPress{}}) == MessageType::kAttackPress));
+    CHECK((TypeOf(Message{OccurrenceAccept{}}) == MessageType::kOccurrenceAccept));
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -1059,6 +1121,7 @@ int main() {
   Version3();
   OwnerFlagsMessage();
   Stage4();
+  Stage5();
 
   return Finish("online_protocol");
 }

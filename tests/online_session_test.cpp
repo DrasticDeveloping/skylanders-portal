@@ -966,6 +966,67 @@ void FakeNetworkScenes() {
   CHECK(!b.session->SendSceneAck(open, w.net.Now()));  // not connected
 }
 
+// Stage 5 (future/online-5.md sections 3.4 and 3.6): OccurrenceAccept and AttackPress reach S as
+// events from the sender's peer, each once and in send order (gameplay lane) under loss,
+// duplication and reordering; S's own messages to a client are not taken from it; after End session
+// a client sends neither.
+void FakeNetworkStage5() {
+  World w(55);
+  LinkConditions c;
+  c.loss_percent = 15;
+  c.duplicate_percent = 10;
+  c.reorder_percent = 15;
+  c.reorder_ms = 20;
+  c.delay_ms = 10;
+  w.net.SetDefault(c);
+  REQUIRE_OR_RETURN_VOID(w.StartServer(Settings()));
+  Client& owner = w.Connect(MakeHello("Owner", true));
+  Client& b = w.Connect(MakeHello("Bee"));
+  CHECK(w.RunUntil([&] { return owner.session->Connected() && b.session->Connected(); }));
+  const uint32_t g1 = w.server.RequestLevel("levels/zone_a", w.net.Now());
+  CHECK(w.RunUntil([&] { return b.session->Generation() == g1 && owner.session->Generation() == g1; }));
+
+  std::vector<OccurrenceAccept> sent;
+  for (uint8_t i = 1; i <= 6; ++i) {
+    OccurrenceAccept a;
+    a.generation = g1;
+    OccurrenceKeyBytes k{};
+    k[0] = i;
+    k[24] = uint8_t(0x80 | i);
+    a.keys.push_back(k);
+    if (i % 2 == 0) a.keys.push_back(OccurrenceKeyBytes{});
+    CHECK(b.session->SendOccurrenceAccept(a, w.net.Now()));
+    sent.push_back(a);
+  }
+  CHECK(!b.session->SendOccurrenceAccept(OccurrenceAccept{g1, {}}, w.net.Now()));  // not encoded
+  const AttackPress press{7, g1, 1, false, 33, 1000};
+  const AttackPress release{7, g1, 1, true, 35, 1040};
+  CHECK(owner.session->SendAttackPress(press, w.net.Now()));
+  CHECK(owner.session->SendAttackPress(release, w.net.Now()));
+  CHECK(w.RunUntil([&] { return w.Count(SE::kOccurrenceAccept) == 6 && w.Count(SE::kAttackPress) == 2; }));
+  w.Run(200ms);
+  CHECK(w.Count(SE::kOccurrenceAccept) == 6 && w.Count(SE::kAttackPress) == 2);  // no duplicates
+  std::vector<OccurrenceAccept> got;
+  std::vector<AttackPress> presses;
+  for (const ServerEvent& e : w.server_events) {
+    if (e.type == SE::kOccurrenceAccept) {
+      CHECK(e.peer_id == b.session->PeerId());
+      got.push_back(e.occurrence_accept);
+    } else if (e.type == SE::kAttackPress) {
+      CHECK(e.peer_id == kOwnerPeerId);
+      presses.push_back(e.attack_press);
+    }
+  }
+  CHECK(got == sent);  // in order: the gameplay lane is ordered
+  CHECK((presses == std::vector<AttackPress>{press, release}));
+
+  // End session: neither goes out any more.
+  w.server.EndSession(w.net.Now());
+  CHECK(w.RunUntil([&] { return b.session->Closing(); }));
+  CHECK(!b.session->SendOccurrenceAccept(sent[0], w.net.Now()));
+  CHECK(!b.session->SendAttackPress(press, w.net.Now()));
+}
+
 // Real UDP sockets on 127.0.0.1 (port 0: any free one), real time.
 // Version 3 (stage 3 section 3.2): Welcome carries S's backend mode and digest; backend frames go
 // both ways on the lane they were sent on, in order; SendBackend's answers; a version 2 Hello is
@@ -1141,6 +1202,7 @@ int main() {
   FakeNetworkCloseGone();
   FakeNetworkScenes();
   FakeNetworkBackendFrames();
+  FakeNetworkStage5();
   LoopbackSession();
   return Finish("online_session");
 }

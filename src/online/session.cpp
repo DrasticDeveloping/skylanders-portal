@@ -246,6 +246,19 @@ void ServerSession::HandleMessage(Peer& peer, const Message& message, Lane lane,
     e.lane = lane;
     e.frame = frame->bytes;
     events_.push_back(std::move(e));
+  } else if (const auto* accept = std::get_if<OccurrenceAccept>(&message)) {  // stage 5
+    ServerEvent e;
+    e.type = ServerEvent::Type::kOccurrenceAccept;
+    e.peer_id = peer.id;
+    e.occurrence_accept = *accept;
+    events_.push_back(std::move(e));
+  } else if (const auto* press = std::get_if<AttackPress>(&message)) {  // stage 5
+    if (requests_.Closing()) return;  // End session: nothing is applied any more
+    ServerEvent e;
+    e.type = ServerEvent::Type::kAttackPress;
+    e.peer_id = peer.id;
+    e.attack_press = *press;
+    events_.push_back(std::move(e));
   } else if (const auto* scene = std::get_if<SceneBarrier>(&message)) {
     // A client only acknowledges; any other phase from it is dropped, and so is an ack that comes
     // after End session began (the scene barrier has nothing left to wait for).
@@ -926,6 +939,16 @@ bool ClientSession::SendWorldRequest(const WorldRequest& request, TimePoint now)
   WorldRequest r = request;
   r.key.peer = peer_id_;
   return Post(Lane::kGameplay, r, now);
+}
+
+bool ClientSession::SendOccurrenceAccept(const OccurrenceAccept& accept, TimePoint now) {
+  if (!Connected() || closing_) return false;
+  return Post(Lane::kGameplay, accept, now);
+}
+
+bool ClientSession::SendAttackPress(const AttackPress& press, TimePoint now) {
+  if (!Connected() || closing_) return false;
+  return Post(Lane::kGameplay, press, now);
 }
 
 bool ClientSession::SendSceneAck(const SceneBarrier& scene, TimePoint now) {

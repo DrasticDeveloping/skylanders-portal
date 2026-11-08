@@ -50,8 +50,12 @@ constexpr uint8_t kBackendModeChurn = 0x02;         // dev_backend_churn (the de
 // (online_requests_generic).
 constexpr uint8_t kBackendModeRecordsPlayers = 0x04;
 constexpr uint8_t kBackendModeRequestsGeneric = 0x08;
+// Stage 5 (future/online-5.md D16; cross-stage decision 1, bit 4): the enemy records, the client
+// simulation boundary and the occurrence scheduler (online_records_enemies).
+constexpr uint8_t kBackendModeRecordsEnemies = 0x10;
 constexpr uint8_t kBackendModeKnown = kBackendModeRecordsPilot | kBackendModeChurn |
-                                      kBackendModeRecordsPlayers | kBackendModeRequestsGeneric;
+                                      kBackendModeRecordsPlayers | kBackendModeRequestsGeneric |
+                                      kBackendModeRecordsEnemies;
 // Hello's flags (stage 4 item 2): a trailing byte, so a Hello without it reads as 0. A bit outside
 // kHelloFlagsKnown makes the message invalid.
 constexpr uint8_t kHelloSynthetic = 0x01;  // a synthetic peer (tools/headless_peer); S accepts it
@@ -88,6 +92,9 @@ enum class MessageType : uint16_t {
   // Stage 4.
   kPlayerActionShown = 23,
   kPlayerPoseShown = 24,
+  // Stage 5.
+  kOccurrenceAccept = 25,
+  kAttackPress = 26,
   // Stage 1C's block (50-54, the 24-hour push's number blocks): types outside the contiguous run
   // 1..kLastType (protocol.cpp). TypeOf and the decoder map them explicitly.
   kOwnerFlags = 50,
@@ -602,13 +609,46 @@ struct OwnerFlags {
   bool operator==(const OwnerFlags&) const = default;
 };
 
-// The variant's order is the type numbering for the contiguous run (Hello = 1 ... BackendFrame =
-// 22); the block types after it (OwnerFlags = 50) are mapped by TypeOf.
+// Stage 5 (future/online-5.md section 3.4, D28): client to S, gameplay lane (reliable, ordered,
+// never dropped by the inbound ring): the retained occurrence rows (`attack`, `telegraph`, a
+// `projectile`'s terminal revision) whose owner on this client (the occurrence scheduler, the
+// retired-shot ledger) has taken the full payload and committed to one outcome since the last
+// message. Each key is the backend's RecordKey wire form (kind u16, EntityId 21 bytes, slot u16:
+// the record key of the row), which the session library carries without reading; the game decodes
+// it. One message per pump; keys of another generation are ignored by S. Empty, or more than
+// kMaxOccurrenceKeys: invalid.
+constexpr size_t kOccurrenceKeyBytes = 25;
+constexpr size_t kMaxOccurrenceKeys = 40;
+using OccurrenceKeyBytes = std::array<uint8_t, kOccurrenceKeyBytes>;
+struct OccurrenceAccept {
+  uint32_t generation = 0;
+  std::vector<OccurrenceKeyBytes> keys;  // 1 to kMaxOccurrenceKeys
+  bool operator==(const OccurrenceAccept&) const = default;
+};
+
+// Stage 5 (future/online-5.md section 3.6, D9): client to S, gameplay lane: an attack press or
+// release announced outside attack replay (S never writes it into a puppet's input). S's press
+// registry takes it on receipt, before the same pump hands later backend frames (a hit's
+// `enemy.hit`) to the backend, so a hit sent after its press finds it. `release`: the slot's
+// release of the press `press_sequence` (its hold ends at `press_tick`). `slot` is 0 to 3.
+struct AttackPress {
+  uint32_t press_sequence = 0;
+  uint32_t generation = 0;
+  uint8_t slot = 0;
+  bool release = false;
+  uint32_t pose_sequence = 0;
+  uint64_t press_tick = 0;  // the shared tick of the press (or of the release)
+  bool operator==(const AttackPress&) const = default;
+};
+constexpr uint8_t kMaxAttackSlot = 3;
+
+// The variant's order is the type numbering for the contiguous run (Hello = 1 ... AttackPress =
+// 26); the block types after it (OwnerFlags = 50) are mapped by TypeOf.
 using Message = std::variant<Hello, Welcome, Refuse, Bye, Ping, Pong, LevelRequest, LevelLoad,
                              LevelLoaded, BarrierGo, PlayerList, PlayerPose, PlayerAction,
                              WorldRequest, WorldDecision, AppliedStep, LevelEnd, Reaction,
                              SessionClosing, SessionClosed, SceneBarrier, BackendFrame,
-                             PlayerActionShown, PlayerPoseShown,
+                             PlayerActionShown, PlayerPoseShown, OccurrenceAccept, AttackPress,
                              OwnerFlags>;
 MessageType TypeOf(const Message& message);
 
