@@ -113,6 +113,10 @@ struct ServerEvent {
     kOwnerFlags,       // peer_id (always the owner), owner_flags: stage 1C's flags snapshot, in
                        // arrival order with the owner's requests; another peer's is refused
                        // kNotOwner, and none is reported once End session began
+    // Stage 5.
+    kOccurrenceAccept,  // peer_id, occurrence_accept: the client's owners took these retained rows
+    kAttackPress,       // peer_id, attack_press: an attack press or release, outside replay; not
+                        // reported once End session began
   };
   Type type = Type::kPeerJoined;
   uint16_t peer_id = 0;
@@ -138,6 +142,8 @@ struct ServerEvent {
   std::vector<uint8_t> frame;                     // kBackendFrame
   OwnerFlags owner_flags;  // kOwnerFlags
   bool synthetic = false;                         // kPeerJoined (stage 4): a synthetic peer
+  OccurrenceAccept occurrence_accept;             // kOccurrenceAccept (stage 5)
+  AttackPress attack_press;                       // kAttackPress (stage 5)
 };
 
 struct PeerInfo {
@@ -250,6 +256,10 @@ class ServerSession {
   // lane). false if it cannot be encoded.
   bool SendPlayerActionShown(const PlayerActionShown& shown, TimePoint now = Clock::now());
   bool SendPlayerPoseShown(const PlayerPoseShown& shown, TimePoint now = Clock::now());
+  // Stage 5 (future/online-5.md section 3.4, D10): one client's enemy poses, fast lane (the caller
+  // filters by that client's interest radius and keeps the 10 Hz rate). false if `peer` is not a
+  // welcomed client or the message cannot be encoded.
+  bool SendEnemyPoses(uint16_t peer, const EnemyPoses& poses, TimePoint now = Clock::now());
   // Datagrams sent to `peer` on `lane` and not yet acked (netplay's Connection::Unacked: every
   // message on that lane counts, the session's own included); 0 for a peer that is not welcomed.
   size_t BackendUnacked(uint16_t peer, netplay::Lane lane) const;
@@ -351,6 +361,8 @@ struct ClientEvent {
     // Stage 4.
     kPlayerActionShown,  // action_shown: another player's attack press or release
     kPlayerPoseShown,    // pose_shown: another player's pose
+    // Stage 5.
+    kEnemyPoses,         // enemy_poses: S's enemy poses for this client (fast lane, 10 Hz)
   };
   Type type = Type::kConnected;
   uint16_t peer_id = 0;
@@ -373,6 +385,7 @@ struct ClientEvent {
   std::vector<uint8_t> frame;                     // kBackendFrame
   PlayerActionShown action_shown;                 // kPlayerActionShown (stage 4)
   PlayerPoseShown pose_shown;                     // kPlayerPoseShown (stage 4)
+  EnemyPoses enemy_poses;                         // kEnemyPoses (stage 5)
 };
 
 // The client side: one server, a ping every kPingInterval for the tick estimate and liveness.
@@ -411,6 +424,11 @@ class ClientSession {
   // (whatever its phase says), with its generation, key and kind. While connected and End session
   // has not begun (SessionClosed is the last thing a client sends); false otherwise.
   bool SendSceneAck(const SceneBarrier& scene, TimePoint now = Clock::now());
+  // Stage 5 (future/online-5.md sections 3.4 and 3.6): the accepted occurrence keys and an attack
+  // press or release, gameplay lane, in order with the backend's gameplay frames. While connected
+  // and End session has not begun; false otherwise or if the message cannot be encoded.
+  bool SendOccurrenceAccept(const OccurrenceAccept& accept, TimePoint now = Clock::now());
+  bool SendAttackPress(const AttackPress& press, TimePoint now = Clock::now());
   // Version 3: one backend frame to S on `lane`, while connected (also during End session's
   // drain: the backend's own End session needs its last acks). The results as the server's.
   BackendSend SendBackend(netplay::Lane lane, std::span<const uint8_t> frame,

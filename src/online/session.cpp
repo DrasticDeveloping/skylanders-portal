@@ -246,6 +246,19 @@ void ServerSession::HandleMessage(Peer& peer, const Message& message, Lane lane,
     e.lane = lane;
     e.frame = frame->bytes;
     events_.push_back(std::move(e));
+  } else if (const auto* accept = std::get_if<OccurrenceAccept>(&message)) {  // stage 5
+    ServerEvent e;
+    e.type = ServerEvent::Type::kOccurrenceAccept;
+    e.peer_id = peer.id;
+    e.occurrence_accept = *accept;
+    events_.push_back(std::move(e));
+  } else if (const auto* press = std::get_if<AttackPress>(&message)) {  // stage 5
+    if (requests_.Closing()) return;  // End session: nothing is applied any more
+    ServerEvent e;
+    e.type = ServerEvent::Type::kAttackPress;
+    e.peer_id = peer.id;
+    e.attack_press = *press;
+    events_.push_back(std::move(e));
   } else if (const auto* scene = std::get_if<SceneBarrier>(&message)) {
     // A client only acknowledges; any other phase from it is dropped, and so is an ack that comes
     // after End session began (the scene barrier has nothing left to wait for).
@@ -583,6 +596,18 @@ bool ServerSession::SendPlayerPoseShown(const PlayerPoseShown& shown, TimePoint 
   return true;
 }
 
+bool ServerSession::SendEnemyPoses(uint16_t peer_id, const EnemyPoses& poses, TimePoint now) {
+  const std::vector<uint8_t> bytes = Encoded(poses);
+  if (!transport_ || bytes.empty()) return false;
+  for (auto& [endpoint, peer] : peers_) {
+    if (peer->state == PeerState::kWelcomed && peer->id == peer_id) {
+      peer->conn->Send(Lane::kFast, bytes, now);
+      return true;
+    }
+  }
+  return false;
+}
+
 bool ServerSession::SendSceneBarrier(const SceneBarrier& scene, TimePoint now) {
   if (scene.phase == ScenePhase::kAck) return false;
   const std::vector<uint8_t> bytes = Encoded(scene);
@@ -868,6 +893,11 @@ void ClientSession::HandleMessage(const Message& message, Lane lane, TimePoint n
     e.type = ClientEvent::Type::kPlayerPoseShown;
     e.pose_shown = *pose_shown;
     events_.push_back(std::move(e));
+  } else if (const auto* enemy_poses = std::get_if<EnemyPoses>(&message)) {  // stage 5
+    ClientEvent e;
+    e.type = ClientEvent::Type::kEnemyPoses;
+    e.enemy_poses = *enemy_poses;
+    events_.push_back(std::move(e));
   } else if (const auto* frame = std::get_if<BackendFrame>(&message)) {
     ClientEvent e;
     e.type = ClientEvent::Type::kBackendFrame;
@@ -926,6 +956,16 @@ bool ClientSession::SendWorldRequest(const WorldRequest& request, TimePoint now)
   WorldRequest r = request;
   r.key.peer = peer_id_;
   return Post(Lane::kGameplay, r, now);
+}
+
+bool ClientSession::SendOccurrenceAccept(const OccurrenceAccept& accept, TimePoint now) {
+  if (!Connected() || closing_) return false;
+  return Post(Lane::kGameplay, accept, now);
+}
+
+bool ClientSession::SendAttackPress(const AttackPress& press, TimePoint now) {
+  if (!Connected() || closing_) return false;
+  return Post(Lane::kGameplay, press, now);
 }
 
 bool ClientSession::SendSceneAck(const SceneBarrier& scene, TimePoint now) {

@@ -809,7 +809,7 @@ void Version3() {
     CHECK(RoundTrip(w));
     const std::vector<uint8_t> good = EncodeMessage(w);
     REQUIRE_OR_RETURN_VOID(good.size() > 9);
-    w.backend_mode = 0x10;  // bits 2 and 3 are stage 4's; bit 4 is not known yet
+    w.backend_mode = 0x20;  // bits 2 and 3 are stage 4's, bit 4 stage 5's; bit 5 is not known yet
     CHECK(EncodeMessage(w).empty());
     std::vector<uint8_t> bad = good;
     bad[bad.size() - 9] = 0x80;  // the mode byte
@@ -890,6 +890,141 @@ void Stage4() {
     b.pop_back();
     b[2] = uint8_t(b.size() - kMessageHeaderSize);
     CHECK(!DecodeMessages(b).has_value());
+  }
+}
+
+// Stage 5 (future/online-5.md sections 3.4, 3.6, D16, D28): the records_enemies bit, the accepted
+// occurrence keys and the attack press outside replay.
+void Stage5() {
+  {
+    Welcome w{3, 1, 60, 2, 7, "levels/zone_hub"};
+    w.backend_mode = kBackendModeRecordsPilot | kBackendModeRecordsEnemies;
+    CHECK(RoundTrip(w));
+    CHECK(kBackendModeRecordsEnemies == 0x10);
+    CHECK((kBackendModeKnown & kBackendModeRecordsEnemies) != 0);
+    // A bit above stage 5's is still unknown, so the Welcome is not encoded.
+    w.backend_mode = 0x20;
+    CHECK(EncodeMessage(w).empty());
+  }
+  // OccurrenceAccept: one key and the most keys round-trip; empty and over the limit are not
+  // encoded; a count byte of 0 or above the limit, and a cut key, are invalid.
+  {
+    OccurrenceAccept a;
+    a.generation = 9;
+    OccurrenceKeyBytes k{};
+    for (size_t i = 0; i < k.size(); ++i) k[i] = uint8_t(i * 5 + 1);
+    a.keys.push_back(k);
+    CHECK(RoundTrip(a));
+    const std::vector<uint8_t> one = EncodeMessage(a);
+    CHECK(one.size() == kMessageHeaderSize + 4 + 1 + kOccurrenceKeyBytes);
+    while (a.keys.size() < kMaxOccurrenceKeys) {
+      k[0] = uint8_t(a.keys.size());
+      a.keys.push_back(k);
+    }
+    CHECK(RoundTrip(a));
+    CHECK(EncodeMessage(a).size() <= 1174);  // one datagram's payload
+    a.keys.push_back(k);
+    CHECK(EncodeMessage(a).empty());
+    CHECK(EncodeMessage(OccurrenceAccept{9, {}}).empty());
+    std::vector<uint8_t> bad = one;
+    bad[kMessageHeaderSize + 4] = 0;  // count 0
+    CHECK(!DecodeMessages(bad).has_value());
+    bad = one;
+    bad[kMessageHeaderSize + 4] = 2;  // count 2, one key's bytes
+    CHECK(!DecodeMessages(bad).has_value());
+    bad = one;
+    bad.pop_back();
+    bad[2] = uint8_t(bad.size() - kMessageHeaderSize);
+    CHECK(!DecodeMessages(bad).has_value());
+  }
+  // AttackPress: press and release round-trip; slot 4 and a release byte of 2 are invalid.
+  {
+    CHECK(RoundTrip(AttackPress{41, 3, 2, false, 900, 0x0102030405ull}));
+    CHECK(RoundTrip(AttackPress{41, 3, 2, true, 950, 0x0102030505ull}));
+    CHECK(EncodeMessage(AttackPress{1, 1, 4, false, 1, 1}).empty());
+    std::vector<uint8_t> b = EncodeMessage(AttackPress{1, 1, 3, false, 1, 1});
+    REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 4 + 4 + 1 + 1 + 4 + 8);
+    std::vector<uint8_t> bad = b;
+    bad[kMessageHeaderSize + 8] = 4;
+    CHECK(!DecodeMessages(bad).has_value());
+    bad = b;
+    bad[kMessageHeaderSize + 9] = 2;
+    CHECK(!DecodeMessages(bad).has_value());
+    CHECK((TypeOf(Message{AttackPress{}}) == MessageType::kAttackPress));
+    CHECK((TypeOf(Message{OccurrenceAccept{}}) == MessageType::kOccurrenceAccept));
+  }
+  // EnemyPoses (type 30, after the contiguous run): one pose and the most poses round-trip, 13
+  // bytes each; empty, over the limit, a zero or repeated handle, handles out of order and a
+  // non-finite anchor are not encoded; a count of 0, above the limit or disagreeing with the length,
+  // a cut pose, a forged handle order and a NaN anchor are invalid.
+  {
+    EnemyPoses p;
+    p.tick = 0x0102030405060708ull;
+    p.generation = 4;
+    p.anchor = {12.5f, -3.0f, 1000.0f};
+    p.poses.push_back(EnemyPose{7, {-32768, 0, 32767}, 0xFFFF, {-128, 0, 127}});
+    CHECK(RoundTrip(p));
+    CHECK((TypeOf(Message{p}) == MessageType::kEnemyPoses));
+    CHECK(uint16_t(MessageType::kEnemyPoses) == 30);
+    const std::vector<uint8_t> one = EncodeMessage(p);
+    CHECK(one.size() == kMessageHeaderSize + 8 + 4 + 12 + 1 + kEnemyPoseBytes);
+    CHECK(one.size() >= 2 && one[0] == 30 && one[1] == 0);
+    while (p.poses.size() < kMaxEnemyPoses) {
+      EnemyPose e;
+      e.handle = uint16_t(p.poses.back().handle + 3);
+      e.offset_cm = {int16_t(p.poses.size()), int16_t(-int(p.poses.size())), 5};
+      e.yaw = uint16_t(p.poses.size() * 700);
+      e.velocity_dm = {1, -1, int8_t(p.poses.size())};
+      p.poses.push_back(e);
+    }
+    CHECK(RoundTrip(p));
+    CHECK(EncodeMessage(p).size() <= 1174);  // one datagram's payload
+    EnemyPoses over = p;
+    over.poses.push_back(EnemyPose{60000, {}, 0, {}});
+    CHECK(EncodeMessage(over).empty());
+    CHECK(EncodeMessage(EnemyPoses{1, 1, {}, {}}).empty());
+    EnemyPoses bad_handle = p;
+    bad_handle.poses[0].handle = 0;
+    CHECK(EncodeMessage(bad_handle).empty());
+    bad_handle = p;
+    bad_handle.poses[2].handle = bad_handle.poses[1].handle;
+    CHECK(EncodeMessage(bad_handle).empty());
+    bad_handle = p;
+    std::swap(bad_handle.poses[3], bad_handle.poses[4]);
+    CHECK(EncodeMessage(bad_handle).empty());
+    EnemyPoses bad_anchor = p;
+    bad_anchor.anchor[1] = std::numeric_limits<float>::infinity();
+    CHECK(EncodeMessage(bad_anchor).empty());
+    const size_t count_at = kMessageHeaderSize + 8 + 4 + 12;
+    std::vector<uint8_t> bad = one;
+    bad[count_at] = 0;
+    CHECK(!DecodeMessages(bad).has_value());
+    bad = one;
+    bad[count_at] = 2;  // two poses, one pose's bytes
+    CHECK(!DecodeMessages(bad).has_value());
+    bad = one;
+    bad[count_at] = uint8_t(kMaxEnemyPoses + 1);
+    CHECK(!DecodeMessages(bad).has_value());
+    bad = one;
+    bad.pop_back();
+    bad[2] = uint8_t(bad.size() - kMessageHeaderSize);
+    CHECK(!DecodeMessages(bad).has_value());
+    bad = one;
+    bad[count_at + 1] = 0;  // handle 0
+    bad[count_at + 2] = 0;
+    CHECK(!DecodeMessages(bad).has_value());
+    bad = one;
+    const uint32_t nan = 0x7FC00000u;
+    for (int i = 0; i < 4; ++i) bad[kMessageHeaderSize + 12 + i] = uint8_t(nan >> (8 * i));
+    CHECK(!DecodeMessages(bad).has_value());
+    // A pose order forged past the encoder: two poses with the handles swapped.
+    EnemyPoses two;
+    two.poses = {EnemyPose{1, {}, 0, {}}, EnemyPose{2, {}, 0, {}}};
+    std::vector<uint8_t> swapped = EncodeMessage(two);
+    REQUIRE_OR_RETURN_VOID(swapped.size() == count_at + 1 + 2 * kEnemyPoseBytes);
+    swapped[count_at + 1] = 2;
+    swapped[count_at + 1 + kEnemyPoseBytes] = 1;
+    CHECK(!DecodeMessages(swapped).has_value());
   }
 }
 
@@ -1059,6 +1194,7 @@ int main() {
   Version3();
   OwnerFlagsMessage();
   Stage4();
+  Stage5();
 
   return Finish("online_protocol");
 }
