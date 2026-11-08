@@ -117,8 +117,11 @@ class TokenBucket {
 };
 
 // Per-source state in a fixed-size table (kMaxSources), keyed by the source address (a port is
-// free for a sender to change). A new source evicts the least recently seen one, preferring one
-// that is not blocked, so many addresses cannot grow memory.
+// free for a sender to change). A new source evicts the least recently seen one, so many addresses
+// cannot grow memory, preferring one that is neither blocked nor holding wrong-secret strikes, then
+// one that is not blocked (council 8, Opus B4: a sender cannot clear its own strikes by pushing its
+// row out with spoofed Hellos from new addresses; a strike needs a valid cookie, so a spoofed row
+// never has one).
 class SourceTable {
  public:
   struct Source {

@@ -219,6 +219,32 @@ int main() {
     CHECK(gate.WrongSecrets() == 4);
   }
 
+  // Council 8, Opus B4: a sender cannot clear its wrong-secret strikes by pushing its own row out
+  // of the table. Rows without strikes are evicted first, so after 3 strikes and 512 spoofed
+  // sources (twice the table) the striking row is still there with its 3, and its 4th wrong secret
+  // blocks it for 60 s.
+  {
+    HelloGate gate({0x1234, Key(19), false, 4}, t0);
+    const Endpoint a{0x0E000010, 4000};
+    TimePoint now = t0;
+    for (int i = 0; i < 3; ++i) {
+      now += seconds(1);
+      CHECK(Join(gate, Facts(a, 1, 0, 0x9999), 0, now).verdict == HelloVerdict::kWrongCode);
+    }
+    for (uint32_t i = 0; i < 2 * kMaxSources; ++i) {
+      now += milliseconds(70);  // under the global rate
+      gate.Check(Facts({0x21000000 + i, 1000}, i, 0, 0), 0, now);
+    }
+    CHECK(gate.Sources().size() == kMaxSources);
+    const SourceTable::Source* striking = gate.Sources().Find(a.address);
+    CHECK(striking != nullptr && striking->wrong_secrets == 3);
+    CHECK(gate.Sources().Find(0x21000000) == nullptr);  // a spoofed row went instead
+    now += seconds(1);
+    CHECK(Join(gate, Facts(a, 1, 0, 0x9999), 0, now).verdict == HelloVerdict::kWrongCode);  // the 4th
+    CHECK(gate.Check(Facts(a, 1, 0, 0x1234), 0, now + seconds(1)).verdict == HelloVerdict::kDrop);
+    CHECK(gate.Check(Facts(a, 1, 0, 0x1234), 0, now + seconds(59)).verdict == HelloVerdict::kDrop);
+  }
+
   // The per-secret budget: 4096 wrong secrets, then no new joiner (the right secret included)
   // until a new code; a player already in is not this gate's business; the owner still gets in.
   {

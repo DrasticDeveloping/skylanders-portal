@@ -132,15 +132,24 @@ SourceTable::Source& SourceTable::Touch(uint32_t address, netplay::TimePoint now
     return it->second.source;
   }
   if (entries_.size() >= kMaxSources) {
-    // The least recently seen source that is not blocked; if every one is blocked, the least
-    // recently seen of all.
-    auto victim = std::prev(lru_.end());
+    // The least recently seen source that is neither blocked nor holding wrong-secret strikes; else
+    // the least recently seen one that is not blocked; if every one is blocked, the least recently
+    // seen of all. Rows with strikes go last but one (council 8, Opus B4): spoofed Hellos from new
+    // addresses (rows that never have a strike: a strike needs a valid cookie) cannot push out the
+    // row of a sender with strikes, so its count is never reset that way.
+    auto victim = lru_.end();
+    auto unblocked = lru_.end();
     for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {
-      if (entries_.at(*it).source.blocked_until <= now) {
+      const Source& s = entries_.at(*it).source;
+      if (s.blocked_until > now) continue;
+      if (s.wrong_secrets == 0) {
         victim = std::prev(it.base());
         break;
       }
+      if (unblocked == lru_.end()) unblocked = std::prev(it.base());
     }
+    if (victim == lru_.end()) victim = unblocked;
+    if (victim == lru_.end()) victim = std::prev(lru_.end());
     entries_.erase(*victim);
     lru_.erase(victim);
   }
