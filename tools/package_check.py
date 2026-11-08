@@ -175,7 +175,10 @@ def check(repo: Path, manifest: Path, iss: Path, staging: Path) -> tuple[list[di
     rows = []
     for f in files:
         src = f["iss_source"]
-        p = installer / src.replace("\\", os.sep)
+        if norm_source(src).startswith("staging\\"):
+            p = staging / src.replace("\\", os.sep).split(os.sep, 1)[1]  # the folder being checked
+        else:
+            p = installer / src.replace("\\", os.sep)
         if not p.is_file():
             errors.append(f"{src}: missing")
             continue

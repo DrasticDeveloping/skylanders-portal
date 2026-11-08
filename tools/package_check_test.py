@@ -124,6 +124,13 @@ class PackageTest(unittest.TestCase):
         digest = pc.write_record(rows, rec)
         self.assertEqual(digest, hashlib.sha256(rec.read_bytes()).hexdigest())
 
+    def test_a_staging_folder_elsewhere_is_the_one_checked(self) -> None:
+        other = self.repo / "elsewhere"
+        pc.stage(self.repo, self.inst / "release-files.toml", other)
+        (other / "engine.dll").write_text("text", encoding="utf-8")
+        _, errors = pc.check(self.repo, self.inst / "release-files.toml", self.inst / "Game.iss", other)
+        self.assertTrue(any("engine.dll: not a pe-x64-dll" in e for e in errors))
+
     # The five negative controls: each must fail.
 
     def test_a_planted_xex(self) -> None:
