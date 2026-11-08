@@ -1,0 +1,25 @@
+# CQ1 CompareEqual
+backend local 0 test.toggle a00000030.4b8c6edd.6cf1ba25@1 slot 0 rev 1 digest af63bc4c8601b62c equal
+backend local 1 test.toggle a00000030.4b8c6edd.6cf1ba25@1 slot 0 rev 1 digest af63bc4c8601b62c equal
+backend compare 1 test.toggle a00000030.4b8c6edd.6cf1ba25@1 equal rev 1/1
+backend compared 1 test.toggle equal 1 repaired 0 pending 0 stuck 0 unsupported 0
+# CQ2 CompareRepaired
+backend local 0 test.toggle a00000030.4b8c6edd.6cf1ba25@1 slot 0 rev 1 digest af63bc4c8601b62c equal
+backend local 1 test.toggle a00000030.4b8c6edd.6cf1ba25@1 slot 0 rev 1 digest af63bc4c8601b62c repaired
+backend compare 1 test.toggle a00000030.4b8c6edd.6cf1ba25@1 repaired rev 1/1 differs client: repaired
+backend compared 1 test.toggle equal 0 repaired 1 pending 0 stuck 0 unsupported 0
+# CQ3 ComparePending
+backend local 0 test.toggle a00000030.4b8c6edd.6cf1ba25@1 slot 0 rev 1 digest af63bc4c8601b62c equal
+backend local 1 test.toggle a00000030.4b8c6edd.6cf1ba25@1 slot 0 rev 1 digest af63bc4c8601b62c pending pending 3000
+backend compare 1 test.toggle a00000030.4b8c6edd.6cf1ba25@1 pending rev 1/1 differs client: pending
+backend compared 1 test.toggle equal 0 repaired 0 pending 1 stuck 0 unsupported 0
+# CQ4 CompareStuck
+backend local 0 test.toggle a00000030.4b8c6edd.6cf1ba25@1 slot 0 rev 1 digest af63bc4c8601b62c equal
+backend local 1 test.toggle a00000030.4b8c6edd.6cf1ba25@1 slot 0 rev 1 digest af63bc4c8601b62c stuck differs value af63bd4c8601b7df
+backend compare 1 test.toggle a00000030.4b8c6edd.6cf1ba25@1 stuck rev 1/1 differs client: value af63bd4c8601b7df
+backend compared 1 test.toggle equal 0 repaired 0 pending 0 stuck 1 unsupported 0
+# CQ5 CompareUnsupported
+backend local 0 cq.never a00000030.4b8c6edd.6cf1ba25@1 slot 0 rev 1 digest af63bc4c8601b62c unsupported
+backend local 1 cq.never a00000030.4b8c6edd.6cf1ba25@1 slot 0 rev 1 digest af63bc4c8601b62c unsupported
+backend compare 1 cq.never a00000030.4b8c6edd.6cf1ba25@1 unsupported rev 1/1
+backend compared 1 cq.never equal 0 repaired 0 pending 0 stuck 0 unsupported 1
