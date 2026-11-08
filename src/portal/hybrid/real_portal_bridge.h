@@ -6,7 +6,8 @@
 //   - every figure standing on the real portal is read whole (all 64 blocks) and put into a free
 //     emulated slot as a copy, with its 1 KB saved as a backup file that is also the copy's source;
 //   - blocks the game writes to the copy go back onto the real figure, one at a time, in order
-//     (never block 0 or 1 or a sector trailer, which hold the tag's identity and keys);
+//     (never block 0 or 1 or a sector trailer, which hold the tag's identity and keys), unless
+//     write-back is off (Options::write_back, a test run): then they stay in the copy;
 //   - lifting the figure off the real portal takes the copy off; a copy the portal menu lifted is
 //     followed by its source path, so it is written again once the menu puts it back;
 //   - the game's light command goes on to the real portal.
@@ -37,6 +38,10 @@ class RealPortalBridge {
     std::function<void(const std::string&)> log;  // optional
     // A copy was put into this emulated slot; called on the bridge's thread.
     std::function<void(int emulated_slot)> on_arrived;
+    // Whether the game's writes to a copy go onto the real figure. Off for a test run (a non-empty
+    // --user_data_root, portal_mode.h PlanPortal): the real portal is only read, and the game's
+    // writes stay in the copy and its backup file (the emulated portal's write callback saves it).
+    bool write_back = true;
   };
 
   RealPortalBridge(SoftwarePortal* emulated, Options options);
@@ -47,8 +52,10 @@ class RealPortalBridge {
   void Step(PortalDevice* real);
 
   // From the emulated portal's write callback (any thread): queues the blocks of a copy that
-  // changed, for writing to the real figure.
+  // changed, for writing to the real figure. Does nothing with write-back off.
   void OnEmulatedWrite(int emulated_slot, const FigureData& data);
+  // Options::write_back, as constructed.
+  bool WritesBack() const { return options_.write_back; }
 
   // The game's light command ('C') for the portal; the newest one goes to the real portal.
   void OnLight(const Report& report);

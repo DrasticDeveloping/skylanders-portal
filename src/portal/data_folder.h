@@ -15,6 +15,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace skylanders {
 
@@ -48,6 +49,54 @@ std::string_view GameFolderForExe(std::string_view exe_name);
 // ...\Profiles\<id>\Giants -> ...\Profiles\<id>); else, as before, "Skylanders" next to it
 // (Documents\giantsrecomp -> Documents\Skylanders; a test copy keeps its own).
 std::filesystem::path SharedBase(const std::filesystem::path& user_data_root);
+
+// Whether `path` is `folder` or lies inside it, as Windows compares paths: both made absolute and
+// resolved as far as they exist (weakly_canonical: `.` and `..`, and the junctions and links on the
+// way), then compared without regard to case. False when either is empty.
+bool PathInside(const std::filesystem::path& path, const std::filesystem::path& folder);
+
+// The owner's figures guard for a run with --user_data_root (a test copy; Swap Force Online's
+// main safety audit): whether saving the figure file `file` must be refused because it lies inside
+// one of `owner_figure_folders` (DataFolder()/Figures, DefaultDataFolder()/Figures) that is not
+// `run_figures_folder`, the run's own figures folder (so an explicit --user_data_root of the owner's
+// real game folder, whose own figures are the owner's, keeps saving them). Empty entries are
+// skipped.
+bool OwnerFigureWriteRefused(const std::filesystem::path& file,
+                             const std::vector<std::filesystem::path>& owner_figure_folders,
+                             const std::filesystem::path& run_figures_folder);
+
+// The reverse: whether `folder` holds (is an ancestor of, or is) one of `owner_figure_folders` that
+// is not `run_figures_folder`, as Documents\Skylanders or a drive root holds the owner's Figures.
+// Such a folder as a figures folder would let the portal menu, which scans it recursively, list,
+// restore and write the owner's figures. Empty entries and an empty `folder` are never refused.
+bool FolderHoldsOwnerFigures(const std::filesystem::path& folder,
+                             const std::vector<std::filesystem::path>& owner_figure_folders,
+                             const std::filesystem::path& run_figures_folder);
+
+// The guard for a figures folder a test copy is configured with (portal_figures_dir): refused when
+// it lies inside an owner's figures folder (OwnerFigureWriteRefused) or holds one
+// (FolderHoldsOwnerFigures); the run's own figures folder is the exception on both sides.
+bool OwnerFiguresDirRefused(const std::filesystem::path& folder,
+                            const std::vector<std::filesystem::path>& owner_figure_folders,
+                            const std::filesystem::path& run_figures_folder);
+
+// The guard for a figure file a test copy would write (the game's saves, a backup restore, New
+// figure, a dump) or play (portal_figure): refused when it lies inside an owner's figures folder
+// (OwnerFigureWriteRefused). A file beside such a folder (Documents\Skylanders\x.dump,
+// Documents\x.dump) is not refused: one file cannot reach into the folder next to it; folders the
+// portal scans or writes into get OwnerFiguresDirRefused. The run's own figures folder is the
+// exception.
+bool OwnerFigureFileRefused(const std::filesystem::path& file,
+                            const std::vector<std::filesystem::path>& owner_figure_folders,
+                            const std::filesystem::path& run_figures_folder);
+
+// SharedBase maps a --user_data_root copy whose folder name is not a game's to "Skylanders" next
+// to it; true when that is one of `owner_data_folders` (DataFolder(), DefaultDataFolder()), as for
+// a copy at Documents\sf-test: such a copy would get the owner's real Figures folder, so it keeps a
+// figures folder of its own (portal_rex SharedFiguresDir). False for a game-named folder, a root
+// and empty entries.
+bool CopySharesOwnersFolder(const std::filesystem::path& user_data_root,
+                            const std::vector<std::filesystem::path>& owner_data_folders);
 
 // The note a copy leaves in the old folder (its first line is the new folder).
 inline constexpr const char* kMovedNote = "MOVED_TO.txt";

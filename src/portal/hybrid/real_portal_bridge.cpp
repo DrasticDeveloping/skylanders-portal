@@ -300,6 +300,9 @@ void RealPortalBridge::TrackCopies() {
 }
 
 void RealPortalBridge::OnEmulatedWrite(int emulated_slot, const FigureData& data) {
+  // A test run never writes to the real figure (Options::write_back): nothing is queued, so
+  // SendNext never sends a block write ('W'). options_ never changes after construction.
+  if (!options_.write_back) return;
   std::lock_guard lock(mu_);
   for (int slot = 0; slot < kMaxFigures; ++slot) {
     if (!mirrored_[slot] || copy_slot_[slot] != emulated_slot) continue;

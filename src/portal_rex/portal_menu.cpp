@@ -225,6 +225,8 @@ enum class Text {
   kQuickSwapTo,
   kQuickSwapNone,
   kImaginatorsToysHint,
+  kRestoreProtected,
+  kTestRunRealPortal,
   kCount,
 };
 
@@ -355,6 +357,9 @@ constexpr const char* kEnglish[] = {
     "Senseis, creation crystals and Imaginators' other toys are signed, so the menu can't make them "
     "itself. They show up here once there's a file of the real toy in the figures folder, for "
     "example read from a real portal (portal mode \"hybrid\").",
+    "This figure is in your real Figures folder: a test run (--user_data_root) doesn't change it.",
+    "Test run (--user_data_root): writes to the real portal are off. The game's changes stay in the "
+    "copy.",
 };
 constexpr const char* kGerman[] = {
     "MAGISCHES PORTAL",
@@ -493,6 +498,10 @@ constexpr const char* kGerman[] = {
     "Men\xC3\xBC kann sie nicht selbst erzeugen. Sie erscheinen hier, sobald eine Datei des echten "
     "Spielzeugs im Figurenordner liegt, etwa von einem echten Portal gelesen (Portal-Modus "
     "\"hybrid\").",
+    "Diese Figur liegt in deinem echten Figurenordner: Ein Testlauf (--user_data_root) \xC3\xA4ndert "
+    "sie nicht.",
+    "Testlauf (--user_data_root): Aufs echte Portal wird nicht geschrieben. Die \xC3\x84nderungen des "
+    "Spiels bleiben in der Kopie.",
 };
 static_assert(std::size(kEnglish) == size_t(Text::kCount));
 static_assert(std::size(kGerman) == size_t(Text::kCount));
@@ -4823,8 +4832,18 @@ class PortalMenuDialog final : public rex::ui::ImGuiDialog {
       ShowOnPortalToast();
       return;
     }
-    if (!portal::RestoreFigureBackup(entry.path, backups_file_,
-                                     portal::FigureBackupDir(backups_file_, FiguresDir()))) {
+    // The owner's figures guard (portal_rex.h OwnerFigureFileProtected, Sol's N1): a test run
+    // (--user_data_root) never writes the owner's figure file, nor its backup copy into such a
+    // folder, whatever its figures folder lists.
+    const std::filesystem::path backup_dir = portal::FigureBackupDir(backups_file_, FiguresDir());
+    if (OwnerFigureFileProtected(backups_file_) || OwnerFigureFolderProtected(backup_dir)) {
+      REXLOG_WARN("Portal menu: not restoring a backup of {}: it is the owner's figure and this run has "
+                  "--user_data_root (a test copy)",
+                  PathUtf8(backups_file_));
+      ShowToast(T(Text::kRestoreProtected));
+      return;
+    }
+    if (!portal::RestoreFigureBackup(entry.path, backups_file_, backup_dir)) {
       REXLOG_WARN("Portal menu: could not restore a figure backup");
       ShowToast(T(Text::kRestoreFailed));
       LoadBackups();
@@ -5887,6 +5906,13 @@ namespace {
 // with the other half for a swapper half, else to the first player without a figure. Items and
 // sidekicks belong to no one, as from the menu.
 void RealFigureArrived(int slot) {
+  // A test run (--user_data_root) reads the real portal but never writes to it (portal_rex.h
+  // RealPortalWritesOff, Sol's N2): said once, when its first real figure arrives.
+  static bool told_writes_off = false;  // UI thread only
+  if (!told_writes_off && RealPortalWritesOff()) {
+    told_writes_off = true;
+    ShowToast(T(Text::kTestRunRealPortal));
+  }
   portal::SoftwarePortal* software = GetSoftwarePortal();
   const SkylanderInfo* sky = FigureIn(slot);
   if (!software || !sky || IsItem(sky) || IsCompanion(sky)) return;

@@ -40,7 +40,28 @@ namespace skylanders {
 //
 // If the `portal_figures_dir` cvar is empty, it is set to `default_figures_dir` (which is created
 // if it doesn't exist yet) so the overlay has somewhere to look without the user passing a flag.
+//
+// The owner's figures guard (Swap Force Online's main safety audit): in a run with a non-empty
+// --user_data_root (a test copy), `default_figures_dir` is the run's own figures folder, and the
+// owner's are DataFolder()/Figures and DefaultDataFolder()/Figures. A figure file inside an owner's
+// folder that is not the run's own, or in a folder holding one (Documents\Skylanders\x.dump), is
+// never saved (nor backed up) and the refusal is logged once per file; a `portal_figure` there is
+// not placed; a `portal_figures_dir` that is, lies in or holds an owner's folder
+// (Documents\Skylanders) is replaced by `default_figures_dir`; New figure, the trap command, a
+// dump of a real figure and the hybrid bridge's copies never write into such a folder; the portal
+// menu's backup restore asks OwnerFigureFileProtected. All with a warning. Such a run also never
+// writes to a physical portal (portal/portal_mode.h PlanPortal): `usb` runs as `hybrid`, and
+// `hybrid` reads the real figures without writing the game's changes back, logged once. A run
+// without --user_data_root is unchanged.
 void InstallPortal(const std::filesystem::path& default_figures_dir);
+
+// The owner's figures guard for code that writes a figure file itself (the portal menu's backup
+// restore): true when this run, with a non-empty --user_data_root (a test copy), must not write
+// `file` because it lies in one of the owner's Figures folders that is not the run's own, or in a
+// folder holding one (portal/data_folder.h OwnerFigureFileRefused); for `folder`, when it is, lies
+// in or holds one (OwnerFiguresDirRefused). Always false without --user_data_root. Any thread.
+bool OwnerFigureFileProtected(const std::filesystem::path& file);
+bool OwnerFigureFolderProtected(const std::filesystem::path& folder);
 
 // For a game's OnConfigurePaths: its user data in the one data folder of every game
 // (portal/data_folder.h), <data folder>\<game> ("Spyro's Adventure", ...), unless --user_data_root
@@ -55,7 +76,9 @@ void UseSharedDataFolder(std::filesystem::path& user_data_root, std::filesystem:
 // runs: Figures in the data folder (Documents\Skylanders\Giants -> Documents\Skylanders\Figures),
 // or for an old per-game folder "Skylanders\Figures" next to it (portal/data_folder.h SharedBase). A
 // run with a copied --user_data_root gets its own one next to the copy, so tests never touch the
-// real figures. The first time a game uses it, the files of its old
+// real figures; a copy whose "Skylanders" next to it would be the owner's data folder (a copy
+// beside it, Documents\sf-test: data_folder.h CopySharesOwnersFolder) keeps <user_data_root>\figures
+// instead, with a warning, and nothing is copied out of it. The first time a game uses it, the files of its old
 // per-game folder (<user_data_root>\figures) are copied in, never over a file the shared folder
 // already has, and a note is left in the old folder, which then stays as a backup and is no longer
 // used. Pass the result to InstallPortal.
@@ -116,6 +139,10 @@ float PortalSpeakerLevel();
 // other modes. Any thread.
 std::vector<uint32_t> RealPortalUids();
 bool IsRealPortalCopy(int slot);
+// portal_mode "hybrid" in a test run (a non-empty --user_data_root, also its "usb"): the real
+// portal is only read, the game's writes stay in the copies (portal/portal_mode.h PlanPortal).
+// False in every other case. Any thread.
+bool RealPortalWritesOff();
 // Called on the bridge's thread when a figure from the real portal arrived in an emulated slot,
 // e.g. so the portal menu can give it to a player.
 void SetRealFigureArrivedHandler(std::function<void(int slot)> handler);

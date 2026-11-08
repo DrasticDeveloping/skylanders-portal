@@ -160,7 +160,9 @@ void PortalOverlayDialog::OnDraw(ImGuiIO& io) {
     ImGui::End();
     return;
   }
-  if (portal::ParsePortalMode(REXCVAR_GET(portal_mode)) == portal::PortalMode::kUsb) {
+  // Not in a test run's usb mode, which runs as hybrid (portal/portal_mode.h PlanPortal) and has the
+  // software portal: its figure picker follows.
+  if (!GetSoftwarePortal() && portal::ParsePortalMode(REXCVAR_GET(portal_mode)) == portal::PortalMode::kUsb) {
     ImGui::TextWrapped(
         "portal_mode is 'usb' but no USB portal is currently connected. Plug it in -- it's "
         "detected automatically, no restart needed.");
