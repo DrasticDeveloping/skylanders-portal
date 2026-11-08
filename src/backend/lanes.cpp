@@ -612,15 +612,17 @@ const PeerQueue::LaneQueue& PeerQueue::Of(netplay::Lane lane) const {
   return lanes_[size_t(lane) % netplay::kLaneCount];
 }
 
-bool PeerQueue::Push(const Message& m, TimePoint now) {
+bool PeerQueue::Push(const Message& m, TimePoint now, bool urgent) {
   LaneQueue& q = Of(LaneOf(TypeOf(m)));
   if (!q.frames.empty() && AppendMessage(m, q.frames.back().bytes)) {
     ++q.frames.back().messages;
+    q.frames.back().urgent = q.frames.back().urgent || urgent;
     return true;
   }
   // The last frame is full (or there is none): a new one, unless the message fits no frame.
   Frame f;
   f.opened = now;
+  f.urgent = urgent;
   if (!AppendMessage(m, f.bytes)) return false;
   f.messages = 1;
   q.frames.push_back(std::move(f));
@@ -637,8 +639,9 @@ PeerQueue::FlushResult PeerQueue::Flush(PeerLink& link, TimePoint now, bool now_
     q.capped = false;
     while (!q.frames.empty()) {
       Frame& head = q.frames.front();
-      // The last frame of the state lane is still filling: it goes once it is a batch old.
-      if (lane == netplay::Lane::kState && !now_all && q.frames.size() == 1 &&
+      // The last frame of the state lane is still filling: it goes once it is a batch old, or at
+      // once when it holds an urgent message (KindSpec::urgent).
+      if (lane == netplay::Lane::kState && !now_all && !head.urgent && q.frames.size() == 1 &&
           now - head.opened < limits_.batch_interval) {
         break;
       }

@@ -72,10 +72,15 @@ struct Client::Impl {
   std::map<uint32_t, uint32_t> next_sequence;  // per generation
   std::map<RequestKey, Sent> requests;
   // Granted, by id, until its LeaseEnd: the last renew, and whether a report of it went to the
-  // link and has no answer yet (a decision with this lease; N1: Report waits for it).
+  // link and has no answer yet (a decision with this lease; N1: Report waits for it). While it has
+  // none, the report's payload, its last send and the sends so far: it is resent at the renew
+  // ticks (S2-L3).
   struct LeaseHeld {
     TimePoint last_renew{};
     bool reported = false;
+    std::vector<uint8_t> payload;
+    TimePoint report_sent{};
+    uint32_t sends = 0;
   };
   std::map<uint32_t, LeaseHeld> leases;
   msg::Ack last_ack;
@@ -177,10 +182,16 @@ struct Client::Impl {
       auto held = leases.find(u.lease);
       if (held == leases.end()) return;  // its LeaseEnd came meanwhile: the key has its final
       held->second.reported = true;
+      held->second.payload = u.payload;
+      held->second.report_sent = now;
+      held->second.sends = 1;
       msg::LeaseReport r;
       r.id = u.lease;
       r.payload = u.payload;
       Push(r);
+      ClientEvent& e = Event(ClientEvent::Type::kLeaseReportSent);
+      e.lease = u.lease;
+      e.sends = 1;
       return;
     }
     // A key closed meanwhile needs nothing sent: a resend waiting here whose key then got S's final
@@ -346,7 +357,9 @@ struct Client::Impl {
     // A late answer to a previous join is not this client's (Sol F3, VR9).
     if (d.key.peer != self || d.key.peer_epoch != peer_epoch) return;
     if (d.outcome == Outcome::kGranted && d.lease != 0) {
-      leases.try_emplace(d.lease, LeaseHeld{now});
+      LeaseHeld held;
+      held.last_renew = now;
+      leases.try_emplace(d.lease, std::move(held));
     }
     if (d.lease != 0 && d.outcome != Outcome::kGranted) {
       auto held = leases.find(d.lease);
@@ -474,13 +487,15 @@ struct Client::Impl {
         continue;
       }
       if (!wait) continue;
+      // The grace counts world-runnable time (S2-L4): it stands still while the world is stopped.
+      const TimePoint world = replica.WorldTime(now);
       if (!e->waiting) {
         e->waiting = true;
-        e->waiting_since = now;
+        e->waiting_since = world;
       }
       const uint32_t grace_ms = spec && spec->pending_grace_ms ? spec->pending_grace_ms
                                                                : limits.pending_grace_ms;
-      if (now - e->waiting_since >= std::chrono::milliseconds(grace_ms)) {
+      if (world - e->waiting_since >= std::chrono::milliseconds(grace_ms)) {
         holder.End(id, ObligationEnd::kRefused, now);  // OB5
       }
     }
@@ -509,12 +524,25 @@ struct Client::Impl {
     }
   }
 
+  // Renews every held lease each lease_renew_interval, a reported one too (S2-L3: the term stays
+  // live while the report is unresolved); at the same tick an unanswered report whose last send is
+  // an interval old goes again, the same id and payload, behind the renew.
   void Renew(TimePoint now) {
     if (Held(netplay::Lane::kGameplay)) return;  // periodic: the next one goes when it opens (F1)
     for (auto& [id, held] : leases) {
       if (now - held.last_renew < limits.lease_renew_interval) continue;
       Push(msg::LeaseRenew{id});
       held.last_renew = now;
+      if (!held.reported || now - held.report_sent < limits.lease_renew_interval) continue;
+      msg::LeaseReport r;
+      r.id = id;
+      r.payload = held.payload;
+      Push(r);
+      held.report_sent = now;
+      ++held.sends;
+      ClientEvent& e = Event(ClientEvent::Type::kLeaseReportSent);
+      e.lease = id;
+      e.sends = held.sends;
     }
   }
 
@@ -683,6 +711,10 @@ void Client::InboundLost(TimePoint now) {
 bool Client::AwaitingRepairBaseline() const { return impl_->repair_above.has_value(); }
 uint64_t Client::DiscardedAfterLoss() const { return impl_->discarded; }
 const Record* Client::Applying() const { return impl_->applying; }
+
+void Client::SetWorldStopped(bool stopped, TimePoint now) {
+  impl_->replica.SetWorldStopped(stopped, now);
+}
 
 const Replica& Client::State() const { return impl_->replica; }
 const ObligationHolder& Client::Obligations() const { return impl_->holder; }

@@ -252,8 +252,22 @@ class Replica {
   // Grace clocks: a key unsettled past its kind's pending_grace_ms (from its first kWaiting or
   // kFailed, whatever its state now: a replacement makes it ready or held again) becomes late,
   // once until it settles: the fence stops waiting for it (kRowLate, and kFenceBroken for each
-  // dependent it held); a late row is still handed out and applied if its entity comes.
+  // dependent it held); a late row is still handed out and applied if its entity comes. The clocks
+  // count world-runnable time (WorldTime, S2-L4).
   void Service(TimePoint now);
+  // S2-L4 (cross-stage decision 4, stage 6 F1 and D33): the client's world is stopped (true: the
+  // bridge's pause service pushed pause mode 0 for a `session` or `join` reason) or runs again
+  // (false: the last such reason popped). While it is stopped every pending_grace_ms clock stands
+  // still, so a long pause never makes a row late that needs the world update to settle; at the
+  // resume the clocks go on from where they stood. A repeated report of the same state changes
+  // nothing. Reset keeps it: it is the game's state, not the session's. The header's own API, as
+  // stage 6 section 1.6 names it.
+  void SetWorldStopped(bool stopped, TimePoint now);
+  bool WorldStopped() const;
+  // World-runnable time at `now`: steady time less every stopped interval (an open one up to
+  // `now`). It stands still while the world is stopped; only its differences mean anything. The
+  // client's obligation grace (OB5) reads it too.
+  TimePoint WorldTime(TimePoint now) const;
   bool PollEvent(ReplicaEvent& out);
   ScopeMask Subscribed() const;
   ScopeMask Staging() const;

@@ -57,6 +57,9 @@ class ScriptedAuthority final : public Authority {
   std::function<std::optional<Verdict>(const Lease&, std::span<const uint8_t>,
                                        const DecideContext&)>
       report;
+  // OnLeaseEnd (S2-L2): the writes a test scripts; every call is kept in `ends`.
+  std::function<std::vector<Write>(const Lease&, LeaseEndReason, const DecideContext&)> end;
+  std::vector<std::pair<Lease, LeaseEndReason>> ends;
   Duration lease_term = 3s;
   int decides = 0;
   int reports = 0;
@@ -93,6 +96,11 @@ class ScriptedAuthority final : public Authority {
     v.writes.push_back(Write{RecordKey{lease.spec.kind, lease.spec.entity, 0},
                              std::vector<uint8_t>(payload.begin(), payload.end()), false});
     return v;
+  }
+  std::vector<Write> OnLeaseEnd(const Lease& lease, LeaseEndReason why,
+                                const DecideContext& c) override {
+    ends.emplace_back(lease, why);
+    return end ? end(lease, why, c) : std::vector<Write>{};
   }
 };
 

@@ -586,6 +586,10 @@ struct Replica::Impl {
   uint32_t epoch = 0;
   ScopeMask subscribed = 0;
   size_t bytes = 0;
+  // S2-L4: the world-stopped report and the stopped time so far (WorldTime). Kept by Reset.
+  bool world_stopped = false;
+  TimePoint stopped_since{};
+  Duration stopped_total{};
 
   Impl(std::span<const KindSpec> t, const Limits& l) : table(t), limits(l), graph(t) {}
 
@@ -940,23 +944,45 @@ void Replica::OnApplied(const RecordKey& key, uint32_t revision, RowApply result
       e.last = result;
       if (!e.has_grace) {
         e.has_grace = true;
-        e.grace_start = now;
+        e.grace_start = WorldTime(now);  // world-runnable time (S2-L4)
       }
       s.Enter(e, result == RowApply::kWaiting ? Impl::QState::kWaiting : Impl::QState::kFailed);
       return;
   }
 }
 
+void Replica::SetWorldStopped(bool stopped, TimePoint now) {
+  Impl& s = *impl_;
+  if (stopped == s.world_stopped) return;
+  if (stopped) {
+    s.stopped_since = now;
+  } else if (now > s.stopped_since) {
+    s.stopped_total += now - s.stopped_since;
+  }
+  s.world_stopped = stopped;
+}
+
+bool Replica::WorldStopped() const { return impl_->world_stopped; }
+
+TimePoint Replica::WorldTime(TimePoint now) const {
+  const Impl& s = *impl_;
+  // While stopped, the time stands at the stop (a `now` before it, from a caller's older clock
+  // reading, counts as the stop).
+  const TimePoint at = s.world_stopped ? std::min(now, s.stopped_since) : now;
+  return at - s.stopped_total;
+}
+
 void Replica::Service(TimePoint now) {
   Impl& s = *impl_;
   bool any_late = false;
+  const TimePoint world = WorldTime(now);
   for (auto& [key, e] : s.queue) {
     // The grace clock of every unsettled entry, whatever its state: a replacement keeps the clock
     // but puts the entry back to ready or held (Enqueue), and the client receives before it
     // services, so a key replaced before every Service is never waiting or failed here and would
     // otherwise never turn late. `late` stays until the entry settles: one event per key.
     if (e.has_grace && !e.late &&
-        now - e.grace_start >= std::chrono::milliseconds(s.GraceMs(key.kind))) {
+        world - e.grace_start >= std::chrono::milliseconds(s.GraceMs(key.kind))) {
       e.late = true;
       any_late = true;
       ReplicaEvent ev;

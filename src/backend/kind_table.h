@@ -74,6 +74,14 @@ struct KindSpec {
   // anything but a skip, requests.cpp:245-249; Opus r2 N2). A scene-skip kind leaves it unset
   // (Opus F11).
   bool requires_precondition = false;
+  // Urgent flush (stage 5's request, its draft 4 section 1.5 and D24; the stage 2 follow-up list):
+  // a delta of this kind flushes the state lane at the pump that walks it, instead of waiting for
+  // the partly filled frame to be limits.batch_interval old. The frame it lands in goes whole,
+  // and so does the Through behind the walk, so the client's prefix covers the row in the same
+  // flush. Nothing else changes: the FIFO order, the backlog cap and a held lane hold it as any
+  // frame. For short-lived occurrence rows (stage 5's `attack` and `telegraph`). Only on a
+  // replicated kind (V14).
+  bool urgent = false;
 };
 
 // Whether a kind's rows leave S at all: not an effect, not server-only. The one predicate the delta
@@ -106,6 +114,8 @@ const KindSpec* FindKind(std::span<const KindSpec> table, KindId id);
 //       another kind depends on, so a fence never breaks on its first wait (Sol F2, draft 4)
 //   V13 replicated deps: a replicated kind depends only on replicated kinds (a fenced row must
 //       never wait for a row that is never sent; Sol F2, Opus F5)
+//   V14 urgent: `urgent` only on a replicated kind (an effect rides the fast lane, flushed at every
+//       pump anyway; a server-only row is never sent)
 struct ValidationIssue {
   KindId kind = 0;
   std::string_view rule;
@@ -115,7 +125,8 @@ std::vector<ValidationIssue> Validate(std::span<const KindSpec> table, const Lim
 
 // Goes in StateHello. Hashes every data field and the contents of depends_on and
 // authored_default, sorted by id; never a function pointer or a span's address, which differ
-// between builds. Whether `equal` or `reason_name` is set is hashed as a bit.
+// between builds. Whether `equal` or `reason_name` is set is hashed as a bit. `urgent` takes the
+// flag byte's last free bit, so a table without it keeps the digest it had before the field.
 uint64_t TableDigest(std::span<const KindSpec> table);
 
 }  // namespace skylanders::backend

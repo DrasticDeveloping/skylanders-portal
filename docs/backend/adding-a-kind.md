@@ -82,6 +82,7 @@ Each field is a decision. Answer them in this order:
 | `max_value_bytes` | The largest value, at most 512. | 8 |
 | `pending_grace_ms` | How long a client waits for the row's entity (not spawned yet, streamed out) before the row is late. | 5000 |
 | `depends_on` | Kinds whose rows must be applied first (a scene that needs its toggle). A kind with dependencies is "fenced": its rows wait for the earlier rows they depend on. | none |
+| `urgent` | Should a change leave at the next pump instead of waiting up to `batch_interval` (100 ms) in a partly filled frame? For short-lived occurrence rows (an attack, a telegraph). Only on a replicated kind (V14). | no |
 
 Then run the validator. The test `VA13b ValidatorTestTable` (`tests/backend_kind_table_test.cpp`)
 checks the test table; a game's table gets the same one-line test:
@@ -108,6 +109,7 @@ avoid them up front:
 | V11 noisy | `noisy` only on a current value |
 | V12 grace | an applied kind read at spawn has `pending_grace_ms` > 0; so has an applied kind another kind depends on |
 | V13 replicated deps | a replicated kind depends only on replicated kinds |
+| V14 urgent | `urgent` only on a replicated kind |
 
 Changing any data field of a kind changes `TableDigest`, which S and every client compare in
 `StateHello`: two builds with different tables refuse each other.
@@ -176,7 +178,7 @@ reads the request and the records and returns a verdict; only the request table 
 |---|---|
 | `kCommit` with `writes` | S writes them all or none (`WorldState::ApplyAll`) and answers `applied` |
 | `kServerRun` | S's game thread runs it (a `kEvaluate` event) and answers with `SubmitEvaluation` |
-| `kOwnerRun` with a `lease` | the asking client runs it under the lease and reports; `OnReport` turns the report into writes |
+| `kOwnerRun` with a `lease` | the asking client runs it under the lease and reports; `OnReport` turns the report into writes. Its `writes`, if any, are applied with the grant, all or none (a held row); a set not written refuses the grant |
 | `kRefuse` with a `reason` | refused; `retryable` lets the client send it again |
 | `kWait` | S waits up to `wait` for something it needs |
 
@@ -199,6 +201,12 @@ std::unique_ptr<Authority> MakeToggleAuthority(KindId kind) {
   return std::make_unique<ToggleAuthority>(kind);
 }
 ```
+
+An owner-run kind may also override `OnLeaseEnd(lease, why, context)`: the writes for a lease
+that ends without a commit (expired, report refused, its holder left, End session), applied all or
+none where the end happens. It is pure like `Decide`, and it is not called at a commit or at a
+generation change. With grant writes it keeps one writer for a held row: the grant sets it, the
+commit or `OnLeaseEnd` clears it.
 
 A kind with `models = 0` needs no authority: only S's own world changes it.
 

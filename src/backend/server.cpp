@@ -89,6 +89,7 @@ struct Server::Impl {
     std::deque<Message> inbox;
     bool play_full = false;
     uint64_t cap_onsets = 0;  // onsets of PlayCap()
+    uint64_t reports_coalesced = 0;  // resent reports dropped behind a waiting copy (S2-L3)
     // S ended the peer's session past both bounds (kPeerOverrun): what it sends is read and
     // dropped, nothing is sent to it, until the host removes it (N1).
     bool overrun = false;
@@ -119,6 +120,7 @@ struct Server::Impl {
   std::map<uint16_t, uint32_t> baseline_ids;
   std::deque<ServerEvent> events;
   TimePoint now{};  // the time of the call in progress (D3: the owner's clock)
+  uint64_t end_writes_refused = 0;  // RequestTable::LeaseEndWritesRefused, as last reported
 
   Peer* Find(uint16_t id) {
     auto it = peers.find(id);
@@ -144,7 +146,7 @@ struct Server::Impl {
   // ObligationAcks in `acks_due`, and no manifest is made (the next one carries the newest head).
   bool Backlogged(const Peer& p) const { return p.queue.Room(*p.link) == 0; }
 
-  void Push(Peer& p, const Message& m) { p.queue.Push(m, now); }
+  void Push(Peer& p, const Message& m, bool urgent = false) { p.queue.Push(m, now, urgent); }
 
   // ------------------------------------------------------------------------------------------
   // The gameplay lane to a peer (R2): bounded like the state lane, by the producer.
@@ -166,7 +168,9 @@ struct Server::Impl {
   // hears them (request.cpp: `pending` once, `granted`, the final, the lease's LeaseEnd; a retry
   // key `pending`, its refusal and a final), and a LeaseEnd can follow the final that closed its
   // key, at most one per lease (max_leases_per_peer, L). So such a peer has at most 4 K + L
-  // messages held; the cap is 5 K + L, a margin of K. Messages from S's own side (Service, an
+  // messages held; the cap is 5 K + L, a margin of K. A report the client resends while unanswered
+  // (S2-L3) is answered from its key's cache, and a cached repeat of a key that already waits adds
+  // nothing (SendPlay), so the resends add at most one message per lease, within the margin. Messages from S's own side (Service, an
   // evaluation, a generation change, End session) are among those four per key, and the message
   // handled just below the cap may add its children's decisions: S's holdings stay bounded. The
   // design names no number: the header's own (a council question).
@@ -252,6 +256,12 @@ struct Server::Impl {
 
   void Drain() {
     DrainLimits();
+    // A kind's lease end writes (S2-L2) that ApplyAll did not write: never silent.
+    if (requests.LeaseEndWritesRefused() > end_writes_refused) {
+      end_writes_refused = requests.LeaseEndWritesRefused();
+      Event(ServerEvent::Type::kLimit, 0).text =
+          "lease end writes refused " + std::to_string(end_writes_refused);
+    }
     for (RequestOutput& o : requests.TakeOutputs()) {
       Peer* p = Find(o.peer);
       if (p && p->overrun) p = nullptr;  // its session ended: nothing more is sent to it (N1)
@@ -496,6 +506,9 @@ struct Server::Impl {
     // stops before it), so the proof covers exactly what went into the FIFO. (Pushing first and
     // answering false would leave the pushed item unproven: sent again at the next pump, and with
     // room for one frame only, never proven at all, a livelock.)
+    // A delta of an urgent kind (KindSpec::urgent, stage 5's request) flushes the lane at this
+    // pump: its frame is marked, and so is the Through behind the walk.
+    bool urgent = false;
     if (p.cursor + 1 >= state.Floor() && !Backlogged(p)) {
       uint64_t proven = p.cursor;
       state.Walk(
@@ -505,7 +518,10 @@ struct Server::Impl {
             if (item.type == EntryType::kEpoch) {
               Push(p, msg::EpochBegin{item.generation, item.lsn});
             } else if (item.record) {
-              Push(p, msg::Delta{*item.record, item.first_lsn});
+              const KindSpec* spec = FindKind(table, item.record->key.kind);
+              const bool now_urgent = spec != nullptr && spec->urgent;
+              Push(p, msg::Delta{*item.record, item.first_lsn}, now_urgent);
+              urgent = urgent || now_urgent;
             }
             return true;
           },
@@ -513,7 +529,7 @@ struct Server::Impl {
       p.cursor = std::max(p.cursor, proven);
     }
     if (p.cursor > p.last_through) {
-      Push(p, msg::Through{p.cursor});
+      Push(p, msg::Through{p.cursor}, urgent);
       p.last_through = p.cursor;
     }
     // 4. A manifest, at the head only, when no baseline runs, and only while the state lane has
@@ -616,6 +632,19 @@ struct Server::Impl {
         // Behind what is held, or at the cap: held. PlayHeld() only grows while S reads (nothing
         // is flushed meanwhile), so a held message keeps every later one behind it.
         if (AnsweredOnGameplay(m) && (!p.inbox.empty() || PlayFull(p))) {
+          // A report resent while unanswered (S2-L3) is the same report (the client never remakes
+          // one with another payload): one per lease waits, so the resends of a held peer do not
+          // fill HeldCap(). The first copy is the one handled; a later one would be a replay.
+          if (const auto* rep = std::get_if<msg::LeaseReport>(&m)) {
+            const bool waiting = std::any_of(p.inbox.begin(), p.inbox.end(), [&](const Message& x) {
+              const auto* w = std::get_if<msg::LeaseReport>(&x);
+              return w && w->id == rep->id;
+            });
+            if (waiting) {
+              ++p.reports_coalesced;
+              continue;
+            }
+          }
           if (p.inbox.size() >= HeldCap()) {
             Overrun(p, now);
             break;
@@ -854,6 +883,7 @@ PeerStats Server::Stats(uint16_t peer) const {
   s.gameplay_held = impl_->PlayHeld(*p);
   s.cap_onsets = p->cap_onsets;
   s.requests_held = p->inbox.size();
+  s.reports_coalesced = p->reports_coalesced;
   s.overrun = p->overrun;
   s.baselines = p->baselines;
   s.manifests = p->manifests;

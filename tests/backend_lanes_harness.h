@@ -216,6 +216,7 @@ class TestAuthority final : public Authority {
   }
   Verdict OnReport(const Lease& lease, std::span<const uint8_t> payload,
                    const DecideContext& /*context*/) override {
+    ++reports;
     Verdict v;
     v.type = Verdict::Type::kCommit;
     v.writes.push_back(Write{RecordKey{lease.spec.kind, lease.spec.entity, 0},
@@ -223,6 +224,7 @@ class TestAuthority final : public Authority {
     return v;
   }
   uint64_t decides = 0;
+  uint64_t reports = 0;  // OnReport calls (S2-L3: one per report, whatever copies arrive)
 
  private:
   Duration term_;

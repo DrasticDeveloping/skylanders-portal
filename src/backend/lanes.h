@@ -268,8 +268,11 @@ class PeerQueue {
   explicit PeerQueue(const Limits& limits);
 
   // Appends `m` to its lane's FIFO (LaneOf). false, nothing queued, for a message that cannot be
-  // framed (a field out of bounds; AppendMessage on an empty frame fails).
-  bool Push(const Message& m, TimePoint now);
+  // framed (a field out of bounds; AppendMessage on an empty frame fails). `urgent` (a delta of an
+  // urgent kind, KindSpec::urgent) marks the frame `m` lands in: a partly filled state frame so
+  // marked goes at the next Flush instead of waiting for the batch interval, and with it every
+  // message already in it or appended to it later.
+  bool Push(const Message& m, TimePoint now, bool urgent = false);
 
   struct FlushResult {
     size_t frames_sent = 0;
@@ -304,6 +307,7 @@ class PeerQueue {
     std::vector<uint8_t> bytes;
     size_t messages = 0;
     TimePoint opened{};
+    bool urgent = false;  // holds a message pushed urgent: goes without the batch wait
   };
   struct LaneQueue {
     std::deque<Frame> frames;
