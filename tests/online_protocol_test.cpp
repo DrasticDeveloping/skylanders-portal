@@ -916,8 +916,16 @@ int main() {
     auto b = EncodeMessage(LevelLoaded{0x01020304});
     const std::vector<uint8_t> want = {9, 0, 4, 0, 4, 3, 2, 1};
     CHECK(b == want);
+    // Hello: version, digest, figure id and variant, name (length byte and bytes), owner token,
+    // and stage 4's trailing flags byte, written even when 0.
     auto h = EncodeMessage(SampleHello());
-    CHECK(h.size() == kMessageHeaderSize + 2 + 32 + 2 + 2 + 1 + SampleHello().name.size() + 16);
+    CHECK(h.size() == kMessageHeaderSize + 2 + 32 + 2 + 2 + 1 + SampleHello().name.size() + 16 + 1);
+    REQUIRE_OR_RETURN(!h.empty());
+    CHECK(h.back() == 0);
+    Hello synthetic = SampleHello();
+    synthetic.flags = kHelloSynthetic;
+    const auto s = EncodeMessage(synthetic);
+    CHECK(s.size() == h.size() && !s.empty() && s.back() == kHelloSynthetic);
   }
 
   // Limits: a name over 32 bytes, a zone over 128, bad UTF-8, too many players: not encoded.

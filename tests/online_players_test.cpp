@@ -194,6 +194,73 @@ void RelayCases() {
     CHECK(q.Keys() == 32);
     CHECK(Has(Drain(q), Ev::Type::kReleased, 1, Relay::ReleaseWhy::kTeardown));
   }
+  // The event queue's bound (Sol stage 4 F3), drop lines: 20 times kMaxEvents duplicate presses and
+  // generation drops without a poll. The queue stays at the cap, the held key's start and its
+  // release (which takes a drop line's place) survive, the slot bits never depend on the queue,
+  // and one kOverflow reports the loss once the queue is empty.
+  {
+    Relay r;
+    r.SetEpoch(1, 3);
+    r.OnAction(3, 1, 0, false, 0ms, kT0);
+    CHECK(r.Think(kT0) == 0x01);
+    const size_t flood = 20 * Relay::kMaxEvents;
+    bool dropped = true, bounded = true;
+    for (size_t i = 0; i < flood; ++i) {
+      dropped &= r.OnAction(3, 1, 0, false, 0ms, kT0) == Relay::Drop::kDuplicatePress;
+      dropped &= r.OnAction(9, 2, 0, false, 0ms, kT0) == Relay::Drop::kGeneration;
+      bounded &= r.EventsQueued() <= Relay::kMaxEvents;
+    }
+    CHECK(dropped);
+    CHECK(bounded);
+    CHECK(r.EventsQueued() == Relay::kMaxEvents);
+    CHECK(r.HeldSlots() == 0x01 && r.Think(kT0 + 16ms) == 0x01);
+    CHECK(r.OnAction(3, 1, 0, true, 0ms, kT0 + 32ms) == Relay::Drop::kNone);
+    CHECK(r.Think(kT0 + 48ms) == 0x00);
+    CHECK(r.EventsQueued() == Relay::kMaxEvents);
+    const uint64_t lost = 2 * flood + 2 - Relay::kMaxEvents;  // a start, the drops, a release
+    CHECK(r.EventsLost() == lost);
+    const auto ev = Drain(r);
+    REQUIRE_OR_RETURN_VOID(ev.size() == Relay::kMaxEvents + 1);
+    CHECK(Count(ev, Ev::Type::kStarted, 1) == 1);
+    CHECK(Has(ev, Ev::Type::kReleased, 1, Relay::ReleaseWhy::kRelease));
+    CHECK(ev.back().type == Ev::Type::kOverflow && ev.back().lost == lost);
+    Ev e;
+    CHECK(r.EventsQueued() == 0 && !r.PollEvent(e));  // reported once
+    // Polled again, the relay works as before: one start, no overflow.
+    r.OnAction(3, 2, 2, false, 0ms, kT0 + 64ms);
+    CHECK(r.Think(kT0 + 80ms) == 0x04);
+    const auto after = Drain(r);
+    CHECK(after.size() == 1 && Count(after, Ev::Type::kStarted, 2) == 1);
+  }
+  // Starts and releases only: a key held on slot 0 while 20 times kMaxEvents presses churn through
+  // slot 1, each taken by a think and released, without a poll. The queue keeps its oldest
+  // kMaxEvents, the keys stay at kMaxKeys, every think holds both slots, and the held key still
+  // ends at its hold timeout.
+  {
+    Relay q;
+    q.SetEpoch(1, 3);
+    q.OnAction(3, 1, 0, false, 0ms, kT0);
+    CHECK(q.Think(kT0) == 0x01);
+    const uint32_t flood = uint32_t(20 * Relay::kMaxEvents);
+    bool held = true, bounded = true;
+    for (uint32_t s = 100; s < 100 + flood; ++s) {
+      q.OnAction(3, s, 1, false, 0ms, kT0 + 16ms);
+      held &= q.Think(kT0 + 16ms) == 0x03;
+      q.OnAction(3, s, 1, true, 0ms, kT0 + 16ms);
+      bounded &= q.EventsQueued() <= Relay::kMaxEvents && q.Keys() <= Relay::kMaxKeys;
+    }
+    CHECK(held);
+    CHECK(bounded);
+    CHECK(q.HeldSlots() == 0x01);
+    CHECK(q.Think(kT0 + 5001ms) == 0x00);  // key 1's timeout
+    CHECK(q.HeldSlots() == 0x00);
+    const uint64_t lost = 2 * uint64_t(flood) + 2 - Relay::kMaxEvents;  // starts and releases
+    CHECK(q.EventsLost() == lost);
+    const auto ev = Drain(q);
+    REQUIRE_OR_RETURN_VOID(ev.size() == Relay::kMaxEvents + 1);
+    CHECK(ev.front().type == Ev::Type::kStarted && ev.front().press_sequence == 1);
+    CHECK(ev.back().type == Ev::Type::kOverflow && ev.back().lost == lost);
+  }
 }
 
 void PoseRateCases() {

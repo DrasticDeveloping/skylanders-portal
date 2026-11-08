@@ -611,13 +611,15 @@ struct Server::Impl {
 
   // Stage 4 (owned.h): a client's own player row. The six checks, then S's own write, so the row
   // reaches every other peer through the change log. A refusal is counted always and reported as a
-  // kLimit event once per (peer, kind, reason) per second; a stale revision is never reported.
+  // kLimit event once per (peer, kind, reason) per second; a stale revision is never reported. The
+  // revision is remembered only when the Put took the value (Sol stage 4 F2): a write refused at
+  // the row limit (WorldState's own kLimit line) leaves the client's next revision admissible.
   void OnOwnedDelta(Peer& p, const Record& r, TimePoint now) {
-    const OwnedVerdict v = owned.Admit(p.id, p.peer_epoch, r);
-    if (v == OwnedVerdict::kAdmitted) {
-      state.Put(r.key, r.value, now);
-      return;
-    }
+    const OwnedVerdict v = owned.Admit(p.id, p.peer_epoch, r, [&] {
+      const PutResult w = state.Put(r.key, r.value, now);
+      return w == PutResult::kWritten || w == PutResult::kUnchanged;
+    });
+    if (v == OwnedVerdict::kAdmitted) return;
     if (owned.ShouldLog(p.id, r.key.kind, v, now)) {
       const KindSpec* spec = FindKind(table, r.key.kind);
       Event(ServerEvent::Type::kLimit, p.id).text =

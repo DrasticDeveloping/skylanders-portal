@@ -34,6 +34,12 @@
 //   releases every key (`teardown`); a new peer epoch or generation drops the table after that.
 // - At most kMaxKeys keys: released keys are evicted first, oldest first; with none released the
 //   oldest pressed key is released (`teardown`) and evicted.
+// - At most kMaxEvents events wait for PollEvent (Sol stage 4 F3): a full queue takes a start or a
+//   release in the place of its oldest drop line; a drop line, or a start or release with no drop
+//   line queued, is lost and counted, and PollEvent reports the count as one kOverflow event once
+//   the queue is empty. The keys, so Think's and HeldSlots' slot bits, never depend on the queue.
+//   kMaxEvents keeps every start and release of one think's worth (at most kMaxKeys releases by
+//   actions, kMaxKeys starts and their releases) for a consumer that polls after each think.
 //
 // Not thread-safe: the game thread owns it (the receive hands actions over in order).
 
@@ -42,6 +48,7 @@ namespace skylanders::online {
 class PuppetActionRelay {
  public:
   static constexpr size_t kMaxKeys = 32;
+  static constexpr size_t kMaxEvents = 4 * kMaxKeys;
   static constexpr std::chrono::milliseconds kStale{500};
   static constexpr std::chrono::milliseconds kMaxHold{5000};
   static constexpr uint8_t kSlots = 8;  // slot numbers 0..7 (the game uses 0..2)
@@ -50,12 +57,13 @@ class PuppetActionRelay {
   enum class ReleaseWhy : uint8_t { kRelease, kReleaseAfter, kTimeout, kTeardown };
 
   struct Event {
-    enum class Type : uint8_t { kStarted, kReleased, kDropped };
+    enum class Type : uint8_t { kStarted, kReleased, kDropped, kOverflow };
     Type type = Type::kStarted;
     uint32_t press_sequence = 0;
     uint8_t slot = 0;
     ReleaseWhy why = ReleaseWhy::kRelease;  // kReleased
     Drop drop = Drop::kNone;                // kDropped
+    uint64_t lost = 0;                      // kOverflow: events lost since the last kOverflow
   };
 
   // The puppet's peer epoch and the client's generation. A change of either tears every key down
@@ -77,10 +85,14 @@ class PuppetActionRelay {
   // torn-down key is a duplicate, not a new press).
   void Teardown();
 
+  // The oldest queued event; with none queued and events lost since the last report, one
+  // kOverflow carrying their count.
   bool PollEvent(Event& out);
   // The bits a think would hold now (without taking anything).
   uint8_t HeldSlots() const;
   size_t Keys() const { return keys_.size(); }
+  size_t EventsQueued() const { return events_.size(); }
+  uint64_t EventsLost() const { return lost_total_; }
 
  private:
   enum class State : uint8_t { kPressed, kReleased };
@@ -102,7 +114,9 @@ class PuppetActionRelay {
   uint32_t generation_ = 0;
   uint64_t next_order_ = 0;
   std::map<Id, Key> keys_;
-  std::deque<Event> events_;
+  std::deque<Event> events_;  // at most kMaxEvents
+  uint64_t lost_ = 0;         // lost since the last kOverflow
+  uint64_t lost_total_ = 0;
 };
 
 }  // namespace skylanders::online

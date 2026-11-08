@@ -1,5 +1,7 @@
 #include "online/action_relay.h"
 
+#include <algorithm>
+
 namespace skylanders::online {
 
 void PuppetActionRelay::Emit(Event::Type type, const Id& id, ReleaseWhy why, Drop drop) {
@@ -9,6 +11,19 @@ void PuppetActionRelay::Emit(Event::Type type, const Id& id, ReleaseWhy why, Dro
   e.slot = id.second;
   e.why = why;
   e.drop = drop;
+  if (events_.size() >= kMaxEvents) {
+    // Full (the consumer stopped polling): a start or release takes the oldest drop line's place;
+    // anything else is lost. Either way one event is lost, counted for the next kOverflow.
+    auto victim = events_.end();
+    if (type != Event::Type::kDropped) {
+      victim = std::find_if(events_.begin(), events_.end(),
+                            [](const Event& q) { return q.type == Event::Type::kDropped; });
+    }
+    ++lost_;
+    ++lost_total_;
+    if (victim == events_.end()) return;
+    events_.erase(victim);
+  }
   events_.push_back(e);
 }
 
@@ -123,7 +138,14 @@ void PuppetActionRelay::Teardown() {
 }
 
 bool PuppetActionRelay::PollEvent(Event& out) {
-  if (events_.empty()) return false;
+  if (events_.empty()) {
+    if (lost_ == 0) return false;
+    out = Event{};
+    out.type = Event::Type::kOverflow;
+    out.lost = lost_;
+    lost_ = 0;
+    return true;
+  }
   out = events_.front();
   events_.pop_front();
   return true;
