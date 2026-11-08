@@ -419,6 +419,94 @@ quit
         self.assertFalse(v["met"])
         self.assertEqual(v["open"], ["r (not ready: legs 11+)"])
 
+    def header(self, name: str) -> bytes:
+        """An SDK content header (XCONTENT_AGGREGATE_DATA, 0x148 bytes) naming the content `name`."""
+        raw = bytearray(b"\x11" * 0x148)
+        raw[264:306] = name.encode().ljust(42, b"\0")
+        return bytes(raw)
+
+    def test_save_slots_fill_the_peer_copy_and_rename_the_header(self) -> None:
+        # Stage 3 item 7: slots 2 and 3 of H's copy are the fixture's slot 1, renamed; the store and the
+        # other peers keep one slot.
+        title = self.cfg.store / "store" / "saves" / "B13EBABEBABEBABE" / "415608E9"
+        (title / "Headers" / "00000001" / "SWAPFORCE_0.header").write_bytes(self.header("SWAPFORCE_0"))
+        self.cfg.save_slot_name = "SWAPFORCE_{index}"
+        self.spec("slots", 'layout = "server+1"\nstage = "3"\n[peer.H]\nscript = "quit\\n"\n'
+                           'save_slots = { "2" = 1, "3" = 1 }\n')
+        spec = skytest.load_spec(self.repo / "tests" / "runtime" / "slots.toml", 20)
+        self.assertEqual(spec.peers["H"].save_slots, {2: 1, 3: 1})
+        self.assertEqual(spec.peers["S"].save_slots, {})
+        run = skytest.make_run_dir(self.cfg, self.cfg.store / "runs" / "slots")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            d, _ = skytest.prepare_peer(self.cfg, spec, "H", run)
+        self.assertIn("slot 2 (SWAPFORCE_1) from slot 1 (SWAPFORCE_0)", out.getvalue())
+        mine = d / "data" / "B13EBABEBABEBABE" / "415608E9"
+        for n in (1, 2):
+            self.assertEqual((mine / "00000001" / f"SWAPFORCE_{n}" / f"SWAPFORCE_{n}.xsg").read_bytes(), b"slot 0")
+            self.assertFalse((mine / "00000001" / f"SWAPFORCE_{n}" / "SWAPFORCE_0.xsg").exists())
+            head = (mine / "Headers" / "00000001" / f"SWAPFORCE_{n}.header").read_bytes()
+            self.assertEqual(head, self.header(f"SWAPFORCE_{n}"))
+        self.assertEqual((mine / "Headers" / "00000001" / "SWAPFORCE_0.header").read_bytes(), self.header("SWAPFORCE_0"))
+        self.assertFalse((title / "00000001" / "SWAPFORCE_1").exists())  # the store is never written
+        d2, _ = skytest.prepare_peer(self.cfg, spec, "S", run)
+        self.assertFalse((d2 / "data" / "B13EBABEBABEBABE" / "415608E9" / "00000001" / "SWAPFORCE_1").exists())
+
+    def test_save_slots_are_refused_when_they_cannot_be_made_right(self) -> None:
+        body = 'layout = "server+1"\nstage = "3"\n[peer.H]\nscript = "quit\\n"\nsave_slots = '
+        for value, why in (('{ "4" = 1 }', "slot '4' is not 1 to 3"), ('{ "2" = 2 }', "slot 2 from itself"),
+                           ('{ "2" = true }', "takes a fixture slot 1 to 3"), ('[2]', "save_slots is a table")):
+            with self.assertRaisesRegex(skytest.SpecError, why):
+                skytest.load_spec(self.spec("bad", body + value + "\n"), 20)
+        hosted = 'layout = "server+1"\nstage = "3"\nserver = "host"\n[peer.H]\nscript = "quit\\n"\n[peer.S]\nsave_slots = { "2" = 1 }\n'
+        with self.assertRaisesRegex(skytest.SpecError, "a hosted server has no data folder"):
+            skytest.load_spec(self.spec("bad", hosted), 20)
+        spec = skytest.load_spec(self.spec("ok", body + '{ "2" = 1 }\n'), 20)
+        run = skytest.make_run_dir(self.cfg, self.cfg.store / "runs" / "refused")
+        with self.assertRaisesRegex(skytest.SpecError, r"save_slot_name"):
+            skytest.prepare_peer(self.cfg, spec, "H", run)
+        self.cfg.save_slot_name = "SWAPFORCE_{index}"
+        # The fixture's header is not an SDK header (the setUp's 6 bytes): refused, never guessed.
+        with self.assertRaisesRegex(skytest.SpecError, "does not hold the file name SWAPFORCE_0"):
+            skytest.prepare_peer(self.cfg, spec, "H", skytest.make_run_dir(self.cfg, self.cfg.store / "runs" / "r2"))
+        three = skytest.load_spec(self.spec("three", body + '{ "1" = 3 }\n'), 20)
+        with self.assertRaisesRegex(skytest.SpecError, r"no profile of the fixture saves has slot 3 \(SWAPFORCE_2\)"):
+            skytest.prepare_peer(self.cfg, three, "H", skytest.make_run_dir(self.cfg, self.cfg.store / "runs" / "r3"))
+
+    def test_a_met_by_case_is_met_by_its_parts(self) -> None:
+        # Stage 3, D14: transport-gates has no spec of its own; killed-message-converges has one.
+        manifest = {"stages": ["3"], "case": [
+            {"id": "gates", "stage": "3", "kind": "required", "met_by": ["a", "b"]},
+            {"id": "own", "stage": "3", "kind": "required", "spec": True, "met_by": ["a"]},
+            {"id": "a", "stage": "3", "kind": "required", "spec": True},
+            {"id": "b", "stage": "3", "kind": "required", "spec": True}]}
+
+        def res(case: str, status: str) -> skytest.CaseResult:
+            return skytest.CaseResult(case=case, layout="server+1", stage="3", status=status)
+
+        v = skytest.checkpoint_verdict(manifest, "3", ["3"], [res("a", "pass"), res("b", "pass"), res("own", "pass")])
+        self.assertTrue(v["met"], v["line"])
+        v = skytest.checkpoint_verdict(manifest, "3", ["3"], [res("a", "pass"), res("b", "fail"), res("own", "pass")])
+        self.assertEqual(v["open"], ["gates (met by b: fail)", "b (fail)"])
+        v = skytest.checkpoint_verdict(manifest, "3", ["3"], [res("a", "pass"), res("b", "pass")])
+        self.assertEqual(v["open"], ["own (not run)"])
+        v = skytest.checkpoint_verdict(manifest, "3", ["3"], [res("b", "pass"), res("own", "pass")])
+        self.assertEqual(v["open"], ["gates (met by a: not run)", "own (met by a: not run)", "a (not run)"])
+
+    def test_met_by_is_checked_by_lint(self) -> None:
+        man = [{"id": "c", "stage": "3", "kind": "required", "met_by": ["a", "x", "c", "o", "m"]},
+               {"id": "a", "stage": "3", "kind": "required"},
+               {"id": "o", "stage": "2", "kind": "required"},
+               {"id": "m", "stage": "3", "kind": "required", "met_by": ["a"]},
+               {"id": "g", "stage": "3", "kind": "required", "gate": True, "met_by": ["a"]},
+               {"id": "e", "stage": "3", "kind": "required", "met_by": []}]
+        self.assertEqual(skytest.met_by_problems(man), [
+            "manifest: c: met_by names x, which is not another case of the manifest",
+            "manifest: c: met_by names c, which is not another case of the manifest",
+            "manifest: c: met_by o is not a required case of stage 3",
+            "manifest: c: met_by m is itself met by other cases (one level only)",
+            "manifest: g: a met_by case with no spec of its own is not a gate case (put its parts in the gate)",
+            "manifest: e: met_by is a list of case ids"])
+
     def test_the_snapshot_survives_a_runner_that_put_it_there_first(self) -> None:
         # PS11: each runner copies into its own partial folder; when another runner renamed the same
         # snapshot into place first, the rename fails and that snapshot is used.
