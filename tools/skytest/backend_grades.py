@@ -5,12 +5,15 @@ bridge_tools.h): `Online: backend local ...` (the library's LocalLine), `Online:
 <layer>:<action> ...`, `Online: backend memory <peer> log <b> ...`.
 
   [grade.backend_compare]  peer = "S" (whose result carries it), kinds = ["prop", "gate"],
-      pending = [kinds allowed pending], unsupported = [kinds allowed unsupported]
-      Joins S's local lines (peer 0) with every client's over the union of their keys, as
-      map_diff.py join and the library's JoinCompare do (a key's last line on a peer counts). Every
-      row of a listed kind must be equal or repaired; pending only for a kind in `pending`,
-      unsupported only for a kind in `unsupported`. A listed kind with no local line on S, or no
-      client's, is "not reached".
+      pending = [kinds allowed pending], unsupported = [kinds allowed unsupported],
+      clients = ["H", "D"] (optional; default every client of the layout)
+      Joins S's local lines (peer 0) with each expected client's over the union of their keys, as
+      map_diff.py join and the library's JoinCompare do (a key's last line on a peer counts). A
+      client's lines come from its own log only. Every row of a listed kind must be equal or
+      repaired; pending only for a kind in `pending`, unsupported only for a kind in `unsupported`.
+      A listed kind with no local line on S is "not reached", and so is a listed kind an expected
+      client did not compare (neither a local line nor its `backend query compare` line of that
+      kind in its log): every peer is compared, a silent one never passes.
   [grade.backend_faults]  peer = "H", rules = [1, 2], before = "<regex>" (optional)
       Each listed rule number fired on that peer (a fault line, not the `armed` line), and, with
       `before`, fired before the first line matching it (the grade's window opening); else "not
@@ -35,6 +38,8 @@ FAULT = re.compile(r"Online: backend fault (\d+) [a-z]+:[a-z]+\b")
 MEMORY_FIELDS = ("log", "staging", "batcher", "held", "bridge_out", "bridge_in", "obligations", "requests")
 MEMORY = re.compile(r"Online: backend memory (\d+) " + " ".join(f"{f} (\\d+)" for f in MEMORY_FIELDS) + r"\b")
 OK_RESULTS = ("equal", "repaired")
+# bridge_tools.cpp RunCompare's summary: a compare of a kind that may have no row at all.
+QUERY = re.compile(r"^backend query compare (\d+) (\S+) rows (\d+) ")
 
 
 class GradeSpecError(ValueError):
@@ -55,6 +60,11 @@ def check(spec: str, gname: str, g: object, names: list[str]) -> None:
         for key in ("pending", "unsupported"):
             if not isinstance(g.get(key, []), list):
                 raise GradeSpecError(f"{spec}: grade backend_compare: `{key}` is a list of kind names")
+        clients = g.get("clients", [n for n in names if n != "S"])
+        if (not isinstance(clients, list) or not clients
+                or not all(isinstance(c, str) and c in names and c != "S" for c in clients)):
+            raise GradeSpecError(f"{spec}: grade backend_compare: `clients` is a list of the layout's clients"
+                                 f" ({[n for n in names if n != 'S']})")
     elif gname == "backend_faults":
         rules = g.get("rules")
         if not isinstance(rules, list) or not rules or not all(isinstance(r, int) and r > 0 for r in rules):
@@ -72,42 +82,59 @@ def check(spec: str, gname: str, g: object, names: list[str]) -> None:
 
 
 def grade_compare(texts: dict[str, str], g: dict) -> tuple[dict, list[str]]:
+    """`texts` holds every peer's log by name (skytest reads one for each peer of the layout, empty when
+    it wrote none); the expected clients are `clients`, else every name but S."""
     kinds = list(g["kinds"])
     allow_pending = set(g.get("pending", []))
     allow_unsupported = set(g.get("unsupported", []))
-    latest: dict[int, dict[tuple[str, str, int], map_diff.LocalLine]] = {}
+    roster = list(g.get("clients", [n for n in texts if n != "S"]))
+    server: dict[tuple[str, str, int], map_diff.LocalLine] = {}
     for text in texts.values():
         for line in map_diff.library_lines(text):
             c = map_diff.parse_local(line)
-            if c is not None:
-                latest.setdefault(c.peer, {})[(c.kind, c.entity, c.slot)] = c
-    server = latest.get(0, {})
-    clients = sorted(p for p in latest if p != 0)
+            if c is not None and c.peer == 0:
+                server[(c.kind, c.entity, c.slot)] = c
     graded = {r: 0 for r in map_diff.RESULTS}
     graded["rows"] = 0
     reasons: list[str] = []
+    # Each expected client's own lines: its local lines (last per key), its peer id, the kinds it compared.
+    own: dict[str, dict[tuple[str, str, int], map_diff.LocalLine]] = {}
+    ids: dict[str, int] = {}
+    compared: dict[str, set] = {}
+    for name in roster:
+        own[name], compared[name] = {}, set()
+        for line in map_diff.library_lines(texts.get(name, "")):
+            c = map_diff.parse_local(line)
+            if c is not None and c.peer != 0:
+                own[name][(c.kind, c.entity, c.slot)] = c
+                ids.setdefault(name, c.peer)
+                compared[name].add(c.kind)
+                continue
+            m = QUERY.match(line)
+            if m and m[1] != "0":
+                ids.setdefault(name, int(m[1]))
+                compared[name].add(m[2])
+    if not roster:
+        reasons.append("grade backend_compare: not reached (no client to compare)")
     for kind in kinds:
         if not any(k[0] == kind for k in server):
             reasons.append(f"grade backend_compare: not reached (no local compare of {kind} on S)")
             continue
-        seen_client = False
-        for peer_id in clients:
-            peer = latest[peer_id]
-            if not any(k[0] == kind for k in peer):
+        for name in roster:
+            if kind not in compared[name]:
+                reasons.append(f"grade backend_compare: not reached (client {name} has no compare of {kind})")
                 continue
-            seen_client = True
+            peer_id = ids.get(name, 0)
             rows = map_diff.join_compare([c for k, c in server.items() if k[0] == kind],
-                                         [c for k, c in peer.items() if k[0] == kind], peer_id)
+                                         [c for k, c in own[name].items() if k[0] == kind], peer_id)
             for row in rows:
                 graded["rows"] += 1
                 graded[row.result] += 1
                 ok = (row.result in OK_RESULTS or (row.result == "pending" and kind in allow_pending)
                       or (row.result == "unsupported" and kind in allow_unsupported))
                 if not ok:
-                    reasons.append(f"grade backend_compare: peer {peer_id} {kind} {row.entity} slot {row.slot} "
+                    reasons.append(f"grade backend_compare: peer {peer_id} ({name}) {kind} {row.entity} slot {row.slot} "
                                    f"{row.result}" + (f" ({row.differs})" if row.differs else ""))
-        if not seen_client:
-            reasons.append(f"grade backend_compare: not reached (no client's local compare of {kind})")
     return graded, reasons
 
 

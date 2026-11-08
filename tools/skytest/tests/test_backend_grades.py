@@ -61,6 +61,43 @@ class Compare(unittest.TestCase):
         self.assertEqual(len(bg.grade_compare(texts, {"kinds": ["prop"]})[1]), 1)
         self.assertEqual(bg.grade_compare(texts, {"kinds": ["prop"], "unsupported": ["prop"]})[1], [])
 
+    def test_missing_client(self):
+        # S and H agree, D wrote no compare at all (an empty log): the grade is not reached, not passed.
+        texts = {"S": local(0, "gate", GATE, 2, D1, "equal"), "H": local(1, "gate", GATE, 2, D1, "equal"), "D": ""}
+        reasons = bg.grade_compare(texts, {"kinds": ["gate"]})[1]
+        self.assertEqual(reasons, ["grade backend_compare: not reached (client D has no compare of gate)"])
+        # the spec's roster: only H is expected
+        self.assertEqual(bg.grade_compare(texts, {"kinds": ["gate"], "clients": ["H"]})[1], [])
+
+    def test_missing_kind(self):
+        # D compared prop but not gate: the gate is not reached on D, the prop rows are graded.
+        texts = {
+            "S": "\n".join([local(0, "gate", GATE, 2, D1, "equal"), local(0, "prop", RING, 1, D0, "equal")]),
+            "H": "\n".join([local(1, "gate", GATE, 2, D1, "equal"), local(1, "prop", RING, 1, D0, "equal")]),
+            "D": local(2, "prop", RING, 1, D0, "equal"),
+        }
+        graded, reasons = bg.grade_compare(texts, {"kinds": ["gate", "prop"]})
+        self.assertEqual(reasons, ["grade backend_compare: not reached (client D has no compare of gate)"])
+        self.assertEqual(graded["rows"], 3)
+
+    def test_client_lines_from_its_own_log(self):
+        # H's log holding D's lines does not make D compared.
+        texts = {"S": local(0, "gate", GATE, 2, D1, "equal"),
+                 "H": "\n".join([local(1, "gate", GATE, 2, D1, "equal"), local(2, "gate", GATE, 2, D1, "equal")]),
+                 "D": ""}
+        reasons = bg.grade_compare(texts, {"kinds": ["gate"]})[1]
+        self.assertEqual(reasons, ["grade backend_compare: not reached (client D has no compare of gate)"])
+
+    def test_query_line_with_no_rows_is_a_compare(self):
+        # D compared the kind and has no row of it: S's row is missing there.
+        texts = {"S": local(0, "gate", GATE, 2, D1, "equal"), "D":
+                 "[12:00:00.000] i> 0001 Online: backend query compare 2 gate rows 0 equal 0 repaired 0 pending 0 "
+                 "stuck 0 unsupported 0"}
+        reasons = bg.grade_compare(texts, {"kinds": ["gate"]})[1]
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("peer 2 (D) gate", reasons[0])
+        self.assertIn("replica missing", reasons[0])
+
 
 class Faults(unittest.TestCase):
     LOG = "\n".join([
@@ -119,7 +156,10 @@ class Check(unittest.TestCase):
         bg.check("x.toml", "backend_memory", {"bounds": {"log": 1}}, names)
         for gname, g in [("backend_compare", {}), ("backend_compare", {"kinds": ["gate"], "peer": "D"}),
                          ("backend_faults", {"rules": [0]}), ("backend_memory", {"bounds": {"nope": 1}}),
-                         ("backend_memory", {"window": 0}), ("backend_compare", "x")]:
+                         ("backend_memory", {"window": 0}), ("backend_compare", "x"),
+                         ("backend_compare", {"kinds": ["gate"], "clients": ["D"]}),
+                         ("backend_compare", {"kinds": ["gate"], "clients": ["S"]}),
+                         ("backend_compare", {"kinds": ["gate"], "clients": []})]:
             with self.assertRaises(bg.GradeSpecError):
                 bg.check("x.toml", gname, g, names)
 
