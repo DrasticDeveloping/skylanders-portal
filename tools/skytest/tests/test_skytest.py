@@ -3573,6 +3573,25 @@ expect = ["Online: starting as the server"]
         self.assertEqual(skytest.timed_grades(skytest.load_spec(self.repo / "tests" / "runtime" / "timed.toml", 10)),
                          ["client_fps"])
 
+    def test_a_unit_case_runs_beside_a_game_case_without_a_game_slot(self) -> None:
+        # --max-games 1 with a solo case: the unit case starts at once beside it (it holds no game and no
+        # machine slot), and the game case still takes its slot, the game's snapshot and the disc check.
+        build = self.repo / "out" / "build"
+        (build / "bin").mkdir()
+        (build / "bin" / "unit_test.py").write_bytes((HERE / "fake_unit.py").read_bytes())
+        self.cfg.unit_launcher = [sys.executable, "-I"]
+        self.spec("game", 'layout = "solo"\nstage = "0"\n[peer.H]\n' + SkytestTest.HUB)
+        self.spec("unit", 'layout = "unit"\nstage = "2"\n[unit]\nbinary = "bin/unit_test.py"\n'
+                  'pass_line = "all backend tests passed"\nargs = ["--sleep=2"]\n', scenes=False)
+        r = self.run_jobs("game", "unit", jobs=2, max_games=1)
+        self.assertEqual(r["exit"], 0, r["printed"])
+        self.assertTrue(r["snapshot"])
+        cases = {c["case"]: c for c in r["cases"]}
+        self.assertEqual(cases["game"]["status"], "pass", cases["game"])
+        self.assertEqual(cases["unit"]["status"], "pass", cases["unit"])
+        self.assertEqual(cases["unit"]["ran_with"], ["game"])
+        self.assertTrue(cases["game"]["machine"].get("slots"), cases["game"]["machine"])
+        self.assertNotIn("slots", cases["unit"]["machine"])
 
 
 def waitfor_log(*waits: tuple[str, str, float]) -> str:
@@ -4577,6 +4596,209 @@ class MachineRunTest(unittest.TestCase):
         with self.assertRaises(skytest.SpecError) as e:
             skytest.load_spec(self.repo / "tests" / "runtime" / "bad.toml", 20)
         self.assertIn("breaker is true or false", str(e.exception))
+
+
+class UnitLayoutTest(unittest.TestCase):
+    """The `unit` layout (stage 2 item 7): a test binary from its snapshot and named ctests, no game.
+    The repository here has no disc and no game exe: a unit case needs neither."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.repo = root / "game"
+        (self.repo / "tests" / "runtime").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        self.build = self.repo / "out" / "build"
+        (self.build / "bin").mkdir(parents=True)
+        (self.build / "bin" / "unit_test.py").write_bytes((HERE / "fake_unit.py").read_bytes())
+        (self.build / "bin" / "helper.dll").write_bytes(b"MZ dll")
+        self.ctest_dir = self.build / "portal" / "backend"
+        self.ctest_dir.mkdir(parents=True)
+        self.ctests("backend.include_rule pass\nskylanders_backend_test pass\n")
+        (self.repo / "tests" / "skytest.toml").write_text(f"""
+[game]
+exe = "game.exe"
+build = "out/build"
+settings_template = "settings.example"
+unit_launcher = [{toml_str(sys.executable)}, "-I"]
+ctest = [{toml_str(sys.executable)}, "-I", {toml_str(HERE / 'fake_ctest.py')}]
+
+[fixtures]
+owner_saves = {toml_str(root / 'owner' / 'saves')}
+owner_figures = {toml_str(root / 'owner' / 'figures')}
+
+[defaults]
+timeout = 20
+""", encoding="utf-8")
+        self.cfg = skytest.load_config(self.repo)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def ctests(self, listing: str) -> None:
+        (self.ctest_dir / "fake_ctest.txt").write_text(listing, encoding="utf-8")
+
+    UNIT = ('layout = "unit"\nstage = "2"\n[unit]\nbinary = "bin/unit_test.py"\n'
+            'pass_line = "all backend tests passed"\n')
+    CTEST = 'ctest = ["backend.include_rule"]\nctest_dir = "portal/backend"\n'
+
+    def spec(self, name: str, body: str) -> Path:
+        p = self.repo / "tests" / "runtime" / f"{name}.toml"
+        p.write_text(f'name = "{name}"\n' + body, encoding="utf-8")
+        return p
+
+    def run_cases(self, *names: str, stage: str | None = None, jobs: int = 1) -> dict:
+        a = argparse.Namespace(cases=list(names), stage=stage, max_games=1, jobs=jobs)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_test(self.cfg, a)
+        printed = out.getvalue().strip().splitlines()
+        report = printed[-1].split("report: ", 1)[1]
+        results = json.loads((Path(report).parent / "results.json").read_text(encoding="utf-8"))
+        results["exit"], results["folder"], results["printed"] = code, Path(report).parent, printed
+        return results
+
+    def test_a_unit_case_passes_on_its_exit_code_and_pass_line_and_meets_the_checkpoint(self) -> None:
+        self.spec("backend-unit", self.UNIT + self.CTEST)
+        (self.repo / "tests" / "manifest.toml").write_text(
+            'stages = ["0", "2"]\n[[case]]\nid = "backend-unit"\nstage = "2"\nlayout = "unit"\nkind = "required"\n'
+            'spec = true\n', encoding="utf-8")
+        r = self.run_cases(stage="2")
+        case = r["cases"][0]
+        self.assertEqual(case["status"], "pass", case)
+        self.assertEqual(r["exit"], 0)
+        self.assertEqual([p["peer"] for p in case["peers"]], ["test", "ctest backend.include_rule"])
+        test = case["peers"][0]
+        self.assertEqual(test["graded"]["unit"], {"pass_line": True, "tests": 3, "failed": 0, "ms": 5})
+        # Run from the snapshot, never from the build folder; the DLLs beside it went along.
+        exe = Path(test["command"][2])
+        self.assertTrue(skytest.inside(exe, self.repo / ".replication-tests" / "snapshots"), exe)
+        self.assertTrue(exe.parent.name.startswith("unit-"))
+        self.assertTrue((exe.parent / "helper.dll").is_file())
+        self.assertIn(f"ran from {exe}", (Path(case["folder"]) / "test.txt").read_text(encoding="utf-8"))
+        ctest = case["peers"][1]["command"]
+        self.assertEqual(ctest[ctest.index("-R") + 1], "^backend\\.include_rule$")
+        self.assertIn("--no-tests=error", ctest)
+        self.assertIn("checkpoint 2: met", r["printed"])
+        self.assertEqual(r["snapshot"], "")  # no game snapshot was taken
+
+    def test_a_failing_or_silent_binary_fails(self) -> None:
+        self.spec("fails", self.UNIT + 'args = ["--mode=fail"]\n')
+        case = self.run_cases("fails")["cases"][0]
+        self.assertEqual(case["status"], "fail")
+        reasons = case["peers"][0]["reasons"]
+        self.assertIn("exit code 1", reasons)
+        self.assertIn("FAIL tests/backend_entity_id_test.cpp:42: id.Valid()", reasons)
+        self.assertIn("no 'all backend tests passed' line", reasons)
+        self.assertEqual(case["peers"][0]["graded"]["unit"]["failed"], 1)
+        self.spec("silent", self.UNIT + 'args = ["--mode=silent"]\n')
+        case = self.run_cases("silent")["cases"][0]
+        self.assertEqual(case["status"], "fail")
+        self.assertEqual(case["peers"][0]["reasons"], ["no 'all backend tests passed' line"])
+
+    def test_a_missing_or_failing_ctest_fails(self) -> None:
+        self.spec("missing", self.UNIT + 'ctest = ["backend.other_rule"]\nctest_dir = "portal/backend"\n')
+        case = self.run_cases("missing")["cases"][0]
+        self.assertEqual(case["status"], "fail")
+        self.assertEqual(case["peers"][1]["exit_code"], 8)
+        self.ctests("backend.include_rule fail\n")
+        self.spec("failing", self.UNIT + self.CTEST)
+        case = self.run_cases("failing")["cases"][0]
+        self.assertEqual(case["status"], "fail")
+        self.assertEqual(case["reasons"], ["failed: ctest backend.include_rule"])
+        # A name is matched whole: neither backendXinclude_rule nor backend.include_rule2 runs.
+        self.ctests("backendXinclude_rule pass\nbackend.include_rule2 pass\n")
+        case = self.run_cases("failing")["cases"][0]
+        self.assertEqual(case["status"], "fail")
+
+    def test_a_hung_binary_is_ended(self) -> None:
+        self.spec("hang", self.UNIT.replace('stage = "2"\n', 'stage = "2"\ntimeout = 2\n') + 'args = ["--mode=hang"]\n')
+        t0 = time.monotonic()
+        case = self.run_cases("hang")["cases"][0]
+        self.assertLess(time.monotonic() - t0, 30)
+        self.assertEqual(case["status"], "fail")
+        self.assertTrue(case["peers"][0]["ended_by_runner"])
+        self.assertIn("did not end within 2 s; ended", case["peers"][0]["reasons"])
+
+    def test_no_binary_or_no_ctest_folder_is_an_error(self) -> None:
+        self.spec("nobin", self.UNIT.replace("bin/unit_test.py", "bin/missing.exe"))
+        case = self.run_cases("nobin")["cases"][0]
+        self.assertEqual(case["status"], "error")
+        self.assertIn("no unit test binary", case["reasons"][0])
+        self.spec("nodir", self.UNIT + 'ctest = ["backend.include_rule"]\nctest_dir = "portal/none"\n')
+        case = self.run_cases("nodir")["cases"][0]
+        self.assertEqual(case["status"], "error")
+        self.assertIn("no ctest folder", case["reasons"][0])
+
+    def test_unit_spec_errors(self) -> None:
+        bad = {
+            "needs a [unit] table": 'layout = "unit"\nstage = "2"\n',
+            "pass_line": 'layout = "unit"\nstage = "2"\n[unit]\nbinary = "bin/unit_test.py"\n',
+            "relative to the build folder": self.UNIT.replace("bin/unit_test.py", "C:/x/unit_test.exe"),
+            "relative to the build folder, inside it": self.UNIT.replace("bin/unit_test.py", "../x/unit_test.exe"),
+            "refusing --update-golden": self.UNIT + 'args = ["--update-golden"]\n',
+            "refusing --diff": self.UNIT + 'args = ["--diff"]\n',
+            "refusing an empty argument": self.UNIT + 'args = ["--filter="]\n',
+            "ctest_dir must be a path": self.UNIT + 'ctest = ["backend.include_rule"]\n',
+            "need ctest names": self.UNIT + 'ctest_dir = "portal/backend"\n',
+            "list of test names": self.UNIT + 'ctest = ["backend include_rule"]\n',
+            "names a test twice": self.UNIT + 'ctest = ["a", "a"]\nctest_dir = "portal/backend"\n',
+            "does not know": self.UNIT + 'binaries = "x"\n',
+            "runs no game; peer": 'layout = "unit"\nstage = "2"\n[peer.H]\nscript = "quit"\n',
+            "runs no game; grade": self.UNIT.replace("[unit]", '[grade.symmetry]\n[unit]'),
+        }
+        for want, body in bad.items():
+            with self.subTest(want=want):
+                p = self.spec("bad", body)
+                with self.assertRaises(skytest.SpecError) as e:
+                    skytest.load_spec(p, 20)
+                self.assertIn(want, str(e.exception))
+        s = skytest.load_spec(self.spec("good", self.UNIT + self.CTEST), 20)
+        self.assertEqual((s.layout, s.peers, s.unit["ctest"]), ("unit", {}, ["backend.include_rule"]))
+
+    def test_unit_cases_run_through_the_scheduler_without_machine_slots(self) -> None:
+        # Two unit cases under --jobs 2 run at once (each holds no game), take no machine slot, write
+        # their own result.json, share one unit snapshot and take no game snapshot (no disc, no exe here).
+        self.spec("one", self.UNIT + 'args = ["--sleep=1.5"]\n')
+        self.spec("two", self.UNIT + 'args = ["--sleep=1.5"]\n')
+        r = self.run_cases("one", "two", jobs=2)
+        self.assertEqual(r["exit"], 0, r["printed"])
+        self.assertEqual(r["snapshot"], "")
+        self.assertEqual(r["jobs"], 2)
+        cases = {c["case"]: c for c in r["cases"]}
+        for name, other in (("one", "two"), ("two", "one")):
+            c = cases[name]
+            self.assertEqual(c["status"], "pass", c)
+            self.assertEqual(c["ran_with"], [other])
+            self.assertNotIn("slots", c["machine"])  # no lease of the machine's game slots
+            self.assertEqual(c["scenes"], "none (a unit case starts no game)")
+            self.assertTrue(c["provenance"]["spec_sha256"])
+            own = json.loads((Path(c["folder"]) / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual((own["case"], own["status"]), (name, "pass"))
+        self.assertEqual(cases["one"]["peers"][0]["command"][2], cases["two"]["peers"][0]["command"][2])
+        self.assertFalse(list((self.repo / ".replication-tests" / "snapshots").glob("*.partial*")))
+
+    def test_a_unit_case_not_ready_or_exclusive(self) -> None:
+        self.spec("later", self.UNIT.replace('stage = "2"\n', 'stage = "2"\nready = false\nreason = "item 6"\n'))
+        r = self.run_cases("later")
+        self.assertEqual(r["cases"][0]["status"], "not ready")
+        self.assertEqual(r["snapshot"], "")
+        self.assertFalse((self.repo / ".replication-tests" / "snapshots").exists())
+        s = skytest.load_spec(self.spec("alone", 'exclusive = true\n' + self.UNIT), 20)
+        self.assertTrue(s.exclusive)
+        self.assertFalse(s.breaker)  # never counted toward, nor stopped by, the circuit breaker
+        for key in ('scenes = "skip"\n', 'breaker = true\n', 'fail_fast = false\n', 'tolerate = ["x"]\n'):
+            with self.subTest(key=key), self.assertRaises(skytest.SpecError) as e:
+                skytest.load_spec(self.spec("bad", key + self.UNIT), 20)
+            self.assertIn("runs no game", str(e.exception))
+
+    def test_lint_takes_a_unit_case(self) -> None:
+        self.spec("backend-unit", self.UNIT + self.CTEST)
+        (self.repo / "tests" / "manifest.toml").write_text(
+            'stages = ["2"]\n[[case]]\nid = "backend-unit"\nstage = "2"\nlayout = "unit"\nkind = "required"\n'
+            'spec = true\n', encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_lint(self.cfg, argparse.Namespace())
+        self.assertEqual(code, 0, out.getvalue())
 
 
 class JobTest(unittest.TestCase):
