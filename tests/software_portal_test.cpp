@@ -447,5 +447,28 @@ int main() {
     CHECK(sink.got.size() == 60);
   }
 
+  // The place filter: asked with the other slots' figures; false refuses and changes nothing.
+  {
+    SoftwarePortal portal;
+    FigureData a{};
+    a[0] = 1;
+    FigureData b{};
+    b[0] = 2;
+    CHECK(portal.PlaceFigure(0, a));
+    size_t asked_with = 99;
+    portal.SetPlaceFilter([&](int slot, const FigureData& data, std::span<const FigureData> others) {
+      asked_with = others.size();
+      return slot != 1 || data[0] != 2;
+    });
+    CHECK(!portal.PlaceFigure(1, b));  // refused
+    CHECK(asked_with == 1);
+    CHECK(!portal.HasFigure(1));
+    CHECK(portal.PlaceFigure(0, b));  // replacing slot 0: its own figure is not among the others
+    CHECK(asked_with == 0);
+    CHECK(portal.Figure(0) && (*portal.Figure(0))[0] == 2);
+    portal.SetPlaceFilter(nullptr);
+    CHECK(portal.PlaceFigure(1, b));  // no filter: every placement goes on
+  }
+
   return Finish("software_portal");
 }

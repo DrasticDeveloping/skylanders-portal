@@ -8,6 +8,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <span>
 
 #include "portal/portal_device.h"
 
@@ -61,6 +62,17 @@ class SoftwarePortal : public PortalDevice {
       std::function<void(const char* op, int slot, int block, const uint8_t* data, size_t n)>
           callback);
 
+  // Asked before every PlaceFigure (the menu, the input script, the overlay, a restore all go
+  // through it) with the slot, the figure to place and the figures on the other slots (the slot's
+  // own figure, when PlaceFigure replaces it, is not among them). false refuses the placement:
+  // PlaceFigure returns false and changes nothing. A game uses it for a rule that holds only for a
+  // while (Swap Force Online: one player's figures in an online session) and clears it after.
+  // Runs under the portal's lock on PlaceFigure's thread, so it must be cheap and must not call
+  // back into this SoftwarePortal. Pass nullptr to remove it (the default: every placement goes on).
+  void SetPlaceFilter(
+      std::function<bool(int slot, const FigureData& data, std::span<const FigureData> others)>
+          filter);
+
  private:
   enum class SlotState : uint8_t { kEmpty = 0, kReady = 1, kRemoving = 2, kAdded = 3 };
   struct Slot {
@@ -81,6 +93,7 @@ class SoftwarePortal : public PortalDevice {
   uint8_t counter_ = 0;
   std::function<void(int, const FigureData&, const std::optional<std::filesystem::path>&)> on_write_;
   std::function<void(const char*, int, int, const uint8_t*, size_t)> research_log_;
+  std::function<bool(int, const FigureData&, std::span<const FigureData>)> place_filter_;
 };
 
 }  // namespace skylanders::portal

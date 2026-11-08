@@ -142,6 +142,14 @@ bool SoftwarePortal::PlaceFigure(int slot, const FigureData& data,
                                  std::optional<std::filesystem::path> source) {
   if (slot < 0 || slot >= kMaxFigures) return false;
   std::lock_guard<std::mutex> lock(mu_);
+  if (place_filter_) {
+    std::array<FigureData, kMaxFigures> others{};
+    size_t n = 0;
+    for (int i = 0; i < kMaxFigures; ++i) {
+      if (i != slot && slots_[i].present) others[n++] = slots_[i].data;
+    }
+    if (!place_filter_(slot, data, std::span<const FigureData>(others.data(), n))) return false;
+  }
   Slot& s = slots_[slot];
   s.present = true;
   s.data = data;
@@ -178,6 +186,12 @@ void SoftwarePortal::SetWriteCallback(
         callback) {
   std::lock_guard<std::mutex> lock(mu_);
   on_write_ = std::move(callback);
+}
+
+void SoftwarePortal::SetPlaceFilter(
+    std::function<bool(int, const FigureData&, std::span<const FigureData>)> filter) {
+  std::lock_guard<std::mutex> lock(mu_);
+  place_filter_ = std::move(filter);
 }
 
 void SoftwarePortal::SetResearchLogCallback(
