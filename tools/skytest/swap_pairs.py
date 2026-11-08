@@ -59,6 +59,7 @@ Event = tuple[int, int]  # (tick, line index in its log): the order of two event
 
 @dataclass
 class Result:
+    swaps: int = 0
     expected: int = 0
     graded: int = 0
     max_lag_ms: float = 0.0
@@ -119,9 +120,11 @@ def _receiver_events(text: str) -> dict[Key, _Seen]:
 
 def grade_swap_pairs(logs: Mapping[int, str], swaps: Mapping[int, int] | Iterable[Iterable[int]],
                      receivers: Iterable[int], pressure: Iterable[tuple[Iterable[int], int]] = (),
-                     max_ms: float = 500.0, hz: int = 60) -> Result:
+                     max_ms: float = 500.0, hz: int = 60, swappers: Iterable[int] | None = None) -> Result:
     """`logs`: each client's log text by its peer id (S's log is not a receiver); `swaps`,
-    `receivers`, `pressure`: the case's expected work (module docstring)."""
+    `receivers`, `pressure`: the case's expected work (module docstring). `swappers` (default: every
+    log) limits whose swap lines are read at all: a peer outside it (a receiver-only client) has no
+    swap keys, so its own swaps are neither graded nor unexpected."""
     res = Result()
     rec = [int(r) for r in receivers]
     if not rec:
@@ -132,7 +135,10 @@ def grade_swap_pairs(logs: Mapping[int, str], swaps: Mapping[int, int] | Iterabl
     # Every swap line, in each swapper's log order.
     observed: dict[int, list[tuple[Key, str, int]]] = {}
     logged: set[Key] = set()
+    scope = None if swappers is None else {int(p) for p in swappers}
     for peer, text in logs.items():
+        if scope is not None and int(peer) not in scope:
+            continue
         for line in text.splitlines():
             m = SWAP_RE.search(line)
             if not m:
@@ -143,6 +149,8 @@ def grade_swap_pairs(logs: Mapping[int, str], swaps: Mapping[int, int] | Iterabl
                 continue
             logged.add(key)
             observed.setdefault(int(peer), []).append((key, m.group(2), int(m.group(5))))
+
+    res.swaps = len(logged)
 
     # The case's ordered swaps, each resolved to its reference line or None (missing).
     required: list[tuple[int, tuple[Key, str, int] | None]] = []
@@ -186,11 +194,11 @@ def grade_swap_pairs(logs: Mapping[int, str], swaps: Mapping[int, int] | Iterabl
     # The case's pressure pairs, resolved to keys. A pair is never dropped: one that names no swap ref
     # of the case is a spec error, and one that resolves to no ordered swap (its swap missing, or not
     # among the first `count` swap lines) fails with its own line.
-    swappers = {peer for peer, _ in required}
+    ordered_swappers = {peer for peer, _ in required}
     pressure_set: set[tuple[Key, int]] = set()
     for ref_in, receiver in pressure:
         ref, receiver = _ref(ref_in), int(receiver)
-        if ref[0] not in swappers or receiver not in rec or receiver == ref[0]:
+        if ref[0] not in ordered_swappers or receiver not in rec or receiver == ref[0]:
             raise ValueError(f"pressure pair {ref} on peer {receiver}: not a pair of the ordered swaps and receivers")
         if refs is not None and not any(_same_swap(ref, s) for s in refs):
             raise ValueError(f"pressure pair {ref} on peer {receiver}: not one of the case's swap refs")
