@@ -46,6 +46,14 @@ constexpr int kConnectedIgd = 1;
 constexpr int kPrivateIpIgd = 2;
 constexpr int kDisconnectedIgd = 3;
 
+#if defined(SKYLANDERS_PORTAL_MINIUPNPC)
+// A miniupnpc bump that renumbers them stops the build here.
+static_assert(kMiniupnpcSuccess == UPNPCOMMAND_SUCCESS && kMiniupnpcHttpError == UPNPCOMMAND_HTTP_ERROR &&
+              kMiniupnpcInvalidResponse == UPNPCOMMAND_INVALID_RESPONSE);
+static_assert(kConnectedIgd == UPNP_CONNECTED_IGD && kPrivateIpIgd == UPNP_PRIVATEIP_IGD &&
+              kDisconnectedIgd == UPNP_DISCONNECTED_IGD);
+#endif
+
 constexpr uint32_t kMaxLeaseS = 604800;
 
 // Digits only (no sign, no space), at most `max_digits` of them (at most 10, so the sum fits).
