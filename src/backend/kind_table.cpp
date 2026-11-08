@@ -23,6 +23,7 @@ constexpr std::string_view kV11 = "V11 noisy";
 constexpr std::string_view kV12 = "V12 grace";
 constexpr std::string_view kV13 = "V13 replicated deps";
 constexpr std::string_view kV14 = "V14 urgent";
+constexpr std::string_view kV15 = "V15 owned";
 
 std::string Named(const KindSpec& spec) {
   return spec.name.empty() ? "kind " + std::to_string(spec.id) : std::string(spec.name);
@@ -139,11 +140,12 @@ std::vector<ValidationIssue> Validate(std::span<const KindSpec> table, const Lim
       issues.Add(spec, kV8, "authored default without kAuthoredDefault");
     }
 
-    // V9 sizes: 0 < max_value_bytes <= the limit; the state class is a known one (1 and 2 are
-    // reserved: stage 4's client-owned value, a merge-on-S class).
+    // V9 sizes: 0 < max_value_bytes <= the limit; the state class is a known one (2 is reserved:
+    // a merge-on-S class; 1 is stage 4's owned value).
     if (spec.max_value_bytes == 0) issues.Add(spec, kV9, "max_value_bytes 0");
     else if (spec.max_value_bytes > max_bytes) issues.Add(spec, kV9, "max_value_bytes over " + std::to_string(max_bytes));
-    if (spec.state_class != StateClass::kCurrentValue && spec.state_class != StateClass::kEvent) {
+    if (spec.state_class != StateClass::kCurrentValue && spec.state_class != StateClass::kOwnedValue &&
+        spec.state_class != StateClass::kEvent) {
       issues.Add(spec, kV9, "state class " + std::to_string(unsigned(spec.state_class)) + " reserved or unknown");
     }
 
@@ -160,8 +162,10 @@ std::vector<ValidationIssue> Validate(std::span<const KindSpec> table, const Lim
       if (spec.requires_precondition) issues.Add(spec, kV10, "requires_precondition on a kind that takes no requests");
     }
 
-    // V11 noisy: only a current value is coalesced.
-    if (spec.noisy && spec.state_class != StateClass::kCurrentValue) issues.Add(spec, kV11, "noisy on a non-current value");
+    // V11 noisy: only a current value or an owned value is coalesced (stage 4: player_vitals).
+    if (spec.noisy && spec.state_class != StateClass::kCurrentValue && spec.state_class != StateClass::kOwnedValue) {
+      issues.Add(spec, kV11, "noisy on a value that is neither current nor owned");
+    }
 
     // V12 grace: an applied kind that waits for its entity, or that a fence waits for, has a grace.
     if (spec.write == WriteMode::kApplied && spec.pending_grace_ms == 0) {
@@ -181,6 +185,18 @@ std::vector<ValidationIssue> Validate(std::span<const KindSpec> table, const Lim
 
     // V14 urgent: only a replicated kind's deltas ride the state lane's batch.
     if (spec.urgent && !Replicated(spec)) issues.Add(spec, kV14, "urgent on a kind that is not replicated");
+  }
+
+  // V15 owned (stage 4, section 3.5): an owned kind is a session row of one player, mirrored or
+  // applied, never server-only, never an effect, never a request's subject.
+  for (const KindSpec& spec : table) {
+    if (spec.state_class != StateClass::kOwnedValue) continue;
+    if (spec.scope != Scope::kSession) issues.Add(spec, kV15, "owned value not session scope");
+    if (spec.tier == Tier::kEffect) issues.Add(spec, kV15, "owned value is an effect");
+    if (spec.write != WriteMode::kMirrored && spec.write != WriteMode::kApplied) {
+      issues.Add(spec, kV15, "owned value neither mirrored nor applied");
+    }
+    if (spec.models != 0) issues.Add(spec, kV15, "owned value takes request models");
   }
 
   // V4 cycles: a kind that reaches itself through other kinds (self edges and unknown ids are

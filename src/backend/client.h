@@ -118,6 +118,11 @@ class Client {
   // payload; the resends stop at the answer or the LeaseEnd. Each send raises kLeaseReportSent.
   bool Report(uint32_t lease, std::span<const uint8_t> payload, TimePoint now,
               SendRefusal* why = nullptr);
+  // Stage 4 (owned.h): a new value of this client's own row of an owned kind, keyed
+  // Player(self, peer epoch), slot 0, with the next revision of the client's own counter for the
+  // kind (from 1 in each peer epoch). Sent as OwnedDelta on the state lane; while the lane is held
+  // only the newest value per kind waits and goes when it opens (F1). false before StateHello.
+  bool WriteOwned(KindId kind, std::span<const uint8_t> value, TimePoint now);
   // Receive; Replica::Service; take every ready row, resolve its entity, call its adapter and
   // answer it with Replica::OnApplied (a release that answer causes is taken in the same pump, so a
   // dependency and its dependent can apply in one pump; Sol F2, draft 4); fulfil releasable

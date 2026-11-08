@@ -1,5 +1,7 @@
 #include "backend/server.h"
 
+#include "backend/owned.h"
+
 #include <algorithm>
 #include <deque>
 #include <map>
@@ -105,7 +107,8 @@ struct Server::Impl {
         digest(TableDigest(table_in)),
         state(table_in, limits_in),
         leases(limits_in),
-        requests(table_in, authorities_in, state, leases, limits_in) {}
+        requests(table_in, authorities_in, state, leases, limits_in),
+        owned(table_in) {}
 
   std::span<const KindSpec> table;
   Limits limits;
@@ -113,6 +116,9 @@ struct Server::Impl {
   WorldState state;
   LeaseTable leases;
   RequestTable requests;
+  // Stage 4: the admission of client-owned rows (owned.h). Holds nothing until a client sends an
+  // OwnedDelta, so a table without owned kinds never touches it.
+  OwnedAdmission owned;
   std::map<uint16_t, std::unique_ptr<Peer>> peers;
   std::map<uint16_t, uint32_t> epochs;  // the last peer epoch given to each peer id
   // The last baseline id given to each peer id: a rejoin's baseline never reuses an id of the
@@ -597,8 +603,34 @@ struct Server::Impl {
       requests.OnLeaseRenew(p.id, renew->id, now);
     } else if (auto* report = std::get_if<msg::LeaseReport>(&m)) {
       requests.OnLeaseReport(p.id, p.peer_epoch, report->id, report->payload, p.role, now);
+    } else if (auto* od = std::get_if<msg::OwnedDelta>(&m)) {
+      OnOwnedDelta(p, od->record, now);
     }
     Drain();
+  }
+
+  // Stage 4 (owned.h): a client's own player row. The six checks, then S's own write, so the row
+  // reaches every other peer through the change log. A refusal is counted always and reported as a
+  // kLimit event once per (peer, kind, reason) per second; a stale revision is never reported.
+  void OnOwnedDelta(Peer& p, const Record& r, TimePoint now) {
+    const OwnedVerdict v = owned.Admit(p.id, p.peer_epoch, r);
+    if (v == OwnedVerdict::kAdmitted) {
+      state.Put(r.key, r.value, now);
+      return;
+    }
+    if (owned.ShouldLog(p.id, r.key.kind, v, now)) {
+      const KindSpec* spec = FindKind(table, r.key.kind);
+      Event(ServerEvent::Type::kLimit, p.id).text =
+          "owned write refused " + std::to_string(p.id) + " " +
+          (spec ? std::string(spec->name) : std::to_string(r.key.kind)) + " (" +
+          std::string(OwnedVerdictName(v)) + ")";
+    }
+  }
+
+  // Stage 4: the peer epoch ended; a tomb for each owned row it wrote (section 3.5), S's only
+  // write to an owned kind.
+  void TombOwned(uint16_t peer, uint32_t peer_epoch, TimePoint now) {
+    for (const RecordKey& key : owned.EndPeerEpoch(peer, peer_epoch)) state.Remove(key, now);
   }
 
   // A request or a lease report: what S answers on the gameplay lane, so what PlayCap() holds back.
@@ -741,6 +773,7 @@ void Server::RemovePeer(uint16_t peer, TimePoint now) {
     for (const uint64_t id : p->ledger.RetireAll()) {
       impl_->ObligationEnded(peer, id, ObligationEnd::kRetiredPeerLeft);
     }
+    impl_->TombOwned(peer, p->peer_epoch, now);  // stage 4: the departed epoch's owned rows
     impl_->peers.erase(peer);
   }
   impl_->Drain();

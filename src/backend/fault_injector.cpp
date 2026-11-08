@@ -355,6 +355,8 @@ void KeysOf(const Message& m, std::vector<RecordKey>& out) {
     for (const Record& r : b->records) out.push_back(r.key);
   } else if (auto* e = std::get_if<msg::Effect>(&m)) {
     for (const Record& r : e->records) out.push_back(r.key);
+  } else if (auto* od = std::get_if<msg::OwnedDelta>(&m)) {  // stage 4
+    out.push_back(od->record.key);
   } else if (auto* q = std::get_if<msg::Request>(&m)) {
     if (q->request.basis.kind != 0) out.push_back(q->request.basis);
     if (q->request.subject.form != IdForm::kNone) {

@@ -6,11 +6,12 @@
 namespace skylanders::backend {
 
 // The variant's order is fixed: TypeOf maps an index to its type number through this table.
-static_assert(std::variant_size_v<Message> == 20);
+static_assert(std::variant_size_v<Message> == 21);
 static_assert(std::is_same_v<std::variant_alternative_t<0, Message>, msg::StateHello>);
 static_assert(std::is_same_v<std::variant_alternative_t<11, Message>, msg::Ack>);
 static_assert(std::is_same_v<std::variant_alternative_t<14, Message>, msg::Request>);
 static_assert(std::is_same_v<std::variant_alternative_t<19, Message>, msg::Effect>);
+static_assert(std::is_same_v<std::variant_alternative_t<20, Message>, msg::OwnedDelta>);  // stage 4
 
 namespace {
 
@@ -21,7 +22,7 @@ constexpr MessageType kTypeOfIndex[] = {
     MessageType::kObligation,    MessageType::kObligationAck,  MessageType::kAck,
     MessageType::kObligationDone, MessageType::kMismatch,      MessageType::kRequest,
     MessageType::kLeaseRenew,    MessageType::kLeaseReport,    MessageType::kDecision,
-    MessageType::kLeaseEnd,      MessageType::kEffect,
+    MessageType::kLeaseEnd,      MessageType::kEffect,         MessageType::kOwnedDelta,
 };
 static_assert(std::size(kTypeOfIndex) == std::variant_size_v<Message>);
 
@@ -53,6 +54,7 @@ constexpr NamedType kTypeNames[] = {
     {MessageType::kDecision, "decision"},
     {MessageType::kLeaseEnd, "lease_end"},
     {MessageType::kEffect, "effect"},
+    {MessageType::kOwnedDelta, "owned_delta"},
 };
 
 // --- Field writers. Each appends to `out` through `w` (the same vector), failing `w` on a field out
@@ -272,6 +274,7 @@ struct FieldWriter {
     w.U64(m.tick);
     PutRecords(w, out, m.records);
   }
+  void operator()(const msg::OwnedDelta& m) { PutRecord(w, out, m.record); }
 };
 
 // Reads one message's fields from `r` (exactly the message's bytes). nullopt: short or broken.
@@ -489,6 +492,13 @@ std::optional<Message> ReadFields(MessageType type, Reader& r) {
       msg::Effect m;
       m.tick = r.U64();
       if (!r.Ok() || !GetRecords(r, m.records)) return std::nullopt;
+      return m;
+    }
+    case MessageType::kOwnedDelta: {
+      msg::OwnedDelta m;
+      auto rec = DecodeRecord(r);
+      if (!rec || !r.Ok()) return std::nullopt;
+      m.record = std::move(*rec);
       return m;
     }
   }
