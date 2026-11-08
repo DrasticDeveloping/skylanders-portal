@@ -26,4 +26,44 @@ std::string FormatJoinCode(std::string_view code);
 // as 0 (Crockford's rule for symbols people mistype).
 std::optional<netplay::Endpoint> DecodeJoinCode(std::string_view code);
 
+// Join code v2 (stage 8 item 4, design D10): one code for the LAN and internet modes, carrying the
+// session's join secret. 85 bits, most significant first: kind (2 bits, 1; 1A's codes are kind 0),
+// revision (3 bits, 0; a later format inside kind 1 raises it), the IPv4 address (32), the port
+// (16) and the secret (32), as 17 Crockford base32 symbols, then one Luhn mod 32 check symbol
+// computed as 1A's: 18 symbols, shown "XXXX-XXXX-XXXX-XXXX-XX". The secret is drawn per session
+// from the OS random source and is never zero; it is not the owner token (which never appears in
+// a code) and grants only the right to ask to be let in. When the session wiring lands, 1A's
+// EncodeJoinCode and DecodeJoinCode above are retired (DecodeJoinCodeV2 already names their codes
+// "older version").
+constexpr size_t kJoinCodeV2Length = 18;
+constexpr uint32_t kJoinCodeV2Kind = 1;
+constexpr uint32_t kJoinCodeV2Revision = 0;
+
+struct JoinTarget {
+  netplay::Endpoint server;
+  uint32_t secret = 0;
+  auto operator<=>(const JoinTarget&) const = default;
+};
+
+enum class JoinCodeStatus : uint8_t {
+  kOk = 0,
+  kNotAJoinCode,  // wrong length or check, an unknown symbol, a zero address, port or secret
+  kOlderVersion,  // 11 symbols that decode as a 1A code
+  kNewerVersion,  // 18 symbols with kind 1 and a revision this build does not know, or another kind
+};
+// The refusal in plain words: "not a join code", "this code is from an older version", "this code
+// is from a newer version" ("" for kOk).
+const char* JoinCodeStatusText(JoinCodeStatus status);
+
+struct JoinCodeResult {
+  JoinCodeStatus status = JoinCodeStatus::kNotAJoinCode;
+  JoinTarget target;  // only for kOk
+};
+
+// The 18 symbols, upper case, no separators; empty if the address, port or secret is zero.
+// FormatJoinCode shows it in groups of four.
+std::string EncodeJoinCodeV2(const JoinTarget& target);
+// Reads either form, with the same leniency as DecodeJoinCode (case, dashes, spaces, I/L/O).
+JoinCodeResult DecodeJoinCodeV2(std::string_view code);
+
 }  // namespace skylanders::online

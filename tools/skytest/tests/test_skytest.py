@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +21,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
+import launch_args  # noqa: E402
+import remote_agent  # noqa: E402
 import skytest  # noqa: E402
 import winjob  # noqa: E402
 
@@ -43,6 +47,55 @@ def tearDownModule() -> None:
 
 def toml_str(p: Path | str) -> str:
     return "'" + str(p) + "'"  # literal string: backslashes stay
+
+
+# The throwaway game's launch tables (stage 8 item 6: every game's line comes from launch_args.py): the
+# settings these tests pass, and the fake game's own script commands.
+TEST_ALLOW = "".join(f'[settings.{n}]\nkind = "runner"\n' for n in launch_args.RUNNER_OWNED) + """
+[settings.audio_mute]
+kind = "bool"
+[settings.fullscreen]
+kind = "bool"
+[settings.window_hidden]
+kind = "bool"
+[settings.dev_skip_scenes]
+kind = "enum"
+values = ["true", "false", "movies"]
+[settings.dev_show_server_window]
+kind = "bool"
+[settings.render_hidden_draw]
+kind = "bool"
+[settings.trace_saves]
+kind = "bool"
+[settings.online_route_file]
+kind = "read_path"
+[settings.online_port]
+kind = "int"
+min = 1
+max = 65535
+[settings.frame_rate_limit]
+kind = "int"
+min = 0
+max = 1000
+[settings.x]
+kind = "int"
+min = 0
+max = 9
+[settings.y]
+kind = "int"
+min = 0
+max = 9
+[settings.dev_x]
+kind = "int"
+min = 0
+max = 9
+[settings.online_control_pipe]
+kind = "refused"
+reason = "Host names its own server's pipe"
+"""
+TEST_COMMANDS = "[commands]\n" + "".join(f'{c} = "none"\n' for c in (
+    "hang", "crash", "exit", "nopresent", "fps0", "scribble", "ownerwrite", "serverframes", "online_host",
+    "serverlog", "online_join", "savewrite"))
 
 
 class SkytestTest(unittest.TestCase):
@@ -88,6 +141,9 @@ args = ["--portal_mode=software", "--audio_mute=true", "--fullscreen=false"]
 timeout = 20
 machine_games = 16
 """, encoding="utf-8")
+        (self.repo / "tests" / "launch_allow.toml").write_text(TEST_ALLOW, encoding="utf-8")
+        (self.repo / "tests" / "script_commands.toml").write_text(TEST_COMMANDS, encoding="utf-8")
+        (self.repo / "tests" / "routes").mkdir()
         self.cfg = skytest.load_config(self.repo)
         self.cfg.start_gap = 0.0
         with contextlib.redirect_stdout(io.StringIO()):
@@ -733,19 +789,55 @@ quit
         self.assertTrue((a / "game.exe").is_file() and (a / "runtime.dll").is_file())
         self.assertTrue(skytest.inside(a, self.cfg.store))
 
-    def owned(self) -> list[str]:
-        return [f"--{k}=x" for k in skytest.RUNNER_OWNED] + ["--portal_mode=software"]
+    def test_the_snapshot_carries_the_routes_folder(self) -> None:
+        # Swap Force Online stage 8 item 5: Host refuses a session without routes/unsupported.toml
+        # beside the exe, so a snapshot keeps the build's routes folder; a changed policy is a new build.
+        routes = self.cfg.build / "routes"
+        routes.mkdir()
+        (routes / "unsupported.toml").write_text("[policy]\nformat = 1\nentries = 0\n", encoding="utf-8")
+        before = skytest.build_hash(self.cfg)
+        snap = skytest.snapshot_build(self.cfg)
+        self.assertTrue((snap / "routes" / "unsupported.toml").is_file())
+        self.assertFalse((snap / "unsupported.toml").exists())
+        self.assertTrue(skytest.snapshot_complete(snap, skytest.build_files(self.cfg), self.cfg))
+        (routes / "unsupported.toml").write_text("[policy]\nformat = 1\nentries = 00\n", encoding="utf-8")
+        self.assertNotEqual(skytest.build_hash(self.cfg), before)
 
     def test_refusals(self) -> None:
-        skytest.check_args(self.owned())
-        with self.assertRaises(skytest.SpecError):
-            skytest.check_args(self.owned() + ["--audio_mute="])  # an empty setting
-        with self.assertRaises(skytest.SpecError):
-            skytest.check_args(self.owned()[1:])  # no data folder
-        with self.assertRaises(skytest.SpecError):
-            skytest.check_args(self.owned() + ["--user_data_root=C:/owner"])  # a second data folder
-        with self.assertRaises(skytest.SpecError):
-            skytest.check_args(self.owned() + ["--portal_mode=usb"])  # the real portal
+        # Every game's line comes from the launch builder (launch_args.build_game): a refused setting or
+        # script command is a spec error, and no game starts.
+        path = self.spec("ref", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
+        for i, (args, script, why) in enumerate((
+                (["--audio_mute="], None, "empty setting"),
+                (["--user_data_root=C:/owner"], None, "runner-owned"),
+                (["--portal_mode=usb"], None, "portal_mode=software"),
+                (["--not_listed=1"], None, "not on the allow list"),
+                (["--online_control_pipe=x"], None, "refused in specs"),
+                (["--x=12"], None, "a whole number from 0 to 9"),
+                (["--online_route_file=" + str(self.repo / "elsewhere.toml")], None, "does not exist"),
+                ([], "save 82000000 10 ..\\..\\x.bin\nquit\n", "outside"),
+                ([], "renderdoc\nquit\n", "renderdoc is refused"),
+                ([], "teleport\nquit\n", "no command in the table"))):
+            with self.subTest(why):
+                spec = skytest.load_spec(path, 20)
+                spec.peers["H"].args = args
+                if script is not None:
+                    spec.peers["H"].script = script
+                run = skytest.make_run_dir(self.cfg, self.cfg.store / "runs" / f"refused-{i}")
+                with self.assertRaisesRegex(skytest.SpecError, why):
+                    skytest.prepare_peer(self.cfg, spec, "H", run)
+        # The line the builder returns: each runner-owned setting once, inside the peer's own folder.
+        d, args = skytest.prepare_peer(self.cfg, skytest.load_spec(path, 20), "H",
+                                       skytest.make_run_dir(self.cfg, self.cfg.store / "runs" / "fine"))
+        for key in skytest.RUNNER_OWNED:
+            self.assertEqual(len(skytest.setting_values(args, key)), 1, key)
+        self.assertEqual(skytest.setting_values(args, "input_script"), [str(d / "script.txt")])
+        self.assertEqual(skytest.setting_values(args, "game_data_root"), [str(self.cfg.rom.resolve())])
+        # Without the game's launch tables no game starts.
+        (self.repo / "tests" / "script_commands.toml").unlink()
+        with self.assertRaisesRegex(skytest.SpecError, "no launch script command table"):
+            skytest.prepare_peer(self.cfg, skytest.load_spec(path, 20), "H",
+                                 skytest.make_run_dir(self.cfg, self.cfg.store / "runs" / "untabled"))
         with self.assertRaises(SystemExit):
             skytest.check_output_path(self.cfg, Path(self.tmp.name) / "elsewhere")
         with self.assertRaises(SystemExit):
@@ -784,7 +876,9 @@ quit
         self.assertIn("portal_mode", case["reasons"][0])
 
     def test_repo_is_substituted_in_a_peers_args(self) -> None:
-        # G3 (stage 1B): a spec names a file of the checkout under test, e.g. the route file.
+        # G3 (stage 1B): a spec names a file of the checkout under test, e.g. the route file (a read path:
+        # it must exist under the checkout's tests/routes/).
+        (self.repo / "tests" / "routes" / "r.toml").write_text("[route]\n", encoding="utf-8")
         self.spec("routed", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n'
                   'args = ["--online_route_file={repo}/tests/routes/r.toml", "--trace_saves=true"]\n')
         case = self.run_cases("routed")["cases"][0]
@@ -1590,6 +1684,163 @@ def server_log(skip: bool = False, level_load: float = 8.0, ticks: int = 7000, b
 COMPARE = {"peer": "S", "noise": ["off1", "off2"], "test": ["on"], "window_end": "Online: End session: closing",
            "load_floor_s": 0.5, "reached": {"S": [r"Online: barrier 2 released at tick \d+ \(1 client\)"],
                                             "H": ["Online: the session ended"]}}
+
+
+@unittest.skipUnless(os.name == "nt", "the remote agent's games run in a Windows job")
+class RemotePeerTest(unittest.TestCase):
+    """A spec's kind = "remote" peer (stage 8 item 6) through a real remote agent on loopback, which starts
+    the fake game in place of the installed one; the agent's store stands for the second PC's."""
+
+    spec = SkytestTest.spec
+    run_cases = SkytestTest.run_cases
+    HUB = SkytestTest.HUB
+
+    def setUp(self) -> None:
+        SkytestTest.setUp(self)
+        root = Path(os.path.realpath(self.tmp.name))
+        self.rstore = root / "rstore"
+        self.rstore.mkdir()
+        install = root / "Install"
+        (install / "rom").mkdir(parents=True)
+        (install / "routes").mkdir()
+        entries = []
+        for name, data in {"swapforcerecompiled.exe": b"MZ game", "settings_template.toml": b"# settings\n"}.items():
+            (install / name).write_bytes(data)
+            entries.append({"name": name, "dest": "{app}", "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                            **({"role": "game"} if name.endswith(".exe") else {})})
+        self.manifest = json.dumps({"format": 1, "files": entries})
+        saves, figures = skytest.fixture_dirs(self.cfg)  # as the fixtures operation leaves them on R
+        shutil.copytree(saves, self.rstore / "fixtures" / "saves")
+        shutil.copytree(figures, self.rstore / "fixtures" / "figures")
+
+        def launcher(argv: list[str], cwd: Path, job: object):  # the fake game in place of the installed exe
+            return remote_agent.default_launcher([sys.executable, "-I", str(FAKE), *argv[1:]], cwd, job)
+
+        mach = remote_agent.Machine(self.rstore, install, launch_args.AllowList.parse(TEST_ALLOW),
+                                    launch_args.CommandTable.parse(TEST_COMMANDS), launcher=launcher)
+        self.token = bytes(range(16))
+        self.agent = remote_agent.Agent("127.0.0.1", 0, "127.0.0.0/8", mach,
+                                        hashlib.sha256(self.manifest.encode()).hexdigest(), token=self.token)
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.agent.serve, args=(self.stop,), daemon=True)
+        self.thread.start()
+        self.cfg.remote = skytest.RemoteTarget("127.0.0.1", self.agent.port, self.token, self.manifest)
+
+    def tearDown(self) -> None:
+        self.stop.set()
+        self.thread.join(10)
+        SkytestTest.tearDown(self)
+
+    FAR = 'layout = "server+2"\nstage = "0"\nstandin_seconds = 1\ntimeout = 40\n[peer.all]\n'
+
+    def test_a_remote_peer_runs_through_the_agent_and_its_files_come_back(self) -> None:
+        self.spec("far", self.FAR + self.HUB + 'expect = ["Where: town_state10"]\n[peer.D]\nkind = "remote"\n')
+        r = self.run_cases("far")
+        case = r["cases"][0]
+        self.assertEqual(case["status"], "pass", case)
+        d = next(p for p in case["peers"] if p["peer"] == "D")
+        self.assertEqual(d["command"][0], f"remote 127.0.0.1:{self.agent.port}")
+        self.assertNotIn("--portal_mode=software", d["command"])  # the agent passes it itself
+        self.assertIn("--dev_skip_scenes=true", d["command"])
+        self.assertEqual((d["exit_code"], d["levels"]), (0, ["town_state10"]))
+        folder = Path(case["folder"]) / "D"
+        self.assertIn("Input script: quit", (folder / "game.log").read_text(encoding="utf-8"))
+        self.assertIn("place 0 figures/Roller Brawl.dump", (folder / "script.txt").read_text(encoding="utf-8"))
+        self.assertEqual(json.loads((folder / "exit.json").read_text(encoding="utf-8"))["state"], "exited")
+        self.assertTrue((folder / "remote-plan.json").is_file())
+        self.assertFalse((folder / "cache").exists())  # the shader cache stays on R
+        self.assertEqual(list((self.rstore / "runs").iterdir()), [])  # cleaned after the collect
+        self.assertTrue(skytest.runs_alone(skytest.load_spec(self.repo / "tests" / "runtime" / "far.toml", 20)))
+
+    def test_a_remote_peer_that_ends_first_still_comes_back(self) -> None:
+        # D quits at once while H plays on: the agent closes the runner's connection once it is idle
+        # (IDLE_DEADLINE_S, 30 s; 3 s here, still above the runner's 2 s polls while D runs), and the
+        # collect after the case still brings D's files back.
+        self.spec("early", self.FAR + self.HUB + '[peer.D]\nkind = "remote"\nscript = "quit\\n"\n'
+                  '[peer.H]\nscript = "wait 900\\nquit\\n"\n')
+        idle = remote_agent.IDLE_DEADLINE_S
+        remote_agent.IDLE_DEADLINE_S = 3.0
+        try:
+            case = self.run_cases("early")["cases"][0]
+        finally:
+            remote_agent.IDLE_DEADLINE_S = idle
+        self.assertEqual(case["status"], "pass", case)
+        folder = Path(case["folder"]) / "D"
+        self.assertIn("Input script: quit", (folder / "game.log").read_text(encoding="utf-8"))
+        self.assertEqual(json.loads((folder / "exit.json").read_text(encoding="utf-8"))["state"], "exited")
+        self.assertEqual(list((self.rstore / "runs").iterdir()), [])
+
+    def test_collect_waits_out_the_agents_request_rate(self) -> None:
+        class Agent:  # refuses twice for its rate (200 requests a minute), then answers
+            counter = 0
+
+            def __init__(self) -> None:
+                self.replies = [{"ok": False, "error": "over 200 requests a minute"}] * 2 + [{"ok": True, "files": []}]
+
+            def call(self, op: str, **kw) -> dict:
+                self.counter += 1
+                return self.replies.pop(0)
+
+        rp = skytest.RemotePeer(Agent(), self.cfg.remote, "r", "D", Path(self.tmp.name), [])
+        retry = skytest.REMOTE_RATE_RETRY_S
+        skytest.REMOTE_RATE_RETRY_S = 0.01
+        try:
+            self.assertEqual(rp._call("collect", patient=True, run="r"), {"ok": True, "files": []})
+            self.assertEqual(self.cfg.remote.counter, 3)  # every request sent counts: a new connection goes on above
+            rp.client = Agent()
+            with self.assertRaisesRegex(skytest.RemoteError, "requests a minute"):
+                rp._call("status")  # only the collect waits: a refused status is the run's problem
+        finally:
+            skytest.REMOTE_RATE_RETRY_S = retry
+
+    def test_without_the_agent_a_remote_case_is_capacity(self) -> None:
+        self.spec("far", self.FAR + self.HUB + '[peer.D]\nkind = "remote"\n')
+        self.cfg.remote = None
+        case = self.run_cases("far")["cases"][0]
+        self.assertEqual(case["status"], "capacity")
+        self.assertIn("peer D runs on the second PC", case["reasons"][0])
+
+    def test_a_lost_agent_fails_the_remote_peer_and_ends_its_game(self) -> None:
+        self.spec("lost", self.FAR + self.HUB + '[peer.D]\nkind = "remote"\nscript = "hang\\nquit\\n"\n')
+
+        def stop_when_started() -> None:
+            end = time.monotonic() + 30
+            while time.monotonic() < end and not list((self.rstore / "runs").glob("*/D/game.log")):
+                time.sleep(0.1)
+            time.sleep(0.5)
+            self.stop.set()  # the agent goes away mid-run: its shutdown ends the game's job
+
+        threading.Thread(target=stop_when_started, daemon=True).start()
+        case = self.run_cases("lost")["cases"][0]
+        self.assertEqual(case["status"], "fail")
+        d = next(p for p in case["peers"] if p["peer"] == "D")
+        self.assertTrue(any("connection to the remote agent was lost" in why for why in d["reasons"]), d["reasons"])
+        exits = [json.loads(p.read_text(encoding="utf-8")) for p in (self.rstore / "runs").glob("*/exit.json")]
+        self.assertEqual([e["state"] for e in exits], ["ended: agent stopped"])
+
+    def test_remote_peers_are_checked(self) -> None:
+        bad = {
+            "owner": ('[peer.H]\nkind = "remote"\n', "runs on this PC"),
+            "two": ('[peer.D]\nkind = "remote"\n[peer.E]\nkind = "remote"\n', "one remote peer per case"),
+            "all": ('kind = "remote"\n', "has no kind"),
+            "kind": ('[peer.D]\nkind = "far"\n', "local or remote"),
+            "repo": ('[peer.D]\nkind = "remote"\nargs = ["--online_route_file={repo}/tests/routes/r.toml"]\n',
+                     "names this PC's checkout"),
+            "slots": ('[peer.D]\nkind = "remote"\nsave_slots = { "2" = 1 }\n', "remote: save_slots"),
+        }
+        for name, (extra, why) in bad.items():
+            with self.subTest(name):
+                layout = self.FAR.replace("server+2", "server+3")
+                with self.assertRaisesRegex(skytest.SpecError, why):
+                    skytest.load_spec(self.spec(name, layout + self.HUB + extra), 20)
+        target = skytest.remote_target("10.0.0.2:5000", None, str(self.repo / "tests" / "skytest.toml"),
+                                       ask=lambda prompt: "00" * 16)
+        self.assertEqual((target.host, target.port, target.token), ("10.0.0.2", 5000, bytes(16)))
+        for where, ask in (("10.0.0.2", "00" * 16), ("10.0.0.2:0", "00" * 16), ("10.0.0.2:5000", "abc")):
+            with self.assertRaises(SystemExit, msg=where):
+                skytest.remote_target(where, None, str(self.repo / "tests" / "skytest.toml"), ask=lambda prompt: ask)
+        self.assertEqual(skytest.remote_plan_name("x" * 80), "x" * 40)
+        self.assertEqual(skytest.remote_plan_name(".a b"), "a-b")
 
 
 class GateTest(unittest.TestCase):
