@@ -170,12 +170,12 @@ void ServerSession::HandleDatagram(const Endpoint& from, std::span<const uint8_t
     for (const Message& message : *messages) {
       // A refused or departed peer's connection only acks; what it still sends is dropped.
       if (peer.state != PeerState::kPending && peer.state != PeerState::kWelcomed) break;
-      HandleMessage(peer, message, now);
+      HandleMessage(peer, message, m.lane, now);
     }
   }
 }
 
-void ServerSession::HandleMessage(Peer& peer, const Message& message, TimePoint now) {
+void ServerSession::HandleMessage(Peer& peer, const Message& message, Lane lane, TimePoint now) {
   if (peer.state == PeerState::kPending) {
     if (const auto* hello = std::get_if<Hello>(&message)) HandleHello(peer, *hello, now);
     return;
@@ -231,6 +231,13 @@ void ServerSession::HandleMessage(Peer& peer, const Message& message, TimePoint 
   } else if (std::holds_alternative<SessionClosed>(message)) {
     requests_.OnClosed(peer.id);
     FlushRequests(now);
+  } else if (const auto* frame = std::get_if<BackendFrame>(&message)) {
+    ServerEvent e;
+    e.type = ServerEvent::Type::kBackendFrame;
+    e.peer_id = peer.id;
+    e.lane = lane;
+    e.frame = frame->bytes;
+    events_.push_back(std::move(e));
   } else if (const auto* scene = std::get_if<SceneBarrier>(&message)) {
     // A client only acknowledges; any other phase from it is dropped, and so is an ack that comes
     // after End session began (the scene barrier has nothing left to wait for).
@@ -293,6 +300,8 @@ void ServerSession::HandleHello(Peer& peer, const Hello& hello, TimePoint now) {
   w.server_tick = Tick(now);
   w.level_generation = generation_;
   w.level_zone = zone_;
+  w.backend_mode = settings_.backend_mode;
+  w.backend_table_digest = settings_.backend_table_digest;
   Post(peer, Lane::kGameplay, w, now);
 
   ServerEvent e;
@@ -405,6 +414,51 @@ void ServerSession::BroadcastPlayerList(TimePoint now) {
 bool ServerSession::Post(Peer& peer, Lane lane, const Message& message, TimePoint now) {
   const std::vector<uint8_t> bytes = Encoded(message);
   return !bytes.empty() && peer.conn->Send(lane, bytes, now) == netplay::SendResult::kSent;
+}
+
+namespace {
+// One backend frame as a BackendFrame message, sent on `lane` of `conn`.
+BackendSend SendFrame(netplay::Connection& conn, Lane lane, std::span<const uint8_t> frame,
+                      TimePoint now) {
+  if (frame.empty() || frame.size() > kMaxBackendFrameBytes) return BackendSend::kTooBig;
+  BackendFrame m;
+  m.bytes.assign(frame.begin(), frame.end());
+  const std::vector<uint8_t> bytes = Encoded(m);
+  if (bytes.empty()) return BackendSend::kTooBig;
+  switch (conn.Send(lane, bytes, now)) {
+    case netplay::SendResult::kSent: return BackendSend::kSent;
+    case netplay::SendResult::kWindowFull: return BackendSend::kFull;
+    default: return BackendSend::kTooBig;
+  }
+}
+}  // namespace
+
+BackendSend ServerSession::SendBackend(uint16_t peer_id, Lane lane, std::span<const uint8_t> frame,
+                                       TimePoint now) {
+  Peer* p = FindById(peer_id);
+  if (!p || p->state != PeerState::kWelcomed) return BackendSend::kGone;
+  return SendFrame(*p->conn, lane, frame, now);
+}
+
+size_t ServerSession::BackendUnacked(uint16_t peer_id, Lane lane) const {
+  for (const auto& [endpoint, peer] : peers_) {
+    if (peer->id == peer_id && peer->state == PeerState::kWelcomed) return peer->conn->Unacked(lane);
+  }
+  return 0;
+}
+
+std::chrono::microseconds ServerSession::BackendRtt(uint16_t peer_id) const {
+  for (const auto& [endpoint, peer] : peers_) {
+    if (peer->id == peer_id && peer->state == PeerState::kWelcomed) return peer->conn->SmoothedRtt();
+  }
+  return std::chrono::microseconds(0);
+}
+
+bool ServerSession::PeerConnected(uint16_t peer_id) const {
+  for (const auto& [endpoint, peer] : peers_) {
+    if (peer->id == peer_id && peer->state == PeerState::kWelcomed) return true;
+  }
+  return false;
 }
 
 void ServerSession::FlushRequests(TimePoint now) {
@@ -616,7 +670,7 @@ void ClientSession::Pump(TimePoint now) {
     while (conn_->Receive(m)) {
       auto messages = DecodeMessages(m.payload);
       if (!messages) continue;
-      for (const Message& message : *messages) HandleMessage(message, now);
+      for (const Message& message : *messages) HandleMessage(message, m.lane, now);
     }
   }
 
@@ -647,7 +701,7 @@ bool ClientSession::PollEvent(ClientEvent& out) {
   return true;
 }
 
-void ClientSession::HandleMessage(const Message& message, TimePoint now) {
+void ClientSession::HandleMessage(const Message& message, Lane lane, TimePoint now) {
   if (state_ != ClientState::kConnecting && state_ != ClientState::kConnected &&
       state_ != ClientState::kDisconnecting) {
     return;
@@ -667,6 +721,8 @@ void ClientSession::HandleMessage(const Message& message, TimePoint now) {
     ticks_.Reset(w->tick_hz != 0 ? w->tick_hz : 60);
     generation_ = w->level_generation;
     zone_ = w->level_zone;
+    backend_mode_ = w->backend_mode;
+    backend_table_digest_ = w->backend_table_digest;
     state_ = ClientState::kConnected;
     next_ping_ = now;  // the first ping goes in this Pump
     ClientEvent e;
@@ -675,6 +731,8 @@ void ClientSession::HandleMessage(const Message& message, TimePoint now) {
     e.generation = generation_;
     e.zone = zone_;
     e.tick = w->server_tick;
+    e.backend_mode = backend_mode_;
+    e.backend_table_digest = backend_table_digest_;
     events_.push_back(std::move(e));
     return;
   }
@@ -735,6 +793,12 @@ void ClientSession::HandleMessage(const Message& message, TimePoint now) {
     ClientEvent e;
     e.type = ClientEvent::Type::kReaction;
     e.reaction = *reaction;
+    events_.push_back(std::move(e));
+  } else if (const auto* frame = std::get_if<BackendFrame>(&message)) {
+    ClientEvent e;
+    e.type = ClientEvent::Type::kBackendFrame;
+    e.lane = lane;
+    e.frame = frame->bytes;
     events_.push_back(std::move(e));
   } else if (const auto* scene = std::get_if<SceneBarrier>(&message)) {
     if (scene->phase == ScenePhase::kAck) return;  // the clients' phase: not the server's to send
@@ -803,6 +867,11 @@ bool ClientSession::Post(Lane lane, const Message& message, TimePoint now) {
   if (!conn_) return false;
   const std::vector<uint8_t> bytes = Encoded(message);
   return !bytes.empty() && conn_->Send(lane, bytes, now) == netplay::SendResult::kSent;
+}
+
+BackendSend ClientSession::SendBackend(Lane lane, std::span<const uint8_t> frame, TimePoint now) {
+  if (!conn_ || state_ != ClientState::kConnected) return BackendSend::kGone;
+  return SendFrame(*conn_, lane, frame, now);
 }
 
 std::chrono::microseconds ClientSession::Rtt() const {

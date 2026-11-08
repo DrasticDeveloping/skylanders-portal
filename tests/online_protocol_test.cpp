@@ -657,6 +657,73 @@ void Version2Scenes() {
   }
 }
 
+// Version 3 (stage 3 section 3.2): BackendFrame and Welcome's backend fields.
+void Version3() {
+  // A frame is the rest of the message: round trip at one byte and at the limit; the type number.
+  {
+    CHECK(RoundTrip(BackendFrame{{0x03, 0x00, 0x01, 0x00, 0xAA}}));
+    BackendFrame big;
+    big.bytes.assign(kMaxBackendFrameBytes, 0x5A);
+    CHECK(RoundTrip(big));
+    const std::vector<uint8_t> b = EncodeMessage(big);
+    CHECK(b.size() == kMessageHeaderSize + kMaxBackendFrameBytes);
+    // A frame and its header fit one datagram's payload.
+    CHECK(b.size() <= skylanders::netplay::kMaxPayload);
+    CHECK((TypeOf(Message{BackendFrame{}}) == MessageType::kBackendFrame));
+    const std::vector<uint8_t> one = EncodeMessage(BackendFrame{{7}});
+    const std::vector<uint8_t> want = {22, 0, 1, 0, 7};
+    CHECK(one == want);
+  }
+  // Empty and oversize frames are neither encoded nor decoded.
+  {
+    CHECK(EncodeMessage(BackendFrame{}).empty());
+    BackendFrame over;
+    over.bytes.assign(kMaxBackendFrameBytes + 1, 1);
+    CHECK(EncodeMessage(over).empty());
+    std::vector<uint8_t> empty = {22, 0, 0, 0};
+    CHECK(!DecodeMessages(empty).has_value());
+    std::vector<uint8_t> raw = {22, 0};
+    const uint16_t n = uint16_t(kMaxBackendFrameBytes + 1);
+    raw.push_back(uint8_t(n & 0xFF));
+    raw.push_back(uint8_t(n >> 8));
+    raw.insert(raw.end(), n, 0);
+    CHECK(!DecodeMessages(raw).has_value());
+  }
+  // Two frames and a session message in one payload keep their order.
+  {
+    std::vector<uint8_t> b;
+    EncodeMessage(BackendFrame{{1, 2}}, b);
+    EncodeMessage(Ping{9}, b);
+    EncodeMessage(BackendFrame{{3}}, b);
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 3);
+    CHECK(((*back)[0] == Message{BackendFrame{{1, 2}}}));
+    CHECK(((*back)[2] == Message{BackendFrame{{3}}}));
+  }
+  // Welcome's backend mode and digest round-trip; a bit outside kBackendModeKnown is invalid both
+  // ways; a Welcome cut before the two fields (a version 2 Welcome) is cut short.
+  {
+    Welcome w{3, 0xDEADBEEF, 60, 0x0102030405060708ull, 7, "levels/zone_hub"};
+    w.backend_mode = kBackendModeRecordsPilot | kBackendModeChurn;
+    w.backend_table_digest = 0x1122334455667788ull;
+    CHECK(RoundTrip(w));
+    const std::vector<uint8_t> good = EncodeMessage(w);
+    REQUIRE_OR_RETURN_VOID(good.size() > 9);
+    w.backend_mode = 0x04;
+    CHECK(EncodeMessage(w).empty());
+    std::vector<uint8_t> bad = good;
+    bad[bad.size() - 9] = 0x80;  // the mode byte
+    CHECK(!DecodeMessages(bad).has_value());
+    std::vector<uint8_t> v2 = good;
+    v2.resize(v2.size() - 9);
+    const uint16_t len = uint16_t(v2.size() - kMessageHeaderSize);
+    v2[2] = uint8_t(len & 0xFF);
+    v2[3] = uint8_t(len >> 8);
+    CHECK(!DecodeMessages(v2).has_value());
+  }
+  CHECK(kProtocolVersion == 3);
+}
+
 }  // namespace
 
 int main() {
@@ -812,6 +879,7 @@ int main() {
   Version2LateStep();
   Version2Limits();
   Version2Scenes();
+  Version3();
 
   return Finish("online_protocol");
 }

@@ -22,7 +22,10 @@ namespace skylanders::online {
 // Version 2 (stage 1B, docs/online-1B.md section 2): the hero pose, attack presses, world
 // requests and their decisions, applied steps, level ends, reactions and End session's drain. A
 // version 1 game is refused at its Hello (kVersion), so the two never mix in one session.
-constexpr uint16_t kProtocolVersion = 2;
+// Version 3 (stage 3, the pilot; future/online-3.md section 3.2): BackendFrame, the backend's
+// frames on the session's lanes, and Welcome's backend mode and table digest. A version 2 game is
+// refused at its Hello the same way.
+constexpr uint16_t kProtocolVersion = 3;
 constexpr size_t kMaxNameBytes = 32;
 constexpr size_t kMaxZoneBytes = 128;
 constexpr size_t kMaxRefuseTextBytes = 200;
@@ -33,6 +36,16 @@ constexpr size_t kMessageHeaderSize = 4;
 // a chain with more steps than this is cut by the sender (stage 1B's two-player trigger, the
 // longest chain the design names, sends a handful).
 constexpr size_t kMaxAppliedSteps = 32;
+// The bytes one BackendFrame carries: the backend's kMaxFrameBytes (skylanders-portal
+// src/backend/limits.h), so a frame and its 4-byte message header fit a datagram's payload
+// (netplay kMaxPayload, 1174 bytes). The session library does not include the backend; the game's
+// bridge checks the two are equal.
+constexpr size_t kMaxBackendFrameBytes = 1152;
+// Welcome's backend_mode bits (stage 3 section 3.2, D4): what S's backend runs, fixed for the
+// session. 0: no backend (the setting off, the plain 1B path).
+constexpr uint8_t kBackendModeRecordsPilot = 0x01;  // online_records_pilot
+constexpr uint8_t kBackendModeChurn = 0x02;         // dev_backend_churn (the dev.churn kind)
+constexpr uint8_t kBackendModeKnown = kBackendModeRecordsPilot | kBackendModeChurn;
 
 using BuildDigest = std::array<uint8_t, 32>;
 using OwnerToken = std::array<uint8_t, 16>;  // all zero: none
@@ -60,6 +73,7 @@ enum class MessageType : uint16_t {
   kSessionClosing = 19,
   kSessionClosed = 20,
   kSceneBarrier = 21,
+  kBackendFrame = 22,
 };
 
 enum class RefuseReason : uint8_t {
@@ -83,7 +97,11 @@ struct Hello {
 };
 
 // Server to client: accepted. tick_hz is the rate of the server's tick (the client's tick
-// estimate needs it). level_generation 0: no level yet.
+// estimate needs it). level_generation 0: no level yet. Version 3 adds two fields at the end
+// (stage 3 section 3.2, D4): backend_mode (kBackendMode* bits; a bit outside kBackendModeKnown
+// makes the message invalid) and backend_table_digest (the digest of S's kind table for that
+// mode; 0 with mode 0). A client builds its kind table from the mode before its first level load
+// and leaves the session if its own digest for that mode differs.
 struct Welcome {
   uint16_t peer_id = 0;
   uint32_t session_id = 0;
@@ -91,6 +109,8 @@ struct Welcome {
   uint64_t server_tick = 0;
   uint32_t level_generation = 0;
   std::string level_zone;  // at most kMaxZoneBytes
+  uint8_t backend_mode = 0;
+  uint64_t backend_table_digest = 0;
   bool operator==(const Welcome&) const = default;
 };
 
@@ -507,10 +527,19 @@ struct SceneBarrier {
   bool operator==(const SceneBarrier&) const = default;
 };
 
+// Version 3 (stage 3 section 3.2; stage 2 section 3.7): one backend frame, either direction, on the
+// lane the backend chose for it (state or gameplay; the fast lane carries none in stage 3). The
+// bytes are the rest of the message: a run of the backend's own messages (type, length, fields),
+// which the session never reads. Empty or longer than kMaxBackendFrameBytes: invalid.
+struct BackendFrame {
+  std::vector<uint8_t> bytes;
+  bool operator==(const BackendFrame&) const = default;
+};
+
 using Message = std::variant<Hello, Welcome, Refuse, Bye, Ping, Pong, LevelRequest, LevelLoad,
                              LevelLoaded, BarrierGo, PlayerList, PlayerPose, PlayerAction,
                              WorldRequest, WorldDecision, AppliedStep, LevelEnd, Reaction,
-                             SessionClosing, SessionClosed, SceneBarrier>;
+                             SessionClosing, SessionClosed, SceneBarrier, BackendFrame>;
 MessageType TypeOf(const Message& message);
 
 // Appends one message to `out`. false (nothing appended) if a string is over its limit or not

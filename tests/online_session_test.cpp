@@ -27,6 +27,7 @@ using namespace skylanders::online;
 using namespace std::chrono_literals;
 using skylanders::netplay::Endpoint;
 using skylanders::netplay::FakeNetwork;
+using skylanders::netplay::Lane;
 using skylanders::netplay::LinkConditions;
 
 namespace {
@@ -845,6 +846,80 @@ void FakeNetworkScenes() {
 }
 
 // Real UDP sockets on 127.0.0.1 (port 0: any free one), real time.
+// Version 3 (stage 3 section 3.2): Welcome carries S's backend mode and digest; backend frames go
+// both ways on the lane they were sent on, in order; SendBackend's answers; a version 2 Hello is
+// refused.
+void FakeNetworkBackendFrames() {
+  World w(31);
+  ServerSettings s = Settings();
+  s.backend_mode = kBackendModeRecordsPilot;
+  s.backend_table_digest = 0xABCDEF0123456789ull;
+  REQUIRE_OR_RETURN_VOID(w.StartServer(s));
+  Client& c = w.Connect(MakeHello("Owner", true));
+  REQUIRE_OR_RETURN_VOID(w.RunUntil([&] { return c.session->Connected(); }));
+  const ClientEvent* connected = c.Last(CE::kConnected);
+  REQUIRE_OR_RETURN_VOID(connected);
+  CHECK(connected->backend_mode == kBackendModeRecordsPilot);
+  CHECK(connected->backend_table_digest == 0xABCDEF0123456789ull);
+  CHECK(c.session->BackendMode() == kBackendModeRecordsPilot);
+  const uint16_t peer = c.session->PeerId();
+
+  // S to the client: three frames on two lanes; each lane keeps its order.
+  const std::vector<uint8_t> a = {1, 0, 1, 0, 0xA1}, b = {3, 0, 1, 0, 0xB2}, d = {40, 0, 1, 0, 0xD3};
+  CHECK(w.server.SendBackend(peer, Lane::kState, a, w.net.Now()) == BackendSend::kSent);
+  CHECK(w.server.SendBackend(peer, Lane::kGameplay, d, w.net.Now()) == BackendSend::kSent);
+  CHECK(w.server.SendBackend(peer, Lane::kState, b, w.net.Now()) == BackendSend::kSent);
+  CHECK(w.server.BackendUnacked(peer, Lane::kState) >= 1);
+  CHECK(w.RunUntil([&] { return c.Count(CE::kBackendFrame) == 3; }));
+  std::vector<std::vector<uint8_t>> state, gameplay;
+  for (const ClientEvent& e : c.events) {
+    if (e.type != CE::kBackendFrame) continue;
+    (e.lane == Lane::kState ? state : gameplay).push_back(e.frame);
+  }
+  CHECK(state.size() == 2 && state[0] == a && state[1] == b);
+  CHECK(gameplay.size() == 1 && gameplay[0] == d);
+  CHECK(w.RunUntil([&] { return w.server.BackendUnacked(peer, Lane::kState) == 0; }));
+  CHECK(w.server.PeerConnected(peer));
+
+  // The client to S.
+  const std::vector<uint8_t> ack = {20, 0, 1, 0, 0x55};
+  CHECK(c.session->SendBackend(Lane::kState, ack, w.net.Now()) == BackendSend::kSent);
+  CHECK(w.RunUntil([&] { return w.Count(SE::kBackendFrame) == 1; }));
+  const ServerEvent* got = w.Last(SE::kBackendFrame);
+  CHECK(got && got->peer_id == peer && got->lane == Lane::kState && got->frame == ack);
+
+  // Refusals: no such peer, an empty frame, one over the limit.
+  CHECK(w.server.SendBackend(9, Lane::kState, a, w.net.Now()) == BackendSend::kGone);
+  CHECK(w.server.SendBackend(peer, Lane::kState, std::vector<uint8_t>{}, w.net.Now()) ==
+        BackendSend::kTooBig);
+  std::vector<uint8_t> over(kMaxBackendFrameBytes + 1, 1);
+  CHECK(w.server.SendBackend(peer, Lane::kState, over, w.net.Now()) == BackendSend::kTooBig);
+  CHECK(c.session->SendBackend(Lane::kState, over, w.net.Now()) == BackendSend::kTooBig);
+  CHECK(w.server.BackendUnacked(9, Lane::kState) == 0);
+  CHECK(w.server.BackendRtt(9).count() == 0);
+  CHECK(!w.server.PeerConnected(9));
+
+  // kFull: the client paused, S fills the lane's window; nothing past it is queued.
+  c.paused = true;
+  size_t sent = 0;
+  BackendSend r = BackendSend::kSent;
+  while (sent < skylanders::netplay::kLaneWindow + 8) {
+    r = w.server.SendBackend(peer, Lane::kState, a, w.net.Now());
+    if (r != BackendSend::kSent) break;
+    ++sent;
+  }
+  CHECK(r == BackendSend::kFull);
+  CHECK(w.server.BackendUnacked(peer, Lane::kState) <= skylanders::netplay::kLaneWindow);
+  c.paused = false;
+
+  // A version 2 game is refused at its Hello.
+  Hello old = MakeHello("Two");
+  old.protocol_version = 2;
+  Client& v = w.Connect(old);
+  CHECK(w.RunUntil([&] { return v.session->State() == ClientState::kRefused; }));
+  CHECK(v.Last(CE::kRefused) && v.Last(CE::kRefused)->refuse_reason == RefuseReason::kVersion);
+}
+
 void LoopbackSession() {
   ServerSession server;
   if (!server.Start("127.0.0.1", 0, Settings())) {
@@ -922,6 +997,7 @@ int main() {
   FakeNetworkRequests();
   FakeNetworkCloseGone();
   FakeNetworkScenes();
+  FakeNetworkBackendFrames();
   LoopbackSession();
   return Finish("online_session");
 }
