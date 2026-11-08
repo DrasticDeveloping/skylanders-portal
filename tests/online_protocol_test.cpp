@@ -303,10 +303,12 @@ void Version2Item11() {
     want.figure.elements = 0;
     CHECK(*got == want);
   }
-  // Half a trailing field is a cut message.
-  {
+  // Half a trailing field is a cut message: half the teleport counter, or the elements' low byte
+  // with no counter after it.
+  for (size_t cut : {size_t(1), size_t(3)}) {
     std::vector<uint8_t> b = EncodeMessage(pose);
-    b.pop_back();
+    REQUIRE_OR_RETURN_VOID(b.size() > kMessageHeaderSize + cut);
+    b.resize(b.size() - cut);
     b[2] = uint8_t(b.size() - kMessageHeaderSize);
     CHECK(!DecodeMessages(b));
   }
@@ -318,14 +320,17 @@ void Version2Item11() {
     p.figure.elements = uint16_t(kElementsKnown | (1u << 9));
     CHECK(EncodeMessage(p).empty());
     std::vector<uint8_t> b = EncodeMessage(pose);
-    REQUIRE_OR_RETURN_VOID(!b.empty());
-    b[b.size() - 1] = 0x02;  // bit 9
+    REQUIRE_OR_RETURN_VOID(b.size() > kMessageHeaderSize + 4);
+    // The elements (u16, little-endian) sit before stage 4's 2-byte teleport counter.
+    const size_t lo = b.size() - 4, hi = b.size() - 3;
+    REQUIRE_OR_RETURN_VOID(b[lo] == uint8_t(pose.figure.elements) && b[hi] == uint8_t(pose.figure.elements >> 8));
+    b[hi] = 0x02;  // bit 9
     CHECK(!DecodeMessages(b));
-    b[b.size() - 1] = 0;
-    b[b.size() - 2] = 0x08;  // bit 3 without kElementsKnown
+    b[hi] = 0;
+    b[lo] = 0x08;  // bit 3 without kElementsKnown
     CHECK(!DecodeMessages(b));
   }
-  // A later field after the elements is ignored, as for any message.
+  // A later field after the teleport counter is ignored, as for any message.
   {
     std::vector<uint8_t> b = EncodeMessage(pose);
     b.push_back(0x5A);
