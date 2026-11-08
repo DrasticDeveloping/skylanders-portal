@@ -2929,6 +2929,11 @@ REMOTE_STATUS_S = 2.0  # how often a remote peer's poll asks the agent (well ins
 REMOTE_LOG_CHUNKS = 8  # 1 MiB chunks of the remote game's log one poll pulls at most
 REMOTE_AGENT_ARGS = ("portal_mode", "audio_mute")  # the agent passes these itself (remote_agent.launch_plan)
 REMOTE_SKIP = ("cache/",)  # what collect leaves on the second PC: the peer's shader cache
+# The agent answers at most 200 requests a minute (remote_agent.REQUESTS_PER_MINUTE) and collect fetches
+# one per file: a refusal for that rate is waited out, retried every REMOTE_RATE_RETRY_S for up to
+# REMOTE_RATE_WAIT_S (past the agent's 60 s window).
+REMOTE_RATE_RETRY_S = 1.0
+REMOTE_RATE_WAIT_S = 65.0
 
 
 class RemoteError(Exception):
@@ -2991,12 +2996,26 @@ class RemotePeer:
         self._asked: float | None = None
         self._log = folder / "game.log"
 
-    def _call(self, op: str, **kw) -> dict:
-        r = self.client.call(op, **kw)
-        self.target.counter = self.client.counter
-        if not r.get("ok"):
-            raise RemoteError(str(r.get("error", "refused")))
-        return r
+    def _call(self, op: str, patient: bool = False, **kw) -> dict:
+        """One request. `patient` (collect's): a refusal for the agent's request rate is waited out."""
+        end = time.monotonic() + REMOTE_RATE_WAIT_S
+        while True:
+            r = self.client.call(op, **kw)
+            self.target.counter = self.client.counter
+            if r.get("ok"):
+                return r
+            why = str(r.get("error", "refused"))
+            if not (patient and "requests a minute" in why and time.monotonic() < end):
+                raise RemoteError(why)
+            time.sleep(REMOTE_RATE_RETRY_S)
+
+    def _reconnect(self) -> None:
+        """A new connection to the agent, its counter above every one sent: the agent closes one idle for
+        30 s (remote_agent.IDLE_DEADLINE_S), as when this peer's game ended long before the case's others."""
+        with contextlib.suppress(OSError):
+            self.client.close()
+        self.client = remote_agent.Client(self.target.host, self.target.port, self.target.token,
+                                          counter=max(time.time_ns(), self.target.counter), timeout=60.0)
 
     def _lost(self, e: Exception) -> None:
         if self.returncode is None:
@@ -3083,13 +3102,18 @@ class RemotePeer:
         try:
             if self.state in ("lost", "running"):
                 return
-            for f in self._call("collect", run=self.run_name)["files"]:
+            try:
+                listing = self._call("collect", patient=True, run=self.run_name)
+            except OSError:  # the agent closed the connection while it was idle: once more on a new one
+                self._reconnect()
+                listing = self._call("collect", patient=True, run=self.run_name)
+            for f in listing["files"]:
                 rel = str(f["path"])
                 sub = rel[len(self.peer) + 1:] if rel.startswith(self.peer + "/") else rel
                 if sub != rel or rel == "exit.json":
                     if not any(sub.startswith(s) for s in REMOTE_SKIP):
                         self._fetch(rel, sub)
-            self._call("clean", run=self.run_name)
+            self._call("clean", patient=True, run=self.run_name)
         except RemoteError as e:
             self.problems.append(f"collecting the remote run failed: {e}")
         except (OSError, ValueError, KeyError, TypeError) as e:
@@ -3106,7 +3130,7 @@ class RemotePeer:
         off = 0
         with open(dest, "wb") as out:
             while True:
-                r = self._call("collect", run=self.run_name, path=rel, offset=off)
+                r = self._call("collect", patient=True, run=self.run_name, path=rel, offset=off)
                 data = base64.b64decode(r.get("data", ""), validate=True)
                 out.write(data)
                 off += len(data)

@@ -1738,6 +1738,47 @@ class RemotePeerTest(unittest.TestCase):
         self.assertEqual(list((self.rstore / "runs").iterdir()), [])  # cleaned after the collect
         self.assertTrue(skytest.runs_alone(skytest.load_spec(self.repo / "tests" / "runtime" / "far.toml", 20)))
 
+    def test_a_remote_peer_that_ends_first_still_comes_back(self) -> None:
+        # D quits at once while H plays on: the agent closes the runner's connection once it is idle
+        # (IDLE_DEADLINE_S, 30 s; 3 s here, still above the runner's 2 s polls while D runs), and the
+        # collect after the case still brings D's files back.
+        self.spec("early", self.FAR + self.HUB + '[peer.D]\nkind = "remote"\nscript = "quit\\n"\n'
+                  '[peer.H]\nscript = "wait 900\\nquit\\n"\n')
+        idle = remote_agent.IDLE_DEADLINE_S
+        remote_agent.IDLE_DEADLINE_S = 3.0
+        try:
+            case = self.run_cases("early")["cases"][0]
+        finally:
+            remote_agent.IDLE_DEADLINE_S = idle
+        self.assertEqual(case["status"], "pass", case)
+        folder = Path(case["folder"]) / "D"
+        self.assertIn("Input script: quit", (folder / "game.log").read_text(encoding="utf-8"))
+        self.assertEqual(json.loads((folder / "exit.json").read_text(encoding="utf-8"))["state"], "exited")
+        self.assertEqual(list((self.rstore / "runs").iterdir()), [])
+
+    def test_collect_waits_out_the_agents_request_rate(self) -> None:
+        class Agent:  # refuses twice for its rate (200 requests a minute), then answers
+            counter = 0
+
+            def __init__(self) -> None:
+                self.replies = [{"ok": False, "error": "over 200 requests a minute"}] * 2 + [{"ok": True, "files": []}]
+
+            def call(self, op: str, **kw) -> dict:
+                self.counter += 1
+                return self.replies.pop(0)
+
+        rp = skytest.RemotePeer(Agent(), self.cfg.remote, "r", "D", Path(self.tmp.name), [])
+        retry = skytest.REMOTE_RATE_RETRY_S
+        skytest.REMOTE_RATE_RETRY_S = 0.01
+        try:
+            self.assertEqual(rp._call("collect", patient=True, run="r"), {"ok": True, "files": []})
+            self.assertEqual(self.cfg.remote.counter, 3)  # every request sent counts: a new connection goes on above
+            rp.client = Agent()
+            with self.assertRaisesRegex(skytest.RemoteError, "requests a minute"):
+                rp._call("status")  # only the collect waits: a refused status is the run's problem
+        finally:
+            skytest.REMOTE_RATE_RETRY_S = retry
+
     def test_without_the_agent_a_remote_case_is_capacity(self) -> None:
         self.spec("far", self.FAR + self.HUB + '[peer.D]\nkind = "remote"\n')
         self.cfg.remote = None
