@@ -291,6 +291,12 @@ void ServerSession::HandleHello(Peer& peer, const Hello& hello, TimePoint now) {
     SendRefuse(peer, RefuseReason::kOther, "synthetic peers are off", now, true);
     return;
   }
+  // A synthetic peer is a dev tool on this machine (tools/headless_peer): one from another address
+  // is refused even with allow_synthetic on (Opus 4 B6).
+  if ((hello.flags & kHelloSynthetic) != 0 && !netplay::IsLoopback(peer.endpoint.address)) {
+    SendRefuse(peer, RefuseReason::kOther, "synthetic peers only on loopback", now, true);
+    return;
+  }
   if (requests_.Closing()) {
     // End session's drain: a client welcomed now would never get SessionClosing nor be awaited.
     SendRefuse(peer, RefuseReason::kOther, "the session is ending", now, true);

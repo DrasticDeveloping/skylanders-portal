@@ -56,7 +56,8 @@ struct ServerSettings {
   uint8_t backend_mode = 0;
   uint64_t backend_table_digest = 0;
   // Stage 4 item 2: a Hello flagged kHelloSynthetic is welcomed only when this is set (the game's
-  // dev_synthetic_peers, off by default); otherwise it is refused kOther.
+  // dev_synthetic_peers, off by default) and it comes from a loopback address (127.x); otherwise
+  // it is refused kOther.
   bool allow_synthetic = false;
 };
 

@@ -484,6 +484,49 @@ void FakeNetworkHelloFlood() {
   CHECK(owner.session->Connected() && w.server.ConnectionCount() <= cap);
 }
 
+// Stage 4 item 2 (Opus 4 B6): a synthetic Hello is welcomed only with allow_synthetic on and from
+// a loopback address; from another address it is refused kOther even with the setting on. A plain
+// Hello from another address is unaffected.
+void FakeNetworkSyntheticHello() {
+  Hello synthetic = MakeHello("Synthetic");
+  synthetic.flags = kHelloSynthetic;
+  const auto join = [](World& w, uint32_t address, const Hello& h) -> Client& {
+    auto c = std::make_unique<Client>();
+    CHECK(c->session->Connect(w.net.Bind(address, 0), kServerEp, h, w.net.Now()));
+    w.clients.push_back(std::move(c));
+    return *w.clients.back();
+  };
+  {
+    World w(31);
+    ServerSettings s = Settings();
+    s.allow_synthetic = true;
+    CHECK(w.StartServer(s));
+    Client& lan = join(w, 0x0A000020, synthetic);  // 10.0.0.32: not this machine
+    CHECK(w.RunUntil([&] { return lan.session->State() == ClientState::kRefused; }));
+    REQUIRE_OR_RETURN_VOID(lan.Last(CE::kRefused) != nullptr);
+    CHECK(lan.Last(CE::kRefused)->refuse_reason == RefuseReason::kOther);
+    CHECK(lan.Last(CE::kRefused)->text == "synthetic peers only on loopback");
+    CHECK(w.Count(SE::kPeerJoined) == 0);
+    Client& local = join(w, 0x7F000002, synthetic);  // 127.0.0.2
+    CHECK(w.RunUntil([&] { return local.session->Connected(); }));
+    REQUIRE_OR_RETURN_VOID(w.Last(SE::kPeerJoined) != nullptr);
+    CHECK(w.Last(SE::kPeerJoined)->synthetic && w.server.PeerCount() == 1);
+    Client& plain = join(w, 0x0A000021, MakeHello("Plain"));
+    CHECK(w.RunUntil([&] { return plain.session->Connected(); }));
+    CHECK(!w.Last(SE::kPeerJoined)->synthetic && w.server.PeerCount() == 2);
+  }
+  {
+    // The setting off: refused from loopback too.
+    World w(32);
+    CHECK(w.StartServer(Settings()));
+    Client& local = join(w, 0x7F000002, synthetic);
+    CHECK(w.RunUntil([&] { return local.session->State() == ClientState::kRefused; }));
+    REQUIRE_OR_RETURN_VOID(local.Last(CE::kRefused) != nullptr);
+    CHECK(local.Last(CE::kRefused)->text == "synthetic peers are off");
+    CHECK(w.server.PeerCount() == 0);
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Version 2: requests through ServerSession's request table, on a lossy, reordering fake network
 // (docs/online-1B.md section 2, "The request state machine"; requests.h has the table's own
@@ -1092,6 +1135,7 @@ int main() {
   FakeNetworkStopAndQuiet();
   FakeNetworkReceiveBudget();
   FakeNetworkHelloFlood();
+  FakeNetworkSyntheticHello();
   FakeNetworkRequests();
   FakeNetworkRateDroppedPose();
   FakeNetworkCloseGone();
