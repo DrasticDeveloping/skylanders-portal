@@ -26,9 +26,10 @@
 //   may have left still goes the way Remove takes an owned entry (re-read, delete only if it still
 //   carries this session's tuple and nonce), whether Map or Renew was under way (Sol 8B F3).
 //
-// The IGD calls go through IgdClient. TODO(stage 8 item 4, OQ-C5): the miniupnpc-backed IgdClient
-// (miniupnpc as a nested submodule of the portal, the council's choice) and Host's three modes; until
-// then nothing in the game creates a PortMapper.
+// The IGD calls go through IgdClient. The system client is MakeSystemIgdClient (igd_system.h:
+// miniupnpc as a nested submodule of the portal, the council's choice, OQ-C5). The game creates a
+// PortMapper only through MappingLease, on S's mapping thread in Host's "Internet" mode (the game's
+// src/online/server/port_mapping_host.cpp).
 
 #include <array>
 #include <atomic>

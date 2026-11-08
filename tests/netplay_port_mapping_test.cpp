@@ -378,7 +378,7 @@ int main() {
     CHECK(lease.Stop() && igd.table.empty());
   }
   {
-    // No IGD (the system client is null until work/8-net, or no router answered): Start says so,
+    // No IGD (a portal built without miniupnpc, or no router answered): Start says so,
     // and Tick and Stop never fail.
     MappingLease lease(nullptr, me, 48800, "n4");
     const MappingResult r = lease.Start(TimePoint{});
