@@ -208,6 +208,42 @@ class SwapPairs(unittest.TestCase):
         self.assertEqual(r.graded, 0)
         self.assertTrue(any("missing release" in f for f in r.failures), r.failures)
 
+    def test_pressure_pair_outside_swap_refs_is_a_spec_error(self) -> None:
+        # Swap-ref mode: a pressure ref that is none of the case's swap refs is never dropped.
+        logs = {1: lines(swap(1, "E", 600), swap(2, "F", 700)),
+                2: lines(body(1, "E", "real", 1, 610), body(1, "F", "real", 2, 710))}
+        for swaps, pressure in (([(1, 1)], [((1, 2), 2)]), ([(1, 1)], [((1, 1, 3, 2), 2)]),
+                                ([(1, 1, 3, 1)], [((1, 2), 2)]), ([(1, 1, 3, 1)], [((1, 2, 3, 1), 2)])):
+            with self.assertRaises(ValueError, msg=(swaps, pressure)):
+                grade(logs, swaps=swaps, pressure=pressure)
+        # A (peer, swap sequence) pressure ref names a whole-key swap ref, and the other way round.
+        ok = {1: swap(1, "E", 600), 2: lines(body(1, "C", "stand-in", 1, 620), freed(1, 1, 1200),
+                                             body(1, "E", "real", 1, 1225))}
+        self.assertTrue(grade(ok, swaps=[(1, 1, 3, 1)], pressure=PRESSURE).passed)
+        self.assertTrue(grade(ok, swaps=[(1, 1)], pressure=[((1, 1, 3, 1), 2)]).passed)
+
+    def test_pressure_pair_of_no_ordered_swap_fails(self) -> None:
+        missing = "pressure pair (1, 1) on peer 2: names no ordered swap (missing)"
+        # Swap-ref mode: the ref is a swap ref of the case, but that swap was never logged.
+        logs = {1: "", 2: lines(body(1, "C", "stand-in", 1, 620), freed(1, 1, 1200),
+                                body(1, "E", "real", 1, 1225))}
+        for swaps in ([(1, 1)], [(1, 1, 3, 1)], {1: 1}):
+            r = grade(logs, swaps=swaps, pressure=PRESSURE)
+            self.assertFalse(r.passed, swaps)
+            self.assertIn(missing, r.failures, swaps)
+        # A whole-key pressure ref whose epoch differs from the swap the (peer, sequence) ref resolved to.
+        ok = {1: swap(1, "E", 600), 2: lines(body(1, "C", "stand-in", 1, 620), freed(1, 1, 1200),
+                                             body(1, "E", "real", 1, 1225))}
+        r = grade(ok, swaps=[(1, 1)], pressure=[((1, 2, 3, 1), 2)])
+        self.assertFalse(r.passed)
+        self.assertIn("pressure pair (1, 2, 3, 1) on peer 2: names no ordered swap (missing)", r.failures)
+        # Count mode: the pressure ref names a swap past the peer's ordered count.
+        logs = {1: lines(swap(1, "E", 600), swap(2, "F", 700)),
+                2: lines(body(1, "E", "real", 1, 610), body(1, "F", "real", 2, 710))}
+        r = grade(logs, swaps={1: 1}, pressure=[((1, 2), 2)])
+        self.assertFalse(r.passed)
+        self.assertIn("pressure pair (1, 2) on peer 2: names no ordered swap (missing)", r.failures)
+
     def test_slot_free_outside_pressure_fails(self) -> None:
         logs = {1: swap(1, "E", 600), 2: lines(body(1, "C", "stand-in", 1, 610), freed(1, 1, 620),
                                                body(1, "E", "real", 1, 630))}

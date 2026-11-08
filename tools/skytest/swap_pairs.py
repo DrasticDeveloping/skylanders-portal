@@ -34,10 +34,12 @@ Grading:
   log's line order deciding equal ticks (Sol F5). It grades the stand-in within max_ms of the
   reference and the real body within max_ms of the slot-free event (plan 2.7's fifth-character rule);
 - a slot-free event on a pair the case does not mark as pressure fails (it would otherwise escape
-  the ordinary grade's case or the pressure grade's).
+  the ordinary grade's case or the pressure grade's);
+- a pressure pair is never dropped: one that resolves to no ordered swap (its swap missing, or past
+  a peer's ordered count) fails with its own line.
 
-A case that orders no swap, names no receiver, or a swap without a receiver is a spec error
-(ValueError), never a pass. Standard library only; run with python -I.
+A case that orders no swap, names no receiver, a swap without a receiver, or (when it orders swap
+refs) a pressure pair whose ref is none of its swap refs is a spec error (ValueError), never a pass. Standard library only; run with python -I.
 """
 from __future__ import annotations
 
@@ -90,6 +92,12 @@ def _matches(ref: SwapRef, key: Key) -> bool:
     return ref == key if len(ref) == 4 else (ref[0], ref[1]) == (key[0], key[3])
 
 
+def _same_swap(a: SwapRef, b: SwapRef) -> bool:
+    """Whether two refs can name one swap without the logs: the same peer and swap sequence, and the
+    same whole key when both are whole keys."""
+    return (a[0], a[-1]) == (b[0], b[-1]) and (len(a) != 4 or len(b) != 4 or a == b)
+
+
 def _receiver_events(text: str) -> dict[Key, _Seen]:
     seen: dict[Key, _Seen] = {}
     for idx, line in enumerate(text.splitlines()):
@@ -139,6 +147,7 @@ def grade_swap_pairs(logs: Mapping[int, str], swaps: Mapping[int, int] | Iterabl
     # The case's ordered swaps, each resolved to its reference line or None (missing).
     required: list[tuple[int, tuple[Key, str, int] | None]] = []
     used: set[Key] = set()
+    refs: list[SwapRef] | None = None  # the case's swap refs (None when it orders counts)
     if isinstance(swaps, Mapping):
         counts = {int(p): int(c) for p, c in swaps.items()}
         if not counts or any(c < 1 for c in counts.values()):
@@ -174,17 +183,23 @@ def grade_swap_pairs(logs: Mapping[int, str], swaps: Mapping[int, int] | Iterabl
         if not any(r != peer for r in rec):
             raise ValueError(f"swap of peer {peer}: no receiver other than the swapper")
 
-    # The case's pressure pairs, resolved to keys (a pair of a missing swap already failed above).
+    # The case's pressure pairs, resolved to keys. A pair is never dropped: one that names no swap ref
+    # of the case is a spec error, and one that resolves to no ordered swap (its swap missing, or not
+    # among the first `count` swap lines) fails with its own line.
     swappers = {peer for peer, _ in required}
     pressure_set: set[tuple[Key, int]] = set()
     for ref_in, receiver in pressure:
         ref, receiver = _ref(ref_in), int(receiver)
         if ref[0] not in swappers or receiver not in rec or receiver == ref[0]:
             raise ValueError(f"pressure pair {ref} on peer {receiver}: not a pair of the ordered swaps and receivers")
+        if refs is not None and not any(_same_swap(ref, s) for s in refs):
+            raise ValueError(f"pressure pair {ref} on peer {receiver}: not one of the case's swap refs")
         hits = [o[0] for _, o in required if o is not None and _matches(ref, o[0])]
-        if len(hits) > 1:
+        if not hits:
+            res.failures.append(f"pressure pair {ref} on peer {receiver}: names no ordered swap (missing)")
+        elif len(hits) > 1:
             res.failures.append(f"pressure pair {ref} on peer {receiver}: {len(hits)} swaps match")
-        elif hits:
+        else:
             if (hits[0], receiver) in pressure_set:
                 raise ValueError(f"pressure pair {ref} on peer {receiver}: named twice")
             pressure_set.add((hits[0], receiver))
