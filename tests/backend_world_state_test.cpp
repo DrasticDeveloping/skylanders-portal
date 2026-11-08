@@ -596,6 +596,85 @@ BACKEND_TEST("AF2", ReplicaGraceMakesLate) {
   CHECK(r.PollEvent(e) && e.type == ReplicaEvent::Type::kRowLate && e.last == RowApply::kFailed);
 }
 
+BACKEND_TEST("AF2b", ReplicaGraceUnderContinuousReplacement) {
+  // AF2 answers each replacement before the next Service, so the key is waiting whenever Service
+  // looks. The client's pump receives first, then services, then applies (Client::Pump): a
+  // dependency replaced before every pump is ready, not waiting or failed, at each Service, and
+  // its grace clock from the first kWaiting or kFailed must still run out at the retained deadline
+  // (council B1). The toggle first answers at 0; the gate (first change after the toggle's) is
+  // held behind it; a newer toggle arrives before every pump through and past the grace while its
+  // entity stays pending (or every apply fails); then the entity comes.
+  for (const RowApply cause : {RowApply::kWaiting, RowApply::kFailed}) {
+    WorldState s(TableB(), {});
+    DirectClient c(TableB());
+    const RecordKey toggle = LevelKey(kToggle, 1), gate = LevelKey(kGate, 2);
+    const auto grace = std::chrono::milliseconds(FindKind(TableB(), kToggle)->pending_grace_ms);
+    if (cause == RowApply::kWaiting) {
+      c.spawn_at[toggle] = TimePoint::max();
+    } else {
+      c.fail_next[toggle] = 1000000;
+    }
+    s.BeginEpoch(1);                 // 1
+    CHECK(Subscribe(c.replica, 1, 1));
+    Subscription sub{kScopeAll, {1, 1}};
+    s.Put(toggle, V(1), kT0);        // 2
+    s.Put(gate, V(1), kT0);          // 3: on the toggle, first change 2 <= 3
+    Batch b = WalkBatch(s, 1, sub, 100);
+    Deliver(c, b);
+    uint64_t cursor = b.proven;
+    c.Pump(kT0);  // the toggle's first kWaiting or kFailed: its grace clock starts at 0
+    CHECK(c.handed == 1 && c.AppliedAt(toggle) < 0);
+    CHECK(c.AppliedAt(gate) < 0 && c.replica.FirstLsn(gate) == 3);
+    CHECK(!c.replica.Completes(Scope::kLevel, 3));
+    uint32_t value = 1;
+    TimePoint late_at = TimePoint::max(), released_at = TimePoint::max();
+    bool kept_clock = true, completes_early = false;
+    for (TimePoint now = kT0 + 100ms; now <= kT0 + grace + 2s; now += 100ms) {
+      // Receive: a newer toggle and its Through, so the entry is ready again when Service runs.
+      s.Put(toggle, V(++value), now);
+      b = WalkBatch(s, cursor, sub, 100);
+      Deliver(c, b);
+      cursor = b.proven;
+      if (c.replica.FirstLsn(toggle) != 2) kept_clock = false;
+      // Service, then ApplyReady.
+      c.Pump(now);
+      if (late_at == TimePoint::max() && c.Count(ReplicaEvent::Type::kRowLate) > 0) late_at = now;
+      if (released_at == TimePoint::max() && c.AppliedAt(gate) >= 0) released_at = now;
+      if (now < kT0 + grace && c.replica.Completes(Scope::kLevel, 3)) completes_early = true;
+    }
+    CHECK(kept_clock);  // the replacements kept the first change (and the clock) of 0
+    CHECK(late_at == kT0 + grace);
+    CHECK(released_at == kT0 + grace);
+    CHECK(!completes_early && c.replica.Completes(Scope::kLevel, 3));
+    // One row-late and one fence-broken event, however many Services followed.
+    CHECK(c.Count(ReplicaEvent::Type::kRowLate) == 1);
+    CHECK(c.Count(ReplicaEvent::Type::kFenceBroken) == 1);
+    for (const ReplicaEvent& e : c.events) {
+      if (e.type == ReplicaEvent::Type::kRowLate) CHECK(e.row == toggle && e.last == cause);
+      if (e.type == ReplicaEvent::Type::kFenceBroken) {
+        CHECK(e.row == gate && e.dependency == toggle && e.last == cause);
+      }
+    }
+    CHECK(c.AppliedAt(gate, 1) >= 0 && c.AppliedAt(toggle) < 0);
+    CHECK(c.replica.Unsettled() == 1);  // the late toggle, still handed out
+    // The toggle's entity comes (or its apply goes): one more replacement, applied at its newest
+    // revision, and nothing is left unsettled; no further event.
+    c.spawn_at.erase(toggle);
+    c.fail_next.erase(toggle);
+    const TimePoint end = kT0 + grace + 2s + 100ms;
+    s.Put(toggle, V(++value), end);
+    b = WalkBatch(s, cursor, sub, 100);
+    Deliver(c, b);
+    c.Pump(end);
+    const Record* last = s.Get(toggle);
+    CHECK(last && c.AppliedAt(toggle) >= 0 && c.AppliedAt(toggle) == c.AppliedAt(toggle, last->revision));
+    CHECK(c.world.contains(toggle) && c.world[toggle].value == V(value));
+    CHECK(c.replica.Unsettled() == 0);
+    CHECK(c.Count(ReplicaEvent::Type::kRowLate) == 1);
+    CHECK(c.Count(ReplicaEvent::Type::kFenceBroken) == 1);
+  }
+}
+
 BACKEND_TEST("AF3", ReplicaEpochDropsUnsettled) {
   Sr6Setup t;
   t.c.spawn_at[t.toggle] = TimePoint::max();

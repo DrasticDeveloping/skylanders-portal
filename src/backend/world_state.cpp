@@ -951,7 +951,10 @@ void Replica::Service(TimePoint now) {
   Impl& s = *impl_;
   bool any_late = false;
   for (auto& [key, e] : s.queue) {
-    if (e.state != Impl::QState::kWaiting && e.state != Impl::QState::kFailed) continue;
+    // The grace clock of every unsettled entry, whatever its state: a replacement keeps the clock
+    // but puts the entry back to ready or held (Enqueue), and the client receives before it
+    // services, so a key replaced before every Service is never waiting or failed here and would
+    // otherwise never turn late. `late` stays until the entry settles: one event per key.
     if (e.has_grace && !e.late &&
         now - e.grace_start >= std::chrono::milliseconds(s.GraceMs(key.kind))) {
       e.late = true;
@@ -962,6 +965,9 @@ void Replica::Service(TimePoint now) {
       ev.last = e.last;
       s.events.push_back(ev);
     }
+    // Retries: only a waiting or failed entry is handed out again (a ready one goes anyway, a held
+    // one waits for the fence).
+    if (e.state != Impl::QState::kWaiting && e.state != Impl::QState::kFailed) continue;
     if (!e.due) {
       e.due = true;
       s.due.push_back(key);

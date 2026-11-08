@@ -247,7 +247,8 @@ class Replica {
   // the key and may release fenced rows it held; kWaiting and kFailed keep it unsettled.
   void OnApplied(const RecordKey& key, uint32_t revision, RowApply result, TimePoint now);
   // Grace clocks: a key unsettled past its kind's pending_grace_ms (from its first kWaiting or
-  // kFailed) becomes late: the fence stops waiting for it (kRowLate, and kFenceBroken for each
+  // kFailed, whatever its state now: a replacement makes it ready or held again) becomes late,
+  // once until it settles: the fence stops waiting for it (kRowLate, and kFenceBroken for each
   // dependent it held); a late row is still handed out and applied if its entity comes.
   void Service(TimePoint now);
   bool PollEvent(ReplicaEvent& out);
