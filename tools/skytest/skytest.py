@@ -113,6 +113,7 @@ import winjob  # noqa: E402
 import backend_grades  # noqa: E402  (stage 3's backend grades: compare, faults, memory)
 import launch_args as la  # noqa: E402
 import remote_agent  # noqa: E402
+import remote_swap_grade  # noqa: E402  (stage 4's remote_swap grade over swap_pairs.py)
 
 STORE = ".replication-tests"
 CLIENTS = ["H", "D", "E", "F"]
@@ -136,7 +137,7 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
 # Where a hosted server (`server = "host"`) writes its log: the owner's session folder.
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
 GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
-          "symmetry", "route", "bandwidth") + backend_grades.NAMES
+          "symmetry", "route", "bandwidth", "remote_swap") + backend_grades.NAMES
 # The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
 # online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
 # for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
@@ -824,6 +825,12 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             try:
                 backend_grades.check(path.name, gname, g, names)
             except (backend_grades.GradeSpecError, re.error) as e:
+                raise SpecError(str(e)) from e
+            continue
+        if gname == "remote_swap":
+            try:
+                remote_swap_grade.check_remote_swap(path.name, g, names)
+            except remote_swap_grade.RemoteSwapSpecError as e:
                 raise SpecError(str(e)) from e
             continue
         if not isinstance(g, dict) or g.get("peer", "S" if gname == "server_frame_time" else "H") not in names:
@@ -1759,6 +1766,10 @@ def grade_cross_peer(spec: Spec, r: PeerResult, texts: dict[str, str], repo: Pat
             # Stage 3 (backend_grades.py): compare joins every peer's local lines; faults and memory
             # read their peer's log.
             r.graded[gname], why = backend_grades.grade(gname, texts, g, r.peer)
+            reasons += why
+        elif gname == "remote_swap" and g.get("peer", "S") == r.peer:
+            # Stage 4 (remote_swap_grade.py): every ordered swap on every named receiver, max_ms each.
+            r.graded[gname], why = remote_swap_grade.grade_remote_swap(texts, g, thresholds or {}, list(spec.peers))
             reasons += why
     return reasons
 
