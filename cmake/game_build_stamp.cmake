@@ -17,16 +17,18 @@ if(GIT)
                     OUTPUT_VARIABLE head OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE failed)
     if(NOT failed AND head)
         set(commit "${head}")
-        execute_process(COMMAND "${GIT}" -C "${REPO}" status --porcelain --ignore-submodules=none
-                        OUTPUT_VARIABLE status OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
-                        RESULT_VARIABLE status_failed)
+        # Dirty means a content difference: `git diff HEAD` (line endings normalized the way git
+        # stores the file) or an untracked file. Not `git status`: the codegen step rewrites
+        # generated/rexglue.cmake and swapforcerecomp_manifest.toml with other line endings at
+        # every build, which status lists as modified although their content equals HEAD, so every
+        # build of a clean commit would have read dirty.
+        execute_process(COMMAND "${GIT}" -C "${REPO}" diff HEAD --binary --submodule=diff
+                        OUTPUT_VARIABLE changes ERROR_QUIET RESULT_VARIABLE status_failed)
+        execute_process(COMMAND "${GIT}" -C "${REPO}" ls-files --others --exclude-standard
+                        OUTPUT_VARIABLE untracked OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
         if(status_failed)
             set(commit "${head}-dirty-unknown")
-        elseif(status)
-            execute_process(COMMAND "${GIT}" -C "${REPO}" diff HEAD --binary --submodule=diff
-                            OUTPUT_VARIABLE changes ERROR_QUIET)
-            execute_process(COMMAND "${GIT}" -C "${REPO}" ls-files --others --exclude-standard
-                            OUTPUT_VARIABLE untracked OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        elseif(changes OR untracked)
             if(untracked)
                 string(REPLACE "\n" ";" untracked "${untracked}")
                 foreach(path IN LISTS untracked)
