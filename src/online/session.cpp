@@ -286,6 +286,10 @@ void ServerSession::HandleHello(Peer& peer, const Hello& hello, TimePoint now) {
     SendRefuse(peer, RefuseReason::kNotOwner, "the owner token does not match", now, true);
     return;
   }
+  if ((hello.flags & kHelloSynthetic) != 0 && !settings_.allow_synthetic) {  // stage 4 item 2
+    SendRefuse(peer, RefuseReason::kOther, "synthetic peers are off", now, true);
+    return;
+  }
   if (requests_.Closing()) {
     // End session's drain: a client welcomed now would never get SessionClosing nor be awaited.
     SendRefuse(peer, RefuseReason::kOther, "the session is ending", now, true);
@@ -332,6 +336,7 @@ void ServerSession::HandleHello(Peer& peer, const Hello& hello, TimePoint now) {
   e.figure_id = hello.figure_id;
   e.figure_variant = hello.figure_variant;
   e.endpoint = peer.endpoint;
+  e.synthetic = (hello.flags & kHelloSynthetic) != 0;
   events_.push_back(std::move(e));
   BroadcastPlayerList(now);
 }
@@ -545,6 +550,25 @@ bool ServerSession::SendLevelEnd(uint16_t peer, const LevelEnd& end, TimePoint n
 bool ServerSession::SendReaction(uint16_t peer, const Reaction& reaction, TimePoint now) {
   Peer* p = FindById(peer);
   return p && Post(*p, Lane::kGameplay, reaction, now);
+}
+
+// Stage 4: to every welcomed client but the one the action or pose came from.
+bool ServerSession::SendPlayerActionShown(const PlayerActionShown& shown, TimePoint now) {
+  const std::vector<uint8_t> bytes = Encoded(shown);
+  if (!transport_ || bytes.empty()) return false;
+  for (auto& [endpoint, peer] : peers_) {
+    if (peer->state == PeerState::kWelcomed && peer->id != shown.peer) peer->conn->Send(Lane::kGameplay, bytes, now);
+  }
+  return true;
+}
+
+bool ServerSession::SendPlayerPoseShown(const PlayerPoseShown& shown, TimePoint now) {
+  const std::vector<uint8_t> bytes = Encoded(shown);
+  if (!transport_ || bytes.empty()) return false;
+  for (auto& [endpoint, peer] : peers_) {
+    if (peer->state == PeerState::kWelcomed && peer->id != shown.peer) peer->conn->Send(Lane::kFast, bytes, now);
+  }
+  return true;
 }
 
 bool ServerSession::SendSceneBarrier(const SceneBarrier& scene, TimePoint now) {
@@ -821,6 +845,16 @@ void ClientSession::HandleMessage(const Message& message, Lane lane, TimePoint n
     ClientEvent e;
     e.type = ClientEvent::Type::kReaction;
     e.reaction = *reaction;
+    events_.push_back(std::move(e));
+  } else if (const auto* shown = std::get_if<PlayerActionShown>(&message)) {  // stage 4
+    ClientEvent e;
+    e.type = ClientEvent::Type::kPlayerActionShown;
+    e.action_shown = *shown;
+    events_.push_back(std::move(e));
+  } else if (const auto* pose_shown = std::get_if<PlayerPoseShown>(&message)) {  // stage 4
+    ClientEvent e;
+    e.type = ClientEvent::Type::kPlayerPoseShown;
+    e.pose_shown = *pose_shown;
     events_.push_back(std::move(e));
   } else if (const auto* frame = std::get_if<BackendFrame>(&message)) {
     ClientEvent e;
