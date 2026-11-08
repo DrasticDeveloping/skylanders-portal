@@ -174,6 +174,10 @@ LetInTable::Add LetInTable::Offer(const PendingJoin& join, netplay::TimePoint no
     }
   }
   if (pending_.size() >= kMaxPendingJoins) return Add::kBusy;
+  const auto from_address = std::count_if(pending_.begin(), pending_.end(), [&](const PendingJoin& p) {
+    return p.from.address == join.from.address;
+  });
+  if (size_t(from_address) >= kMaxPendingPerAddress) return Add::kBusy;
   PendingJoin entry = join;
   entry.id = next_id_++;
   if (next_id_ == 0) next_id_ = 1;

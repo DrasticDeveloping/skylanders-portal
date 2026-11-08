@@ -40,9 +40,9 @@ namespace skylanders::online {
 //      kept decision whose Hello carries that secret skips this step, so a new code or a spent
 //      budget does not strand a joiner already waiting; any other Hello with an old code is a
 //      wrong code;
-//   6. let in: a joiner waits as a pending entry (at most 4, each expiring 60 s after it was shown,
-//      never a player slot) unless "let anyone with the code in" is on; the owner (a valid owner
-//      token, checked by the caller) skips the secret and let in;
+//   6. let in: a joiner waits as a pending entry (at most 4, at most 2 of them from one address,
+//      each expiring 60 s after it was shown, never a player slot) unless "let anyone with the code
+//      in" is on; the owner (a valid owner token, checked by the caller) skips the secret and let in;
 //   7. players: at most the session's maximum; one more is refused "full". The owner's Hello that
 //      replaces the owner's own connection (HelloFacts::replaces_owner) takes no new place.
 //
@@ -69,6 +69,9 @@ constexpr int kWrongSecretsPerSource = 4;
 constexpr auto kWrongSecretBlock = std::chrono::seconds(60);
 constexpr uint32_t kWrongSecretBudget = 4096;
 constexpr size_t kMaxPendingJoins = 4;
+// Of them, at most this many from one source address (council 8, Opus B5): one holder of the code
+// cannot take every pending place with several nonces, and two players behind one NAT still wait.
+constexpr size_t kMaxPendingPerAddress = 2;
 constexpr auto kPendingJoinExpiry = std::chrono::seconds(60);
 constexpr size_t kMaxDecided = 16;
 constexpr auto kDecidedLifetime = std::chrono::seconds(30);
@@ -159,7 +162,8 @@ class LetInTable {
  public:
   enum class Add { kAdded, kRetransmit, kBusy };
   // A new pending entry for (from, nonce), or the existing one for the same tuple (a retransmit:
-  // no second entry), or kBusy when kMaxPendingJoins are waiting. `id` gets the entry's id.
+  // no second entry), or kBusy when kMaxPendingJoins are waiting, or kMaxPendingPerAddress from
+  // that tuple's address. `id` gets the entry's id.
   Add Offer(const PendingJoin& join, netplay::TimePoint now, uint32_t* id);
   // The owner's decision takes the entry out (nullopt: no such entry, or it expired).
   std::optional<PendingJoin> Take(uint32_t id);

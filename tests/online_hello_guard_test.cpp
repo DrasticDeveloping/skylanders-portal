@@ -297,6 +297,36 @@ int main() {
     CHECK(gate.Pending().Pending().empty());
   }
 
+  // Council 8, Opus B5: at most 2 pending entries per address. A third nonce from the same address
+  // (any port) hears "busy" while two places are still free for other addresses; a retransmit of
+  // one of its two is still the same entry; once one of them is answered, the address may wait
+  // again.
+  {
+    HelloGate gate({0x1234, Key(20), false, 4}, t0);
+    TimePoint now = t0;
+    auto ask = [&](Endpoint from, uint64_t nonce) {
+      now += seconds(1);  // two Hellos a join, within the per-source rate
+      return Join(gate, Facts(from, nonce, 0, 0x1234), 1, now);
+    };
+    const uint32_t nat = 0x45000001;
+    HelloDecision a = ask({nat, 1000}, 1);
+    HelloDecision b = ask({nat, 1001}, 2);
+    CHECK(a.verdict == HelloVerdict::kWait && a.new_pending);
+    CHECK(b.verdict == HelloVerdict::kWait && b.new_pending);
+    CHECK(ask({nat, 1002}, 3).verdict == HelloVerdict::kBusy);
+    CHECK(ask({nat, 1000}, 4).verdict == HelloVerdict::kBusy);
+    HelloDecision a2 = ask({nat, 1000}, 1);
+    CHECK(a2.verdict == HelloVerdict::kWait && !a2.new_pending && a2.pending_id == a.pending_id);
+    CHECK(gate.Pending().Pending().size() == 2);
+    CHECK(ask({0x45000002, 1000}, 1).verdict == HelloVerdict::kWait);
+    CHECK(ask({0x45000003, 1000}, 1).verdict == HelloVerdict::kWait);
+    CHECK(gate.Pending().Pending().size() == 4);
+    CHECK(gate.Refuse(a.pending_id, now));
+    HelloDecision c = ask({nat, 1002}, 3);
+    CHECK(c.verdict == HelloVerdict::kWait && c.new_pending);
+    CHECK(gate.Pending().Pending().size() == 4);
+  }
+
   // The gate's order around the caller's own checks: limits and the cookie first (an incompatible
   // Hello without a cookie gets only a cookie reply, so no refusal goes to an unproven address),
   // then the caller's checks, before the owner, the secret and let in (no wrong secret is counted
