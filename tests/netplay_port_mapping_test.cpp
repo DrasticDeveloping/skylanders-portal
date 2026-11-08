@@ -1,6 +1,7 @@
 // The port mapping rules (stage 8 item 4, design D8) on recorded router answers: a fake IGD that
 // keeps a mapping table and a log of every call, so each test can say what was and was not sent.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -33,6 +34,10 @@ class FakeIgd : public IgdClient {
     auto it = table.find(port);
     if (it == table.end()) return kUpnpNoSuchEntry;
     *out = it->second;
+    // A router that does not return the description in full (council 8, Opus B6).
+    if (description_shown != std::string::npos) {
+      out->description.resize(std::min(out->description.size(), description_shown));
+    }
     return kUpnpOk;
   }
   int AddPortMapping(const PortMappingEntry& e) override {
@@ -92,6 +97,7 @@ class FakeIgd : public IgdClient {
   uint32_t external = kIp(203, 0, 113, 7);
   std::atomic<bool>* stop = nullptr;
   size_t stop_at_call = 0;
+  size_t description_shown = std::string::npos;  // how much of a description a read returns
 };
 
 std::vector<std::string> Ops(const FakeIgd& igd) {
@@ -195,6 +201,80 @@ int main() {
     CHECK(r.outcome == MappingOutcome::kMapped && r.external_port == 52001);
     CHECK(m.Remove());
     CHECK(igd.Count("delete", 52000) == 0 && igd.table.count(52000) == 1);
+  }
+
+  // Council 8, Opus B6: a router that does not return the description (or cuts it off). The re-read
+  // after the add shows this session's internal client and port without its nonce: the candidates
+  // stop there (one entry, not one per candidate), the entry is not owned (never renewed or
+  // deleted; it ends with its lease), and Host's line says so.
+  {
+    FakeIgd igd(1);
+    igd.external = kIp(8, 8, 4, 4);
+    igd.description_shown = 0;
+    PortMapper m(&igd, me, 52000, "u1");
+    const MappingResult r = m.Map();
+    CHECK(r.outcome == MappingOutcome::kUnconfirmed && r.external_port == 52000 && !m.owned());
+    CHECK(r.external_address == kIp(8, 8, 4, 4));
+    CHECK(r.message.find("port mapping unconfirmed (external 8.8.4.4:52000)") == 0);
+    CHECK(r.message.find("ends with its one-hour lease") != std::string::npos);
+    CHECK((Ops(igd) == std::vector<std::string>{"get 52000", "add 52000", "get 52000", "extip 0"}));
+    CHECK(igd.table.size() == 1 && igd.Count("add") == 1);
+    CHECK(!m.Renew() && !m.Remove());
+    CHECK(igd.Count("add") == 1 && igd.Count("delete") == 0 && igd.table.size() == 1);
+    // A cut-off description is the same.
+    FakeIgd cut(1);
+    cut.description_shown = 16;  // "Swap Force Onlin"
+    PortMapper c(&cut, me, 52000, "u2");
+    CHECK(c.Map().outcome == MappingOutcome::kUnconfirmed && cut.Count("add") == 1 && !c.owned());
+    // A non-public external address still says why internet hosting cannot work.
+    FakeIgd inner(1);
+    inner.external = kIp(192, 168, 0, 1);
+    inner.description_shown = 0;
+    PortMapper n(&inner, me, 52000, "u3");
+    CHECK(n.Map().message.find("double NAT") != std::string::npos);
+  }
+  {
+    // IGD v2: one AddAnyPortMapping, then the unconfirmed re-read: no second request, no delete.
+    FakeIgd igd(2);
+    igd.description_shown = 0;
+    PortMapper m(&igd, me, 52000, "u4");
+    const MappingResult r = m.Map();
+    CHECK(r.outcome == MappingOutcome::kUnconfirmed && r.external_port == 52000 && !m.owned());
+    CHECK((Ops(igd) == std::vector<std::string>{"addany 52000", "get 52000", "extip 0"}));
+    CHECK(!m.Remove() && igd.Count("delete") == 0 && igd.table.size() == 1);
+  }
+  {
+    // Only this session's internal port counts: the same client without a description but another
+    // internal port (another program on this PC) is a conflict, and the next candidate is mapped.
+    FakeIgd igd(1);
+    igd.race[52000] = Foreign(52000, me, "");
+    igd.race[52000].internal_port = 52010;
+    PortMapper m(&igd, me, 52000, "u5");
+    const MappingResult r = m.Map();
+    CHECK(r.outcome == MappingOutcome::kMapped && r.external_port == 52001 && m.owned());
+  }
+  {
+    // The lease of an unconfirmed entry: never renewed, never deleted.
+    const TimePoint t0{};
+    FakeIgd igd(1);
+    igd.description_shown = 0;
+    MappingLease lease(&igd, me, 48800, "u7");
+    CHECK(lease.Start(t0).outcome == MappingOutcome::kUnconfirmed && !lease.owned());
+    CHECK(lease.Tick(t0 + std::chrono::seconds(1800)).empty());
+    CHECK(!lease.Stop());
+    CHECK(igd.Count("add") == 1 && igd.Count("delete") == 0 && igd.table.size() == 1);
+  }
+  {
+    // The stop asked during the unconfirmed re-read: no address read, nothing deleted (not owned).
+    FakeIgd igd(1);
+    std::atomic<bool> stop{false};
+    igd.stop = &stop;
+    igd.stop_at_call = 3;
+    igd.description_shown = 0;
+    PortMapper m(&igd, me, 52000, "u8");
+    m.SetStop(&stop);
+    CHECK(m.Map().outcome == MappingOutcome::kUnconfirmed && !m.owned());
+    CHECK((Ops(igd) == std::vector<std::string>{"get 52000", "add 52000", "get 52000"}));
   }
 
   // Renewal and removal skipped when the entry no longer matches.

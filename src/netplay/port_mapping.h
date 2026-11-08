@@ -16,7 +16,12 @@
 // - An add that fails (718 ConflictInMappingEntry, 729 ConflictWithOtherMechanisms, anything else) is
 //   never followed by a delete, an overwrite or a second add on that external port.
 // - After a successful add the entry is read again and owned only if it carries this session's tuple
-//   and nonce; anything else is a conflict: not owned, never renewed or deleted.
+//   and nonce; anything else is a conflict: not owned, never renewed or deleted. One exception stops
+//   the candidates (council 8, Opus B6): a re-read that shows this session's internal client and
+//   internal port with no description, or a cut-off one (routers that do not return the description
+//   in full), is this session's add as far as anyone can tell, but not proved. It is not owned
+//   (never renewed or deleted, it ends with its lease), no further candidate is added, and Host says
+//   so (kUnconfirmed). So such a router keeps at most one entry of a session, not one per candidate.
 // - Only the owned entry is renewed and deleted, each after a re-read that still shows the owned tuple
 //   and nonce. A crash leaves it to its lease.
 // - NAT-PMP cannot prove a mapping is this session's, so no NAT-PMP mapping request (opcodes 1, 2) is
@@ -124,6 +129,10 @@ enum class MappingOutcome {
   kNatPmpOnly,           // "your router offers only NAT-PMP, which this version does not use ..."
   kNoUpnp,               // "no router answered UPnP"
   kStopped,              // the stop came first: nothing owned, nothing this session added left
+  // The add succeeded, but the re-read shows this session's internal client and port without its
+  // description (or with a cut-off one): not owned, left to its lease, no further candidate
+  // (council 8, Opus B6). "port mapping unconfirmed (external <addr>:<port>) ..."
+  kUnconfirmed,
 };
 
 struct MappingResult {
@@ -148,6 +157,8 @@ class PortMapper {
 
   // kStopped when the stop came before the mapping was done: no further candidate is tried, and an
   // entry already added has gone through Remove's re-read and delete (owned() is false then).
+  // kUnconfirmed when the re-read after an add showed this session's internal client and port but
+  // not its description: owned() stays false, and no further candidate is tried.
   MappingResult Map();
   // Renewal at half the lease: re-reads the owned entry and renews it only if it still carries the
   // owned tuple and nonce. False (and not owned any more) otherwise: "the router dropped the port
@@ -167,8 +178,15 @@ class PortMapper {
   bool IsOurs(const PortMappingEntry& e, uint16_t external_port) const;
 
  private:
+  // What the re-read after a successful add shows: this session's tuple and nonce, this session's
+  // internal client and port without the description in full (unconfirmed), or anything else.
+  enum class AfterAdd { kOurs, kUnconfirmed, kOther };
+  AfterAdd ReadAfterAdd(uint16_t external_port);
   bool OwnedAfterAdd(uint16_t external_port);
   MappingResult Mapped(uint16_t external_port);
+  // The add on `external_port` stands but is not proved this session's: not owned, never renewed
+  // or deleted, no further candidate.
+  MappingResult Unconfirmed(uint16_t external_port);
   bool Stopping() const { return stop_ != nullptr && stop_->load(); }
   // The stop after a successful add on `external_port`: the entry goes through Remove (re-read,
   // delete only if ours), then kStopped.

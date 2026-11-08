@@ -112,12 +112,26 @@ bool PortMapper::IsOurs(const PortMappingEntry& e, uint16_t external_port) const
          e.description == description_;
 }
 
-bool PortMapper::OwnedAfterAdd(uint16_t external_port) {
+PortMapper::AfterAdd PortMapper::ReadAfterAdd(uint16_t external_port) {
   PortMappingEntry got;
-  if (igd_->GetSpecificPortMappingEntry(external_port, "UDP", &got) != kUpnpOk) return false;
+  if (igd_->GetSpecificPortMappingEntry(external_port, "UDP", &got) != kUpnpOk) return AfterAdd::kOther;
   // Some routers leave the external port out of the answer to a lookup by that port.
   if (got.external_port == 0) got.external_port = external_port;
-  return IsOurs(got, external_port);
+  if (IsOurs(got, external_port)) return AfterAdd::kOurs;
+  // This session's internal client and port (the server's socket holds the port exclusively), with
+  // no description or the start of this session's own: a router that does not return the
+  // description in full (council 8, Opus B6). Any other description, another session's nonce
+  // included, is a conflict as before.
+  const bool cut_description = got.description.size() < description_.size() &&
+                               description_.compare(0, got.description.size(), got.description) == 0;
+  if (got.internal_client == internal_client_ && got.internal_port == port_ && cut_description) {
+    return AfterAdd::kUnconfirmed;
+  }
+  return AfterAdd::kOther;
+}
+
+bool PortMapper::OwnedAfterAdd(uint16_t external_port) {
+  return ReadAfterAdd(external_port) == AfterAdd::kOurs;
 }
 
 namespace {
@@ -156,6 +170,18 @@ MappingResult PortMapper::Mapped(uint16_t external_port) {
   return r;
 }
 
+MappingResult PortMapper::Unconfirmed(uint16_t external_port) {
+  // Never owned: Renew and Remove leave it alone, and it ends with its lease. The address read is
+  // skipped once the stop is asked (the server is ending: nobody reads the result).
+  MappingResult r;
+  r.outcome = MappingOutcome::kUnconfirmed;
+  r.external_port = external_port;
+  uint32_t address = 0;
+  if (!Stopping() && igd_->GetExternalIPAddress(&address) == kUpnpOk) r.external_address = address;
+  r.message = MappingMessage(r);
+  return r;
+}
+
 MappingResult PortMapper::Map() {
   MappingResult r;
   if (igd_ == nullptr) {
@@ -180,7 +206,9 @@ MappingResult PortMapper::Map() {
         break;  // the router refuses this request; asking again the same way changes nothing
       }
       if (Stopping()) return StoppedAfterAdd(reserved);
-      if (OwnedAfterAdd(reserved)) return Mapped(reserved);
+      const AfterAdd seen = ReadAfterAdd(reserved);
+      if (seen == AfterAdd::kOurs) return Mapped(reserved);
+      if (seen == AfterAdd::kUnconfirmed) return Unconfirmed(reserved);
       taken = true;  // the re-read shows another entry: a conflict, never renewed or deleted
       preferred = uint32_t(reserved) + 1;
     }
@@ -208,7 +236,9 @@ MappingResult PortMapper::Map() {
         continue;
       }
       if (Stopping()) return StoppedAfterAdd(uint16_t(p));
-      if (OwnedAfterAdd(uint16_t(p))) return Mapped(uint16_t(p));
+      const AfterAdd seen = ReadAfterAdd(uint16_t(p));
+      if (seen == AfterAdd::kOurs) return Mapped(uint16_t(p));
+      if (seen == AfterAdd::kUnconfirmed) return Unconfirmed(uint16_t(p));
       taken = true;
     }
   }
@@ -304,6 +334,17 @@ std::string MappingMessage(const MappingResult& r) {
       return "no router answered UPnP";
     case MappingOutcome::kStopped:
       return "stopped before the port was mapped (the server is ending)";
+    case MappingOutcome::kUnconfirmed: {
+      std::string m = "port mapping unconfirmed (external " +
+                      (r.external_address ? Dotted(r.external_address) : std::string("unknown address")) +
+                      ":" + std::to_string(r.external_port) +
+                      "): the router does not show it as this session's, so it is not renewed or removed "
+                      "and ends with its one-hour lease";
+      const AddressClass c =
+          r.external_address ? ClassifyExternalAddress(r.external_address) : AddressClass::kPublic;
+      if (c != AddressClass::kPublic) return m + "; " + AddressClassMessage(c);
+      return m;
+    }
   }
   return {};
 }
