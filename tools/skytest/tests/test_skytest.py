@@ -19,6 +19,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
+import launch_args  # noqa: E402
 import skytest  # noqa: E402
 import winjob  # noqa: E402
 
@@ -43,6 +44,55 @@ def tearDownModule() -> None:
 
 def toml_str(p: Path | str) -> str:
     return "'" + str(p) + "'"  # literal string: backslashes stay
+
+
+# The throwaway game's launch tables (stage 8 item 6: every game's line comes from launch_args.py): the
+# settings these tests pass, and the fake game's own script commands.
+TEST_ALLOW = "".join(f'[settings.{n}]\nkind = "runner"\n' for n in launch_args.RUNNER_OWNED) + """
+[settings.audio_mute]
+kind = "bool"
+[settings.fullscreen]
+kind = "bool"
+[settings.window_hidden]
+kind = "bool"
+[settings.dev_skip_scenes]
+kind = "enum"
+values = ["true", "false", "movies"]
+[settings.dev_show_server_window]
+kind = "bool"
+[settings.render_hidden_draw]
+kind = "bool"
+[settings.trace_saves]
+kind = "bool"
+[settings.online_route_file]
+kind = "read_path"
+[settings.online_port]
+kind = "int"
+min = 1
+max = 65535
+[settings.frame_rate_limit]
+kind = "int"
+min = 0
+max = 1000
+[settings.x]
+kind = "int"
+min = 0
+max = 9
+[settings.y]
+kind = "int"
+min = 0
+max = 9
+[settings.dev_x]
+kind = "int"
+min = 0
+max = 9
+[settings.online_control_pipe]
+kind = "refused"
+reason = "Host names its own server's pipe"
+"""
+TEST_COMMANDS = "[commands]\n" + "".join(f'{c} = "none"\n' for c in (
+    "hang", "crash", "exit", "nopresent", "fps0", "scribble", "ownerwrite", "serverframes", "online_host",
+    "serverlog", "online_join", "savewrite"))
 
 
 class SkytestTest(unittest.TestCase):
@@ -88,6 +138,9 @@ args = ["--portal_mode=software", "--audio_mute=true", "--fullscreen=false"]
 timeout = 20
 machine_games = 16
 """, encoding="utf-8")
+        (self.repo / "tests" / "launch_allow.toml").write_text(TEST_ALLOW, encoding="utf-8")
+        (self.repo / "tests" / "script_commands.toml").write_text(TEST_COMMANDS, encoding="utf-8")
+        (self.repo / "tests" / "routes").mkdir()
         self.cfg = skytest.load_config(self.repo)
         self.cfg.start_gap = 0.0
         with contextlib.redirect_stdout(io.StringIO()):
@@ -733,19 +786,41 @@ quit
         self.assertTrue((a / "game.exe").is_file() and (a / "runtime.dll").is_file())
         self.assertTrue(skytest.inside(a, self.cfg.store))
 
-    def owned(self) -> list[str]:
-        return [f"--{k}=x" for k in skytest.RUNNER_OWNED] + ["--portal_mode=software"]
-
     def test_refusals(self) -> None:
-        skytest.check_args(self.owned())
-        with self.assertRaises(skytest.SpecError):
-            skytest.check_args(self.owned() + ["--audio_mute="])  # an empty setting
-        with self.assertRaises(skytest.SpecError):
-            skytest.check_args(self.owned()[1:])  # no data folder
-        with self.assertRaises(skytest.SpecError):
-            skytest.check_args(self.owned() + ["--user_data_root=C:/owner"])  # a second data folder
-        with self.assertRaises(skytest.SpecError):
-            skytest.check_args(self.owned() + ["--portal_mode=usb"])  # the real portal
+        # Every game's line comes from the launch builder (launch_args.build_game): a refused setting or
+        # script command is a spec error, and no game starts.
+        path = self.spec("ref", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
+        for i, (args, script, why) in enumerate((
+                (["--audio_mute="], None, "empty setting"),
+                (["--user_data_root=C:/owner"], None, "runner-owned"),
+                (["--portal_mode=usb"], None, "portal_mode=software"),
+                (["--not_listed=1"], None, "not on the allow list"),
+                (["--online_control_pipe=x"], None, "refused in specs"),
+                (["--x=12"], None, "a whole number from 0 to 9"),
+                (["--online_route_file=" + str(self.repo / "elsewhere.toml")], None, "does not exist"),
+                ([], "save 82000000 10 ..\\..\\x.bin\nquit\n", "outside"),
+                ([], "renderdoc\nquit\n", "renderdoc is refused"),
+                ([], "teleport\nquit\n", "no command in the table"))):
+            with self.subTest(why):
+                spec = skytest.load_spec(path, 20)
+                spec.peers["H"].args = args
+                if script is not None:
+                    spec.peers["H"].script = script
+                run = skytest.make_run_dir(self.cfg, self.cfg.store / "runs" / f"refused-{i}")
+                with self.assertRaisesRegex(skytest.SpecError, why):
+                    skytest.prepare_peer(self.cfg, spec, "H", run)
+        # The line the builder returns: each runner-owned setting once, inside the peer's own folder.
+        d, args = skytest.prepare_peer(self.cfg, skytest.load_spec(path, 20), "H",
+                                       skytest.make_run_dir(self.cfg, self.cfg.store / "runs" / "fine"))
+        for key in skytest.RUNNER_OWNED:
+            self.assertEqual(len(skytest.setting_values(args, key)), 1, key)
+        self.assertEqual(skytest.setting_values(args, "input_script"), [str(d / "script.txt")])
+        self.assertEqual(skytest.setting_values(args, "game_data_root"), [str(self.cfg.rom.resolve())])
+        # Without the game's launch tables no game starts.
+        (self.repo / "tests" / "script_commands.toml").unlink()
+        with self.assertRaisesRegex(skytest.SpecError, "no launch script command table"):
+            skytest.prepare_peer(self.cfg, skytest.load_spec(path, 20), "H",
+                                 skytest.make_run_dir(self.cfg, self.cfg.store / "runs" / "untabled"))
         with self.assertRaises(SystemExit):
             skytest.check_output_path(self.cfg, Path(self.tmp.name) / "elsewhere")
         with self.assertRaises(SystemExit):
@@ -784,7 +859,9 @@ quit
         self.assertIn("portal_mode", case["reasons"][0])
 
     def test_repo_is_substituted_in_a_peers_args(self) -> None:
-        # G3 (stage 1B): a spec names a file of the checkout under test, e.g. the route file.
+        # G3 (stage 1B): a spec names a file of the checkout under test, e.g. the route file (a read path:
+        # it must exist under the checkout's tests/routes/).
+        (self.repo / "tests" / "routes" / "r.toml").write_text("[route]\n", encoding="utf-8")
         self.spec("routed", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n'
                   'args = ["--online_route_file={repo}/tests/routes/r.toml", "--trace_saves=true"]\n')
         case = self.run_cases("routed")["cases"][0]

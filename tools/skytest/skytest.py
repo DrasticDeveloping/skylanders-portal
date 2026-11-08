@@ -70,7 +70,11 @@ lifecycle script (it boots hidden and quits); it runs no case script.
 
 Rules the runner enforces (docs/RULES.md of the game): outputs only inside the worktree's
 .replication-tests/; never under the owner's data folder, never into the disc; the build is copied
-into a snapshot and run from there, never from the build folder; every setting passed is non-empty;
+into a snapshot and run from there, never from the build folder; every game's command line and input
+script come from the launch builder (launch_args.py, against the game's tests/launch_allow.toml and
+tests/script_commands.toml), which refuses an empty setting, a runner-owned one set twice, a path
+outside the peer's own run folder, a setting off the allow list and a script command that writes
+outside the run folder;
 every game is in a job object, so none outlives the run; a case that cannot run says why in its
 report (capacity, missing fixture, spec error) instead of being skipped silently. A runner with a
 restricted token (an agent sandbox) starts no game unless --allow-restricted (its games could not use
@@ -101,6 +105,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import winjob  # noqa: E402
 import backend_grades  # noqa: E402  (stage 3's backend grades: compare, faults, memory)
+import launch_args as la  # noqa: E402
 
 STORE = ".replication-tests"
 CLIENTS = ["H", "D", "E", "F"]
@@ -367,6 +372,11 @@ class Config:
     # command put in front of its test binary (only the runner's own tests set that one).
     ctest: list[str] = field(default_factory=list)
     unit_launcher: list[str] = field(default_factory=list)
+    # The launch builder's two tables (launch_args.py, design D21): the top-level `launch_allow` and
+    # `script_commands` of tests/skytest.toml, by default tests/launch_allow.toml and
+    # tests/script_commands.toml. No game starts without them (launch_tables).
+    launch_allow: Path | None = None
+    script_commands: Path | None = None
 
 
 def main_store(repo: Path) -> Path:
@@ -444,6 +454,8 @@ def load_config(repo: Path) -> Config:
         slots=main_store(repo) / "slots",
         ctest=[os.path.expandvars(x) for x in g.get("ctest", [])],
         unit_launcher=[os.path.expandvars(x) for x in g.get("unit_launcher", [])],
+        launch_allow=repo / c.get("launch_allow", "tests/launch_allow.toml"),
+        script_commands=repo / c.get("script_commands", "tests/script_commands.toml"),
     )
 
 
@@ -451,23 +463,9 @@ def load_config(repo: Path) -> Config:
 
 
 def owner_data_roots() -> list[Path]:
-    home = Path(os.environ.get("USERPROFILE") or Path.home())
-    docs = [home / "Documents", home / "OneDrive" / "Documents"]
-    for var in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
-        if os.environ.get(var):
-            docs.append(Path(os.environ[var]) / "Documents")
-    if os.name == "nt":
-        try:
-            import winreg
-
-            key = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
-                value, _ = winreg.QueryValueEx(k, "Personal")
-            if value:
-                docs.append(Path(os.path.expandvars(value)))
-        except OSError:
-            pass
-    return [d / "Skylanders" for d in docs]
+    """The owner's data folders (every Documents\\Skylanders the user can have): the launch builder's
+    list (launch_args.owner_data_roots), one for the runner's own outputs and every game's settings."""
+    return la.owner_data_roots()
 
 
 def inside(path: Path, folder: Path) -> bool:
@@ -507,30 +505,12 @@ def gate_cadence(case: dict) -> str:
         return "daily"
     return GATE_PER_BUILD if g == GATE_PER_BUILD else ""
 
-# Settings the runner sets for each peer itself. A case or the defaults may not set them again: the
-# game takes the last of two, so a second --user_data_root would point a test at any folder.
-RUNNER_OWNED = ("user_data_root", "cache_root", "config_file", "log_file", "portal_figures_dir",
-                "game_data_root", "input_script")
-
-
-def check_args(args: list[str]) -> None:
-    """A setting with an empty value makes the game drop its whole command line (and run on the
-    owner's real data): refuse it. Each runner-owned setting appears exactly once, and the portal is
-    the software one (a real portal would get the test's writes)."""
-    counts: dict[str, int] = {}
-    for a in args:
-        if a.startswith("--") and a.endswith("="):
-            raise SpecError(f"refusing an empty setting {a!r}: the game would ignore its whole command line")
-        if a.startswith("--"):
-            key = a[2:].split("=", 1)[0]
-            key = key[3:] if key.startswith("no-") else key
-            counts[key] = counts.get(key, 0) + 1
-    for key in RUNNER_OWNED:
-        if counts.get(key, 0) != 1:
-            raise SpecError(f"refusing to start a game with --{key} set {counts.get(key, 0)} times (the runner"
-                             " sets it once, for the peer's own copy)")
-    if counts.get("portal_mode", 0) != 1 or "--portal_mode=software" not in args:
-        raise SpecError("refusing to start a game without exactly one --portal_mode=software")
+# Settings the runner sets for each peer itself (launch_args.RUNNER_OWNED). A case or the defaults may
+# not set them again: the game takes the last of two, so a second --user_data_root would point a test at
+# any folder. The whole command line is checked by the launch builder (launch_args.check_args, through
+# build_game in prepare_peer): no empty value, each of these once and inside the peer's run folder,
+# exactly one --portal_mode=software, every other setting on the game's allow list.
+RUNNER_OWNED = la.RUNNER_OWNED
 
 
 # --- specs ----------------------------------------------------------------------------------------
@@ -2840,38 +2820,56 @@ def scene_policy(cfg: Config, spec: Spec) -> str:
     return "none (no scenes key, no --" + SCENE_SETTING + "): refused"
 
 
+def launch_tables(cfg: Config) -> tuple[la.AllowList, la.CommandTable]:
+    """The game's two launch tables (Config.launch_allow, Config.script_commands): every setting a game
+    may get, with its value kind, and every script command the game registers. Without them no game
+    starts."""
+    for path, what in ((cfg.launch_allow, "allow list"), (cfg.script_commands, "script command table")):
+        if path is None or not path.is_file():
+            raise SpecError(f"no launch {what} at {path}: the launch builder (launch_args.py) checks every"
+                            " game's settings and input script against the game's own tables")
+    try:
+        return la.AllowList.load(cfg.launch_allow), la.CommandTable.load(cfg.script_commands)
+    except (la.LaunchError, OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        raise SpecError(f"the launch tables do not read: {e}") from None
+
+
+def launch_context(cfg: Config, folder: Path, tables: tuple[la.AllowList, la.CommandTable]) -> la.RunContext:
+    """A development run's context for the launch builder: the worktree's store, the peer's fresh run
+    folder, the configured disc (resolved: a worktree's rom\\ is a junction to the main checkout's),
+    the settings template, and the checkout's tests/routes/ as the one place besides the run folder a
+    read-path setting (--online_route_file={repo}/tests/routes/...) may point."""
+    return la.RunContext(kind="dev", store=cfg.store.resolve(), run_folder=folder, rom=cfg.rom.resolve(),
+                         template=cfg.settings_template, allow=tables[0], commands=tables[1],
+                         read_roots=[(cfg.repo / "tests" / "routes").resolve()])
+
+
 def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -> tuple[Path, list[str]]:
-    d = run / peer
-    check_output_path(cfg, d)
+    """A local peer's own run folder and command line, made by the launch builder (launch_args.build_game,
+    design D21): the copies of the fixture saves and figures, the settings template's copy, the input
+    script (checked command by command, every path inside the folder), and the settings, checked as a
+    whole. A refusal is a spec error: no game of the case starts."""
+    check_output_path(cfg, run / peer)
     saves, figures = fixture_dirs(cfg)
     if not saves.is_dir() or not figures.is_dir():
         raise SpecError(f"missing fixtures ({saves}, {figures}): run `skytest.py fixtures --from-owner`")
-    shutil.copytree(saves, d / "data")
+    tables = launch_tables(cfg)
+    try:
+        d = la.make_run_folder(run.resolve(), peer)
+        ctx = launch_context(cfg, d, tables)
+        script = peer_script(spec, peer, ctx.figures, f"127.0.0.1:{port}" if port else "")
+        runner = [*cfg.default_args, *scene_args(cfg, spec), *show_server_args(cfg, spec, peer),
+                  *([f"--online_port={port}"] if port and peer == "H" else [])]
+        args = la.build_game(ctx, peer_args(cfg, spec.peers[peer].args), script, fixtures=(saves, figures),
+                             runner_args=runner)
+    except la.LaunchError as e:
+        raise SpecError(f"peer {peer}: {e}") from None
     (d / "data" / ".skytest-copy").write_text("a skytest run copy\n", encoding="ascii")  # the game's dev hooks need it
     if spec.peers[peer].save_slots:
         for line in fill_save_slots(d / "data", cfg.title_id, cfg.save_slot_name, spec.peers[peer].save_slots):
             print(f"  {spec.name} {peer}: save_slots: {line}")
-    shutil.copytree(figures, d / "figures")
-    (d / "cache").mkdir()
-    shutil.copy2(cfg.settings_template, d / "settings.toml")
-    script = d / "script.txt"
-    script.write_text(peer_script(spec, peer, d / "figures", f"127.0.0.1:{port}" if port else ""), encoding="utf-8")
-    args = [
-        f"--user_data_root={d / 'data'}",
-        f"--cache_root={d / 'cache'}",
-        f"--config_file={d / 'settings.toml'}",
-        f"--log_file={d / 'game.log'}",
-        f"--portal_figures_dir={d / 'figures'}",
-        f"--game_data_root={cfg.rom.resolve()}",
-        f"--input_script={script}",
-        *cfg.default_args,
-        *scene_args(cfg, spec),
-        *show_server_args(cfg, spec, peer),
-        *([f"--online_port={port}"] if port and peer == "H" else []),
-        *peer_args(cfg, spec.peers[peer].args),
-    ]
-    check_args(args)
     return d, args
+
 
 
 def parse_log(text: str) -> dict:
