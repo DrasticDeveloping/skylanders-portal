@@ -7,6 +7,7 @@
 #include <initializer_list>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "portal/figure_file.h"
@@ -113,6 +114,36 @@ int main() {
     CHECK(!emulated.HasFigure(3));
     CHECK(emulated.HasFigure(0));
     CHECK(bridge.RealUids().empty());
+  }
+
+  // Write-back off (a test run, Sol's N2): the copy and its backup file arrive as before, but the
+  // game's writes stay in the copy and never reach the real figure.
+  {
+    SoftwarePortal real, emulated;
+    RealPortalBridge::Options options{dir / "test run", nullptr, nullptr};
+    options.write_back = false;
+    RealPortalBridge bridge(&emulated, std::move(options));
+    CHECK(!bridge.WritesBack());
+    real.PlaceFigure(0, chop);
+    Run(bridge, &real);
+    const int copy = FirstFigure(emulated);
+    CHECK(copy == kMaxFigures - 1);
+    CHECK(bridge.IsCopySlot(copy));
+    const auto source = emulated.Source(copy);
+    CHECK(source && LoadFigureFile(*source) == chop);
+    emulated.SetWriteCallback([&](int slot, const FigureData& data,
+                                  const std::optional<std::filesystem::path>&) {
+      bridge.OnEmulatedWrite(slot, data);
+    });
+    GameWrite(emulated, copy, 8, 0xAB);
+    Run(bridge, &real);
+    CHECK(emulated.Figure(copy) && BlockIs(*emulated.Figure(copy), 8, 0xAB));
+    CHECK(real.Figure(0) == chop);
+    CHECK(bridge.IsCopySlot(copy));
+    // Lifted off the real portal: the copy still goes.
+    real.RemoveFigure(0);
+    Run(bridge, &real);
+    CHECK(FirstFigure(emulated) == -1);
   }
 
   // Two figures on the real portal; unplugging it takes both copies off.

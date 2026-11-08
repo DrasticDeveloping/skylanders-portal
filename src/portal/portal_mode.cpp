@@ -21,4 +21,10 @@ std::optional<PortalMode> ParsePortalMode(std::string_view text) {
   return std::nullopt;
 }
 
+PortalPlan PlanPortal(PortalMode requested, bool test_run) {
+  if (!test_run) return {requested, true};
+  if (requested == PortalMode::kUsb) return {PortalMode::kHybrid, false};
+  return {requested, false};
+}
+
 }  // namespace skylanders::portal

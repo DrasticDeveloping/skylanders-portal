@@ -49,8 +49,10 @@ namespace skylanders {
 // not placed; a `portal_figures_dir` that is, lies in or holds an owner's folder
 // (Documents\Skylanders) is replaced by `default_figures_dir`; New figure, the trap command, a
 // dump of a real figure and the hybrid bridge's copies never write into such a folder; the portal
-// menu's backup restore asks OwnerFigureFileProtected. All with a warning. A run without
-// --user_data_root is unchanged.
+// menu's backup restore asks OwnerFigureFileProtected. All with a warning. Such a run also never
+// writes to a physical portal (portal/portal_mode.h PlanPortal): `usb` runs as `hybrid`, and
+// `hybrid` reads the real figures without writing the game's changes back, logged once. A run
+// without --user_data_root is unchanged.
 void InstallPortal(const std::filesystem::path& default_figures_dir);
 
 // The owner's figures guard for code that writes a figure file itself (the portal menu's backup
@@ -137,6 +139,10 @@ float PortalSpeakerLevel();
 // other modes. Any thread.
 std::vector<uint32_t> RealPortalUids();
 bool IsRealPortalCopy(int slot);
+// portal_mode "hybrid" in a test run (a non-empty --user_data_root, also its "usb"): the real
+// portal is only read, the game's writes stay in the copies (portal/portal_mode.h PlanPortal).
+// False in every other case. Any thread.
+bool RealPortalWritesOff();
 // Called on the bridge's thread when a figure from the real portal arrived in an emulated slot,
 // e.g. so the portal menu can give it to a player.
 void SetRealFigureArrivedHandler(std::function<void(int slot)> handler);

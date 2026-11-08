@@ -522,25 +522,41 @@ skylanders::portal::SoftwarePortal* SetUpSoftwarePortal() {
 // On failure (unknown mode, or USB requested but not found), logs a warning and leaves whatever
 // was already active running, rather than dropping to no portal.
 void SwitchPortalMode(std::string_view mode_text) {
-  const auto mode = skylanders::portal::ParsePortalMode(mode_text);
-  if (!mode) {
+  const auto requested = skylanders::portal::ParsePortalMode(mode_text);
+  if (!requested) {
     REXLOG_WARN("Unknown portal_mode '{}'; leaving the current portal active (use 'software', "
                 "'usb', or 'none')",
                 mode_text);
     return;
   }
+  // A test run (a non-empty --user_data_root, Sol's N2) never writes to the physical portal: usb
+  // runs as hybrid (the real portal is read, the game's writes go to the emulated copies), hybrid
+  // without write-back (portal/portal_mode.h PlanPortal). A run without it is unchanged.
+  const skylanders::portal::PortalPlan plan =
+      skylanders::portal::PlanPortal(*requested, !REXCVAR_GET(user_data_root).empty());
+  const skylanders::portal::PortalMode mode = plan.mode;
+  if (mode == skylanders::portal::PortalMode::kHybrid && !plan.real_write_back) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+      REXLOG_WARN("Portal: test run (--user_data_root): writes to the real portal are off");
+    }
+    if (*requested == skylanders::portal::PortalMode::kUsb) {
+      REXLOG_INFO("Portal: portal_mode usb runs as hybrid in this test run: the real portal's figures are "
+                  "read into the emulated portal, and the game's writes stay there");
+    }
+  }
   // Whatever comes next, a running bridge stops (its thread sees the new generation).
   g_bridge_generation.fetch_add(1);
   g_bridge.store(nullptr);
   g_xbox360.store(nullptr);  // only the USB mode looks for one (UsbHotPlugPortal)
-  if (*mode == skylanders::portal::PortalMode::kNone) {
+  if (mode == skylanders::portal::PortalMode::kNone) {
     g_portal.store(nullptr);
     g_software_portal.store(nullptr);
     g_usb_portal.store(nullptr);
     REXLOG_INFO("Portal: none");
     return;
   }
-  if (*mode == skylanders::portal::PortalMode::kUsb) {
+  if (mode == skylanders::portal::PortalMode::kUsb) {
     // g_software_portal is null in this mode: it is a SoftwarePortal-only status handle (used by
     // GetSoftwarePortal() for the figure-picker overlay), and there is no software portal active.
     // Installed even if no device is found right now -- UsbHotPlugPortal keeps retrying on its
@@ -559,7 +575,7 @@ void SwitchPortalMode(std::string_view mode_text) {
   skylanders::portal::SoftwarePortal* software = SetUpSoftwarePortal();
   g_usb_portal.store(nullptr);
   g_software_portal.store(software);
-  if (*mode == skylanders::portal::PortalMode::kHybrid) {
+  if (mode == skylanders::portal::PortalMode::kHybrid) {
     // Copies of the real figures are backed up next to the menu's figure files.
     const std::string dir_utf8 = REXCVAR_GET(portal_figures_dir);
     skylanders::portal::RealPortalBridge::Options options;
@@ -573,6 +589,7 @@ void SwitchPortalMode(std::string_view mode_text) {
       const bool own = !run.empty() && !OwnerFolderRefused(run / "real");
       options.backup_dir = own ? run / "real" : std::filesystem::path();
     }
+    options.write_back = plan.real_write_back;
     options.log = [](const std::string& text) { REXLOG_INFO("{}", text); };
     options.on_arrived = [](int slot) {
       std::function<void(int)> handler;
@@ -888,6 +905,11 @@ std::vector<uint32_t> RealPortalUids() {
 bool IsRealPortalCopy(int slot) {
   portal::RealPortalBridge* bridge = g_bridge.load();
   return bridge && bridge->IsCopySlot(slot);
+}
+
+bool RealPortalWritesOff() {
+  portal::RealPortalBridge* bridge = g_bridge.load();
+  return bridge && !bridge->WritesBack();
 }
 
 bool OwnerFigureFileProtected(const std::filesystem::path& file) { return OwnerFiguresRefused(file); }

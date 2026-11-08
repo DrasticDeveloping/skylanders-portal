@@ -226,6 +226,7 @@ enum class Text {
   kQuickSwapNone,
   kImaginatorsToysHint,
   kRestoreProtected,
+  kTestRunRealPortal,
   kCount,
 };
 
@@ -357,6 +358,8 @@ constexpr const char* kEnglish[] = {
     "itself. They show up here once there's a file of the real toy in the figures folder, for "
     "example read from a real portal (portal mode \"hybrid\").",
     "This figure is in your real Figures folder: a test run (--user_data_root) doesn't change it.",
+    "Test run (--user_data_root): writes to the real portal are off. The game's changes stay in the "
+    "copy.",
 };
 constexpr const char* kGerman[] = {
     "MAGISCHES PORTAL",
@@ -497,6 +500,8 @@ constexpr const char* kGerman[] = {
     "\"hybrid\").",
     "Diese Figur liegt in deinem echten Figurenordner: Ein Testlauf (--user_data_root) \xC3\xA4ndert "
     "sie nicht.",
+    "Testlauf (--user_data_root): Aufs echte Portal wird nicht geschrieben. Die \xC3\x84nderungen des "
+    "Spiels bleiben in der Kopie.",
 };
 static_assert(std::size(kEnglish) == size_t(Text::kCount));
 static_assert(std::size(kGerman) == size_t(Text::kCount));
@@ -5901,6 +5906,13 @@ namespace {
 // with the other half for a swapper half, else to the first player without a figure. Items and
 // sidekicks belong to no one, as from the menu.
 void RealFigureArrived(int slot) {
+  // A test run (--user_data_root) reads the real portal but never writes to it (portal_rex.h
+  // RealPortalWritesOff, Sol's N2): said once, when its first real figure arrives.
+  static bool told_writes_off = false;  // UI thread only
+  if (!told_writes_off && RealPortalWritesOff()) {
+    told_writes_off = true;
+    ShowToast(T(Text::kTestRunRealPortal));
+  }
   portal::SoftwarePortal* software = GetSoftwarePortal();
   const SkylanderInfo* sky = FigureIn(slot);
   if (!software || !sky || IsItem(sky) || IsCompanion(sky)) return;
