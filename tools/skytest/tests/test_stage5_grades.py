@@ -16,6 +16,21 @@ import skytest  # noqa: E402
 REF = "s:1a2b3c4d.0.7.2"
 
 
+def started(seq: int, ref: str = REF, at: str = "") -> str:
+    stamp = f"[{at}] " if at else ""
+    return f"{stamp}[info] Online: attack {ref} #{seq} CCEAtk start {100 + seq}"
+
+
+def starts_for(lines: list[str]) -> list[str]:
+    """S's start line for every key the S lines retire (the tests before F9 named only retirements)."""
+    keys: list[tuple[str, int]] = []
+    for line in lines:
+        m = occurrence_outcomes.RETIRED_RE.search(line) or occurrence_outcomes.EXPIRED_RE.search(line)
+        if m and (m.group(1), int(m.group(2))) not in keys:
+            keys.append((m.group(1), int(m.group(2))))
+    return [started(seq, ref) for ref, seq in keys]
+
+
 def retired(seq: int, how: str = "delivered all", ref: str = REF) -> str:
     return f"[info] Online: attack {ref} #{seq} ({how})"
 
@@ -42,7 +57,7 @@ def client(*lines: str) -> str:
 class Occurrences(unittest.TestCase):
     def grade(self, s: list[str], h: list[str], **kw) -> occurrence_outcomes.Result:
         kw.setdefault("min_occurrences", 1)
-        return occurrence_outcomes.grade_occurrences("\n".join(s), {"H": client(*h)}, **kw)
+        return occurrence_outcomes.grade_occurrences("\n".join(starts_for(s) + s), {"H": client(*h)}, **kw)
 
     def test_one_outcome_each_passes(self) -> None:
         s = [retired(1), retired(2), retired(3, "claims ended")]
@@ -133,6 +148,53 @@ class Occurrences(unittest.TestCase):
         self.assertTrue(r.passed, r.failures)
         self.assertEqual(r.occurrences, 2)
 
+    def test_a_start_never_retired_fails(self) -> None:
+        # Sol stage 5 r1 F9: 21 starts, 20 retirements and outcomes, one row never retired. Graded by
+        # retirements only it passed min_occurrences=20; by the starts it fails.
+        s = [started(n) for n in range(1, 22)] + [retired(n) for n in range(1, 21)]
+        h = [x for n in range(1, 21) for x in (accepted(n), outcome(n, f"forced at {100 + n}"))]
+        r = occurrence_outcomes.grade_occurrences("\n".join(s), {"H": client(*h)}, min_occurrences=20)
+        self.assertFalse(r.passed)
+        self.assertEqual(r.occurrences, 21)
+        self.assertTrue(any("#21 started, never retired" in f for f in r.failures), r.failures)
+        self.assertTrue(any("#21 has no outcome" in f for f in r.failures), r.failures)
+        # Its client outcome alone does not save it: S never retired the row.
+        h21 = h + [accepted(21), outcome(21, "forced at 121")]
+        r = occurrence_outcomes.grade_occurrences("\n".join(s), {"H": client(*h21)}, min_occurrences=20)
+        self.assertFalse(r.passed)
+        self.assertEqual([f for f in r.failures if "#21" in f], [f"S: attack {REF} #21 started, never retired"])
+
+    def test_the_end_of_run_grace_permits_a_late_start(self) -> None:
+        # The 21st start falls 2 s before S's End session line: inside the grace, so it may stay
+        # unretired; the other 20 are graded in full.
+        s = [started(n, at=f"2026-11-08 10:00:{n:02d}.000") for n in range(1, 21)]
+        s += [retired(n) for n in range(1, 21)]
+        s += [started(21, at="2026-11-08 10:00:40.000"),
+              "[2026-11-08 10:00:42.000] [info] [core] [t1] Online: End session: closing (1 client to drain)",
+              "[2026-11-08 10:00:55.000] [info] [core] [t1] Online: End session: every client is closed"]
+        h = [x for n in range(1, 21) for x in (accepted(n), outcome(n, f"forced at {100 + n}"))]
+        h.append(outcome(21, "forced at 121"))
+        r = occurrence_outcomes.grade_occurrences("\n".join(s), {"H": client(*h)}, min_occurrences=20)
+        self.assertTrue(r.passed, r.failures)
+        self.assertEqual((r.occurrences, r.in_grace, r.unretired["H"]), (20, 1, 1))
+        # Outside the grace (a shorter grace) the same start must be retired.
+        r = occurrence_outcomes.grade_occurrences("\n".join(s), {"H": client(*h)}, min_occurrences=20,
+                                                  retire_grace_ms=1000)
+        self.assertFalse(r.passed)
+        self.assertTrue(any("#21 started, never retired" in f for f in r.failures), r.failures)
+        # Two outcomes for a start in the grace still fail.
+        r = occurrence_outcomes.grade_occurrences("\n".join(s), {"H": client(*h, outcome(21, "late 3"))},
+                                                  min_occurrences=20)
+        self.assertTrue(any("#21 has 2 outcomes" in f for f in r.failures), r.failures)
+
+    def test_a_retirement_without_a_start_fails(self) -> None:
+        r = occurrence_outcomes.grade_occurrences(retired(1), {"H": client(outcome(1, "forced at 101"))},
+                                                  min_occurrences=0)
+        self.assertTrue(any("#1 retired without a start line" in f for f in r.failures), r.failures)
+        r = occurrence_outcomes.grade_occurrences("\n".join([started(1), started(1), retired(1)]),
+                                                  {"H": client(outcome(1, "forced at 101"))}, min_occurrences=0)
+        self.assertTrue(any("#1 started twice" in f for f in r.failures), r.failures)
+
     def test_client_without_a_connection_line_fails(self) -> None:
         r = occurrence_outcomes.grade_occurrences(retired(1), {"H": outcome(1, "forced at 101")}, min_occurrences=1)
         self.assertTrue(any("no `connected as peer` line" in f for f in r.failures), r.failures)
@@ -205,13 +267,14 @@ class RunnerSide(unittest.TestCase):
                     ["[grade.occurrence_outcomes]", 'expected_unconfirmed = { "H" = 1 }'],
                     ["[grade.occurrence_outcomes]", 'expected_unconfirmed = { "1" = 1 }', 'min_unconfirmed = { "1" = 1 }'],
                     ["[grade.occurrence_outcomes]", "what = 1"],
+                    ["[grade.occurrence_outcomes]", "retire_grace_ms = -5"],
                     ["[grade.memory_growth]", 'peers = ["H"]'],
                     ["[grade.memory_growth]", 'anchor = "x"', "start_min = 20", "end_min = 5"]):
             with self.assertRaises(skytest.SpecError, msg=str(bad)):
                 self.load(*bad)
 
     def test_occurrence_grade_spec(self) -> None:
-        texts = {"S": "\n".join([retired(1), expired(2)]),
+        texts = {"S": "\n".join([started(1), started(2), retired(1), expired(2)]),
                  "H": client(accepted(1), outcome(1, "forced at 101"), accepted(2), outcome(2, "late 2"))}
         record, reasons = occurrence_outcomes.grade_spec(texts, {"min_occurrences": 2,
                                                                  "expected_unconfirmed": {"1": 1}}, ["H", "S"])
