@@ -551,9 +551,28 @@ def check_output_path(cfg: Config, path: Path) -> None:
 
 # What a spec's `args` may name: the game checkout the runner tests (its repository root, as
 # forward slashes), e.g. --online_route_file={repo}/tests/routes/tutorial_b.toml. Scripts take
-# {figures}, {peer} and {join} instead (peer_script).
+# {figures}, {peer}, {join} and {joincode} instead (peer_script).
 ARG_PLACEHOLDERS = ("{repo}",)
 ARG_PLACEHOLDER = re.compile(r"\{[A-Za-z_]+\}")
+# Stage 8 item 4 (join code v2): a client's script may name {joincode}, the hosted session's join code
+# with its secret. {join} is the server's address:port and carries no secret, so a server whose Hello
+# gate is on (dev_hello_gate_loopback on loopback) refuses it "wrong code". The code exists only once
+# the owner's game has started its server, so the runner reads it from the hosted server's log line
+# (the game's src/online/server/server_role.cpp, InstallServerRole:
+#   REXLOG_INFO("Online: the server listens on port {}, join code {}", started->port, started->join_code);
+# the code as the portal's EncodeJoinCodeV2 makes it: 18 symbols of JOIN_CODE_SYMBOLS, no dashes) and
+# starts a client whose script names {joincode} only then, with the code in its script (run_case,
+# start_joiners). Fails closed: with no such line (the server did not start, a build before stage 8), or
+# a line whose code is not 18 such symbols, that client never starts and fails; it never joins with an
+# empty or guessed code.
+JOIN_CODE_PLACEHOLDER = "{joincode}"
+JOIN_CODE_SYMBOLS = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # the portal's join_code.cpp kSymbols (Crockford)
+JOIN_CODE_V2 = re.compile(f"[{JOIN_CODE_SYMBOLS}]{{18}}")
+SERVER_JOIN_CODE = re.compile(r"Online: the server listens on port \d+, join code (\S*)")
+# What the launch builder checks in a {joincode} script before the code exists (prepare_peer): one word
+# that no join code is (U is not a symbol), swapped for the code when it comes (fill_join_code). A spec
+# may not write it itself.
+JOIN_CODE_STANDIN = "JOINCODE-NOT-KNOWN-YET-U"
 # The plan's daily gate: each stage names a 30-minute subset (docs/online-fork-plan.md 5.4).
 GATE_MINUTES = 30
 # A manifest case's `gate`: true is the daily gate; "per-build" runs once per build in an idle slot
@@ -681,6 +700,58 @@ def peer_kind(spec_name: str, peer: str, own: dict, common: dict) -> str:
         raise SpecError(f'{spec_name}: peer {peer} runs on this PC (the server and the owner\'s client); kind ='
                         ' "remote" is for D, E or F')
     return kind
+
+
+def check_join_code_peers(spec_name: str, peers: dict[str, "PeerSpec"], server: str) -> None:
+    """{joincode} (JOIN_CODE_PLACEHOLDER) only in the script of a local client other than H, in a hosted
+    case: the code is the hosted server's (server = "host"), H is the owner whose game starts that server,
+    and a remote peer's script goes to the second PC when the run starts, before the code exists. No
+    script writes the stand-in itself (fill_join_code swaps every one of them)."""
+    for n, ps in peers.items():
+        if JOIN_CODE_STANDIN in ps.script:
+            raise SpecError(f"{spec_name}: peer {n}'s script has {JOIN_CODE_STANDIN}, the runner's stand-in for"
+                            " {joincode}")
+        if JOIN_CODE_PLACEHOLDER not in ps.script:
+            continue
+        if server != "host":
+            raise SpecError(f'{spec_name}: peer {n}: {{joincode}} is a hosted server\'s join code: say server = "host"')
+        if n == "H":
+            raise SpecError(f"{spec_name}: peer H hosts the session; {{joincode}} is for a client that joins (D, E, F)")
+        if ps.kind == "remote":
+            raise SpecError(f"{spec_name}: peer {n} is remote: its script goes to the second PC before the join code"
+                            " exists; {joincode} is for a local client")
+
+
+def uses_join_code(spec: "Spec", peer: str) -> bool:
+    """The peer's script names {joincode}: it starts once the hosted server logged its code (run_case)."""
+    ps = spec.peers.get(peer)
+    return peer != "S" and ps is not None and JOIN_CODE_PLACEHOLDER in ps.script
+
+
+def join_code_from(lines: list[str]) -> tuple[str, str]:
+    """The session's join code from a hosted server's log lines, at the first SERVER_JOIN_CODE line:
+    (code, "") when its code is a join code v2 (JOIN_CODE_V2), ("", why) when it is not; ("", "") while
+    no such line came."""
+    for line in lines:
+        m = SERVER_JOIN_CODE.search(line)
+        if not m:
+            continue
+        if JOIN_CODE_V2.fullmatch(m.group(1)):
+            return m.group(1), ""
+        return "", f"S logged its join code as {m.group(1)!r}, not a join code v2 (18 symbols, no dashes)"
+    return "", ""
+
+
+def fill_join_code(script: Path, code: str) -> None:
+    """The session's join code into a prepared peer's input script (prepare_peer wrote it with
+    JOIN_CODE_STANDIN, which the launch builder checked): only a join code v2, whose 18 symbols hold no
+    space, `;` or `#` that could change the script's commands, and only where the stand-in stands."""
+    if not JOIN_CODE_V2.fullmatch(code):
+        raise SpecError(f"{code!r} is not a join code v2 (18 symbols, no dashes); {script} keeps no guess")
+    text = script.read_bytes().decode("utf-8")
+    if JOIN_CODE_STANDIN not in text:
+        raise SpecError(f"{script} has no {JOIN_CODE_STANDIN} for the join code (it was not prepared for one)")
+    script.write_bytes(text.replace(JOIN_CODE_STANDIN, code).encode("utf-8"))
 
 
 def check_remote_peers(spec_name: str, peers: dict[str, "PeerSpec"], grades: dict, names: list[str]) -> None:
@@ -928,6 +999,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
     if server == "host" and "S" in peers and peers["S"].save_slots:
         raise SpecError(f"{path.name}: save_slots: a hosted server has no data folder of its own (Host copies the"
                         " owner's slot into its session folder)")
+    check_join_code_peers(path.name, peers, server)
     synthetic = load_synthetic(path.name, d, names, server)
     grades = d.get("grade", {})
     for gname, g in grades.items():
@@ -2501,10 +2573,11 @@ def fail_fast_patterns(spec: Spec, peer: str) -> list[str]:
     return [rx for rx, _ in peer_fatal_lines(spec, peer)]
 
 
-def peer_script(spec: Spec, peer: str, figures: Path, join: str = "") -> str:
+def peer_script(spec: Spec, peer: str, figures: Path, join: str = "", joincode: str = "") -> str:
     if peer == "S":
         return STANDIN_SERVER_SCRIPT.format(seconds=int(spec.standin_seconds))
-    return spec.peers[peer].script.replace("{figures}", str(figures)).replace("{peer}", peer).replace("{join}", join)
+    return (spec.peers[peer].script.replace("{figures}", str(figures)).replace("{peer}", peer)
+            .replace("{join}", join).replace(JOIN_CODE_PLACEHOLDER, joincode))
 
 
 def peer_args(cfg: Config, args: list[str]) -> list[str]:
@@ -3187,7 +3260,9 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -
     """A local peer's own run folder and command line, made by the launch builder (launch_args.build_game,
     design D21): the copies of the fixture saves and figures, the settings template's copy, the input
     script (checked command by command, every path inside the folder), and the settings, checked as a
-    whole. A refusal is a spec error: no game of the case starts."""
+    whole. A refusal is a spec error: no game of the case starts. A {joincode} script is written with
+    JOIN_CODE_STANDIN, which run_case swaps for the session's code (fill_join_code) before the peer
+    starts."""
     check_output_path(cfg, run / peer)
     saves, figures = fixture_dirs(cfg)
     if not saves.is_dir() or not figures.is_dir():
@@ -3196,7 +3271,7 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -
     try:
         d = la.make_run_folder(run.resolve(), peer)
         ctx = launch_context(cfg, d, tables)
-        script = peer_script(spec, peer, ctx.figures, f"127.0.0.1:{port}" if port else "")
+        script = peer_script(spec, peer, ctx.figures, f"127.0.0.1:{port}" if port else "", JOIN_CODE_STANDIN)
         runner = [*cfg.default_args, *scene_args(cfg, spec), *show_server_args(cfg, spec, peer),
                   *([f"--online_port={port}"] if port and peer == "H" else []),
                   *synthetic_server_args(cfg, spec, peer)]
@@ -4225,18 +4300,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                     ended[name] = time.monotonic()
 
         with winjob.Job() as job:
-            for n in starts:
-                # Games booting in the same instant crashed and froze each other in a test
-                # (stage 0, five at once); real sessions never start them together either. The gap
-                # holds across every case running at once (StartPacer); the games already started
-                # are watched meanwhile.
-                pacer.wait_turn(note_ends)
-                if n in remote:  # on the second PC: no boot token or job of this machine
-                    remotes[n] = procs[n] = start_remote(cfg, spec, n, run, port)
-                    results[n].command = remotes[n].command
-                    started[n] = time.monotonic()
-                    results[n].started_after_s = round(started[n] - t_start, 1)
-                    continue
+            def start_local(n: str) -> None:
                 # PS15: the machine's boot token (no other runner's game boots meanwhile), held until
                 # this game's first frame line, its exit or BOOT_TIMEOUT_S (BootHold.watch).
                 hold = pacer.machine_turn(note_ends)
@@ -4271,7 +4335,44 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                 procs[n] = p
                 started[n] = time.monotonic()
                 results[n].started_after_s = round(started[n] - t_start, 1)
+
+            # Stage 8 item 4: a client whose script names {joincode} starts once the hosted server
+            # logged its join code (start_joiners below), never before.
+            joiners = [n for n in starts if n not in remote and uses_join_code(spec, n)]
+            for n in starts:
+                if n in joiners:
+                    continue
+                # Games booting in the same instant crashed and froze each other in a test
+                # (stage 0, five at once); real sessions never start them together either. The gap
+                # holds across every case running at once (StartPacer); the games already started
+                # are watched meanwhile.
+                pacer.wait_turn(note_ends)
+                if n in remote:  # on the second PC: no boot token or job of this machine
+                    remotes[n] = procs[n] = start_remote(cfg, spec, n, run, port)
+                    results[n].command = remotes[n].command
+                    started[n] = time.monotonic()
+                    results[n].started_after_s = round(started[n] - t_start, 1)
+                    continue
+                start_local(n)
             deadline = time.monotonic() + spec.timeout
+            # {joincode}: the hosted server's log, read for its join code until the joiners started.
+            join_tail = LogTail(peer_log_path(run, "S", hosted)) if joiners else None
+            join_waits = list(joiners)
+            not_started: dict[str, str] = {}  # a joiner that will not start, and why
+
+            def start_joiners() -> None:
+                code, problem = join_code_from(join_tail.new_lines())
+                if problem:  # fails closed: no joiner starts with a code that is not one
+                    not_started.update({n: f"never started: {problem}" for n in join_waits})
+                    join_waits.clear()
+                    return
+                if not code:
+                    return
+                while join_waits:
+                    n = join_waits.pop(0)
+                    fill_join_code(prepared[n][0] / la.SCRIPT_FILE, code)
+                    pacer.wait_turn(note_ends)
+                    start_local(n)
             # server+N+hK: each synthetic peer waits for its start condition in its start peer's log.
             syn_waits = {n: (LogTail(peer_log_path(run, s.start_peer, hosted)), re.compile(s.start_after))
                          for n, s in spec.synthetic.items()}
@@ -4310,6 +4411,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                     start_synthetic()
                 if droot is not None:
                     droot.check()  # a phase line: that phase's end snapshot
+                if join_waits and not (watch is not None and watch.hit):  # no new game after a fatal line
+                    start_joiners()
                 if watch is not None and time.monotonic() >= next_check:
                     next_check = time.monotonic() + FAIL_FAST_POLL
                     # Checked through the grace too: a hit whose log was replaced meanwhile is dropped.
@@ -4317,6 +4420,9 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                         if watch.check({**procs, **syn_procs}) else deadline
                     early = stop_at < deadline  # else the timeout comes first: a timeout as before
                 time.sleep(min(0.5, max(0.0, stop_at - time.monotonic())))
+            # {joincode}: a joiner still waiting when the run ended never got the code (fails closed).
+            not_started.update({n: "never started: S never logged its join code (/"
+                                   f"{SERVER_JOIN_CODE.pattern}/), so {{joincode}} had no value" for n in join_waits})
             stopped = ""
             if early and watch is not None and watch.hit and any(p.poll() is None for p in procs.values()):
                 stopped = f"stopped early: {watch.hit[0]} {watch.hit[1]} (fail fast)"
@@ -4382,6 +4488,9 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         r.frame_p95_ms, r.peak_video_mb = parsed["frame_p95"], parsed["video"]
         r.startup_stall_s = parsed["startup_stall"]
         grade_peer(spec, r, text, parsed)
+        if n in not_started:  # a {joincode} joiner the run never started (start_joiners)
+            r.reasons.insert(0, not_started[n])
+            r.status = "fail"
         if n in remotes and remotes[n].problems:  # a lost agent or a file that did not come back
             r.reasons += remotes[n].problems
             r.status = "fail"
