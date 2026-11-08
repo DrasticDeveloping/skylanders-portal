@@ -76,7 +76,10 @@ struct Verdict {
   uint8_t kind_reason = 0;
   bool retryable = false;
   std::vector<Write> writes;  // kCommit: applied all or nothing (Sol F8); all in one scope (a mixed
-                              // set is kMixedScope, refused `model`, RM11; Opus r2 N3)
+                              // set is kMixedScope, refused `model`, RM11; Opus r2 N3). kOwnerRun:
+                              // the grant's writes (S2-L1), applied the same way with the grant; a
+                              // set not written refuses the grant (`limit` or `model`), and the
+                              // granted decision carries their at_lsn and scope
   LeaseSpec lease;            // kOwnerRun
   Duration wait{};            // kWait: S's own wait, at most this long (1B amendment n)
 };
@@ -100,6 +103,17 @@ class Authority {
     Verdict refused;  // kRefuse
     refused.reason = Reason::kModel;
     return refused;
+  }
+  // The writes for a lease's end without a commit (S2-L2, stage 6 section 3.6): called by the
+  // request table for kExpired, kReportRefused, kRevokedPeerLeft and kRevokedClose, at the point
+  // that emits the end, and applied all or none (ApplyAll; a set not written is counted,
+  // RequestTable::LeaseEndWritesRefused, and S raises a limit event). Never for kCommitted (the
+  // report's own writes are the commit) nor kRevokedEpoch (the level's rows end with the
+  // generation). `lease` is the lease as it ended. Pure, as Decide: a call that writes is counted
+  // (ImpureVerdicts) and its writes are not applied. Default: nothing.
+  virtual std::vector<Write> OnLeaseEnd(const Lease& /*lease*/, LeaseEndReason /*why*/,
+                                        const DecideContext& /*context*/) {
+    return {};
   }
 };
 
@@ -220,7 +234,8 @@ class RequestTable {
   // Counters (the server's events and stats read them).
   uint64_t LateEvaluationsDropped() const;  // SubmitEvaluation for a key not evaluating
   uint64_t UnknownReports() const;          // LeaseReport for no lease and no tomb
-  uint64_t ImpureVerdicts() const;          // Decide or OnReport changed the state (RM9)
+  uint64_t ImpureVerdicts() const;          // Decide, OnReport or OnLeaseEnd changed the state (RM9)
+  uint64_t LeaseEndWritesRefused() const;   // OnLeaseEnd writes ApplyAll did not write (S2-L2)
 
  private:
   struct Entry {
@@ -266,6 +281,9 @@ class RequestTable {
   void RefuseMaybeRetry(Entry& e, Reason reason, uint8_t kind_reason, bool retryable);
   void PreconditionMissing(Entry& e, TimePoint now);
   void EndLease(uint32_t lease, uint16_t holder, LeaseEndReason why);
+  // S2-L2: the kind's OnLeaseEnd writes for `lease`'s end `why`, applied all or none; nothing for
+  // kCommitted and kRevokedEpoch.
+  void EndWrites(const Lease& lease, LeaseEndReason why, TimePoint now);
 
   void Dispatch(Entry& e, TimePoint now);
   void DispatchChild(Entry& child, TimePoint now);
@@ -294,7 +312,7 @@ class RequestTable {
   uint32_t previous_generation_ = 0;  // the generation before the last change (the tomb window)
   bool closing_ = false;
   uint64_t next_order_ = 0;
-  uint64_t late_evaluations_ = 0, unknown_reports_ = 0, impure_ = 0;
+  uint64_t late_evaluations_ = 0, unknown_reports_ = 0, impure_ = 0, end_writes_refused_ = 0;
   std::vector<RequestOutput> outputs_;
 };
 

@@ -28,6 +28,13 @@
 // LeaseEnd{committed}; not written: refused `limit`, kMixedScope `model`) or kRefuse (RefuseReport,
 // LeaseEnd{report refused}). Every final decision goes into the key's cache before it is sent. The
 // lease's request key stays pending until one of these ends it, or the lease expires or is revoked.
+//
+// Stage 2 follow-up (cross-stage decision 4, stage 6 section 3.6): S2-L1, an owner-run verdict's
+// writes are applied with the grant, all or none (a refused write refuses the grant); S2-L2, the
+// kind's Authority::OnLeaseEnd returns the writes for every end without a commit (expired, report
+// refused, revoked peer left, revoked close; a generation change writes nothing, the level's rows
+// end with it), applied all or none by the request table at the point that emits the end. So the
+// row stays as it was before the grant for everything but what the grant and the end write.
 
 namespace skylanders::backend {
 
@@ -62,12 +69,15 @@ struct Lease {  // (Opus F12)
 };
 
 // A lease that ended outside a report (expired, revoked), for S to answer the request and send
-// LeaseEnd. Not named by the design ("expiries come out as events"); the header's own.
+// LeaseEnd. Not named by the design ("expiries come out as events"); the header's own. `lease` is
+// the lease as it ended (its final state and `why` set): the kind's OnLeaseEnd reads it (S2-L2),
+// also for a holder that left, whose lease is gone from the table by then.
 struct LeaseEndEvent {
   uint32_t id = 0;
   uint16_t holder = 0;
   RequestKey request;
   LeaseEndReason why = LeaseEndReason::kExpired;
+  Lease lease;
 };
 
 // What LeaseTable::Report found (Sol r2 N2). The table acts on it in section 3.8's order.
@@ -91,6 +101,10 @@ class LeaseTable {
   // kLeased when the entity is held, kLimit past limits.max_leases_per_peer.
   std::variant<uint32_t, Reason> Grant(const LeaseSpec& spec, const RequestKey& request,
                                        TimePoint now);
+  // What Grant would answer, without granting: kNone when it would grant. The request table asks
+  // it before it applies a grant's writes (S2-L1), so a grant that cannot be made writes nothing.
+  // The header's own.
+  Reason CanGrant(const LeaseSpec& spec) const;
   bool Renew(uint32_t id, uint16_t peer, TimePoint now);
   // Checks only who, whether it already ended, and when, in that order (Sol r2 N2); the payload
   // goes to the kind (section 3.9). Only a granted lease is checked against its term or moved.

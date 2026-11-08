@@ -119,6 +119,7 @@ struct Server::Impl {
   std::map<uint16_t, uint32_t> baseline_ids;
   std::deque<ServerEvent> events;
   TimePoint now{};  // the time of the call in progress (D3: the owner's clock)
+  uint64_t end_writes_refused = 0;  // RequestTable::LeaseEndWritesRefused, as last reported
 
   Peer* Find(uint16_t id) {
     auto it = peers.find(id);
@@ -252,6 +253,12 @@ struct Server::Impl {
 
   void Drain() {
     DrainLimits();
+    // A kind's lease end writes (S2-L2) that ApplyAll did not write: never silent.
+    if (requests.LeaseEndWritesRefused() > end_writes_refused) {
+      end_writes_refused = requests.LeaseEndWritesRefused();
+      Event(ServerEvent::Type::kLimit, 0).text =
+          "lease end writes refused " + std::to_string(end_writes_refused);
+    }
     for (RequestOutput& o : requests.TakeOutputs()) {
       Peer* p = Find(o.peer);
       if (p && p->overrun) p = nullptr;  // its session ended: nothing more is sent to it (N1)

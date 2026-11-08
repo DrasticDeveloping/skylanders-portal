@@ -176,7 +176,7 @@ reads the request and the records and returns a verdict; only the request table 
 |---|---|
 | `kCommit` with `writes` | S writes them all or none (`WorldState::ApplyAll`) and answers `applied` |
 | `kServerRun` | S's game thread runs it (a `kEvaluate` event) and answers with `SubmitEvaluation` |
-| `kOwnerRun` with a `lease` | the asking client runs it under the lease and reports; `OnReport` turns the report into writes |
+| `kOwnerRun` with a `lease` | the asking client runs it under the lease and reports; `OnReport` turns the report into writes. Its `writes`, if any, are applied with the grant, all or none (a held row); a set not written refuses the grant |
 | `kRefuse` with a `reason` | refused; `retryable` lets the client send it again |
 | `kWait` | S waits up to `wait` for something it needs |
 
@@ -199,6 +199,12 @@ std::unique_ptr<Authority> MakeToggleAuthority(KindId kind) {
   return std::make_unique<ToggleAuthority>(kind);
 }
 ```
+
+An owner-run kind may also override `OnLeaseEnd(lease, why, context)`: the writes for a lease
+that ends without a commit (expired, report refused, its holder left, End session), applied all or
+none where the end happens. It is pure like `Decide`, and it is not called at a commit or at a
+generation change. With grant writes it keeps one writer for a held row: the grant sets it, the
+commit or `OnLeaseEnd` clears it.
 
 A kind with `models = 0` needs no authority: only S's own world changes it.
 

@@ -134,6 +134,7 @@ size_t RequestTable::KeysOfGeneration(uint32_t generation) const {
 uint64_t RequestTable::LateEvaluationsDropped() const { return late_evaluations_; }
 uint64_t RequestTable::UnknownReports() const { return unknown_reports_; }
 uint64_t RequestTable::ImpureVerdicts() const { return impure_; }
+uint64_t RequestTable::LeaseEndWritesRefused() const { return end_writes_refused_; }
 
 RequestTable::Entry& RequestTable::Insert(const Request& request, PeerRole role) {
   Entry& e = entries_[request.key];
@@ -330,12 +331,31 @@ void RequestTable::EndLease(uint32_t lease, uint16_t holder, LeaseEndReason why)
   outputs_.push_back(std::move(o));
 }
 
+void RequestTable::EndWrites(const Lease& lease, LeaseEndReason why, TimePoint now) {
+  if (why == LeaseEndReason::kCommitted || why == LeaseEndReason::kRevokedEpoch) return;
+  Authority* authority = authorities_.For(lease.spec.kind);
+  if (!authority) return;
+  const Entry* e = Find(lease.request);
+  const PeerRole role = e ? e->role : PeerRole::kGuest;
+  const uint64_t head = state_.Head();
+  const uint64_t count = state_.Writes();
+  std::vector<Write> writes = authority->OnLeaseEnd(lease, why, Context(role, now));
+  if (state_.Head() != head || state_.Writes() != count) {
+    ++impure_;  // OnLeaseEnd wrote (D7, RM9): its own writes are not applied
+    return;
+  }
+  if (writes.empty()) return;
+  if (state_.ApplyAll(writes, now).result != PutResult::kWritten) ++end_writes_refused_;
+}
+
 // Leases that ended outside a report: an expiry ends its key `lease expired` (final); a revocation
 // at the generation change or End session tells the holder (the keys' finals come from those
-// paths); a holder that left hears nothing.
+// paths); a holder that left hears nothing. The kind's end writes go first (S2-L2), for a holder
+// that left too.
 void RequestTable::DrainLeaseEnds(TimePoint now) {
   LeaseEndEvent ev;
   while (leases_.PollEnd(ev)) {
+    EndWrites(ev.lease, ev.why, now);
     if (ev.why == LeaseEndReason::kRevokedPeerLeft) continue;
     if (ev.why == LeaseEndReason::kExpired) {
       Entry* e = Find(ev.request);
@@ -580,8 +600,36 @@ void RequestTable::TakeVerdict(Entry& e, Verdict v, TimePoint now) {
       spec.holder = key.peer;
       if (spec.entity.form == IdForm::kNone) spec.entity = e.request.subject;
       if (spec.kind == 0) spec.kind = e.request.kind;
+      // S2-L1: the grant's writes go with the grant, all or none. A grant that cannot be made
+      // writes nothing (asked first), and a set not written refuses the grant with ApplyAll's
+      // mapping (`limit`, `model`, `stale generation`), no lease made.
+      if (const Reason busy = leases_.CanGrant(spec); busy != Reason::kNone) {
+        Refuse(e, busy);
+        AfterParent(key, now);
+        return;
+      }
+      uint64_t grant_lsn = 0;
+      Scope grant_scope = Scope::kLevel;
+      if (!v.writes.empty()) {
+        const WriteResult r = state_.ApplyAll(v.writes, now);
+        if (r.result != PutResult::kWritten) {
+          Refuse(e, FromPut(r.result));
+          AfterParent(key, now);
+          return;
+        }
+        grant_lsn = r.last_lsn;
+        if (grant_lsn == 0) {  // nothing changed: complete at the stored changes (as Commit)
+          for (const Write& w : v.writes) {
+            const Record* row = state_.Get(w.key);
+            grant_lsn = std::max(grant_lsn, row ? row->lsn : state_.Head());
+          }
+        }
+        const KindSpec* wspec = Spec(v.writes.front().key.kind);
+        grant_scope = wspec ? wspec->scope : Scope::kLevel;
+      }
       auto granted = leases_.Grant(spec, key, now);
       if (const Reason* why = std::get_if<Reason>(&granted)) {
+        // Not reached: CanGrant answered for the same table on the same thread.
         Refuse(e, *why);
         AfterParent(key, now);
         return;
@@ -595,6 +643,12 @@ void RequestTable::TakeVerdict(Entry& e, Verdict v, TimePoint now) {
       }
       e.lease = std::get<uint32_t>(granted);
       Send(e, Outcome::kGranted, Reason::kNone, 0, false, false);
+      if (!v.writes.empty()) {
+        // The granted decision says where the grant's writes are complete (S2-L1).
+        e.decision.at_lsn = grant_lsn;
+        e.decision.scope = grant_scope;
+        outputs_.back().decision = e.decision;
+      }
       return;
     }
   }
@@ -733,6 +787,7 @@ void RequestTable::OnLeaseReport(uint16_t peer, uint32_t peer_epoch, uint32_t le
       if (const Entry* e = Find(check.request)) SendCached(*e);
       return;
     case ReportCheck::Type::kExpired: {
+      if (const Lease* ended = leases_.Get(lease)) EndWrites(*ended, LeaseEndReason::kExpired, now);
       Entry* e = Find(check.request);
       if (e && !Final(e->state)) {
         Refuse(*e, Reason::kLeaseExpired);
@@ -760,9 +815,16 @@ void RequestTable::OnLeaseReport(uint16_t peer, uint32_t peer_epoch, uint32_t le
       v.reason = Reason::kModel;
     }
   }
+  // A refused report ends the lease without a commit: the kind's end writes first (S2-L2).
+  auto refuse_report = [&] {
+    leases_.RefuseReport(lease);
+    if (const Lease* ended = leases_.Get(lease)) {
+      EndWrites(*ended, LeaseEndReason::kReportRefused, now);
+    }
+  };
   if (!e || Final(e->state)) {
     // The key went (it cannot while the lease lives); nothing to commit for.
-    leases_.RefuseReport(lease);
+    refuse_report();
     EndLease(lease, peer, LeaseEndReason::kReportRefused);
     return;
   }
@@ -771,11 +833,11 @@ void RequestTable::OnLeaseReport(uint16_t peer, uint32_t peer_epoch, uint32_t le
       leases_.Commit(lease);
       EndLease(lease, peer, LeaseEndReason::kCommitted);
     } else {
-      leases_.RefuseReport(lease);  // not written: a limit (or `model`), as a refusal
+      refuse_report();  // not written: a limit (or `model`), as a refusal
       EndLease(lease, peer, LeaseEndReason::kReportRefused);
     }
   } else {
-    leases_.RefuseReport(lease);
+    refuse_report();
     const Reason reason = v.type == Verdict::Type::kRefuse ? VerdictReason(v) : Reason::kModel;
     Refuse(*e, reason, v.kind_reason);
     EndLease(lease, peer, LeaseEndReason::kReportRefused);

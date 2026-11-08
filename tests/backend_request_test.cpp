@@ -1,13 +1,16 @@
 // Requests, decisions and leases (design sections 3.8, 3.9 and 10; work item 4): every request model
 // (RM1 to RM11 with RM5b to RM5f) and lease expiry (LE1 to LE8). The table's own cases run on direct
 // calls (backend_request_harness.h); the ones that need the client (completion at at_lsn, the
-// rejoin) run on FakeSession through the lanes harness's Rig.
+// rejoin) run on FakeSession through the lanes harness's Rig. The stage 2 follow-up item's lease
+// cases (S2L1a to S2L2e) close the file.
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "backend/fake_world.h"
@@ -861,6 +864,246 @@ BACKEND_TEST("RM12", ModelNeverResentParentMissingFinal) {
         !retry->final);
   CHECK(t.requests.StateOf(plain.key) == RequestState::kRetry);
   CheckFinals(t, /*all_final=*/false);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The stage 2 follow-up item (cross-stage decision 4): S2-L1, a grant's writes applied with the
+// grant; S2-L2, OnLeaseEnd's writes at every end without a commit. Their own ids, S2L1a to S2L2f.
+
+// The lease's held field: slot 1 of the leased entity's row (the report commits slot 0).
+RecordKey HeldKey(const EntityId& e) { return RecordKey{kProp, e, 1}; }
+
+// An owner-run Decide whose grant carries `writes` (S2-L1).
+void GrantWrites(TableRig& t, std::function<std::vector<Write>(const Request&)> writes) {
+  t.authority.decide = [&t, writes](const Request& r, const DecideContext&) -> std::optional<Verdict> {
+    if (r.model != Model::kOwnerRun) return std::nullopt;
+    Verdict v;
+    v.type = Verdict::Type::kOwnerRun;
+    v.lease = LeaseSpec{r.subject, r.kind, r.key.peer, t.authority.lease_term};
+    v.writes = writes(r);
+    return v;
+  };
+}
+
+BACKEND_TEST("S2L1a", LeaseGrantWritesWithTheGrant) {
+  // The grant's writes are applied with the grant, and the granted decision says where they are
+  // complete: at_lsn is the held row's LSN, in its scope. The decision stays not final.
+  TableRig t;
+  GrantWrites(t, [](const Request& r) {
+    return std::vector<Write>{Write{HeldKey(r.subject), Val(r.key.peer), false}};
+  });
+  const EntityId e = Ent(kGen, 1);
+  const uint64_t head = t.state.Head();
+  const auto [key, lease] = Granted(t, e, 1);
+  REQUIRE_OR_RETURN_VOID(lease != 0);
+  const Record* held = t.state.Get(HeldKey(e));
+  REQUIRE_OR_RETURN_VOID(held != nullptr);
+  CHECK(held->value == Val(kPeer));
+  CHECK(t.state.Head() == head + 1);
+  const auto granted = t.Last(key);
+  REQUIRE_OR_RETURN_VOID(granted.has_value());
+  CHECK(granted->outcome == Outcome::kGranted && !granted->final && granted->lease == lease);
+  CHECK(granted->at_lsn == held->lsn && granted->scope == Scope::kLevel);
+  // The report then commits as before; the held row is the kind's to change, not the table's.
+  t.Report(lease, Val(7));
+  CHECK(t.Final(key) && t.Final(key)->outcome == Outcome::kApplied);
+  CHECK(t.state.Get(HeldKey(e))->value == Val(kPeer));
+  // A grant without writes says nothing of an LSN (the earlier behaviour).
+  t.authority.decide = nullptr;
+  const auto [key2, lease2] = Granted(t, Ent(kGen, 2), 2);
+  REQUIRE_OR_RETURN_VOID(lease2 != 0);
+  CHECK(t.Last(key2)->at_lsn == 0);
+  CheckFinals(t, false);
+}
+
+BACKEND_TEST("S2L1b", LeaseGrantWritesNotWrittenRefuseTheGrant) {
+  // A set ApplyAll does not write refuses the grant with the table's mapping, and no lease is
+  // made: too big `limit`, mixed scopes `model`. Nothing is written (all or none).
+  TableRig t;
+  const EntityId e = Ent(kGen, 1);
+  GrantWrites(t, [](const Request& r) {
+    return std::vector<Write>{Write{HeldKey(r.subject), Val(1), false},
+                              Write{RecordKey{kProp, r.subject, 2}, Val(1, 65), false}};  // > 64
+  });
+  const uint64_t head = t.state.Head();
+  const auto [key, lease] = Granted(t, e, 1);
+  CHECK(lease == 0);
+  CHECK(t.Final(key) && t.Final(key)->reason == Reason::kLimit);
+  CHECK(t.state.Head() == head && t.state.Get(HeldKey(e)) == nullptr);
+  CHECK(t.leases.Of(e) == nullptr && t.leases.Held(kPeer) == 0 && t.leases.Size() == 0);
+  GrantWrites(t, [](const Request& r) {
+    return std::vector<Write>{Write{HeldKey(r.subject), Val(1), false},
+                              Write{Key(kCounter, SessionObject(1)), Val(1), false}};
+  });
+  const auto [key2, lease2] = Granted(t, e, 2);
+  CHECK(lease2 == 0);
+  CHECK(t.Final(key2) && t.Final(key2)->reason == Reason::kModel);
+  CHECK(t.state.Head() == head && t.leases.Size() == 0);
+  // The entity is free: a grant whose writes go takes it.
+  GrantWrites(t, [](const Request& r) {
+    return std::vector<Write>{Write{HeldKey(r.subject), Val(3), false}};
+  });
+  const auto [key3, lease3] = Granted(t, e, 3);
+  CHECK(lease3 != 0 && t.state.Get(HeldKey(e)) != nullptr);
+  CheckFinals(t, false);
+}
+
+BACKEND_TEST("S2L1c", LeaseGrantThatCannotBeMadeWritesNothing) {
+  // Past max_leases_per_peer (4) the grant is refused `limit` before its writes: the held row of
+  // the fifth entity is never written (the table asks the lease table first).
+  TableRig t;
+  GrantWrites(t, [](const Request& r) {
+    return std::vector<Write>{Write{HeldKey(r.subject), Val(r.key.sequence), false}};
+  });
+  for (uint32_t n = 1; n <= 4; ++n) CHECK(Granted(t, Ent(kGen, n), n).second != 0);
+  const uint64_t head = t.state.Head();
+  const auto [fifth, none] = Granted(t, Ent(kGen, 5), 5);
+  CHECK(none == 0);
+  CHECK(t.Final(fifth) && t.Final(fifth)->reason == Reason::kLimit);
+  CHECK(t.state.Head() == head && t.state.Get(HeldKey(Ent(kGen, 5))) == nullptr);
+  CheckFinals(t, false);
+}
+
+// OnLeaseEnd writes the held field back to 0 (stage 6's `closed`/`free`).
+void EndWritesFree(TableRig& t) {
+  t.authority.end = [](const Lease& l, LeaseEndReason, const DecideContext&) {
+    return std::vector<Write>{Write{HeldKey(l.spec.entity), Val(0), false}};
+  };
+}
+void HeldOnGrant(TableRig& t) {
+  GrantWrites(t, [](const Request& r) {
+    return std::vector<Write>{Write{HeldKey(r.subject), Val(r.key.peer), false}};
+  });
+}
+
+BACKEND_TEST("S2L2a", LeaseEndWritesOnExpiry) {
+  // An expiry (Service) calls OnLeaseEnd once, with the lease as it ended, and applies its writes
+  // before the key's `lease expired` and the LeaseEnd go out.
+  TableRig t;
+  HeldOnGrant(t);
+  EndWritesFree(t);
+  const EntityId e = Ent(kGen, 1);
+  const auto [key, lease] = Granted(t, e, 1);
+  REQUIRE_OR_RETURN_VOID(lease != 0);
+  CHECK(t.state.Get(HeldKey(e))->value == Val(kPeer));
+  t.Wait(3100ms);
+  REQUIRE_OR_RETURN_VOID(t.authority.ends.size() == 1);
+  const auto& [ended, why] = t.authority.ends.front();
+  CHECK(why == LeaseEndReason::kExpired && ended.id == lease && ended.state == LeaseState::kExpired);
+  CHECK(ended.spec.holder == kPeer && ended.request == key);
+  CHECK(t.state.Get(HeldKey(e))->value == Val(0));
+  CHECK(t.Final(key) && t.Final(key)->reason == Reason::kLeaseExpired);
+  CHECK(t.LeaseEnds(lease) == std::vector<LeaseEndReason>{LeaseEndReason::kExpired});
+  t.Wait(5s);
+  CHECK(t.authority.ends.size() == 1);  // an ended lease never ends again
+  CheckFinals(t, false);
+}
+
+BACKEND_TEST("S2L2b", LeaseEndWritesOnReportRefusedAndLateReport) {
+  // A refused report and a report found past the term (OnLeaseReport's own expiry) both write the
+  // end; a commit does not call OnLeaseEnd.
+  TableRig t;
+  HeldOnGrant(t);
+  EndWritesFree(t);
+  t.authority.report = [](const Lease&, std::span<const uint8_t> payload,
+                          const DecideContext&) -> std::optional<Verdict> {
+    if (!payload.empty() && payload[0] == 9) return Refusal(Reason::kKind, false, 3);
+    return std::nullopt;  // commits
+  };
+  const EntityId a = Ent(kGen, 1), b = Ent(kGen, 2), c = Ent(kGen, 3);
+  const auto [ka, la] = Granted(t, a, 1);
+  const auto [kb, lb] = Granted(t, b, 2);
+  const auto [kc, lc] = Granted(t, c, 3);
+  REQUIRE_OR_RETURN_VOID(la != 0 && lb != 0 && lc != 0);
+  t.Report(la, Val(9));  // refused
+  REQUIRE_OR_RETURN_VOID(t.authority.ends.size() == 1);
+  CHECK(t.authority.ends[0].second == LeaseEndReason::kReportRefused);
+  CHECK(t.authority.ends[0].first.state == LeaseState::kRevoked);
+  CHECK(t.state.Get(HeldKey(a))->value == Val(0));
+  t.Report(lb, Val(5));  // committed: no end writes
+  CHECK(t.authority.ends.size() == 1);
+  CHECK(t.state.Get(HeldKey(b))->value == Val(kPeer));
+  t.now += 3s;  // c's term passed, no Service in between
+  t.Report(lc, Val(5));
+  REQUIRE_OR_RETURN_VOID(t.authority.ends.size() == 2);
+  CHECK(t.authority.ends[1].second == LeaseEndReason::kExpired && t.authority.ends[1].first.id == lc);
+  CHECK(t.state.Get(HeldKey(c))->value == Val(0));
+  t.Wait(1s);  // the expired lease is not ended again by Service
+  CHECK(t.authority.ends.size() == 2);
+  // Duplicates are replays: nothing ends twice.
+  t.Report(la, Val(9));
+  t.Report(lc, Val(5));
+  CHECK(t.authority.ends.size() == 2);
+  CheckFinals(t, false);
+}
+
+BACKEND_TEST("S2L2c", LeaseEndWritesOnPeerLeftAndClose) {
+  // A holder that left gets nothing sent, but its lease's end writes are applied (the held row
+  // must not stay held by a departed peer); End session's revocation writes too.
+  TableRig t;
+  HeldOnGrant(t);
+  EndWritesFree(t);
+  const EntityId a = Ent(kGen, 1), b = Ent(kGen, 2);
+  const auto [ka, la] = Granted(t, a, 1);
+  const auto [kb, lb] = Granted(t, b, 1, kOther);
+  REQUIRE_OR_RETURN_VOID(la != 0 && lb != 0);
+  const size_t outputs = t.log.size();
+  t.requests.ForgetPeer(kPeer, t.now);
+  t.Take();
+  CHECK(t.log.size() == outputs);  // nothing sent to a peer that left
+  REQUIRE_OR_RETURN_VOID(t.authority.ends.size() == 1);
+  CHECK(t.authority.ends[0].second == LeaseEndReason::kRevokedPeerLeft);
+  CHECK(t.authority.ends[0].first.id == la && t.authority.ends[0].first.state == LeaseState::kRevoked);
+  CHECK(t.state.Get(HeldKey(a))->value == Val(0));
+  t.requests.BeginClose(t.now);
+  t.Take();
+  REQUIRE_OR_RETURN_VOID(t.authority.ends.size() == 2);
+  CHECK(t.authority.ends[1].second == LeaseEndReason::kRevokedClose && t.authority.ends[1].first.id == lb);
+  CHECK(t.state.Get(HeldKey(b))->value == Val(0));
+  CHECK(t.LeaseEnds(lb) == std::vector<LeaseEndReason>{LeaseEndReason::kRevokedClose});
+}
+
+BACKEND_TEST("S2L2d", LeaseEndWritesNothingAtTheGenerationChange) {
+  // kRevokedEpoch: the level's rows end with the generation; OnLeaseEnd is not called.
+  TableRig t;
+  HeldOnGrant(t);
+  EndWritesFree(t);
+  const auto [key, lease] = Granted(t, Ent(kGen, 1), 1);
+  REQUIRE_OR_RETURN_VOID(lease != 0);
+  t.NewGeneration();
+  CHECK(t.authority.ends.empty());
+  CHECK(t.LeaseEnds(lease) == std::vector<LeaseEndReason>{LeaseEndReason::kRevokedEpoch});
+  CHECK(t.requests.LeaseEndWritesRefused() == 0);
+}
+
+BACKEND_TEST("S2L2e", LeaseEndWritesImpureOrRefused) {
+  // OnLeaseEnd is pure: one that writes is counted and its returned writes are not applied. A set
+  // ApplyAll refuses is counted (S raises a limit event on it), all or none.
+  TableRig t;
+  HeldOnGrant(t);
+  const EntityId a = Ent(kGen, 1), b = Ent(kGen, 2);
+  t.authority.end = [&t, a](const Lease& l, LeaseEndReason, const DecideContext&) {
+    if (l.spec.entity == a) {
+      t.state.Put(RecordKey{kProp, a, 3}, Val(1), t.now);  // impure
+      return std::vector<Write>{Write{HeldKey(a), Val(0), false}};
+    }
+    return std::vector<Write>{Write{HeldKey(l.spec.entity), Val(0), false},
+                              Write{RecordKey{kProp, l.spec.entity, 2}, Val(1, 65), false}};
+  };
+  const auto [ka, la] = Granted(t, a, 1);
+  const auto [kb, lb] = Granted(t, b, 2);
+  REQUIRE_OR_RETURN_VOID(la != 0 && lb != 0);
+  const uint64_t impure = t.requests.ImpureVerdicts();
+  t.Wait(3100ms);
+  CHECK(t.authority.ends.size() == 2);
+  CHECK(t.requests.ImpureVerdicts() == impure + 1);
+  CHECK(t.state.Get(HeldKey(a))->value == Val(kPeer));  // not applied
+  CHECK(t.requests.LeaseEndWritesRefused() == 1);
+  CHECK(t.state.Get(HeldKey(b))->value == Val(kPeer));  // none of the set
+  // Both keys still end `lease expired` and both holders hear LeaseEnd.
+  CHECK(t.Final(ka) && t.Final(ka)->reason == Reason::kLeaseExpired);
+  CHECK(t.Final(kb) && t.Final(kb)->reason == Reason::kLeaseExpired);
+  CHECK(t.LeaseEnds(la).size() == 1 && t.LeaseEnds(lb).size() == 1);
 }
 
 }  // namespace

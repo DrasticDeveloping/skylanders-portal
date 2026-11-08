@@ -37,10 +37,15 @@ std::string_view LeaseEndReasonName(LeaseEndReason why) {
 
 LeaseTable::LeaseTable(const Limits& limits) : limits_(limits) {}
 
-std::variant<uint32_t, Reason> LeaseTable::Grant(const LeaseSpec& spec, const RequestKey& request,
-                                                 TimePoint now) {
+Reason LeaseTable::CanGrant(const LeaseSpec& spec) const {
   if (Of(spec.entity) != nullptr) return Reason::kLeased;
   if (Held(spec.holder) >= limits_.max_leases_per_peer) return Reason::kLimit;
+  return Reason::kNone;
+}
+
+std::variant<uint32_t, Reason> LeaseTable::Grant(const LeaseSpec& spec, const RequestKey& request,
+                                                 TimePoint now) {
+  if (const Reason why = CanGrant(spec); why != Reason::kNone) return why;
   Lease l;
   l.id = next_id_++;
   l.spec = spec;
@@ -113,7 +118,7 @@ void LeaseTable::Service(TimePoint now) {
     if (l.state != LeaseState::kGranted || now < l.expires) continue;
     l.state = LeaseState::kExpired;
     l.why = LeaseEndReason::kExpired;
-    ended_.push_back(LeaseEndEvent{id, l.spec.holder, l.request, LeaseEndReason::kExpired});
+    ended_.push_back(LeaseEndEvent{id, l.spec.holder, l.request, LeaseEndReason::kExpired, l});
   }
 }
 
@@ -125,8 +130,11 @@ void LeaseTable::OnPeerLeft(uint16_t peer) {
       continue;
     }
     if (Live(l)) {
+      Lease ended = l;
+      ended.state = LeaseState::kRevoked;
+      ended.why = LeaseEndReason::kRevokedPeerLeft;
       ended_.push_back(
-          LeaseEndEvent{l.id, l.spec.holder, l.request, LeaseEndReason::kRevokedPeerLeft});
+          LeaseEndEvent{l.id, l.spec.holder, l.request, LeaseEndReason::kRevokedPeerLeft, ended});
     }
     it = leases_.erase(it);  // its tombs go with it
   }
@@ -135,7 +143,11 @@ void LeaseTable::OnPeerLeft(uint16_t peer) {
 void LeaseTable::OnEpoch(uint32_t /*generation*/) {
   for (auto& [id, l] : leases_) {
     if (Live(l)) {
-      ended_.push_back(LeaseEndEvent{id, l.spec.holder, l.request, LeaseEndReason::kRevokedEpoch});
+      Lease ended = l;
+      ended.state = LeaseState::kRevoked;
+      ended.why = LeaseEndReason::kRevokedEpoch;
+      ended_.push_back(
+          LeaseEndEvent{id, l.spec.holder, l.request, LeaseEndReason::kRevokedEpoch, ended});
     }
   }
   leases_.clear();  // lease ids live one generation; every tomb goes
@@ -146,7 +158,7 @@ void LeaseTable::OnClose() {
     if (!Live(l)) continue;
     l.state = LeaseState::kRevoked;
     l.why = LeaseEndReason::kRevokedClose;
-    ended_.push_back(LeaseEndEvent{id, l.spec.holder, l.request, LeaseEndReason::kRevokedClose});
+    ended_.push_back(LeaseEndEvent{id, l.spec.holder, l.request, LeaseEndReason::kRevokedClose, l});
   }
 }
 
