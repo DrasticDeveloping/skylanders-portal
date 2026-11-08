@@ -405,6 +405,25 @@ int main() {
     CHECK(gate.WrongSecrets() == kWrongSecretBudget);
   }
 
+  // Sol 8B F2: the gate's capacity check knows the owner's Hello replaces the owner's connection:
+  // a full session admits it when a welcomed owner is there (no new place), and still refuses an
+  // owner Hello "full" when there is no owner to replace, and every other joiner.
+  {
+    HelloGate gate({0x1234, Key(18), true, 2}, t0);
+    HelloFacts owner = Facts({0x7F000001, 5000}, 1, 0, 0);
+    owner.owner = true;
+    owner.replaces_owner = true;
+    CHECK(Join(gate, owner, 2, t0).verdict == HelloVerdict::kAdmit);
+    HelloFacts first = Facts({0x7F000002, 5000}, 1, 0, 0);
+    first.owner = true;  // no owner in the session to replace
+    CHECK(Join(gate, first, 2, t0 + seconds(1)).verdict == HelloVerdict::kFull);
+    CHECK(Join(gate, first, 1, t0 + seconds(2)).verdict == HelloVerdict::kAdmit);
+    HelloFacts joiner = Facts({0x7F000003, 5000}, 1, 0, 0x1234);
+    joiner.replaces_owner = true;  // read only for an owner Hello
+    CHECK(Join(gate, joiner, 2, t0 + seconds(3)).verdict == HelloVerdict::kFull);
+    CHECK(Join(gate, joiner, 1, t0 + seconds(4)).verdict == HelloVerdict::kAdmit);
+  }
+
   // "Let anyone with the code in": no pending entry, admitted while there is room.
   {
     HelloGate gate({0x1234, Key(13), true, 4}, t0);

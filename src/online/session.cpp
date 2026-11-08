@@ -379,6 +379,8 @@ bool ServerSession::AdmitThroughGate(const Endpoint& from, size_t size,
   std::string text;
   f.compatible = CompatibleHello(*hello, from, &reason, &text);
   f.owner = f.compatible && !IsNone(hello->owner_token);  // compatible: the token matched
+  // HandleHello replaces a welcomed owner's connection with this one: no new place (Sol 8B F2).
+  f.replaces_owner = f.owner && FindById(kOwnerPeerId) != nullptr;
   const HelloDecision d = gate_->Check(f, int(PeerCount()), now);
   switch (d.verdict) {
     case HelloVerdict::kDrop:

@@ -42,7 +42,8 @@ namespace skylanders::online {
 //   6. let in: a joiner waits as a pending entry (at most 4, each expiring 60 s after it was shown,
 //      never a player slot) unless "let anyone with the code in" is on; the owner (a valid owner
 //      token, checked by the caller) skips the secret and let in;
-//   7. players: at most the session's maximum; one more is refused "full".
+//   7. players: at most the session's maximum; one more is refused "full". The owner's Hello that
+//      replaces the owner's own connection (HelloFacts::replaces_owner) takes no new place.
 //
 // The owner's answer to a pending entry (let in, refuse) and its expiry are kept as a decision for
 // that entry's (address, port, nonce) for kDecidedLifetime (at most kMaxDecided of them): the
@@ -175,6 +176,10 @@ struct HelloFacts {
   uint64_t cookie = 0;  // 0: none
   uint32_t secret = 0;
   bool owner = false;  // the Hello carries the session's owner token (the caller compared it)
+  // With `owner`: the session already has a welcomed owner whose connection this Hello replaces
+  // (the session drops the old one when it welcomes the new one), so it needs no new place (Sol 8B
+  // F2). Read only for an owner Hello.
+  bool replaces_owner = false;
   // The caller's own stateless checks passed (version, digest, no wrong owner token, a synthetic
   // flag it takes); false: kIncompatible once the cookie is valid, refused with the caller's reason.
   bool compatible = true;

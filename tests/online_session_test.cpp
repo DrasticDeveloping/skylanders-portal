@@ -1316,6 +1316,33 @@ void FakeNetworkHelloGate() {
   CHECK(stale.Last(CE::kRefused) && stale.Last(CE::kRefused)->refuse_reason == RefuseReason::kWrongCode);
 }
 
+// Sol 8B F2: with the gate on and the session full, the owner's game coming back (a restart, a new
+// address) still gets in at once: its Hello replaces the owner's connection and takes no new place;
+// the old connection is told Bye. Another joiner is still refused "full".
+void FakeNetworkGateOwnerReplacesWhenFull() {
+  World w(90);
+  ServerSettings s = Settings();
+  s.gate = true;
+  s.join_secret = 0x89ABCDEF;
+  s.max_clients = 1;
+  REQUIRE_OR_RETURN_VOID(w.StartServer(s));
+  Client& owner = w.Connect(MakeHello("Owner", true));
+  CHECK(w.RunUntil([&] { return owner.session->Connected(); }));
+  CHECK(w.server.PeerCount() == 1);
+  Client& owner2 = w.Connect(MakeHello("Owner", true));
+  CHECK(w.RunUntil([&] { return owner2.session->Connected(); }));
+  CHECK(owner2.session->PeerId() == kOwnerPeerId);
+  CHECK(w.RunUntil([&] { return owner.session->State() == ClientState::kDisconnected; }));
+  CHECK(owner.Last(CE::kDisconnected) &&
+        owner.Last(CE::kDisconnected)->disconnect_reason == DisconnectReason::kBye);
+  CHECK(w.server.PeerCount() == 1);
+  Hello joiner = MakeHello("Joiner");
+  joiner.join_secret = s.join_secret;
+  Client& j = w.Connect(joiner);
+  CHECK(w.RunUntil([&] { return j.session->State() == ClientState::kRefused; }));
+  CHECK(j.Last(CE::kRefused) && j.Last(CE::kRefused)->refuse_reason == RefuseReason::kFull);
+}
+
 // The gate off (every loopback session without the game's test switch): a Hello with no secret
 // and no cookie is welcomed at once, as before stage 8; no stateless answer is ever sent.
 void FakeNetworkGateOff() {
@@ -1330,6 +1357,7 @@ void FakeNetworkGateOff() {
 
 int main() {
   FakeNetworkHelloGate();
+  FakeNetworkGateOwnerReplacesWhenFull();
   FakeNetworkGateOff();
   FakeNetworkSession();
   FakeNetworkStopAndQuiet();

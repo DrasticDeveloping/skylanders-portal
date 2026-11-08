@@ -245,9 +245,12 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
     d.verdict = HelloVerdict::kIncompatible;
     return d;
   }
-  // The owner (its token checked by the caller) skips the secret and let in.
+  // The owner (its token checked by the caller) skips the secret and let in. Its Hello that replaces
+  // the owner's own connection (the session drops the old one when it welcomes this one) takes no
+  // new place, so a full session still lets the owner's game back in at once (Sol 8B F2).
   if (hello.owner) {
-    d.verdict = players < settings_.max_players ? HelloVerdict::kAdmit : HelloVerdict::kFull;
+    const int taken = players - (hello.replaces_owner && players > 0 ? 1 : 0);
+    d.verdict = taken < settings_.max_players ? HelloVerdict::kAdmit : HelloVerdict::kFull;
     return d;
   }
   // Decisions kept past kDecidedLifetime go before the secret is weighed.
