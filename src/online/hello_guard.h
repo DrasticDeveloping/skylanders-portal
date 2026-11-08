@@ -34,7 +34,11 @@ namespace skylanders::online {
 //      a wrong owner token, a synthetic peer it does not take): refused with the caller's reason;
 //   5. the secret: a cookie-valid Hello with the wrong secret is refused "wrong code"; after 4 a
 //      source gets no replies for 60 s; 4096 wrong secrets spend the secret's budget and no new
-//      joiner is admitted until the owner makes a new code (a new secret);
+//      joiner is admitted until the owner makes a new code (a new secret). A join already under
+//      way keeps the secret it was verified with (Sol 8B F1): a tuple with a pending entry or a
+//      kept decision whose Hello carries that secret skips this step, so a new code or a spent
+//      budget does not strand a joiner already waiting; any other Hello with an old code is a
+//      wrong code;
 //   6. let in: a joiner waits as a pending entry (at most 4, each expiring 60 s after it was shown,
 //      never a player slot) unless "let anyone with the code in" is on; the owner (a valid owner
 //      token, checked by the caller) skips the secret and let in;
@@ -42,9 +46,9 @@ namespace skylanders::online {
 //
 // The owner's answer to a pending entry (let in, refuse) and its expiry are kept as a decision for
 // that entry's (address, port, nonce) for kDecidedLifetime (at most kMaxDecided of them): the
-// joiner's next cookie-valid Hello with the right secret gets it (admitted, "not let in", "not let
-// in: timed out", "full"), since the joiner holds no connection and learns it only from its next
-// Hello.
+// joiner's next cookie-valid Hello with the secret its entry was verified with (or the current one)
+// gets it (admitted, "not let in", "not let in: timed out", "full"), since the joiner holds no
+// connection and learns it only from its next Hello.
 
 using CookieKey = std::array<uint8_t, 16>;
 
@@ -142,6 +146,7 @@ struct PendingJoin {
   std::string name;
   uint16_t figure_id = 0;
   uint16_t figure_variant = 0;
+  uint32_t secret = 0;  // the secret its Hello was verified with (kept across a new code, Sol 8B F1)
   netplay::TimePoint shown{};
 };
 
@@ -237,9 +242,13 @@ class HelloGate {
     netplay::Endpoint from;
     uint64_t client_nonce = 0;
     Decided decided = Decided::kRefused;
+    uint32_t secret = 0;  // the pending entry's verified secret
     netplay::TimePoint until{};
   };
   void Decide(const PendingJoin& join, Decided decided, netplay::TimePoint now);
+  // A join already under way: (from, nonce) has a pending entry or a kept decision verified with
+  // `secret` (Sol 8B F1).
+  bool VerifiedBefore(const netplay::Endpoint& from, uint64_t client_nonce, uint32_t secret) const;
 
   HelloGateSettings settings_;
   CookieJar cookies_;

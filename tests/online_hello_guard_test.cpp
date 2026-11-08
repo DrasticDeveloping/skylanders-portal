@@ -330,6 +330,81 @@ int main() {
     CHECK(many.DecidedCount() == kMaxDecided);
   }
 
+  // Sol 8B F1: a join under way keeps the secret it was verified with. After New code (secret B)
+  // the tuple still pending under A keeps waiting on A (the same entry, nothing counted wrong, its
+  // source never blocked) and is admitted once let in; an already-refused tuple collects its
+  // decision under A. Any other Hello with A (another nonce, another address) is a wrong code, so
+  // is a tuple's Hello with a third secret, and a decided tuple's A once its decision is gone.
+  {
+    constexpr uint32_t kA = 0x1234, kB = 0x4321;
+    HelloGate gate({kA, Key(17), false, 4}, t0);
+    TimePoint now = t0;
+    auto ask = [&](uint32_t address, uint64_t nonce, uint32_t secret) {
+      now += milliseconds(1100);  // a Join (two Hellos) every 1.1 s holds the per-source rate
+      return Join(gate, Facts({address, 1000}, nonce, 0, secret), 1, now);
+    };
+    const HelloDecision w = ask(0x72000001, 1, kA);  // pending, let in after New code
+    const HelloDecision r = ask(0x72000002, 1, kA);  // pending, refused before New code
+    REQUIRE_OR_RETURN(w.verdict == HelloVerdict::kWait && r.verdict == HelloVerdict::kWait);
+    CHECK(gate.Refuse(r.pending_id, now));
+    gate.NewSecret(kB);
+    for (int i = 0; i < kWrongSecretsPerSource + 1; ++i) {
+      const HelloDecision again = ask(0x72000001, 1, kA);
+      CHECK(again.verdict == HelloVerdict::kWait && !again.new_pending &&
+            again.pending_id == w.pending_id);
+    }
+    CHECK(gate.WrongSecrets() == 0);
+    CHECK(ask(0x72000002, 1, kA).verdict == HelloVerdict::kNotLetIn);
+    PendingJoin let{};
+    CHECK(gate.LetIn(w.pending_id, 1, now, &let) == HelloVerdict::kAdmit);
+    CHECK(let.secret == kA);
+    CHECK(ask(0x72000001, 1, kA).verdict == HelloVerdict::kAdmit);
+    CHECK(ask(0x72000001, 2, kA).verdict == HelloVerdict::kWrongCode);      // another nonce
+    CHECK(ask(0x72000009, 1, kA).verdict == HelloVerdict::kWrongCode);      // another address
+    CHECK(ask(0x72000002, 1, 0x7777).verdict == HelloVerdict::kWrongCode);  // a third secret
+    CHECK(gate.WrongSecrets() == 3);
+    CHECK(ask(0x7200000A, 1, kB).verdict == HelloVerdict::kWait);  // the new code works
+    now += kDecidedLifetime;  // the refusal is gone: its A is an old code now
+    CHECK(ask(0x72000002, 1, kA).verdict == HelloVerdict::kWrongCode);
+    CHECK(gate.WrongSecrets() == 4);
+  }
+
+  // Sol 8B F1: a spent budget strands no join under way either. Entries made while the budget was
+  // nearly spent: one let in before it ran out collects its admission after, one still waiting
+  // keeps waiting and is admitted once let in; a new joiner with the same (current) secret hears
+  // "code spent".
+  {
+    constexpr uint32_t kA = 0x1234;
+    HelloGate gate({kA, Key(19), false, 4}, t0);
+    TimePoint now = t0;
+    uint32_t n = 0;
+    auto wrong = [&] {
+      now += milliseconds(150);  // two Hellos a join, under the global rate
+      Join(gate, Facts({0x73000000 + n, 1000}, n, 0, 0x9999), 0, now);
+      ++n;
+    };
+    while (gate.WrongSecrets() + 2 < kWrongSecretBudget && n < 2 * kWrongSecretBudget) wrong();
+    REQUIRE_OR_RETURN(gate.WrongSecrets() + 2 == kWrongSecretBudget);
+    auto join = [&](uint32_t address) {
+      now += seconds(1);
+      return Join(gate, Facts({address, 1000}, 1, 0, kA), 1, now);
+    };
+    const HelloDecision p1 = join(0x74000001);
+    const HelloDecision p2 = join(0x74000002);
+    REQUIRE_OR_RETURN(p1.verdict == HelloVerdict::kWait && p2.verdict == HelloVerdict::kWait);
+    PendingJoin let{};
+    CHECK(gate.LetIn(p1.pending_id, 1, now, &let) == HelloVerdict::kAdmit);
+    wrong();
+    wrong();
+    REQUIRE_OR_RETURN(gate.CodeSpent());
+    CHECK(join(0x74000001).verdict == HelloVerdict::kAdmit);
+    CHECK(join(0x74000002).verdict == HelloVerdict::kWait);
+    CHECK(gate.LetIn(p2.pending_id, 1, now, &let) == HelloVerdict::kAdmit);
+    CHECK(join(0x74000002).verdict == HelloVerdict::kAdmit);
+    CHECK(join(0x74000003).verdict == HelloVerdict::kCodeSpent);
+    CHECK(gate.WrongSecrets() == kWrongSecretBudget);
+  }
+
   // "Let anyone with the code in": no pending entry, admitted while there is room.
   {
     HelloGate gate({0x1234, Key(13), true, 4}, t0);

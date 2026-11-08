@@ -250,12 +250,22 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
     d.verdict = players < settings_.max_players ? HelloVerdict::kAdmit : HelloVerdict::kFull;
     return d;
   }
-  // 5. The secret; only cookie-valid attempts count, so a spoofer cannot spend them.
-  if (CodeSpent()) {
+  // Decisions kept past kDecidedLifetime go before the secret is weighed.
+  std::erase_if(decided_, [now](const DecidedJoin& j) { return now >= j.until; });
+  // 5. The secret; only cookie-valid attempts count, so a spoofer cannot spend them. A join already
+  // under way (Sol 8B F1) keeps the secret it was verified with: a tuple with a pending entry or a
+  // kept decision whose Hello carries that secret skips the current secret and its budget, so the
+  // owner's New code or a spent budget does not strand a joiner already waiting or already
+  // answered (Host: joiners waiting stay and can still be let in). Only such a tuple gets past:
+  // cookie-proven, at most kMaxPendingJoins + kMaxDecided of them, each bounded in time; a Hello
+  // with an old code from any other tuple (another nonce or address) is a wrong code.
+  const bool under_way =
+      hello.secret != 0 && VerifiedBefore(hello.from, hello.client_nonce, hello.secret);
+  if (!under_way && CodeSpent()) {
     d.verdict = HelloVerdict::kCodeSpent;
     return d;
   }
-  if (hello.secret != settings_.secret || settings_.secret == 0) {
+  if (!under_way && (hello.secret != settings_.secret || settings_.secret == 0)) {
     ++wrong_secrets_;
     if (++source.wrong_secrets >= kWrongSecretsPerSource) {
       source.blocked_until = now + kWrongSecretBlock;
@@ -265,7 +275,6 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
     return d;
   }
   // The owner's answer to this tuple's pending entry, or its expiry (kept kDecidedLifetime).
-  std::erase_if(decided_, [now](const DecidedJoin& j) { return now >= j.until; });
   for (auto it = decided_.begin(); it != decided_.end(); ++it) {
     if (it->from != hello.from || it->client_nonce != hello.client_nonce) continue;
     switch (it->decided) {
@@ -299,6 +308,7 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
   join.name = hello.name;
   join.figure_id = hello.figure_id;
   join.figure_variant = hello.figure_variant;
+  join.secret = hello.secret;  // a retransmit keeps the entry's own (Offer leaves it alone)
   switch (pending_.Offer(join, now, &d.pending_id)) {
     case LetInTable::Add::kAdded:
       d.new_pending = true;
@@ -344,7 +354,19 @@ void HelloGate::Decide(const PendingJoin& join, Decided decided, netplay::TimePo
     return now >= j.until || (j.from == join.from && j.client_nonce == join.client_nonce);
   });
   if (decided_.size() >= kMaxDecided) decided_.erase(decided_.begin());  // the oldest goes
-  decided_.push_back(DecidedJoin{join.from, join.client_nonce, decided, now + kDecidedLifetime});
+  decided_.push_back(
+      DecidedJoin{join.from, join.client_nonce, decided, join.secret, now + kDecidedLifetime});
+}
+
+bool HelloGate::VerifiedBefore(const netplay::Endpoint& from, uint64_t client_nonce,
+                               uint32_t secret) const {
+  for (const PendingJoin& p : pending_.Pending()) {
+    if (p.from == from && p.client_nonce == client_nonce && p.secret == secret) return true;
+  }
+  for (const DecidedJoin& j : decided_) {
+    if (j.from == from && j.client_nonce == client_nonce && j.secret == secret) return true;
+  }
+  return false;
 }
 
 }  // namespace skylanders::online
