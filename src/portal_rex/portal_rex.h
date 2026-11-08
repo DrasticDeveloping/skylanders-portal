@@ -40,6 +40,13 @@ namespace skylanders {
 //
 // If the `portal_figures_dir` cvar is empty, it is set to `default_figures_dir` (which is created
 // if it doesn't exist yet) so the overlay has somewhere to look without the user passing a flag.
+//
+// The owner's figures guard (Swap Force Online's main safety audit): in a run with a non-empty
+// --user_data_root (a test copy), `default_figures_dir` is the run's own figures folder, and the
+// owner's are DataFolder()/Figures and DefaultDataFolder()/Figures. A figure file inside an owner's
+// folder that is not the run's own is never saved (nor backed up) and the refusal is logged once
+// per file; a `portal_figure` there is not placed; a `portal_figures_dir` there is replaced by
+// `default_figures_dir`. All with a warning. A run without --user_data_root is unchanged.
 void InstallPortal(const std::filesystem::path& default_figures_dir);
 
 // For a game's OnConfigurePaths: its user data in the one data folder of every game
@@ -55,7 +62,9 @@ void UseSharedDataFolder(std::filesystem::path& user_data_root, std::filesystem:
 // runs: Figures in the data folder (Documents\Skylanders\Giants -> Documents\Skylanders\Figures),
 // or for an old per-game folder "Skylanders\Figures" next to it (portal/data_folder.h SharedBase). A
 // run with a copied --user_data_root gets its own one next to the copy, so tests never touch the
-// real figures. The first time a game uses it, the files of its old
+// real figures; a copy whose "Skylanders" next to it would be the owner's data folder (a copy
+// beside it, Documents\sf-test: data_folder.h CopySharesOwnersFolder) keeps <user_data_root>\figures
+// instead, with a warning, and nothing is copied out of it. The first time a game uses it, the files of its old
 // per-game folder (<user_data_root>\figures) are copied in, never over a file the shared folder
 // already has, and a note is left in the old folder, which then stays as a backup and is no longer
 // used. Pass the result to InstallPortal.

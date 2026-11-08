@@ -142,6 +142,83 @@ fs::path SharedBase(const fs::path& user_data_root) {
   return user_data_root.parent_path() / "Skylanders";
 }
 
+namespace {
+
+// A path as Windows compares it: absolute, resolved as far as it exists (weakly_canonical), with
+// the preferred separator, no "\\?\" prefix and no trailing separator (but a root's). Compared with
+// SameText, two keys are equal when the paths name one folder.
+fs::path::string_type CompareKey(const fs::path& path) {
+  std::error_code ec;
+  fs::path p = fs::absolute(path, ec);
+  if (ec) p = path;
+  fs::path resolved = fs::weakly_canonical(p, ec);
+  if (ec) resolved = p.lexically_normal();
+  resolved.make_preferred();
+#ifdef _WIN32
+  constexpr std::wstring_view kLong = L"\\\\?\\";
+  const std::wstring& n = resolved.native();
+  if (n.size() >= kLong.size() + 2 && n.compare(0, kLong.size(), kLong) == 0 && n[kLong.size() + 1] == L':') {
+    resolved = fs::path(n.substr(kLong.size()));
+  }
+#endif
+  fs::path::string_type s = resolved.native();
+  const size_t root = resolved.root_path().native().size();
+  while (s.size() > root && s.size() > 1 && s.back() == fs::path::preferred_separator) s.pop_back();
+  return s;
+}
+
+// The first `n` characters of `a` and `b` as the file system compares names: on Windows without
+// regard to case, by the system's own case table (CompareStringOrdinal, kernel32).
+bool SameText(const fs::path::value_type* a, const fs::path::value_type* b, size_t n) {
+#ifdef _WIN32
+  return CompareStringOrdinal(a, static_cast<int>(n), b, static_cast<int>(n), TRUE) == CSTR_EQUAL;
+#else
+  return fs::path::string_type(a, n) == fs::path::string_type(b, n);
+#endif
+}
+
+bool SameFolder(const fs::path& a, const fs::path& b) {
+  if (a.empty() || b.empty()) return false;
+  const fs::path::string_type ka = CompareKey(a);
+  const fs::path::string_type kb = CompareKey(b);
+  return ka.size() == kb.size() && SameText(ka.data(), kb.data(), ka.size());
+}
+
+}  // namespace
+
+bool PathInside(const fs::path& path, const fs::path& folder) {
+  if (path.empty() || folder.empty()) return false;
+  const fs::path::string_type p = CompareKey(path);
+  const fs::path::string_type f = CompareKey(folder);
+  if (f.empty() || p.size() < f.size() || !SameText(p.data(), f.data(), f.size())) return false;
+  return p.size() == f.size() || f.back() == fs::path::preferred_separator ||
+         p[f.size()] == fs::path::preferred_separator;
+}
+
+bool OwnerFigureWriteRefused(const fs::path& file, const std::vector<fs::path>& owner_figure_folders,
+                             const fs::path& run_figures_folder) {
+  for (const fs::path& owner : owner_figure_folders) {
+    if (owner.empty() || !PathInside(file, owner)) continue;
+    // The run's own figures folder is the owner's only for an explicit --user_data_root of the
+    // owner's real game folder: that run plays the owner's game and keeps saving its figures.
+    if (SameFolder(owner, run_figures_folder)) continue;
+    return true;
+  }
+  return false;
+}
+
+bool CopySharesOwnersFolder(const fs::path& user_data_root, const std::vector<fs::path>& owner_data_folders) {
+  // SharedBase's own rule, so the answer is about the folder SharedFiguresDir would really take: a
+  // game-named folder whose parent is an owner's data folder is the owner's game folder itself.
+  if (user_data_root.empty() || user_data_root.parent_path().empty()) return false;
+  if (IsGameFolderName(user_data_root.filename())) return false;
+  const fs::path base = SharedBase(user_data_root);
+  for (const fs::path& owner : owner_data_folders) {
+    if (SameFolder(base, owner)) return true;
+  }
+  return false;
+}
+
 CopyResult CopyFolderVerified(const fs::path& from, const fs::path& to,
                               const std::function<void(const fs::path&)>& on_file) {
   CopyResult result;

@@ -10,6 +10,7 @@
 #include <fstream>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -360,6 +361,51 @@ void BridgeThread(skylanders::portal::RealPortalBridge* bridge, uint32_t generat
   bridge->Step(nullptr);  // takes the copies off
 }
 
+// The owner's figures guard (Swap Force Online's main safety audit, settings-figures): a run with
+// --user_data_root is a test copy, yet a settings file it reads (the one beside the exe, or a copy
+// of the owner's) can name a figure in the owner's real Figures folder (portal_figure) or that
+// folder itself (portal_figures_dir), and so can an input script's `place`; the game would then
+// save into the owner's figure. InstallPortal notes the run's own figures folder (its argument,
+// SharedFiguresDir's answer) and the owner's figure folders (DataFolder()/Figures and
+// DefaultDataFolder()/Figures, which differ when Core of Light picked a folder).
+std::mutex g_figures_guard_mutex;
+std::filesystem::path g_run_figures_dir;
+std::vector<std::filesystem::path> g_owner_figure_dirs;
+
+std::vector<std::filesystem::path> OwnerFigureDirs() {
+  return {skylanders::DataFolder() / "Figures", skylanders::DefaultDataFolder() / "Figures"};
+}
+
+// Whether saving `file` is refused: only with a non-empty --user_data_root (a run without it plays
+// the owner's own data and saves the owner's figures as always), for a file inside one of the
+// owner's figure folders that is not this run's own (portal/data_folder.h OwnerFigureWriteRefused;
+// an explicit --user_data_root of the owner's real game folder keeps its figures).
+bool OwnerFiguresRefused(const std::filesystem::path& file) {
+  if (REXCVAR_GET(user_data_root).empty()) return false;
+  std::filesystem::path run;
+  std::vector<std::filesystem::path> owners;
+  {
+    std::lock_guard<std::mutex> lock(g_figures_guard_mutex);
+    run = g_run_figures_dir;
+    owners = g_owner_figure_dirs;
+  }
+  if (owners.empty()) owners = OwnerFigureDirs();  // before InstallPortal noted them
+  return skylanders::OwnerFigureWriteRefused(file, owners, run);
+}
+
+// The write callback's refusal, logged once per file (the game writes several blocks a second).
+void LogFigureSaveRefused(int slot, const std::filesystem::path& file) {
+  static std::mutex mutex;
+  static std::set<std::filesystem::path> logged;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!logged.insert(file).second) return;
+  }
+  REXLOG_WARN("Portal: not saving slot {}'s figure file {}: it is in the owner's Figures folder and "
+              "this run has --user_data_root (a test copy); the game's changes to it stay in memory",
+              slot, skylanders::Utf8Path(file));
+}
+
 // Keeps a copy of a figure file before the game first saves over it in this run, and again when the
 // last copy is 30 minutes old (the game writes several blocks a second while it plays, a copy each
 // time would be far too many): Backups\Figures next to the figures folder in use, the newest
@@ -401,6 +447,11 @@ skylanders::portal::SoftwarePortal* SetUpSoftwarePortal() {
       bridge->OnEmulatedWrite(slot, data);
     }
     if (!source) return;  // this slot's figure did not come from a file
+    // A test copy never saves (or backs up) into the owner's figures (OwnerFiguresRefused).
+    if (OwnerFiguresRefused(*source)) {
+      LogFigureSaveRefused(slot, *source);
+      return;
+    }
     BackUpBeforeFirstSave(*source);
     if (skylanders::portal::SaveFigureFileAtomic(*source, data)) {
       REXLOG_INFO("Portal: saved changes back to slot {}'s figure file", slot);
@@ -555,6 +606,21 @@ std::filesystem::path SharedFiguresDir(const std::filesystem::path& user_data_ro
   }
   const fs::path old_dir = user_data_root / "figures";
   if (user_data_root.parent_path().empty()) return old_dir;
+  // Swap Force Online's main safety audit (settings-figures): SharedBase maps a --user_data_root
+  // copy whose name is not a game's to "Skylanders" next to it, so a copy beside the data folder
+  // (Documents\sf-test) would get, and fill, the owner's real Figures. Such a copy keeps its own
+  // figures folder instead, and nothing is copied out of it. Only with the setting given: without
+  // it user_data_root is the game's folder (or its old one in Documents), whose shared folder is
+  // the owner's by design.
+  if (!REXCVAR_GET(user_data_root).empty() &&
+      CopySharesOwnersFolder(user_data_root, {DataFolder(), DefaultDataFolder()})) {
+    std::error_code own_ec;
+    fs::create_directories(old_dir, own_ec);
+    REXLOG_WARN("Portal: --user_data_root {} sits beside the owner's data folder, whose Figures it would "
+                "share; this run keeps its own figures folder {}",
+                Utf8Path(user_data_root), Utf8Path(old_dir));
+    return old_dir;
+  }
   const fs::path shared = SharedBase(user_data_root) / "Figures";
   std::error_code ec;
   fs::create_directories(shared, ec);
@@ -606,6 +672,21 @@ std::filesystem::path SharedFiguresDir(const std::filesystem::path& user_data_ro
 void InstallPortal(const std::filesystem::path& default_figures_dir) {
   // After F4's "Spiel neu starten": the old game first closes its saves and figure files.
   WaitForRestartedInstance();
+  {
+    std::lock_guard<std::mutex> lock(g_figures_guard_mutex);
+    g_run_figures_dir = default_figures_dir;
+    g_owner_figure_dirs = OwnerFigureDirs();
+  }
+  // The owner's figures guard (OwnerFiguresRefused): a test copy whose portal_figures_dir (from a
+  // settings file or the command line) is one of the owner's figure folders, or inside one, uses
+  // its own instead, so New figure, the trap command, the recent list and the backups stay out of
+  // the owner's folder.
+  if (const std::string dir = REXCVAR_GET(portal_figures_dir); !dir.empty() && OwnerFiguresRefused(Utf8ToPath(dir))) {
+    REXLOG_WARN("Portal: portal_figures_dir {} is the owner's Figures folder and this run has --user_data_root "
+                "(a test copy); using {} instead",
+                dir, Utf8Path(default_figures_dir));
+    REXCVAR_SET(portal_figures_dir, std::string());
+  }
   if (REXCVAR_GET(portal_figures_dir).empty()) {
     std::error_code ec;
     std::filesystem::create_directories(default_figures_dir, ec);
@@ -620,7 +701,12 @@ void InstallPortal(const std::filesystem::path& default_figures_dir) {
   // empty, same as if you'd launched straight into it (see docs/architecture.md, "Figures").
   if (portal::SoftwarePortal* software = g_software_portal.load()) {
     const std::string figure_path = REXCVAR_GET(portal_figure);
-    if (!figure_path.empty()) {
+    if (!figure_path.empty() && OwnerFiguresRefused(Utf8ToPath(figure_path))) {
+      // The owner's figures guard: a test copy does not play (and save into) the owner's figure.
+      REXLOG_WARN("Portal: not placing portal_figure {}: it is in the owner's Figures folder and this run has "
+                  "--user_data_root (a test copy); running with an empty portal",
+                  figure_path);
+    } else if (!figure_path.empty()) {
       if (!PlaceFigureFromFile(0, Utf8ToPath(figure_path))) {
         REXLOG_WARN("Portal: cannot load '{}' (it must be a regular file of exactly {} bytes); "
                     "running with an empty portal",
