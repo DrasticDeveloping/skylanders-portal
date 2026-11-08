@@ -82,8 +82,10 @@ bool OwnerFiguresDirRefused(const std::filesystem::path& folder,
 
 // The guard for a figure file a test copy would write (the game's saves, a backup restore, New
 // figure, a dump) or play (portal_figure): refused when it lies inside an owner's figures folder
-// (OwnerFigureWriteRefused) or the folder it lies in holds one (FolderHoldsOwnerFigures:
-// Documents\Skylanders\x.dump, Documents\x.dump). The run's own figures folder is the exception.
+// (OwnerFigureWriteRefused). A file beside such a folder (Documents\Skylanders\x.dump,
+// Documents\x.dump) is not refused: one file cannot reach into the folder next to it; folders the
+// portal scans or writes into get OwnerFiguresDirRefused. The run's own figures folder is the
+// exception.
 bool OwnerFigureFileRefused(const std::filesystem::path& file,
                             const std::vector<std::filesystem::path>& owner_figure_folders,
                             const std::filesystem::path& run_figures_folder);

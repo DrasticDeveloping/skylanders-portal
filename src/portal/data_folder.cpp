@@ -230,12 +230,10 @@ bool OwnerFiguresDirRefused(const fs::path& folder, const std::vector<fs::path>&
 bool OwnerFigureFileRefused(const fs::path& file, const std::vector<fs::path>& owner_figure_folders,
                             const fs::path& run_figures_folder) {
   if (file.empty()) return false;
-  if (OwnerFigureWriteRefused(file, owner_figure_folders, run_figures_folder)) return true;
-  // The folder the file lies in, made absolute first: a bare "x.dump" lies in the current folder.
-  std::error_code ec;
-  fs::path absolute = fs::absolute(file, ec);
-  if (ec) absolute = file;
-  return FolderHoldsOwnerFigures(absolute.parent_path(), owner_figure_folders, run_figures_folder);
+  // One file cannot reach into a folder beside it, so only a file inside an owner's figures folder
+  // is refused (Sol fu-fig r2 M1). The holds-Figures rule is for folders the portal scans or writes
+  // into (OwnerFiguresDirRefused), not for a single file such as Documents\test.dump.
+  return OwnerFigureWriteRefused(file, owner_figure_folders, run_figures_folder);
 }
 
 bool CopySharesOwnersFolder(const fs::path& user_data_root, const std::vector<fs::path>& owner_data_folders) {

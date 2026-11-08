@@ -107,15 +107,16 @@ int main() {
   CHECK(!OwnerFiguresDirRefused(owner_figures, {owner_figures}, owner_figures));
   CHECK(!OwnerFiguresDirRefused(owner_data, {owner_figures}, owner_figures));
 
-  // OwnerFigureFileRefused: a file inside an owner figures folder, or in a folder holding one
-  // (Documents\Skylanders\x.dump, the temp root), is refused; a file in the run's own folder,
-  // beside the data folder's Figures in a folder of its own, or elsewhere is not; the explicit
-  // owner run keeps its own figures.
+  // OwnerFigureFileRefused: only a file inside an owner figures folder is refused. A file in a
+  // folder that holds one (Documents\Skylanders\x.dump, Documents\x.dump, the temp root) is an
+  // independent test dump and is not (Sol fu-fig r2 M1); neither is a file in the run's own folder
+  // or elsewhere; the explicit owner run keeps its own figures.
   CHECK(OwnerFigureFileRefused(owner_figures / L"Swap Force" / L"Blast Zone.dump", owners, run_figures));
-  CHECK(OwnerFigureFileRefused(owner_data / L"Blast Zone.dump", owners, run_figures));
-  CHECK(OwnerFigureFileRefused(t / L"Docs" / L"x.dump", owners, run_figures));
-  CHECK(OwnerFigureFileRefused(t / L"x.dump", owners, run_figures));
-  CHECK(OwnerFigureFileRefused(t / L"Picked" / L"x.dump", owners, run_figures));
+  CHECK(OwnerFigureFileRefused(owner_figures / L"x.dump", owners, run_figures));
+  CHECK(!OwnerFigureFileRefused(owner_data / L"Blast Zone.dump", owners, run_figures));
+  CHECK(!OwnerFigureFileRefused(t / L"Docs" / L"x.dump", owners, run_figures));
+  CHECK(!OwnerFigureFileRefused(t / L"x.dump", owners, run_figures));
+  CHECK(!OwnerFigureFileRefused(t / L"Picked" / L"x.dump", owners, run_figures));
   CHECK(!OwnerFigureFileRefused(run_figures / L"Swap Force" / L"Blast Zone.dump", owners, run_figures));
   CHECK(!OwnerFigureFileRefused(owner_data / L"Pictures" / L"x.dump", owners, run_figures));
   CHECK(!OwnerFigureFileRefused(t / L"run" / L"x.dump", owners, run_figures));
@@ -123,7 +124,7 @@ int main() {
   CHECK(!OwnerFigureFileRefused(owner_figures / L"Swap Force" / L"x.dump", {owner_figures}, owner_figures));
   CHECK(!OwnerFigureFileRefused(owner_data / L"x.dump", {owner_figures}, owner_figures));
   CHECK(!OwnerFigureFileRefused(owner_data / L"x.dump", owners, owner_figures));
-  CHECK(OwnerFigureFileRefused(t / L"x.dump", owners, owner_figures));  // the picked folder is under t
+  CHECK(!OwnerFigureFileRefused(t / L"x.dump", owners, owner_figures));  // beside, not inside
 
   // CopySharesOwnersFolder: a copy beside the owner's data folder whose name is not a game's
   // (Documents\sf-test, SharedBase -> Documents\Skylanders) shares the owner's folder; a game-named

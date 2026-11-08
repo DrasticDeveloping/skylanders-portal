@@ -388,9 +388,9 @@ void FiguresGuardFolders(std::filesystem::path& run, std::vector<std::filesystem
 
 // Whether writing (or playing) the figure file `file` is refused: only with a non-empty
 // --user_data_root (a run without it plays the owner's own data and saves the owner's figures as
-// always), for a file inside one of the owner's figure folders that is not this run's own, or in a
-// folder that holds one, such as Documents\Skylanders (portal/data_folder.h OwnerFigureFileRefused;
-// an explicit --user_data_root of the owner's real game folder keeps its figures). The game's saves
+// always), for a file inside one of the owner's figure folders that is not this run's own
+// (portal/data_folder.h OwnerFigureFileRefused; a file beside such a folder is an independent test
+// dump; an explicit --user_data_root of the owner's real game folder keeps its figures). The game's saves
 // ask this first, and the portal menu's backup restore does (OwnerFigureFileProtected).
 bool OwnerFiguresRefused(const std::filesystem::path& file) {
   if (REXCVAR_GET(user_data_root).empty()) return false;
