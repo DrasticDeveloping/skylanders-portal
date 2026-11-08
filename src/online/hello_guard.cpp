@@ -222,13 +222,15 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
   HelloDecision d;
   // 1. Size.
   if (hello.datagram_bytes < kMinHelloBytes || hello.datagram_bytes > kMaxHelloBytes) return d;
-  // 3. Limits: a blocked source first (no token spent on it), then the global and source buckets.
+  // 3. Limits: a blocked source first (no token spent on it), then the source's bucket, then the
+  // global one: a source over its own limit spends no global token, so one address flooding
+  // cannot use up the whole server's 16 a second and keep every other joiner out.
   if (const SourceTable::Source* s = sources_.Find(hello.from.address); s && now < s->blocked_until) {
     return d;
   }
-  if (!global_.Take(now)) return d;
   SourceTable::Source& source = sources_.Touch(hello.from.address, now);
   if (!source.bucket.Take(now)) return d;
+  if (!global_.Take(now)) return d;
   // 4. The cookie.
   if (!cookies_.Verify(hello.cookie, hello.from, hello.client_nonce, now)) {
     d.verdict = HelloVerdict::kCookieReply;

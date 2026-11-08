@@ -155,6 +155,14 @@ int main() {
     CHECK(gate.Check(Facts({addr, 2000}, 1, 0, 0), 0, t0 + milliseconds(700)).verdict == HelloVerdict::kCookieReply);
   }
 
+  // One source flooding spends only its own burst of the global bucket: another source still gets
+  // its cookie reply in the same instant.
+  {
+    HelloGate gate({0x1234, Key(14), false, 4}, t0);
+    for (uint32_t i = 0; i < 100; ++i) gate.Check(Facts({0x0D000002, 2000}, i, 0, 0), 0, t0);
+    CHECK(gate.Check(Facts({0x0D000003, 2000}, 1, 0, 0), 0, t0).verdict == HelloVerdict::kCookieReply);
+  }
+
   // The source table stays at 256 entries under 10,000 sources.
   {
     HelloGate gate({0x1234, Key(9), false, 4}, t0);
