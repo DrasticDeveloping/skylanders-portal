@@ -100,6 +100,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import winjob  # noqa: E402
+import backend_grades  # noqa: E402  (stage 3's backend grades: compare, faults, memory)
 
 STORE = ".replication-tests"
 CLIENTS = ["H", "D", "E", "F"]
@@ -123,7 +124,7 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
 # Where a hosted server (`server = "host"`) writes its log: the owner's session folder.
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
 GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
-          "symmetry", "route", "bandwidth")
+          "symmetry", "route", "bandwidth") + backend_grades.NAMES
 # The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
 # online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
 # for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
@@ -696,6 +697,12 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             continue
         if gname == "bandwidth":
             check_bandwidth(path.name, g, names)
+            continue
+        if gname in backend_grades.NAMES:
+            try:
+                backend_grades.check(path.name, gname, g, names)
+            except (backend_grades.GradeSpecError, re.error) as e:
+                raise SpecError(str(e)) from e
             continue
         if not isinstance(g, dict) or g.get("peer", "S" if gname == "server_frame_time" else "H") not in names:
             raise SpecError(f"{path.name}: grade {gname} names a peer not in {names}")
@@ -1624,6 +1631,11 @@ def grade_cross_peer(spec: Spec, r: PeerResult, texts: dict[str, str], repo: Pat
             reasons += why
         elif gname == "bandwidth" and g.get("peer", "S") == r.peer:
             r.graded[gname], why = grade_bandwidth(parse_log(texts.get(r.peer, ""))["lines"], g, thresholds or {})
+            reasons += why
+        elif gname in backend_grades.NAMES and g.get("peer", "H" if gname == "backend_faults" else "S") == r.peer:
+            # Stage 3 (backend_grades.py): compare joins every peer's local lines; faults and memory
+            # read their peer's log.
+            r.graded[gname], why = backend_grades.grade(gname, texts, g, r.peer)
             reasons += why
     return reasons
 
