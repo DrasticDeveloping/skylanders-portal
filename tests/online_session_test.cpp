@@ -1027,6 +1027,33 @@ void FakeNetworkStage5() {
   CHECK(!b.session->SendAttackPress(press, w.net.Now()));
 }
 
+// Stage 5 (future/online-5.md section 3.4, D10): EnemyPoses go to the one client named, on the fast
+// lane, and arrive there as they were sent (a frame lost on the fast lane is never resent, so a
+// clean link is used for the content check); no other client gets them; a peer that is not a
+// welcomed client gets nothing.
+void FakeNetworkEnemyPoses() {
+  World w(56);
+  REQUIRE_OR_RETURN_VOID(w.StartServer(Settings()));
+  Client& owner = w.Connect(MakeHello("Owner", true));
+  Client& b = w.Connect(MakeHello("Bee"));
+  CHECK(w.RunUntil([&] { return owner.session->Connected() && b.session->Connected(); }));
+  EnemyPoses p;
+  p.tick = 1234;
+  p.generation = 1;
+  p.anchor = {1, 2, 3};
+  p.poses = {EnemyPose{3, {100, -200, 300}, 0x4000, {5, -5, 0}}, EnemyPose{9, {0, 0, 0}, 0, {0, 0, 0}}};
+  CHECK(w.server.SendEnemyPoses(b.session->PeerId(), p, w.net.Now()));
+  CHECK(!w.server.SendEnemyPoses(99, p, w.net.Now()));  // not a peer
+  CHECK(!w.server.SendEnemyPoses(b.session->PeerId(), EnemyPoses{}, w.net.Now()));  // not encoded
+  CHECK(w.RunUntil([&] { return b.Count(ClientEvent::Type::kEnemyPoses) == 1; }));
+  w.Run(100ms);
+  CHECK(b.Count(ClientEvent::Type::kEnemyPoses) == 1);
+  CHECK(owner.Count(ClientEvent::Type::kEnemyPoses) == 0);
+  for (const ClientEvent& e : b.events) {
+    if (e.type == ClientEvent::Type::kEnemyPoses) CHECK(e.enemy_poses == p);
+  }
+}
+
 // Real UDP sockets on 127.0.0.1 (port 0: any free one), real time.
 // Version 3 (stage 3 section 3.2): Welcome carries S's backend mode and digest; backend frames go
 // both ways on the lane they were sent on, in order; SendBackend's answers; a version 2 Hello is
@@ -1203,6 +1230,7 @@ int main() {
   FakeNetworkScenes();
   FakeNetworkBackendFrames();
   FakeNetworkStage5();
+  FakeNetworkEnemyPoses();
   LoopbackSession();
   return Finish("online_session");
 }

@@ -95,6 +95,7 @@ enum class MessageType : uint16_t {
   // Stage 5.
   kOccurrenceAccept = 25,
   kAttackPress = 26,
+  kEnemyPoses = 30,  // stage 5's number block (25, 26, 30 to 34): after the contiguous run
   // Stage 1C's block (50-54, the 24-hour push's number blocks): types outside the contiguous run
   // 1..kLastType (protocol.cpp). TypeOf and the decoder map them explicitly.
   kOwnerFlags = 50,
@@ -642,14 +643,39 @@ struct AttackPress {
 };
 constexpr uint8_t kMaxAttackSlot = 3;
 
+// Stage 5 (future/online-5.md section 3.4, D10): S to one client, fast lane (unreliable: a lost
+// frame is never resent, the next one replaces it), at 10 Hz: the poses of the enemies within that
+// client's interest radius (only poses are interest-filtered; rows and shots are not). Each pose is
+// 13 bytes: the `enemy` row's 16-bit pose handle, the position as centimetres from the frame's
+// anchor (16 bits per axis, so +-327.67 m), the yaw (65536 per turn) and the velocity in 0.1 m/s (8
+// bits per axis). The session library carries the quantized fields; the game quantizes them. One to
+// kMaxEnemyPoses poses, handles non-zero and strictly ascending (one pose per enemy, one byte form);
+// the anchor finite. `tick` is S's tick at the sample.
+struct EnemyPose {
+  uint16_t handle = 0;
+  std::array<int16_t, 3> offset_cm{};
+  uint16_t yaw = 0;
+  std::array<int8_t, 3> velocity_dm{};  // 0.1 m/s
+  bool operator==(const EnemyPose&) const = default;
+};
+constexpr size_t kEnemyPoseBytes = 13;
+constexpr size_t kMaxEnemyPoses = 80;  // 4 + 25 + 80 * 13 = 1069 bytes: inside one datagram
+struct EnemyPoses {
+  uint64_t tick = 0;
+  uint32_t generation = 0;
+  std::array<float, 3> anchor{};
+  std::vector<EnemyPose> poses;
+  bool operator==(const EnemyPoses&) const = default;
+};
+
 // The variant's order is the type numbering for the contiguous run (Hello = 1 ... AttackPress =
-// 26); the block types after it (OwnerFlags = 50) are mapped by TypeOf.
+// 26); the block types after it (OwnerFlags = 50, EnemyPoses = 30) are mapped by TypeOf.
 using Message = std::variant<Hello, Welcome, Refuse, Bye, Ping, Pong, LevelRequest, LevelLoad,
                              LevelLoaded, BarrierGo, PlayerList, PlayerPose, PlayerAction,
                              WorldRequest, WorldDecision, AppliedStep, LevelEnd, Reaction,
                              SessionClosing, SessionClosed, SceneBarrier, BackendFrame,
                              PlayerActionShown, PlayerPoseShown, OccurrenceAccept, AttackPress,
-                             OwnerFlags>;
+                             OwnerFlags, EnemyPoses>;
 MessageType TypeOf(const Message& message);
 
 // Appends one message to `out`. false (nothing appended) if a string is over its limit or not

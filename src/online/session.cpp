@@ -596,6 +596,18 @@ bool ServerSession::SendPlayerPoseShown(const PlayerPoseShown& shown, TimePoint 
   return true;
 }
 
+bool ServerSession::SendEnemyPoses(uint16_t peer_id, const EnemyPoses& poses, TimePoint now) {
+  const std::vector<uint8_t> bytes = Encoded(poses);
+  if (!transport_ || bytes.empty()) return false;
+  for (auto& [endpoint, peer] : peers_) {
+    if (peer->state == PeerState::kWelcomed && peer->id == peer_id) {
+      peer->conn->Send(Lane::kFast, bytes, now);
+      return true;
+    }
+  }
+  return false;
+}
+
 bool ServerSession::SendSceneBarrier(const SceneBarrier& scene, TimePoint now) {
   if (scene.phase == ScenePhase::kAck) return false;
   const std::vector<uint8_t> bytes = Encoded(scene);
@@ -880,6 +892,11 @@ void ClientSession::HandleMessage(const Message& message, Lane lane, TimePoint n
     ClientEvent e;
     e.type = ClientEvent::Type::kPlayerPoseShown;
     e.pose_shown = *pose_shown;
+    events_.push_back(std::move(e));
+  } else if (const auto* enemy_poses = std::get_if<EnemyPoses>(&message)) {  // stage 5
+    ClientEvent e;
+    e.type = ClientEvent::Type::kEnemyPoses;
+    e.enemy_poses = *enemy_poses;
     events_.push_back(std::move(e));
   } else if (const auto* frame = std::get_if<BackendFrame>(&message)) {
     ClientEvent e;

@@ -256,6 +256,10 @@ class ServerSession {
   // lane). false if it cannot be encoded.
   bool SendPlayerActionShown(const PlayerActionShown& shown, TimePoint now = Clock::now());
   bool SendPlayerPoseShown(const PlayerPoseShown& shown, TimePoint now = Clock::now());
+  // Stage 5 (future/online-5.md section 3.4, D10): one client's enemy poses, fast lane (the caller
+  // filters by that client's interest radius and keeps the 10 Hz rate). false if `peer` is not a
+  // welcomed client or the message cannot be encoded.
+  bool SendEnemyPoses(uint16_t peer, const EnemyPoses& poses, TimePoint now = Clock::now());
   // Datagrams sent to `peer` on `lane` and not yet acked (netplay's Connection::Unacked: every
   // message on that lane counts, the session's own included); 0 for a peer that is not welcomed.
   size_t BackendUnacked(uint16_t peer, netplay::Lane lane) const;
@@ -357,6 +361,8 @@ struct ClientEvent {
     // Stage 4.
     kPlayerActionShown,  // action_shown: another player's attack press or release
     kPlayerPoseShown,    // pose_shown: another player's pose
+    // Stage 5.
+    kEnemyPoses,         // enemy_poses: S's enemy poses for this client (fast lane, 10 Hz)
   };
   Type type = Type::kConnected;
   uint16_t peer_id = 0;
@@ -379,6 +385,7 @@ struct ClientEvent {
   std::vector<uint8_t> frame;                     // kBackendFrame
   PlayerActionShown action_shown;                 // kPlayerActionShown (stage 4)
   PlayerPoseShown pose_shown;                     // kPlayerPoseShown (stage 4)
+  EnemyPoses enemy_poses;                         // kEnemyPoses (stage 5)
 };
 
 // The client side: one server, a ping every kPingInterval for the tick estimate and liveness.
