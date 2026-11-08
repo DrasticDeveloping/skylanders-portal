@@ -195,6 +195,7 @@ class RunLock:
     def __init__(self, store: Path) -> None:
         self.path = store / "run.lock"
         self.held = False
+        self._fd: int | None = None
 
     def acquire(self, who: str) -> None:
         for _ in range(2):
@@ -207,16 +208,34 @@ class RunLock:
                     pid = -1
                 if pid == os.getpid() or pid_alive(pid):
                     raise Refused(f"another run holds the run lock ({self.path})") from None
-                self.path.unlink(missing_ok=True)  # its holder is gone
+                try:
+                    # Its holder is gone. A live holder keeps the file open, and Windows refuses to
+                    # delete an open file: a holder whose pid is not written yet is never taken over.
+                    self.path.unlink(missing_ok=True)
+                except PermissionError:
+                    raise Refused(f"another run holds the run lock ({self.path})") from None
                 continue
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(f"{os.getpid()} {who}\n")
+            os.write(fd, f"{os.getpid()} {who}\n".encode("utf-8"))
+            self._fd = fd  # open until release
             self.held = True
             return
         raise Refused("the run lock cannot be taken")
 
+    def busy(self) -> bool:
+        """True when someone else holds the lock: a `run-local` run (another RunLock of this process included)."""
+        if self.held or not self.path.exists():
+            return False
+        try:
+            pid = int(self.path.read_text(encoding="utf-8").split()[0])
+        except (OSError, ValueError, IndexError):
+            return True  # being written by its new holder
+        return pid == os.getpid() or pid_alive(pid)
+
     def release(self) -> None:
         if self.held:
+            if self._fd is not None:
+                os.close(self._fd)
+                self._fd = None
             self.path.unlink(missing_ok=True)
             self.held = False
 
@@ -615,7 +634,7 @@ class Agent:
         return {"verified": True}
 
     def op_fixtures(self, req: dict, now: float) -> dict:
-        if self._running():
+        if self._running() or self.lock.busy():
             raise Refused("no fixture changes while a peer runs")
         act = req.get("action")
         incoming = self.mach.store / "fixtures-incoming"
@@ -668,6 +687,11 @@ class Agent:
                     p.write_bytes(b"")
                 if got != f["size"] or sha256_file(p) != f["sha256"]:
                     raise Refused(f"fixture {f['path']} does not match its size and SHA-256")
+                with open(p, "rb") as fh:
+                    if fh.read(2) == b"MZ":  # also when the first chunk carried only "M"
+                        self.incoming = None
+                        shutil.rmtree(incoming, ignore_errors=True)
+                        raise Refused(f"fixture {f['path']} starts with an executable header")
             final = self.mach.store / "fixtures"
             if final.exists():
                 shutil.rmtree(final)
@@ -762,6 +786,8 @@ class Agent:
         return {"offset": off, "data": base64.b64encode(data).decode("ascii"), "eof": len(data) < CHUNK}
 
     def op_clean(self, req: dict, now: float) -> dict:
+        if self.lock.busy():
+            raise Refused("a run-local run holds the run lock: clean after it ends")
         removed = []
         runs = self.mach.runs()
         active = self.run.folder if self._running() else None

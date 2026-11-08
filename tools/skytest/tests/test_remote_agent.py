@@ -359,6 +359,13 @@ class AgentTest(unittest.TestCase):
         self.call(c, "fixtures", action="begin", files=[{"path": "saves/a", "size": 1, "sha256": sha(b"2")}])
         self.call(c, "fixtures", action="chunk", index=0, offset=0, data=base64.b64encode(b"1").decode())
         self.assertIn("does not match", self.call(c, "fixtures", action="end")["error"])
+        # "MZ" split over two chunks: the first carries only "M".
+        self.call(c, "fixtures", action="begin", files=[{"path": "figures/split.sky", "size": 4, "sha256": sha(b"MZ\x90\0")}])
+        self.assertTrue(self.call(c, "fixtures", action="chunk", index=0, offset=0, data=base64.b64encode(b"M").decode())["ok"])
+        self.assertTrue(self.call(c, "fixtures", action="chunk", index=0, offset=1,
+                                  data=base64.b64encode(b"Z\x90\0").decode())["ok"])
+        self.assertIn("executable header", self.call(c, "fixtures", action="end")["error"])
+        self.assertFalse((self.store / "fixtures").exists())
 
     def test_record_shapes(self) -> None:
         bad = [
@@ -396,6 +403,10 @@ class AgentTest(unittest.TestCase):
         t.start()
         self.until(lambda: (self.store / "run.lock").exists() or not t.is_alive())
         self.assertTrue(t.is_alive())
+        c2 = self.client()
+        self.assertIn("run-local", self.call(c2, "clean")["error"])
+        self.assertIn("while a peer runs", self.fixtures(c2)["error"])
+        self.assertTrue(any((self.store / "runs").iterdir()))
         stop.set()
         t.join(5)
         self.assertEqual(done["state"], "stopped")
@@ -421,6 +432,21 @@ class LockTest(unittest.TestCase):
             other = ra.RunLock(Path(d))
             with self.assertRaises(ra.Refused):
                 other.acquire("second")
+            lock.release()
+            self.assertFalse((Path(d) / "run.lock").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows refuses to delete an open file")
+    def test_a_held_lock_is_never_taken_over(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            lock = ra.RunLock(Path(d))
+            lock.acquire("test")
+            # As a holder looks before it wrote its pid, or after its pid was reused: no live pid.
+            (Path(d) / "run.lock").write_text("999999999 agent\n", encoding="utf-8")
+            other = ra.RunLock(Path(d))
+            with self.assertRaises(ra.Refused):
+                other.acquire("second")
+            self.assertFalse(other.held)
+            self.assertTrue((Path(d) / "run.lock").exists())
             lock.release()
             self.assertFalse((Path(d) / "run.lock").exists())
 
