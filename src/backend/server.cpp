@@ -89,6 +89,7 @@ struct Server::Impl {
     std::deque<Message> inbox;
     bool play_full = false;
     uint64_t cap_onsets = 0;  // onsets of PlayCap()
+    uint64_t reports_coalesced = 0;  // resent reports dropped behind a waiting copy (S2-L3)
     // S ended the peer's session past both bounds (kPeerOverrun): what it sends is read and
     // dropped, nothing is sent to it, until the host removes it (N1).
     bool overrun = false;
@@ -167,7 +168,9 @@ struct Server::Impl {
   // hears them (request.cpp: `pending` once, `granted`, the final, the lease's LeaseEnd; a retry
   // key `pending`, its refusal and a final), and a LeaseEnd can follow the final that closed its
   // key, at most one per lease (max_leases_per_peer, L). So such a peer has at most 4 K + L
-  // messages held; the cap is 5 K + L, a margin of K. Messages from S's own side (Service, an
+  // messages held; the cap is 5 K + L, a margin of K. A report the client resends while unanswered
+  // (S2-L3) is answered from its key's cache, and a cached repeat of a key that already waits adds
+  // nothing (SendPlay), so the resends add at most one message per lease, within the margin. Messages from S's own side (Service, an
   // evaluation, a generation change, End session) are among those four per key, and the message
   // handled just below the cap may add its children's decisions: S's holdings stay bounded. The
   // design names no number: the header's own (a council question).
@@ -623,6 +626,19 @@ struct Server::Impl {
         // Behind what is held, or at the cap: held. PlayHeld() only grows while S reads (nothing
         // is flushed meanwhile), so a held message keeps every later one behind it.
         if (AnsweredOnGameplay(m) && (!p.inbox.empty() || PlayFull(p))) {
+          // A report resent while unanswered (S2-L3) is the same report (the client never remakes
+          // one with another payload): one per lease waits, so the resends of a held peer do not
+          // fill HeldCap(). The first copy is the one handled; a later one would be a replay.
+          if (const auto* rep = std::get_if<msg::LeaseReport>(&m)) {
+            const bool waiting = std::any_of(p.inbox.begin(), p.inbox.end(), [&](const Message& x) {
+              const auto* w = std::get_if<msg::LeaseReport>(&x);
+              return w && w->id == rep->id;
+            });
+            if (waiting) {
+              ++p.reports_coalesced;
+              continue;
+            }
+          }
           if (p.inbox.size() >= HeldCap()) {
             Overrun(p, now);
             break;
@@ -861,6 +877,7 @@ PeerStats Server::Stats(uint16_t peer) const {
   s.gameplay_held = impl_->PlayHeld(*p);
   s.cap_onsets = p->cap_onsets;
   s.requests_held = p->inbox.size();
+  s.reports_coalesced = p->reports_coalesced;
   s.overrun = p->overrun;
   s.baselines = p->baselines;
   s.manifests = p->manifests;

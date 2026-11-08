@@ -45,12 +45,16 @@ struct ClientEvent {
                         // review r2, R4; the header's own)
     kInboundLost,       // InboundLost: recoverable state messages were discarded below the
                         // client; staging dropped, Mismatch{`lsn` (the prefix), 0} sent (stage 3)
+    kLeaseReportSent,   // the report of `lease` went to the link for the `sends`th time: 1 when
+                        // first sent, more for each resend while unanswered (S2-L3; stage 6's line
+                        // `report sent <n>`; the header's own)
   };
   Type type = Type::kDecided;
   RequestKey key;
   Decision decision;
   uint32_t lease = 0;
   LeaseEndReason lease_end = LeaseEndReason::kExpired;
+  uint32_t sends = 0;  // kLeaseReportSent
   uint32_t baseline = 0;
   uint64_t lsn = 0;
   uint64_t bucket_mask = 0;
@@ -104,6 +108,14 @@ class Client {
   // answer yet (kUnanswered; one waiting for the lane is replaced instead, as above). A report
   // taken is kept until it is sent (or its LeaseEnd comes first: the key has its final), and S
   // answers it (N1).
+  //
+  // S2-L3 (cross-stage decision 4, stage 6 D29): a report that went to S stays unresolved until a
+  // decision for the lease or its LeaseEnd comes. Meanwhile the client keeps renewing the lease
+  // and, at each renew tick once limits.lease_renew_interval (1 s) has passed since the last send
+  // without an answer, sends the same LeaseReport{id, payload} again, so a killed report is
+  // replaced inside the live term. S evaluates the first copy that arrives and answers a later one
+  // from the key's cache, so one report commits once. A report is never remade with another
+  // payload; the resends stop at the answer or the LeaseEnd. Each send raises kLeaseReportSent.
   bool Report(uint32_t lease, std::span<const uint8_t> payload, TimePoint now,
               SendRefusal* why = nullptr);
   // Receive; Replica::Service; take every ready row, resolve its entity, call its adapter and

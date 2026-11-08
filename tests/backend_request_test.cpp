@@ -2,7 +2,7 @@
 // (RM1 to RM11 with RM5b to RM5f) and lease expiry (LE1 to LE8). The table's own cases run on direct
 // calls (backend_request_harness.h); the ones that need the client (completion at at_lsn, the
 // rejoin) run on FakeSession through the lanes harness's Rig. The stage 2 follow-up item's lease
-// cases (S2L1a to S2L2e) close the file.
+// cases (S2L1a to S2L2e, then S2L3a to S2L3c on the facades) close the file.
 
 #include <algorithm>
 #include <array>
@@ -1104,6 +1104,134 @@ BACKEND_TEST("S2L2e", LeaseEndWritesImpureOrRefused) {
   CHECK(t.Final(ka) && t.Final(ka)->reason == Reason::kLeaseExpired);
   CHECK(t.Final(kb) && t.Final(kb)->reason == Reason::kLeaseExpired);
   CHECK(t.LeaseEnds(la).size() == 1 && t.LeaseEnds(lb).size() == 1);
+}
+
+// S2-L3 on the facades: the holder resends its unresolved report inside the live term.
+
+// The holder's kLeaseReportSent events for `lease`: how many, and the highest `sends`.
+std::pair<size_t, uint32_t> ReportSends(Rig& r, uint32_t lease, uint16_t peer = 1) {
+  size_t events = 0;
+  uint32_t sends = 0;
+  for (const ClientEvent& ev : r.session.ClientEvents(peer)) {
+    if (ev.type != ClientEvent::Type::kLeaseReportSent || ev.lease != lease) continue;
+    ++events;
+    sends = std::max(sends, ev.sends);
+  }
+  return {events, sends};
+}
+
+// A granted owner-run key of peer 1 on `e`, and its lease (0: not granted within 1 s).
+std::pair<RequestKey, uint32_t> GrantOn(Rig& r, const EntityId& e) {
+  const auto key = r.C(1).Send(lanes::OwnerRun(kProp, e), r.Now());
+  if (!key) return {RequestKey{}, 0};
+  uint32_t lease = 0;
+  r.session.RunUntil(
+      [&] {
+        for (const Decision& d : lanes::DecisionsFor(r.session, 1, *key)) {
+          if (d.outcome == Outcome::kGranted) lease = d.lease;
+        }
+        return lease != 0;
+      },
+      1s);
+  return {*key, lease};
+}
+
+// The client's finals for `key` that are not cached repeats; a cached one repeats the first.
+size_t FreshFinals(Rig& r, const RequestKey& key) {
+  size_t n = 0;
+  std::optional<Decision> first;
+  for (const Decision& d : lanes::DecisionsFor(r.session, 1, key)) {
+    if (!d.final) continue;
+    if (!first) first = d;
+    if (d.cached) {
+      CHECK(d.outcome == first->outcome && d.reason == first->reason);
+    } else {
+      ++n;
+    }
+  }
+  return n;
+}
+
+bool LeaseEndedWith(Rig& r, uint32_t lease, LeaseEndReason why) {
+  bool found = false;
+  for (const ClientEvent& ev : r.session.ClientEvents(1)) {
+    if (ev.type == ClientEvent::Type::kLeaseEnded && ev.lease == lease) found = ev.lease_end == why;
+  }
+  return found;
+}
+
+BACKEND_TEST("S2L3a", LeaseReportResentAfterAKilledFirst) {
+  // The first LeaseReport is killed above the lane (stage 6's fault case): the holder keeps
+  // renewing, resends the same report at a renew tick a second after the first send, inside the
+  // term, and S evaluates it once: one commit, the report's value, no `lease expired`.
+  Rig r(lanes::WithFaults("message:kill dir=c2s type=lease_report nth=1"));
+  const EntityId e = Ready(r);
+  const auto [key, lease] = GrantOn(r, e);
+  REQUIRE_OR_RETURN_VOID(lease != 0);
+  CHECK(r.C(1).Report(lease, Val(42), r.Now()));
+  CHECK(r.session.RunUntil([&] { return Completed(r.session, 1, key); }, 3s));
+  const auto fin = FinalFor(r.session, 1, key);
+  CHECK(fin && fin->outcome == Outcome::kApplied && fin->lease == lease);
+  CHECK(r.authorities.authority.reports == 1);
+  const Record* row = r.S().State().Get(Key(kProp, e));
+  CHECK(row && row->value == Val(42));
+  CHECK(r.S().Leases().Get(lease) && r.S().Leases().Get(lease)->state == LeaseState::kCommitted);
+  CHECK(LeaseEndedWith(r, lease, LeaseEndReason::kCommitted));
+  const auto [events, sends] = ReportSends(r, lease);
+  CHECK(events == 2 && sends == 2);  // the line `report sent 2`
+  CHECK(r.wire.client_sent[1][MessageType::kLeaseReport] == 2);
+  // Answered: no more resends.
+  r.session.Run(3s);
+  CHECK(ReportSends(r, lease).first == 2);
+  CHECK(r.wire.client_sent[1][MessageType::kLeaseReport] == 2);
+  CHECK(FreshFinals(r, key) == 1);
+}
+
+BACKEND_TEST("S2L3b", LeaseReportAnsweredIsNotResent) {
+  // An answered report goes once: `report sent 1`, nothing more while the lease's renew ticks
+  // pass.
+  Rig r;
+  const EntityId e = Ready(r);
+  const auto [key, lease] = GrantOn(r, e);
+  REQUIRE_OR_RETURN_VOID(lease != 0);
+  CHECK(r.C(1).Report(lease, Val(7), r.Now()));
+  CHECK(r.session.RunUntil([&] { return Completed(r.session, 1, key); }, 2s));
+  r.session.Run(4s);
+  const auto [events, sends] = ReportSends(r, lease);
+  CHECK(events == 1 && sends == 1);
+  CHECK(r.wire.client_sent[1][MessageType::kLeaseReport] == 1);
+  CHECK(r.authorities.authority.reports == 1);
+  CHECK(FreshFinals(r, key) == 1);
+}
+
+BACKEND_TEST("S2L3c", LeaseReportResentWhileTheAnswerIsHeld) {
+  // S's answer is held (S to the client's gameplay lane full for 4 s): the report committed at
+  // once on S, but the holder hears nothing and resends at its renew ticks. Every resend is a
+  // replay on S (one OnReport, one commit), answered from the key's cache; when the lane opens the
+  // answer and the LeaseEnd arrive and the resends stop.
+  FakeSessionOptions o = lanes::WithFaults("link:full peer=1 dir=s2c lane=gameplay from=5000 ms=4000");
+  Rig r(o);
+  const EntityId e = Ready(r);
+  const auto [key, lease] = GrantOn(r, e);
+  REQUIRE_OR_RETURN_VOID(lease != 0);
+  r.session.RunUntil([&] { return r.Now() >= lanes::kStart + 5500ms; }, 6s);
+  CHECK(r.C(1).Report(lease, Val(9), r.Now()));
+  r.session.Run(3s);  // the lane still held
+  CHECK(r.S().Leases().Get(lease) && r.S().Leases().Get(lease)->state == LeaseState::kCommitted);
+  CHECK(!FinalFor(r.session, 1, key).has_value());
+  CHECK(ReportSends(r, lease).second >= 2);
+  CHECK(r.session.RunUntil([&] { return LeaseEndedWith(r, lease, LeaseEndReason::kCommitted); },
+                           5s));
+  r.session.Run(100ms);
+  const size_t after = ReportSends(r, lease).first;
+  r.session.Run(3s);
+  CHECK(ReportSends(r, lease).first == after);  // stopped at the LeaseEnd
+  CHECK(r.authorities.authority.reports == 1);
+  const auto fin = FinalFor(r.session, 1, key);
+  CHECK(fin && fin->outcome == Outcome::kApplied && fin->lease == lease);
+  CHECK(FreshFinals(r, key) == 1);
+  const Record* row = r.S().State().Get(Key(kProp, e));
+  CHECK(row && row->value == Val(9));
 }
 
 }  // namespace

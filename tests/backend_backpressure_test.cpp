@@ -342,6 +342,24 @@ size_t FinalsFor(FakeSession& s, uint16_t peer, const RequestKey& key) {
   return n;
 }
 
+// The finals of a lease's key that are not cached repeats; every cached final repeats the first
+// one (CHECKed). A report the client resent while unanswered (S2-L3) may meet the key's end on S
+// and be answered from its cache, so a lease's key can see a cached repeat of its final.
+size_t FreshFinalsFor(FakeSession& s, uint16_t peer, const RequestKey& key) {
+  size_t n = 0;
+  std::optional<Decision> first;
+  for (const Decision& d : DecisionsFor(s, peer, key)) {
+    if (!d.final) continue;
+    if (!first) first = d;
+    if (d.cached) {
+      CHECK(d.outcome == first->outcome && d.reason == first->reason);
+    } else {
+      ++n;
+    }
+  }
+  return n;
+}
+
 BACKEND_TEST("BP6", BackpressureClientAdmitsWhatItCanKeep) {
   // N1 (Sol code review r3) on R2's case (the reviewer's PB1): S to the client's gameplay lane held
   // for 120 s. First the client resends a key in the retry state at every pump: one resend is
@@ -830,7 +848,7 @@ BACKEND_TEST("BP9", BackpressureReportAtTheBoundCommits) {
   r.session.Run(1s);
   const auto fin = FinalFor(r.session, 1, *owner_key);
   CHECK(fin && fin->outcome == Outcome::kApplied && fin->lease == lease);
-  CHECK(FinalsFor(r.session, 1, *owner_key) == 1);
+  CHECK(FreshFinalsFor(r.session, 1, *owner_key) == 1);  // cached repeats aside (S2-L3)
   const Record* row = r.S().State().Get(Key(test::kProp, owned));
   CHECK(row && row->value == Val(42));
   bool committed = false;
@@ -902,7 +920,7 @@ BACKEND_TEST("BP9b", BackpressureReportHeldAtCapCommits) {
   r.session.Run(1s);
   const auto fin = FinalFor(r.session, 1, *owner_key);
   CHECK(fin && fin->outcome == Outcome::kApplied && fin->lease == lease);
-  CHECK(FinalsFor(r.session, 1, *owner_key) == 1);
+  CHECK(FreshFinalsFor(r.session, 1, *owner_key) == 1);  // cached repeats aside (S2-L3)
   const Record* row = r.S().State().Get(Key(test::kProp, owned));
   CHECK(row && row->value == Val(42));
   bool committed = false;

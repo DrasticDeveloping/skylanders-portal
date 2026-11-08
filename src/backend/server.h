@@ -111,6 +111,9 @@ struct PeerStats {
   size_t gameplay_held = 0;
   uint64_t cap_onsets = 0;
   size_t requests_held = 0;
+  // Lease reports resent while unanswered (S2-L3) that came while a copy already waited in the
+  // held requests: dropped, the waiting copy answers them. The header's own.
+  uint64_t reports_coalesced = 0;
   bool overrun = false;
   uint64_t baselines = 0, manifests = 0, mismatches = 0;
 };
