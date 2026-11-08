@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include "portal/portal_device.h"
 
@@ -94,6 +95,24 @@ class SoftwarePortal : public PortalDevice {
   std::function<void(int, const FigureData&, const std::optional<std::filesystem::path>&)> on_write_;
   std::function<void(const char*, int, int, const uint8_t*, size_t)> research_log_;
   std::function<bool(int, const FigureData&, std::span<const FigureData>)> place_filter_;
+};
+
+// A place filter that holds for every SoftwarePortal a game builds, including the ones built later
+// (portal_rex: a live switch back into software mode builds a new SoftwarePortal). Each new portal is
+// attached as it is built and gets the current filter; Set gives every attached portal the new one
+// (nullptr removes it). Portals are never freed in this codebase (portal_rex), so the attached
+// pointers stay valid. Thread-safe; Set and Attach take this lock, then the portal's.
+class PlaceFilterPolicy {
+ public:
+  using Filter = std::function<bool(int slot, const FigureData& data, std::span<const FigureData> others)>;
+  void Set(Filter filter);
+  void Attach(SoftwarePortal* portal);
+  size_t Attached() const;
+
+ private:
+  mutable std::mutex mu_;
+  Filter filter_;
+  std::vector<SoftwarePortal*> portals_;
 };
 
 }  // namespace skylanders::portal

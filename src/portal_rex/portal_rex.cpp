@@ -69,6 +69,9 @@ namespace {
 
 std::atomic<skylanders::portal::PortalDevice*> g_portal{nullptr};
 std::atomic<skylanders::portal::SoftwarePortal*> g_software_portal{nullptr};
+// The game's place filter (SetSoftwarePortalPlaceFilter): every SoftwarePortal SetUpSoftwarePortal
+// builds is attached, the startup one and each live switch back into software mode.
+skylanders::portal::PlaceFilterPolicy g_place_policy;
 std::atomic<skylanders::portal::UsbPortal*> g_usb_portal{nullptr};
 // A real Xbox 360 portal on WinUSB (portal/usb/xbox360_portal.h), set by the USB mode when no HID
 // portal opens: the game's frames then go to it unchanged, bypassing g_portal and the bridge.
@@ -387,6 +390,7 @@ void BackUpBeforeFirstSave(const std::filesystem::path& file) {
 // startup portal or a live switch back into software mode from the F4 menu.
 skylanders::portal::SoftwarePortal* SetUpSoftwarePortal() {
   auto* software = new skylanders::portal::SoftwarePortal();  // intentionally never freed, see below
+  g_place_policy.Attach(software);  // the game's place filter, if it set one, holds here too
   // The source path each slot's figure was loaded from (if any) is tracked by SoftwarePortal
   // itself, set atomically with the figure's data — see PlaceFigure's doc comment for why that
   // matters. This callback just saves whatever source it is handed.
@@ -734,6 +738,11 @@ bool CreateAndPlaceVillainTrap(int slot, const portal::TrapVillain& villain) {
 }
 
 portal::SoftwarePortal* GetSoftwarePortal() { return g_software_portal.load(); }
+
+void SetSoftwarePortalPlaceFilter(
+    std::function<bool(int, const portal::FigureData&, std::span<const portal::FigureData>)> filter) {
+  g_place_policy.Set(std::move(filter));
+}
 
 float PortalSpeakerLevel() {
   skylanders::SdlPortalAudioSink* sink = g_speaker_sink.load();

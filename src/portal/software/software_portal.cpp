@@ -220,4 +220,22 @@ void SoftwarePortal::WriteAudio(std::span<const int16_t> pcm) {
   if (PortalAudioSink* sink = audio_sink_.load()) sink->Submit(pcm);
 }
 
+void PlaceFilterPolicy::Set(Filter filter) {
+  std::lock_guard<std::mutex> lock(mu_);
+  filter_ = std::move(filter);
+  for (SoftwarePortal* portal : portals_) portal->SetPlaceFilter(filter_);
+}
+
+void PlaceFilterPolicy::Attach(SoftwarePortal* portal) {
+  if (portal == nullptr) return;
+  std::lock_guard<std::mutex> lock(mu_);
+  if (std::find(portals_.begin(), portals_.end(), portal) == portals_.end()) portals_.push_back(portal);
+  portal->SetPlaceFilter(filter_);
+}
+
+size_t PlaceFilterPolicy::Attached() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return portals_.size();
+}
+
 }  // namespace skylanders::portal

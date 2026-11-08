@@ -470,5 +470,29 @@ int main() {
     CHECK(portal.PlaceFigure(1, b));  // no filter: every placement goes on
   }
 
+  // The policy (Sol 4-rest F3): a portal built after the filter was set (a live switch back into
+  // software mode) gets it too; clearing it clears every attached portal.
+  {
+    PlaceFilterPolicy policy;
+    SoftwarePortal before;
+    SoftwarePortal after;
+    FigureData a{};
+    a[0] = 1;
+    FigureData b{};
+    b[0] = 2;
+    policy.Attach(&before);
+    policy.Set([](int, const FigureData&, std::span<const FigureData> others) { return others.empty(); });
+    CHECK(before.PlaceFigure(0, a));
+    CHECK(!before.PlaceFigure(1, b));  // a second figure refused on the portal it was set on
+    policy.Attach(&after);             // built later
+    policy.Attach(&after);             // attached once
+    CHECK(policy.Attached() == 2);
+    CHECK(after.PlaceFigure(0, a));
+    CHECK(!after.PlaceFigure(1, b));  // refused on the new portal too
+    CHECK(!after.HasFigure(1));
+    policy.Set(nullptr);
+    CHECK(before.PlaceFigure(1, b) && after.PlaceFigure(1, b));
+  }
+
   return Finish("software_portal");
 }
