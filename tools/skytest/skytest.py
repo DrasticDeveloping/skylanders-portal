@@ -161,7 +161,7 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
 GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
           "symmetry", "route", "bandwidth", "remote_swap", "exclusive", "occurrence_outcomes",
-          "memory_growth") + backend_grades.NAMES
+          "memory_growth", "data_root_untouched") + backend_grades.NAMES
 # The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
 # online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
 # for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
@@ -251,6 +251,13 @@ DEFAULT_FATAL = [
     ("*", r"Input script: waitfor (" + "|".join(DEAD_SESSION_WAITS) + r") timed out"),
     ("*", r"Dev: .*no player frame within"),
     ("*", r"refused: dev_\w+ is off"),
+    # Stage 7 (future/online-7.md section 3 "Settings", item 8): the game's own refusal of the
+    # write-back on anything but a checked copy, and the dev commit gate's lost release.
+    ("H", r"Online: dev_writeback_on_copies refused"),
+    ("S", r"Online: commit gate timed out"),
+    # Stage 7, council 7 (Sol B1, Opus B2): dev_unlock_nightmare or dev_save_reload on a data root the
+    # game does not admit as a test copy (the game calls nothing then; a spec's copy should pass).
+    ("*", r"Dev: \w+ refused: not a test copy"),
 ]
 # One line each DEFAULT_FATAL pattern matches, as the game logs it (lint warns of a `tolerate` pattern that
 # matches none of them: it takes nothing out).
@@ -263,6 +270,9 @@ DEFAULT_FATAL_EXAMPLES = [_LOG_PREFIX_EXAMPLE + line for line in (
     *(f"Input script: waitfor {w} timed out after 60 s" for w in DEAD_SESSION_WAITS),
     "Dev: navto: no player frame within 5 s",
     "refused: dev_navto is off",
+    "Online: dev_writeback_on_copies refused (no --user_data_root); Host does not host",
+    "Online: commit gate timed out SWAPFORCE_1",
+    "Dev: dev_unlock_nightmare refused: not a test copy (no --user_data_root)",
 )]
 # A case that is not ready (PS2) is reported `not ready` at 0 s and starts no game: `ready = false`
 # with a `reason`, or, without a `ready` key, a comment line in the spec that starts with PLACEHOLDER
@@ -928,6 +938,9 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             continue
         if gname == "save_copy":
             check_save_copy(path.name, g, names, server)
+            continue
+        if gname == DATA_ROOT_GRADE:
+            check_data_root(path.name, g, names, server)
             continue
         if gname == "requests_answered":
             check_requests_answered(path.name, g, names)
@@ -3649,8 +3662,9 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
     """Plan 5.5 against tests/thresholds.toml, for the grades the spec names for this peer."""
     reasons = []
     for gname, g in spec.grades.items():
-        if gname in ("requests_answered", "symmetry", "save_copy", "route", "bandwidth", "remote_swap", "exclusive"):
-            continue  # graded across peers (grade_cross_peer, grade_save_copy)
+        if gname in ("requests_answered", "symmetry", "save_copy", "route", "bandwidth", "remote_swap", "exclusive",
+                     DATA_ROOT_GRADE):
+            continue  # graded across peers (grade_cross_peer, grade_save_copy, grade_data_root)
         if g.get("peer", "S" if gname == "server_frame_time" else "H") != r.peer:
             continue
         after = lines_after(parsed["lines"], g.get("after"))
@@ -3743,6 +3757,323 @@ def grade_save_copy(r: PeerResult, before: dict[str, str], after: dict[str, str]
                  for what, files in (("changed", changed), ("added", added), ("removed", removed)) if files]
         return [f"grade save_copy: the save copy changed: {'; '.join(parts)}"]
     return []
+
+
+# --- the data_root_untouched grade (stage 7 item 9, future/online-7.md 3.9) ---------------------------
+# Each named peer's files are hashed before its game starts, at each named phase boundary and after the
+# run, and each phase's changes are compared with that phase's exact allowed list. Graded: the peer's
+# user data root (data/), its figure copy (figures/), the figure backups the portal keeps next to it
+# (Backups/: portal/figure_file.cpp FigureBackupDir, Backups\Figures beside the figures folder) and its
+# settings file (settings.toml). Left out: logs (*.log, e.g. a hosted server's game.log in the owner's
+# Online/session) and the runner's own files outside those (script, stderr, screenshots, the cache).
+#
+#   [grade.data_root_untouched]
+#   peers = ["H", "D"]       the clients graded (default: every client; a hosted S has no data root)
+#   by = "D"                 whose log carries the phase lines (default: the first of peers)
+#   [[grade.data_root_untouched.phase]]
+#   name = "session"         every phase but the last ends at the line `Input script: data root phase
+#                            <name> done` in by's log (the script's `log data root phase <name> done`;
+#                            the runner hashes within one poll of it, so the script waits 2 s before
+#                            its next step); the last phase ends with the run
+#   allow = { H = ["slot SWAPFORCE_0", "online", "import_journal"], D = ["figure Roller Brawl"] }
+#   require_changed = { D = ["slot SWAPFORCE_0"] }   entries that must show a change in this phase
+#
+# Without phase tables the grade is one phase, "run", with `allow` and `require_changed` at its top.
+# An allowed entry names files, never a folder of saves (the design's "by name only"):
+#   slot [<profile>/]<SLOT>   <data>/<profile>/<title>/00000001/<SLOT>/<SLOT>.xsg, changed only (an
+#                             import replaces it in place); without a profile, the one profile that has
+#                             that slot before the phase (more than one: the entry must name it)
+#   header [<profile>/]<SLOT> <data>/<profile>/<title>/Headers/00000001/<SLOT>.header, changed only (an
+#                             offline phase's native save; never in a session phase: the import never
+#                             writes the header)
+#   online                    anything under data/Online/
+#   import_journal            data/save-backup/import/ and data/save-backup/previous-import/
+#   import_orphaned           data/save-backup/import-orphaned/ (only a case that makes an orphan)
+#   native_journal            data/save-backup/pending/ and data/save-backup/previous/ (ReplaceContent's
+#                             own; an offline phase's native save)
+#   figure <name>             figures/<name>.dump, changed only, and anything under
+#                             Backups/Figures/<name>/ (the figure the peer played, if figures earn: CQ1)
+#   file <path>               that one path, relative to the peer's run folder
+DATA_ROOT_GRADE = "data_root_untouched"
+DATA_ROOT_TREES = ("data", "figures", "Backups")
+DATA_ROOT_FILES = ("settings.toml",)
+DATA_ROOT_PHASE_LINE = re.compile(r"Input script: data root phase (\S+) done\s*$")
+DATA_ROOT_PHASE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+DATA_ROOT_SLOT = re.compile(r"^(?:([0-9A-Fa-f]{16})/)?([A-Za-z0-9_]+)$")
+DATA_ROOT_PREFIXES = {
+    "online": ("data/Online/",),
+    "import_journal": ("data/save-backup/import/", "data/save-backup/previous-import/"),
+    "import_orphaned": ("data/save-backup/import-orphaned/",),
+    "native_journal": ("data/save-backup/pending/", "data/save-backup/previous/"),
+}
+DATA_ROOT_CLASSES = ("slot", "header", "figure", "file", *DATA_ROOT_PREFIXES)
+DATA_ROOT_SAVE_TYPE = "00000001"  # the saved-game content type's folder (content_manager.cpp)
+
+
+def data_root_entry(entry: object) -> tuple[str, str]:
+    """An allowed entry as (class, argument); ValueError when it is not one."""
+    if not isinstance(entry, str):
+        raise ValueError(f"{entry!r} is not a string")
+    cls, _, arg = entry.strip().partition(" ")
+    arg = arg.strip()
+    if cls not in DATA_ROOT_CLASSES:
+        raise ValueError(f"{entry!r}: {cls!r} is not one of {', '.join(DATA_ROOT_CLASSES)}")
+    if cls in DATA_ROOT_PREFIXES:
+        if arg:
+            raise ValueError(f"{entry!r}: {cls} takes no argument")
+    elif not arg:
+        raise ValueError(f"{entry!r}: {cls} needs a name")
+    elif cls in ("slot", "header") and not DATA_ROOT_SLOT.match(arg):
+        raise ValueError(f"{entry!r}: a slot is SWAPFORCE_<n> or <16 hex digit profile>/SWAPFORCE_<n>")
+    elif cls in ("figure", "file") and (".." in Path(arg).parts or Path(arg).is_absolute() or "\\" in arg
+                                         or (cls == "figure" and "/" in arg)):
+        raise ValueError(f"{entry!r}: a {cls} is a plain name{' or relative path' if cls == 'file' else ''}")
+    return cls, arg
+
+
+def data_root_phases(g: dict) -> list[dict]:
+    """The grade's phases in order, each {name, allow, require_changed}: its `phase` tables, or one phase
+    `run` from the grade's own `allow` and `require_changed`."""
+    if "phase" in g:
+        return [{"name": p.get("name"), "allow": p.get("allow", {}), "require_changed": p.get("require_changed", {})}
+                for p in g["phase"]]
+    return [{"name": "run", "allow": g.get("allow", {}), "require_changed": g.get("require_changed", {})}]
+
+
+def data_root_peers(g: dict, names: list[str]) -> list[str]:
+    """The peers a data_root_untouched grade hashes: its `peers`, or every client."""
+    return list(g.get("peers", [n for n in names if n != "S"]))
+
+
+def check_data_root(spec_name: str, g: object, names: list[str], server: str) -> None:
+    def bad(why: str) -> SpecError:
+        return SpecError(f"{spec_name}: grade {DATA_ROOT_GRADE}: {why}")
+    if not isinstance(g, dict):
+        raise bad("must be a table")
+    unknown = set(g) - {"peers", "by", "phase", "allow", "require_changed", "title"}
+    if unknown:
+        raise bad(f"unknown keys {sorted(unknown)}")
+    peers = g.get("peers", [n for n in names if n != "S"])
+    if not isinstance(peers, list) or not peers or any(p not in names for p in peers) or len(set(peers)) != len(peers):
+        raise bad(f"`peers` must name peers of {names}, each once")
+    if server == "host" and "S" in peers:
+        raise bad("a hosted server has no data folder of its own (its files are in the owner's Online/session)")
+    by = g.get("by", peers[0])
+    if by not in names or by == "S":
+        raise bad("`by` names the client whose script logs the phase lines")
+    if "phase" in g and ("allow" in g or "require_changed" in g):
+        raise bad("with phase tables, `allow` and `require_changed` go into each phase")
+    if "phase" in g and (not isinstance(g["phase"], list) or not g["phase"]):
+        raise bad("`phase` is a list of tables ([[grade.data_root_untouched.phase]])")
+    if "title" in g and not TITLE_ID.match(str(g["title"])):
+        raise bad("`title` is a title id, eight hex digits")
+    seen: set[str] = set()
+    for p in g.get("phase", []):
+        if not isinstance(p, dict) or set(p) - {"name", "allow", "require_changed"}:
+            raise bad("a phase has `name`, `allow` and `require_changed` only")
+    for p in data_root_phases(g):
+        name = p["name"]
+        if not isinstance(name, str) or not DATA_ROOT_PHASE_NAME.match(name) or name in seen:
+            raise bad(f"phase name {name!r}: letters, digits, _ and -, each name once")
+        seen.add(name)
+        for key in ("allow", "require_changed"):
+            table = p[key]
+            if not isinstance(table, dict) or any(n not in peers for n in table):
+                raise bad(f"phase {name}: `{key}` is a table of graded peers ({peers}) to lists of entries")
+            for n, entries in table.items():
+                if not isinstance(entries, list):
+                    raise bad(f"phase {name}: {key}.{n} is a list of entries")
+                for e in entries:
+                    try:
+                        data_root_entry(e)
+                    except ValueError as err:
+                        raise bad(f"phase {name}: {key}.{n}: {err}") from err
+            if key == "require_changed":
+                for n, entries in table.items():
+                    allowed = set(p["allow"].get(n, []))
+                    for e in entries:
+                        if e not in allowed:
+                            raise bad(f"phase {name}: require_changed.{n} entry {e!r} is not in its allow list")
+
+
+def tree_state(peer_dir: Path) -> dict[str, str]:
+    """Every file the grade watches in a peer's run folder (DATA_ROOT_TREES, DATA_ROOT_FILES): its path
+    relative to that folder (forward slashes) and the SHA-256 of its bytes. Logs are left out; links are
+    never followed."""
+    out: dict[str, str] = {}
+
+    def add(full: Path) -> None:
+        if full.is_symlink() or full.suffix.lower() == ".log":
+            return
+        h = hashlib.sha256()
+        try:
+            with open(full, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+        except OSError as e:
+            h.update(f"unreadable: {e}".encode())
+        out[full.relative_to(peer_dir).as_posix()] = h.hexdigest()
+
+    for top in DATA_ROOT_TREES:
+        root = peer_dir / top
+        if not root.is_dir() or root.is_symlink():
+            continue
+        for d, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = [x for x in dirs if not os.path.islink(os.path.join(d, x))]
+            for f in files:
+                add(Path(d) / f)
+    for f in DATA_ROOT_FILES:
+        if (peer_dir / f).is_file():
+            add(peer_dir / f)
+    return out
+
+
+def data_root_profiles(state: dict[str, str], title: str, cls: str, slot: str) -> list[str]:
+    """The profiles whose slot (or header) file is in `state`."""
+    found = set()
+    for path in state:
+        parts = path.split("/")
+        if cls == "slot" and len(parts) == 6 and parts[0] == "data" and parts[2] == title and \
+                parts[3] == DATA_ROOT_SAVE_TYPE and parts[4] == slot and parts[5] == f"{slot}.xsg":
+            found.add(parts[1])
+        if cls == "header" and len(parts) == 6 and parts[0] == "data" and parts[2] == title and \
+                parts[3] == "Headers" and parts[4] == DATA_ROOT_SAVE_TYPE and parts[5] == f"{slot}.header":
+            found.add(parts[1])
+    return sorted(found)
+
+
+def data_root_matcher(entry: str, before: dict[str, str], title: str):
+    """(a function of (path, how) that says whether the entry allows that change, or None, and why not)
+    how is changed, added or removed. A slot or header entry without a profile resolves against the
+    phase's starting state; a figure or slot entry allows only a change of the existing file."""
+    cls, arg = data_root_entry(entry)
+    if cls in DATA_ROOT_PREFIXES:
+        prefixes = DATA_ROOT_PREFIXES[cls]
+        return (lambda path, how: path.startswith(prefixes)), ""
+    if cls == "file":
+        return (lambda path, how: path == arg), ""
+    if cls == "figure":
+        dump, backups = f"figures/{arg}.dump", f"Backups/Figures/{arg}/"
+        return (lambda path, how: (path == dump and how == "changed") or path.startswith(backups)), ""
+    m = DATA_ROOT_SLOT.match(arg)
+    profile, slot = m.group(1), m.group(2)
+    if profile is None:
+        profiles = data_root_profiles(before, title, cls, slot)
+        if len(profiles) != 1:
+            return None, (f"{entry!r} names no profile and {len(profiles)} profiles have it"
+                          f"{' (' + ', '.join(profiles) + ')' if profiles else ''}; name one as <profile>/{slot}")
+        profile = profiles[0]
+    if cls == "slot":
+        want = f"data/{profile}/{title}/{DATA_ROOT_SAVE_TYPE}/{slot}/{slot}.xsg"
+    else:
+        want = f"data/{profile}/{title}/Headers/{DATA_ROOT_SAVE_TYPE}/{slot}.header"
+    return (lambda path, how: path == want and how == "changed"), ""
+
+
+def data_root_phase_result(before: dict[str, str], after: dict[str, str], allow: list[str],
+                           require: list[str], title: str) -> dict:
+    """One phase of one peer: every change (changed, added, removed), which entry allowed it, the changes
+    no entry allows, the required entries that saw no change, and the entries that could not be read."""
+    changes = sorted([(p, "changed") for p in before.keys() & after.keys() if before[p] != after[p]] +
+                     [(p, "added") for p in after.keys() - before.keys()] +
+                     [(p, "removed") for p in before.keys() - after.keys()])
+    matchers, problems = {}, []
+    for e in allow:
+        fn, why = data_root_matcher(e, before, title)
+        if fn is None:
+            problems.append(why)
+        else:
+            matchers[e] = fn
+    used: dict[str, int] = {e: 0 for e in matchers}
+    not_allowed = []
+    for path, how in changes:
+        hit = next((e for e, fn in matchers.items() if fn(path, how)), None)
+        if hit is None:
+            not_allowed.append(f"{how} {path}")
+        else:
+            used[hit] += 1
+    missing = [e for e in require if used.get(e, 0) == 0 and e in matchers]
+    return {"files_before": len(before), "files_after": len(after),
+            "changes": [f"{how} {path}" for path, how in changes], "not_allowed": not_allowed,
+            "missing_required": missing, "problems": problems}
+
+
+class DataRootWatch:
+    """The grade's snapshots over one run: the start (before any game), each phase line in `by`'s log
+    (LogTail) in order, and the end. `problems` collects phase lines out of order and phases that never
+    ended; snapshot i is phase i's start."""
+
+    def __init__(self, run: Path, g: dict, names: list[str], log: Path) -> None:
+        self.run, self.phases = run, data_root_phases(g)
+        self.peers = data_root_peers(g, names)
+        self.tail = LogTail(log)
+        self.snaps: list[dict[str, dict[str, str]]] = [self._snap()]
+        self.problems: list[str] = []
+        self.finished = False
+
+    def _snap(self) -> dict[str, dict[str, str]]:
+        return {n: tree_state(self.run / n) for n in self.peers}
+
+    def check(self) -> None:
+        """Takes the snapshot of each phase line logged since the last call (the run loop calls it)."""
+        for line in self.tail.new_lines():
+            m = DATA_ROOT_PHASE_LINE.search(line)
+            if not m:
+                continue
+            running = len(self.snaps) - 1
+            if running >= len(self.phases) - 1 or self.phases[running]["name"] != m.group(1):
+                expected = self.phases[running]["name"] if running < len(self.phases) - 1 else "none (the last" \
+                    " phase ends with the run)"
+                self.problems.append(f"phase line `{m.group(1)}` out of order (expected {expected})")
+                continue
+            self.snaps.append(self._snap())
+
+    def finish(self) -> None:
+        """After every game ended: the lines not read yet, then the end's snapshot."""
+        if self.finished:
+            return
+        self.finished = True
+        self.check()
+        ended = len(self.snaps) - 1
+        for p in self.phases[ended:-1]:
+            self.problems.append(f"phase {p['name']} did not end: no `data root phase {p['name']} done` line")
+        self.snaps.append(self._snap())
+
+
+def grade_data_root(r: PeerResult, watch: DataRootWatch, title: str) -> list[str]:
+    """The data_root_untouched grade for one peer (stage 7 item 9): each phase that has both ends
+    graded against its own allowed list. Any change no entry allows fails and names the file."""
+    reasons: list[str] = []
+    phases_out = []
+    reached = min(len(watch.snaps) - 1, len(watch.phases))
+    # A phase that never ended: the run's end closes the phase it was in, and the phases after it have
+    # no snapshot of their own (watch.problems names them).
+    for i in range(reached):
+        p = watch.phases[i]
+        res = data_root_phase_result(watch.snaps[i][r.peer], watch.snaps[i + 1][r.peer],
+                                     list(p["allow"].get(r.peer, [])), list(p["require_changed"].get(r.peer, [])),
+                                     title)
+        res["name"] = p["name"]
+        phases_out.append(res)
+        for why in res["problems"]:
+            reasons.append(f"grade {DATA_ROOT_GRADE}: phase {p['name']}: {why}")
+        if res["not_allowed"]:
+            files = res["not_allowed"]
+            reasons.append(f"grade {DATA_ROOT_GRADE}: phase {p['name']}: not allowed: {'; '.join(files[:5])}"
+                           f"{f' (and {len(files) - 5} more)' if len(files) > 5 else ''}")
+        for e in res["missing_required"]:
+            reasons.append(f"grade {DATA_ROOT_GRADE}: phase {p['name']}: {e!r} must change and did not")
+    reasons += [f"grade {DATA_ROOT_GRADE}: {why}" for why in watch.problems]
+    if not title:
+        reasons.append(f"grade {DATA_ROOT_GRADE}: no title id (the grade's `title` or tests/skytest.toml [game]"
+                       " title_id)")
+    if not watch.snaps[0].get(r.peer):
+        reasons.append(f"grade {DATA_ROOT_GRADE}: no file under the peer's data root before the run (nothing to"
+                       " compare)")
+    r.graded[DATA_ROOT_GRADE] = {"title": title, "phases": phases_out, "problems": list(watch.problems)}
+    if any(ph["not_allowed"] or ph["missing_required"] for ph in phases_out):
+        r.graded[DATA_ROOT_GRADE]["violation"] = True
+    return reasons
 
 
 def peer_log_path(run: Path, peer: str, hosted: bool) -> Path:
@@ -3866,6 +4197,9 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
     save_title = str(save_grade.get("title", cfg.title_id)) if save_grade is not None else ""
     saves_before: dict[str, dict[str, str]] = {}
     remotes: dict[str, RemotePeer] = {}  # the started remote peers (kind = "remote")
+    droot_grade = spec.grades.get(DATA_ROOT_GRADE)
+    droot_title = str(droot_grade.get("title", cfg.title_id)) if droot_grade is not None else ""
+    droot: DataRootWatch | None = None
     try:
         # Every peer's folder first (copies take a moment), then all games start close together, and
         # a spec error in a later peer starts no game at all.
@@ -3876,6 +4210,11 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         # save_copy: each named peer's save copy as it is before any game starts.
         if save_grade is not None:
             saves_before = {n: save_state(run / n / "data", save_title) for n in save_copy_peers(save_grade, names)}
+        # data_root_untouched: each named peer's files before any game starts (stage 7 item 9).
+        if droot_grade is not None:
+            droot = DataRootWatch(run, droot_grade, names,
+                                  peer_log_path(run, droot_grade.get("by", data_root_peers(droot_grade, names)[0]),
+                                                hosted))
         started: dict[str, float] = {}
         ended: dict[str, float] = {}  # each game's own end, for its time
         holds: list[tuple[str, BootHold]] = []  # each started game's boot token (PS15)
@@ -3969,6 +4308,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                 note_ends()
                 if syn_waits:
                     start_synthetic()
+                if droot is not None:
+                    droot.check()  # a phase line: that phase's end snapshot
                 if watch is not None and time.monotonic() >= next_check:
                     next_check = time.monotonic() + FAIL_FAST_POLL
                     # Checked through the grace too: a hit whose log was replaced meanwhile is dropped.
@@ -4023,6 +4364,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         res.status, res.reasons = "error", [str(e)]
         return res
     saves_after = {n: save_state(run / n / "data", save_title) for n in saves_before}
+    if droot is not None:
+        droot.finish()
     res.seconds = round(time.monotonic() - t_start, 1)
     texts = {n: read_peer_log(run, n, hosted) for n in names}
     # The synthetic peers' output, graded on its own and read by the cross-client grades (remote_swap).
@@ -4047,6 +4390,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             extra = grade_thresholds(spec, r, parsed, thresholds or {}, limit, baseline)
             if n in saves_before:
                 extra += grade_save_copy(r, saves_before[n], saves_after[n], save_title)
+            if droot is not None and n in droot.peers:
+                extra += grade_data_root(r, droot, droot_title)
             extra += grade_cross_peer(spec, r, {**texts, **syn_texts}, cfg.repo, thresholds or {})
             # A grade the manifest accepts for this case (plan 5.4: accepted failures with a reason)
             # is recorded, not failed on; everything else still has to pass.

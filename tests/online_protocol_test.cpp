@@ -809,7 +809,7 @@ void Version3() {
     CHECK(RoundTrip(w));
     const std::vector<uint8_t> good = EncodeMessage(w);
     REQUIRE_OR_RETURN_VOID(good.size() > 9);
-    w.backend_mode = 0x40;  // bits 2-3 are stage 4's, 4 stage 5's, 5 stage 6's; bit 6 is not known yet
+    w.backend_mode = 0x80;  // bits 2-3 stage 4's, 4-6 stages 5-7's; bit 7 is not known (1C's reserve)
     CHECK(EncodeMessage(w).empty());
     std::vector<uint8_t> bad = good;
     bad[bad.size() - 9] = 0x80;  // the mode byte
@@ -844,6 +844,20 @@ void Stage4() {
     w.backend_mode = kBackendModeRecordsPilot | kBackendModeRecordsPlayers | kBackendModeRequestsGeneric;
     CHECK(RoundTrip(w));
     CHECK(kBackendModeRecordsPlayers == 0x04 && kBackendModeRequestsGeneric == 0x08);
+  }
+  // Stage 7's records_progress is bit 6 (cross-stage decision 1): it round-trips alone and with the
+  // others; bit 7 (reserved for 1C) stays invalid both ways.
+  {
+    Welcome w{3, 1, 60, 2, 7, "levels/zone_hub"};
+    w.backend_mode = kBackendModeRecordsProgress;
+    CHECK(RoundTrip(w));
+    w.backend_mode = kBackendModeRecordsPilot | kBackendModeRecordsPlayers | kBackendModeRecordsProgress;
+    CHECK(RoundTrip(w));
+    w.backend_mode = kBackendModeRecordsEnemies | kBackendModeRecordsWorld | kBackendModeRecordsProgress;
+    CHECK(RoundTrip(w));
+    CHECK(kBackendModeRecordsProgress == 0x40);
+    w.backend_mode = 0x80;
+    CHECK(EncodeMessage(w).empty());
   }
   // Hello's flags: round-trip; an unknown bit is invalid both ways; a Hello without the byte (an
   // earlier build's) reads as 0.
@@ -914,8 +928,8 @@ void Stage5() {
     CHECK(RoundTrip(w));
     CHECK(kBackendModeRecordsEnemies == 0x10);
     CHECK((kBackendModeKnown & kBackendModeRecordsEnemies) != 0);
-    // A bit above stages 5 and 6's is still unknown, so the Welcome is not encoded.
-    w.backend_mode = 0x40;
+    // A bit above stages 5 to 7's is still unknown, so the Welcome is not encoded.
+    w.backend_mode = 0x80;
     CHECK(EncodeMessage(w).empty());
   }
   // OccurrenceAccept: one key and the most keys round-trip; empty and over the limit are not

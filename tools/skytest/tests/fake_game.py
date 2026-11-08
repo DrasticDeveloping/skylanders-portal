@@ -10,7 +10,10 @@ logs the connection when the address has the owner's port. `savewrite` rewrites 
 the data folder's <profile>/415608E9 (as a save the game writes); `savewrite backup` writes only into
 the data folder's save-backup (as the SDK does), which is no save. `serverlog <text>` appends a line
 to the hosted server's log (a [compare] case's workload); with `--render_hidden_draw=false` the
-hosted server's log says the draw skip is on, as the real server's does."""
+hosted server's log says the draw skip is on, as the real server's does. `datawrite <path>` appends to
+that file under the data folder (made if missing; the data_root_untouched grade's tests), `figurewrite
+<name>` to the figure copy's <name>.dump and a file in its Backups/Figures/<name> beside the figures
+folder, as the portal writes a figure and its backup."""
 import os
 import sys
 import time
@@ -107,6 +110,19 @@ def main() -> int:
                     with open(target, "ab") as f:
                         f.write(b"progress")
                     line(f"Content: saving {os.path.relpath(target, data)} anew")
+            elif cmd == "datawrite":
+                target = os.path.join(arg("user_data_root"), *rest.split("/"))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "ab") as f:
+                    f.write(b"data")
+            elif cmd == "figurewrite":
+                figures = arg("portal_figures_dir")
+                with open(os.path.join(figures, rest + ".dump"), "ab") as f:
+                    f.write(b"xp")
+                backups = os.path.join(os.path.dirname(figures), "Backups", "Figures", rest)
+                os.makedirs(backups, exist_ok=True)
+                with open(os.path.join(backups, "copy.dump"), "wb") as f:
+                    f.write(b"old")
             elif cmd == "hang":
                 time.sleep(3600)
             elif cmd == "crash":
