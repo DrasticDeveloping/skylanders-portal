@@ -76,6 +76,25 @@ class Occurrences(unittest.TestCase):
         self.assertTrue(r.passed, r.failures)
         self.assertEqual(r.expired, {1: 1})
 
+    def test_telegraph_missed_is_the_one_outcome_and_a_miss(self) -> None:
+        # The scheduler's kTelegraphMissed (the telegraph after L) is the key's outcome, not a missing one.
+        r = self.grade([retired(1)], [accepted(1), outcome(1, "telegraph missed")])
+        self.assertFalse(any("has no outcome" in f for f in r.failures), r.failures)
+        self.assertTrue(any("1 missed" in f for f in r.failures), r.failures)
+        self.assertTrue(self.grade([retired(1)], [accepted(1), outcome(1, "telegraph missed")], max_missed=1).passed)
+
+    def test_min_unconfirmed_for_a_held_hold(self) -> None:
+        # P4 (e) in a live fight: any number of expiries, at least one, each for a key H accepted.
+        s = [retired(1), expired(2), expired(3)]
+        h = [accepted(1), outcome(1, "forced at 101"), accepted(2), outcome(2, "forced at 102"),
+             accepted(3), outcome(3, "late 2")]
+        self.assertTrue(self.grade(s, h, min_unconfirmed={1: 1}).passed)
+        r = self.grade([retired(1)], [outcome(1, "forced at 101")], min_unconfirmed={1: 1})
+        self.assertTrue(any("0 expired unconfirmed line(s) for peer 1, at least 1" in f for f in r.failures))
+        # An expiry of a key H never accepted is a lost row, not the hold.
+        r = self.grade([expired(1)], [outcome(1, "undelivered")], min_unconfirmed={1: 1}, max_undelivered=1)
+        self.assertTrue(any("without its `accepted` line" in f for f in r.failures), r.failures)
+
     def test_unexpected_expiry_fails(self) -> None:
         r = self.grade([expired(1)], [accepted(1), outcome(1, "late 4")])
         self.assertFalse(r.passed)
@@ -184,6 +203,7 @@ class RunnerSide(unittest.TestCase):
         for bad in (["[grade.occurrence_outcomes]", 'clients = ["S"]'],
                     ["[grade.occurrence_outcomes]", "min_occurrences = -1"],
                     ["[grade.occurrence_outcomes]", 'expected_unconfirmed = { "H" = 1 }'],
+                    ["[grade.occurrence_outcomes]", 'expected_unconfirmed = { "1" = 1 }', 'min_unconfirmed = { "1" = 1 }'],
                     ["[grade.occurrence_outcomes]", "what = 1"],
                     ["[grade.memory_growth]", 'peers = ["H"]'],
                     ["[grade.memory_growth]", 'anchor = "x"', "start_min = 20", "end_min = 5"]):

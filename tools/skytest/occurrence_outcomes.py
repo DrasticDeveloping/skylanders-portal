@@ -9,7 +9,7 @@ S's lines (the claim table, the game's online/backend/stage5.cpp):
 
 A client's lines (its occurrence scheduler):
 
-    Online: attack <ref> #<seq> <hash> start <t> (forced at <t'>|late <n>|missed|missed (no telegraph)|undelivered|duplicate)
+    Online: attack <ref> #<seq> <hash> start <t> (forced at <t'>|late <n>|missed|missed (no telegraph)|telegraph missed|undelivered|duplicate)
     Online: attack <ref> #<seq> accepted
 
 - S's occurrences are the keys (ref, seq) S retired: one retirement each (`delivered all`, `claims
@@ -17,11 +17,15 @@ A client's lines (its occurrence scheduler):
   of the same key, or one peer's expiry twice, fails.
 - Each graded client must log exactly one outcome per S occurrence: none or two fail. `duplicate`
   is a dev line (a row for a key already decided), never an outcome.
-- missed and undelivered outcomes are limited (0 each on loopback, section 5.6).
+- missed and undelivered outcomes are limited (0 each on loopback, section 5.6). `telegraph missed`
+  (a telegraphed occurrence whose telegraph came after L: nothing shown) is the key's one outcome
+  and counts as missed (section 5.6's missed telegraphs, 0 on loopback).
 - `expired unconfirmed peer <p>` lines are delivery-proof failures, graded apart from the client's
-  outcome: their count per peer must equal `expected_unconfirmed` (0 by default; P4 (e) expects one).
-  A key the client accepted and S then expired must still get forced, late or missed there, never
-  undelivered (the client owned the entry).
+  outcome: their count per peer must equal `expected_unconfirmed` (0 by default). A case that holds
+  a client's accepts through a live fight (P4 (e)) cannot know how many occurrences fall in the hold:
+  `min_unconfirmed` asks at least that many for the peer instead, each for a key that client logged
+  `accepted` (a held accept, never a lost row). A key the client accepted and S then expired must
+  still get forced, late or missed there, never undelivered (the client owned the entry).
 - Fewer than `min_occurrences` S occurrences (20, section 5.2) is "not reached": an empty trace
   never passes.
 - A client outcome for a key S has not retired (the run ended inside the retention) is counted as
@@ -39,7 +43,7 @@ RETIRED_RE = re.compile(r"Online: attack (\S+) #(\d+) \((delivered all|claims en
 EXPIRED_RE = re.compile(r"Online: attack (\S+) #(\d+) expired unconfirmed peer (\d+)(?: \(table full\))?\s*$")
 OUTCOME_RE = re.compile(
     r"Online: attack (\S+) #(\d+) (\S+) start (-?\d+) "
-    r"\((forced at -?\d+|late \d+|missed \(no telegraph\)|missed|undelivered|duplicate)\)\s*$")
+    r"\((forced at -?\d+|late \d+|missed \(no telegraph\)|missed|telegraph missed|undelivered|duplicate)\)\s*$")
 ACCEPTED_RE = re.compile(r"Online: attack (\S+) #(\d+) accepted\s*$")
 CONNECTED_RE = re.compile(r"Online: connected as peer (\d+)")
 
@@ -51,7 +55,7 @@ def _kind(outcome: str) -> str:
         return "forced"
     if outcome.startswith("late"):
         return "late"
-    if outcome.startswith("missed"):
+    if outcome.startswith("missed") or outcome == "telegraph missed":
         return "missed"
     return outcome  # undelivered, duplicate
 
@@ -73,7 +77,8 @@ class Result:
 
 def grade_occurrences(server_log: str, client_logs: dict[str, str], *, min_occurrences: int = 20,
                       max_missed: int = 0, max_undelivered: int = 0,
-                      expected_unconfirmed: dict[int, int] | None = None) -> Result:
+                      expected_unconfirmed: dict[int, int] | None = None,
+                      min_unconfirmed: dict[int, int] | None = None) -> Result:
     """`server_log`: S's log text; `client_logs`: each graded client's log text by its peer name."""
     res = Result()
     retired: dict[Key, str] = {}
@@ -98,10 +103,14 @@ def grade_occurrences(server_log: str, client_logs: dict[str, str], *, min_occur
     res.delivered_all = sum(1 for k in keys if retired.get(k) == "delivered all")
     res.expired = dict(Counter(p for peers in expired.values() for p in peers))
     want = expected_unconfirmed or {}
-    for peer in sorted(set(res.expired) | set(want)):
-        got, wanted = res.expired.get(peer, 0), want.get(peer, 0)
-        if got != wanted:
-            res.failures.append(f"S: {got} expired unconfirmed line(s) for peer {peer}, expected {wanted}")
+    at_least = min_unconfirmed or {}
+    for peer in sorted(set(res.expired) | set(want) | set(at_least)):
+        got = res.expired.get(peer, 0)
+        if peer in at_least:
+            if got < at_least[peer]:
+                res.failures.append(f"S: {got} expired unconfirmed line(s) for peer {peer}, at least {at_least[peer]}")
+        elif got != want.get(peer, 0):
+            res.failures.append(f"S: {got} expired unconfirmed line(s) for peer {peer}, expected {want.get(peer, 0)}")
     if res.occurrences < min_occurrences:
         res.not_reached = f"{res.occurrences} attack occurrence(s) retired on S, at least {min_occurrences} needed"
 
@@ -132,6 +141,9 @@ def grade_occurrences(server_log: str, client_logs: dict[str, str], *, min_occur
             elif (peer is not None and peer in expired.get(key, []) and key in accepted
                   and _kind(got[0]) == "undelivered"):
                 res.failures.append(f"{name}: attack {key[0]} #{key[1]} accepted, then undelivered at S's expiry")
+            if peer in at_least and peer in expired.get(key, []) and key not in accepted:
+                res.failures.append(f"{name}: attack {key[0]} #{key[1]} expired for peer {peer} without its "
+                                    f"`accepted` line (a lost row, not a held accept)")
         if counts["missed"] > max_missed:
             res.failures.append(f"{name}: {counts['missed']} missed occurrence(s), at most {max_missed}")
         if counts["undelivered"] > max_undelivered:
@@ -141,14 +153,17 @@ def grade_occurrences(server_log: str, client_logs: dict[str, str], *, min_occur
 
 # --- the runner's side (skytest.py: `[grade.occurrence_outcomes]` in a case) ----------------------
 
-SPEC_KEYS = {"peer", "clients", "min_occurrences", "max_missed", "max_undelivered", "expected_unconfirmed"}
+SPEC_KEYS = {"peer", "clients", "min_occurrences", "max_missed", "max_undelivered", "expected_unconfirmed",
+             "min_unconfirmed"}
 
 
 def check_spec(g: object, names: list[str]) -> str:
     """The grade's options; returns why they are wrong, or "". `peer`: the log with the claim lines
     (default S); `clients`: the graded clients (default every client of the case); `min_occurrences`
     (20), `max_missed` (0), `max_undelivered` (0): whole numbers >= 0; `expected_unconfirmed`: a table
-    of peer id (a string) to the number of expired unconfirmed lines the case injects (default none)."""
+    of peer id (a string) to the number of expired unconfirmed lines the case injects (default none);
+    `min_unconfirmed`: the same table as a minimum, for a hold whose count the case cannot know (a
+    peer in only one of the two)."""
     if not isinstance(g, dict):
         return "must be a table"
     if unknown := set(g) - SPEC_KEYS:
@@ -162,10 +177,13 @@ def check_spec(g: object, names: list[str]) -> str:
         v = g.get(key, 0)
         if not isinstance(v, int) or isinstance(v, bool) or v < 0:
             return f"{key} must be a whole number >= 0"
-    expected = g.get("expected_unconfirmed", {})
-    if not isinstance(expected, dict) or any(
-            not str(k).isdigit() or not isinstance(v, int) or isinstance(v, bool) or v < 0 for k, v in expected.items()):
-        return "expected_unconfirmed maps peer ids (\"1\") to whole numbers >= 0"
+    for key in ("expected_unconfirmed", "min_unconfirmed"):
+        table = g.get(key, {})
+        if not isinstance(table, dict) or any(
+                not str(k).isdigit() or not isinstance(v, int) or isinstance(v, bool) or v < 0 for k, v in table.items()):
+            return f"{key} maps peer ids (\"1\") to whole numbers >= 0"
+    if both := {int(k) for k in g.get("expected_unconfirmed", {})} & {int(k) for k in g.get("min_unconfirmed", {})}:
+        return f"peer(s) {sorted(both)} in both expected_unconfirmed and min_unconfirmed"
     return ""
 
 
@@ -177,7 +195,8 @@ def grade_spec(texts: dict[str, str], g: dict, names: list[str]) -> tuple[dict, 
         texts.get(g.get("peer", "S"), ""), {c: texts.get(c, "") for c in clients},
         min_occurrences=g.get("min_occurrences", 20), max_missed=g.get("max_missed", 0),
         max_undelivered=g.get("max_undelivered", 0),
-        expected_unconfirmed={int(k): v for k, v in g.get("expected_unconfirmed", {}).items()})
+        expected_unconfirmed={int(k): v for k, v in g.get("expected_unconfirmed", {}).items()},
+        min_unconfirmed={int(k): v for k, v in g.get("min_unconfirmed", {}).items()})
     record = {"occurrences": res.occurrences, "delivered_all": res.delivered_all,
               "expired": {str(k): v for k, v in res.expired.items()}, "counts": res.counts,
               "unretired": res.unretired, "not_reached": res.not_reached, "failures": res.failures[:20]}
