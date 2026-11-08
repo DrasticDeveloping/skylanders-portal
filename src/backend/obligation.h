@@ -95,8 +95,9 @@ class ObligationLedger {
   // `*credit_bound` (if given) is then true when only the credit holds the head back.
   const Obligation* NextToSend(uint64_t cursor, bool* credit_bound = nullptr) const;
   void MarkSent(uint64_t id, TimePoint now);
-  // ObligationDone{id}: true when S still held it (it ends now with the client's end); false when
-  // it had ended already (retired, completed), which is acked, ignored and counted (Sol F9).
+  // ObligationDone{id}: true when S still held it, sent (it ends now with the client's end); false
+  // when it had ended already (retired, completed) or was never sent (it stays, unsent; council 2
+  // B11), which is acked, ignored and counted (Sol F9).
   bool OnDone(uint64_t id);
   // A repair baseline began: the sent ones end kRetiredBaseline, never resent (D6); unsent ones
   // stay. Returns the ids retired.
@@ -117,7 +118,7 @@ class ObligationLedger {
   uint64_t ClientSeen() const;  // the newest Ack's seen
   size_t Outstanding() const;   // sent and not ended, plus waiting
   size_t Waiting() const;       // made and not sent
-  uint64_t Ignored() const;     // ObligationDone for an id no longer held
+  uint64_t Ignored() const;     // ObligationDone for an id no longer held or not yet sent
   // The mark ObligationAck{0, floor, last_sent} is due: S has sent an id above the client's seen,
   // and limits.obligation_report_interval passed since the last mark and since that id went.
   bool MarkDue(TimePoint now) const;

@@ -617,4 +617,32 @@ BACKEND_TEST("OB13", ObligationCreditReturnedByDrop) {
   }
 }
 
+// OB14 (council 2 B11): an ObligationDone for an id S made and has not sent (no client can have
+// received it) ends nothing: it is ignored and counted like one for an ended id, and the obligation
+// stays, goes out in its turn, and ends at the report that follows its send. On the ledger itself,
+// as Server::Handle calls it (it answers every ObligationDone with an ObligationAck either way).
+BACKEND_TEST("OB14", ObligationDoneForAnUnsentId) {
+  ObligationLedger ledger{Limits{}};
+  Obligation o;
+  o.recipient = 1;
+  o.key = EventKey(1, 1);
+  o.value = Val(1);
+  o.lsn = 5;
+  ledger.Add(o);
+  const uint64_t id = ledger.NextId() - 1;
+  CHECK(!ledger.OnDone(id));
+  CHECK(ledger.Ignored() == 1);
+  CHECK(ledger.Get(id) != nullptr && !ledger.Get(id)->sent);
+  CHECK(ledger.Waiting() == 1 && ledger.Outstanding() == 1);
+  CHECK(ledger.Floor() == id);
+  const Obligation* next = ledger.NextToSend(5);
+  CHECK(next != nullptr && next->id == id);
+  ledger.MarkSent(id, lanes::kStart);
+  CHECK(ledger.OnDone(id));
+  CHECK(ledger.Get(id) == nullptr && ledger.Outstanding() == 0);
+  CHECK(ledger.Ignored() == 1);
+  CHECK(!ledger.OnDone(id));  // ended already: ignored again
+  CHECK(ledger.Ignored() == 2);
+}
+
 }  // namespace

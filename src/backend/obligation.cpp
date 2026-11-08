@@ -61,10 +61,14 @@ void ObligationLedger::MarkSent(uint64_t id, TimePoint now) {
 }
 
 bool ObligationLedger::OnDone(uint64_t id) {
-  if (outstanding_.erase(id) == 0) {
+  auto it = outstanding_.find(id);
+  // An id S no longer holds, or one it has not sent: the client cannot have received an unsent
+  // one, so its report ends nothing (council 2 B11). The obligation stays and goes out in its turn.
+  if (it == outstanding_.end() || !it->second.sent) {
     ++ignored_;
     return false;
   }
+  outstanding_.erase(it);
   return true;
 }
 
