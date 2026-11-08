@@ -194,6 +194,26 @@ enum class RowApply : uint8_t {
   kFailed,   // the adapter's write failed (AdapterResult::kFailed): unsettled, handed out again
 };
 
+// Where an unsettled key's revision on the apply queue came from (stage 6, Sol F3; the header's
+// own). Kept per key and revision from receipt or installation until the key settles, through
+// every kWaiting or kFailed answer and retry, so an adapter whose entity resolves pumps later still
+// reads it. The revision decides: a row that replaces an unsettled entry at another revision brings
+// its own origin, one at the same revision keeps the entry's (the revision was first received that
+// way). A delta read while its scope stages keeps kDelta through the swap, and so does a delta read
+// after a BaselineEnd in the same receive.
+// Next to it the entry keeps its first origin: the origin the key had when it entered the queue,
+// never changed by a later revision, until the key settles or is erased (a new entry starts over).
+// A key a baseline's swap queues is first kBaseline when its BaselineRows carried it, even when a
+// delta read while staging brought the newest revision. An adapter deciding about a key it meets
+// for the first time reads the first origin (Replica::FirstOrigin, Client::ApplyingFirstOrigin);
+// apply mode stays per revision (stage 6, F3's remaining hole).
+enum class ApplyOrigin : uint8_t {
+  kNone = 0,  // no row: outside an adapter call, or a settled key
+  kDelta,     // received as a Delta or Tomb (also staged during a baseline, or waiting for its
+              // EpochBegin)
+  kBaseline,  // installed by a baseline's swap from its BaselineRows (join, repair, scope)
+};
+
 // What the Replica reports to the client's event stream (draft 4).
 struct ReplicaEvent {
   enum class Type : uint8_t {
@@ -245,6 +265,8 @@ class Replica {
   // then waiting and failed rows due again (once per Service). Every row handed out is unsettled
   // until OnApplied answers it; the client answers each one in the same pump (Sol F2, draft 4).
   bool TakeReady(Record& out);
+  // The same, and the row's origin at that revision (ApplyOrigin; stage 6, Sol F3).
+  bool TakeReady(Record& out, ApplyOrigin& origin);
   // The apply result of a row TakeReady handed out, at that revision (an older revision's result,
   // for a key that a newer row replaced meanwhile, settles nothing). kApplied and kDropped settle
   // the key and may release fenced rows it held; kWaiting and kFailed keep it unsettled.
@@ -310,6 +332,11 @@ class Replica {
   // An unsettled key's first change (the smaller one kept across replacements, Sol r2 N1; SR7b
   // reads it); nullopt for a settled key.
   std::optional<uint64_t> FirstLsn(const RecordKey& key) const;
+  // An unsettled key's origin at its queued revision (stage 6, Sol F3); kNone for a settled key.
+  ApplyOrigin Origin(const RecordKey& key) const;
+  // An unsettled key's first origin: the one it entered the queue with, kept through later
+  // revisions until it settles or is erased (ApplyOrigin); kNone for a settled key.
+  ApplyOrigin FirstOrigin(const RecordKey& key) const;
 
   std::span<const KindSpec> Table() const;
 

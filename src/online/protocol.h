@@ -53,9 +53,12 @@ constexpr uint8_t kBackendModeRequestsGeneric = 0x08;
 // Stage 5 (future/online-5.md D16; cross-stage decision 1, bit 4): the enemy records, the client
 // simulation boundary and the occurrence scheduler (online_records_enemies).
 constexpr uint8_t kBackendModeRecordsEnemies = 0x10;
+// Stage 6 (future/online-6.md D25; cross-stage decision 1, bit 5 `records_world`): the world
+// records, leases, scenes and the session pause (online_records_world). Bit 4 is stage 5's.
+constexpr uint8_t kBackendModeRecordsWorld = 0x20;
 constexpr uint8_t kBackendModeKnown = kBackendModeRecordsPilot | kBackendModeChurn |
                                       kBackendModeRecordsPlayers | kBackendModeRequestsGeneric |
-                                      kBackendModeRecordsEnemies;
+                                      kBackendModeRecordsEnemies | kBackendModeRecordsWorld;
 // Hello's flags (stage 4 item 2): a trailing byte, so a Hello without it reads as 0. A bit outside
 // kHelloFlagsKnown makes the message invalid.
 constexpr uint8_t kHelloSynthetic = 0x01;  // a synthetic peer (tools/headless_peer); S accepts it
