@@ -182,6 +182,11 @@ struct ObligationDone {
 struct Mismatch {
   uint64_t lsn = 0;
   uint64_t bucket_mask = 0;  // 0: a failed baseline digest
+  // Client::InboundLost's repair (stage 3, Sol code review r1 F1): S begins a fresh full baseline
+  // after the running one even when that one's `at` and scopes cover `lsn`, since the client
+  // discards the rest of the running one. On the wire one trailing byte, sent only when true; an
+  // older reader ignores it (bytes past the fields it knows).
+  bool lost = false;
 };
 struct Request {  // on the wire: no peer, no peer epoch (S stamps both from the link; Sol F3)
   backend::Request request;

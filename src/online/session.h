@@ -51,13 +51,23 @@ struct ServerSettings {
   BuildDigest build_digest{};   // a Hello with another digest is refused
   OwnerToken owner_token{};     // the Hello with this token gets id 1; all zero: no owner, id 1 stays free
   uint32_t session_id = 0;      // 0: a random one
+  // Version 3 (stage 3 section 3.2, D4): what S's backend runs, sent in every Welcome. Fixed for
+  // the session; 0 (no backend) unless the game sets it.
+  uint8_t backend_mode = 0;
+  uint64_t backend_table_digest = 0;
 };
+
+// What SendBackend did with a frame (stage 3 section 3.2). kFull: the lane's window holds
+// netplay::kLaneWindow unacked datagrams; nothing was queued and the caller keeps the frame.
+enum class BackendSend : uint8_t { kSent, kFull, kTooBig, kGone };
 
 enum class LeaveReason : uint8_t {
   kBye,       // it said Bye
   kTimeout,   // nothing from it for kPeerTimeout
   kReplaced,  // the owner connected again from another address
   kClosed,    // End session's drain is done for it: its finals went out, then S's Bye (version 2)
+  kRemoved,   // the game removed it (RemoveClient: its backend's control overflow or overrun,
+              // stage 3); told Bye
 };
 
 struct ServerEvent {
@@ -88,6 +98,12 @@ struct ServerEvent {
                        // within kCloseWait
     kSceneAck,         // peer_id, scene (phase kAck): the client plays a matching occurrence of
                        // the scene S opened (item 12); not reported once End session began
+    // Version 3 (stage 3).
+    kBackendFrame,     // peer_id, lane, frame: one backend frame from a welcomed client, in its
+                       // lane's order (the bridge's inbound ring takes it at once)
+    kPeerLevelLoaded,  // peer_id, generation: the client has the current generation's level up
+                       // (its LevelLoaded; also a late joiner's, which no barrier waits for): the
+                       // backend's OnPeerLevelReady
   };
   Type type = Type::kPeerJoined;
   uint16_t peer_id = 0;
@@ -109,6 +125,8 @@ struct ServerEvent {
   bool gone = false;
   bool sent = false;  // kDecisionSent
   SceneBarrier scene;  // kSceneAck
+  netplay::Lane lane = netplay::Lane::kGameplay;  // kBackendFrame
+  std::vector<uint8_t> frame;                     // kBackendFrame
 };
 
 struct PeerInfo {
@@ -204,6 +222,23 @@ class ServerSession {
   // To every client: a scene occurrence's open, release or end (the scene barrier, item 12). false
   // for a kAck (the clients' phase), or if it cannot be encoded, or the session is not running.
   bool SendSceneBarrier(const SceneBarrier& scene, TimePoint now = Clock::now());
+  // Version 3 (stage 3 section 3.2; stage 2 section 3.7): one backend frame to a welcomed client
+  // on `lane` (state or gameplay). kFull when the lane's window is full (nothing queued: the
+  // caller keeps the frame at its ring's head and retries), kTooBig for an empty frame or one over
+  // kMaxBackendFrameBytes, kGone when `peer` is not a welcomed client.
+  BackendSend SendBackend(uint16_t peer, netplay::Lane lane, std::span<const uint8_t> frame,
+                          TimePoint now = Clock::now());
+  // Datagrams sent to `peer` on `lane` and not yet acked (netplay's Connection::Unacked: every
+  // message on that lane counts, the session's own included); 0 for a peer that is not welcomed.
+  size_t BackendUnacked(uint16_t peer, netplay::Lane lane) const;
+  // The smoothed round trip to `peer`; 0 for a peer that is not welcomed.
+  std::chrono::microseconds BackendRtt(uint16_t peer) const;
+  // `peer` is a welcomed client (the bridge's "connected" in its metric snapshot).
+  bool PeerConnected(uint16_t peer) const;
+  // The game removes a welcomed client (stage 3 section 3.2: its backend's control overflow, or the
+  // backend's kPeerOverrun): told Bye, kPeerLeft with kRemoved, its keys forgotten as at any leave.
+  // false if `peer` is not a welcomed client.
+  bool RemoveClient(uint16_t peer, TimePoint now = Clock::now());
   // End session's drain: SessionClosing to every client; from now on nothing is applied.
   void EndSession(TimePoint now = Clock::now());
   bool Closing() const { return requests_.Closing(); }
@@ -232,7 +267,7 @@ class ServerSession {
   };
 
   void HandleDatagram(const netplay::Endpoint& from, std::span<const uint8_t> bytes, TimePoint now);
-  void HandleMessage(Peer& peer, const Message& message, TimePoint now);
+  void HandleMessage(Peer& peer, const Message& message, netplay::Lane lane, TimePoint now);
   void HandleHello(Peer& peer, const Hello& hello, TimePoint now);
   void SendRefuse(Peer& peer, RefuseReason reason, std::string text, TimePoint now, bool close);
   void DropPeer(Peer& peer, LeaveReason reason, TimePoint now);
@@ -289,6 +324,8 @@ struct ClientEvent {
     kReaction,        // reaction
     kSessionClosing,  // End session: requests stop; SessionClosed went back already
     kSceneBarrier,    // scene: S opened, released or ended a scene occurrence (never kAck)
+    // Version 3 (stage 3).
+    kBackendFrame,    // lane, frame: one backend frame from S, in its lane's order
   };
   Type type = Type::kConnected;
   uint16_t peer_id = 0;
@@ -304,6 +341,11 @@ struct ClientEvent {
   LevelEnd level_end;
   Reaction reaction;
   SceneBarrier scene;
+  // kConnected (version 3): S's backend mode and kind table digest from the Welcome.
+  uint8_t backend_mode = 0;
+  uint64_t backend_table_digest = 0;
+  netplay::Lane lane = netplay::Lane::kGameplay;  // kBackendFrame
+  std::vector<uint8_t> frame;                     // kBackendFrame
 };
 
 // The client side: one server, a ping every kPingInterval for the tick estimate and liveness.
@@ -342,6 +384,15 @@ class ClientSession {
   // (whatever its phase says), with its generation, key and kind. While connected and End session
   // has not begun (SessionClosed is the last thing a client sends); false otherwise.
   bool SendSceneAck(const SceneBarrier& scene, TimePoint now = Clock::now());
+  // Version 3: one backend frame to S on `lane`, while connected (also during End session's
+  // drain: the backend's own End session needs its last acks). The results as the server's.
+  BackendSend SendBackend(netplay::Lane lane, std::span<const uint8_t> frame,
+                          TimePoint now = Clock::now());
+  // Datagrams sent to S on `lane` and not yet acked; 0 with no connection.
+  size_t BackendUnacked(netplay::Lane lane) const { return conn_ ? conn_->Unacked(lane) : 0; }
+  // S's backend mode and table digest from the Welcome (0 before it).
+  uint8_t BackendMode() const { return backend_mode_; }
+  uint64_t BackendTableDigest() const { return backend_table_digest_; }
   // End session began (SessionClosing came): no request leaves this client any more.
   bool Closing() const { return closing_; }
   // The connection's counters (per-lane bytes included); all zero with no connection.
@@ -367,7 +418,7 @@ class ClientSession {
   const std::string& Error() const { return error_; }
 
  private:
-  void HandleMessage(const Message& message, TimePoint now);
+  void HandleMessage(const Message& message, netplay::Lane lane, TimePoint now);
   void Finish(DisconnectReason reason);
   bool Post(netplay::Lane lane, const Message& message, TimePoint now);
 
@@ -382,6 +433,8 @@ class ClientSession {
   std::vector<PlayerEntry> players_;
   ClientTickEstimator ticks_;
   bool closing_ = false;
+  uint8_t backend_mode_ = 0;
+  uint64_t backend_table_digest_ = 0;
   TimePoint next_ping_{};
   TimePoint closing_since_{};
   std::deque<ClientEvent> events_;

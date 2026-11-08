@@ -12,14 +12,15 @@ using netplay::ByteReader;
 using netplay::ByteWriter;
 
 // The variant's order is the type numbering (Hello = 1 ...), which TypeOf relies on.
-static_assert(std::variant_size_v<Message> == 21);
+static_assert(std::variant_size_v<Message> == 22);
 static_assert(std::is_same_v<std::variant_alternative_t<0, Message>, Hello>);
 static_assert(std::is_same_v<std::variant_alternative_t<10, Message>, PlayerList>);
 static_assert(std::is_same_v<std::variant_alternative_t<11, Message>, PlayerPose>);
 static_assert(std::is_same_v<std::variant_alternative_t<14, Message>, WorldDecision>);
 static_assert(std::is_same_v<std::variant_alternative_t<19, Message>, SessionClosed>);
 static_assert(std::is_same_v<std::variant_alternative_t<20, Message>, SceneBarrier>);
-constexpr uint16_t kLastType = uint16_t(MessageType::kSceneBarrier);
+static_assert(std::is_same_v<std::variant_alternative_t<21, Message>, BackendFrame>);
+constexpr uint16_t kLastType = uint16_t(MessageType::kBackendFrame);
 static_assert(kLastType == std::variant_size_v<Message>);
 
 bool IsNone(const OwnerToken& token) {
@@ -386,7 +387,11 @@ bool Fields(ByteWriter& w, const Welcome& m) {
   w.U16(m.tick_hz);
   w.U64(m.server_tick);
   w.U32(m.level_generation);
-  return PutString(w, m.level_zone, kMaxZoneBytes);
+  if (!PutString(w, m.level_zone, kMaxZoneBytes)) return false;
+  if ((m.backend_mode & ~kBackendModeKnown) != 0) return false;
+  w.U8(m.backend_mode);
+  w.U64(m.backend_table_digest);
+  return true;
 }
 bool Fields(ByteWriter& w, const Refuse& m) {
   w.U8(uint8_t(m.reason));
@@ -497,6 +502,11 @@ bool Fields(ByteWriter& w, const Reaction& m) {
 }
 bool Fields(ByteWriter&, const SessionClosing&) { return true; }
 bool Fields(ByteWriter&, const SessionClosed&) { return true; }
+bool Fields(ByteWriter& w, const BackendFrame& m) {
+  if (m.bytes.empty() || m.bytes.size() > kMaxBackendFrameBytes) return false;
+  w.Bytes(m.bytes);
+  return true;
+}
 // phase u8, generation u32, the scene (25 bytes), kind u8, end u8, skips u8: 33 bytes.
 bool Fields(ByteWriter& w, const SceneBarrier& m) {
   if (!ValidScenePhase(uint8_t(m.phase)) || !ValidSceneKind(uint8_t(m.kind)) ||
@@ -542,6 +552,11 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
       m.server_tick = r.U64();
       m.level_generation = r.U32();
       ok = GetString(r, kMaxZoneBytes, m.level_zone);
+      // Version 3's two trailing fields. Only a version 3 client is ever welcomed (a version 2
+      // Hello is refused kVersion), so a Welcome that ends before them is cut short.
+      m.backend_mode = r.U8();
+      m.backend_table_digest = r.U64();
+      ok = ok && (m.backend_mode & ~kBackendModeKnown) == 0;
       result = std::move(m);
       break;
     }
@@ -733,6 +748,14 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
       m.end = end <= uint8_t(SceneEndReason::kOther) ? SceneEndReason(end) : SceneEndReason::kOther;
       ok = ok && ConsistentScene(m);
       result = m;
+      break;
+    }
+    case MessageType::kBackendFrame: {
+      // The rest of the message is the frame (the session never reads it).
+      if (body.empty() || body.size() > kMaxBackendFrameBytes) return std::nullopt;
+      BackendFrame m;
+      m.bytes.assign(body.begin(), body.end());
+      result = std::move(m);
       break;
     }
     default:

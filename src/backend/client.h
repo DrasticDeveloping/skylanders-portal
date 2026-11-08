@@ -43,6 +43,8 @@ struct ClientEvent {
     kBaselineLost,      // a Manifest (at `lsn`) came while a baseline was still staging: its
                         // BaselineEnd was lost above the lane, Mismatch{lsn, 0} sent (Sol code
                         // review r2, R4; the header's own)
+    kInboundLost,       // InboundLost: recoverable state messages were discarded below the
+                        // client; staging dropped, Mismatch{`lsn` (the prefix), 0} sent (stage 3)
   };
   Type type = Type::kDecided;
   RequestKey key;
@@ -112,6 +114,31 @@ class Client {
   // (Ack{prefix, manifest_ok, holding, seen} on a change and at least every
   // obligation_report_interval; Sol r3 F9, draft 5); check manifests.
   void Pump(TimePoint now);
+  // Stage 3 (future/online-3.md section 3.2, "Recoverable overflow on a client"): the game's bridge
+  // discarded recoverable state messages from S (Delta, Tomb, Through, Manifest, BaselineBegin,
+  // BaselineRows, BaselineEnd) because its inbound budget was spent, and its receive reached the
+  // loss mark: every message before the mark has been read, none after it. Drops staging as a
+  // failed baseline digest does (the active replica and the apply queue untouched), sends
+  // Mismatch{prefix, 0, lost} (lost: S answers with a fresh full baseline even while one whose
+  // `at` covers the prefix runs, since its rest is discarded here; Sol code review r1 F1), and
+  // from now on discards recoverable state messages until the
+  // BaselineBegin of a baseline with an id above the last one read before the mark (a baseline S
+  // began after the loss; S numbers each peer's baselines upward). Control messages (StateHello,
+  // EpochBegin, Obligation, ObligationAck, Decision, LeaseEnd) are never discarded here. Safe on
+  // the ordered lane: every delta S sent before it read the Mismatch has an LSN at or below the new
+  // baseline's `at`, and every later one comes after its BaselineBegin. Nothing before StateHello
+  // (nothing is read then). Called between pumps, never from inside the link's Receive. A second
+  // loss while discarding sends another Mismatch and keeps the same id floor.
+  void InboundLost(TimePoint now);
+  // True from InboundLost until the repair baseline's BaselineBegin is read (for tests and the
+  // debug window).
+  bool AwaitingRepairBaseline() const;
+  // Recoverable state messages discarded since the last InboundLost (for the bridge's line).
+  uint64_t DiscardedAfterLoss() const;
+  // The row whose adapter Apply or Retire call is in progress on this thread (the fault injector's
+  // `newer` matcher reads its revision; stage 3 section 3.7); nullptr outside such a call (an
+  // effect's apply included).
+  const Record* Applying() const;
   const Replica& State() const;
   // The client's obligation entries and its side of the credit account (item 4; for tests and
   // the invariant checker).

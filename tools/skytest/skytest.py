@@ -100,6 +100,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import winjob  # noqa: E402
+import backend_grades  # noqa: E402  (stage 3's backend grades: compare, faults, memory)
 
 STORE = ".replication-tests"
 CLIENTS = ["H", "D", "E", "F"]
@@ -123,7 +124,7 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
 # Where a hosted server (`server = "host"`) writes its log: the owner's session folder.
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
 GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
-          "symmetry", "route", "bandwidth")
+          "symmetry", "route", "bandwidth") + backend_grades.NAMES
 # The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
 # online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
 # for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
@@ -181,6 +182,14 @@ TRAFFIC_PEER = re.compile(r"Online: traffic peer (\d+) gameplay (\d+)/(\d+) stat
 RETRYABLE_ENTER = ("too_far", "rate", "not released", "not in play")
 # A title folder's name (the game's title id in hex), for the save_copy grade.
 TITLE_ID = re.compile(r"^[0-9A-F]{8}$")
+# A peer's save_slots (stage 3 item 7, fill_save_slots): the save menu's slots (three in Swap Force:
+# client/host.cpp refuses a fourth), the saved-game content type's folder (XContentType 1), and where
+# an SDK content header keeps the content's file name (XCONTENT_DATA: device id 4, content type 4,
+# display name 256 bytes, then file_name_raw[42]; rexglue-sdk content_manager.h).
+SAVE_SLOT_MAX = 3
+SAVE_CONTENT_TYPE = "00000001"
+SAVE_HEADER_NAME_AT = 264
+SAVE_HEADER_NAME_LEN = 42
 # S's boot timeline ending outside play (server_role.cpp BootCheck) is fatal for every hosted case:
 # the owner's game then waits for a hub that never comes (P1m: a case ran to its 1200 s limit).
 ALWAYS_FORBIDDEN = [r"\] Crash: ", r"\[FATAL\]", r"Input script: cannot (parse|use)",
@@ -338,6 +347,9 @@ class Config:
     launcher: list[str]
     # The game's title id (its save folder <data>/<profile>/<title_id>), for the save_copy grade.
     title_id: str = ""
+    # [game] save_slot_name: a save slot's content name with {index} for the zero-based slot
+    # ("SWAPFORCE_{index}"), for a peer's save_slots (fill_save_slots). Missing: save_slots is refused.
+    save_slot_name: str = ""
     # Fail fast: seconds between a run's first fatal line and the stop of its games.
     fail_fast_grace: float = DEFAULT_FAIL_FAST_GRACE
     # [defaults] show_server_window: the server peer's window is shown (a playtest the owner
@@ -424,6 +436,7 @@ def load_config(repo: Path) -> Config:
         # Only the runner's own tests set this: a command that stands in for the game's exe.
         launcher=[os.path.expandvars(x) for x in g.get("launcher", [])],
         title_id=str(g.get("title_id", "")),
+        save_slot_name=str(g.get("save_slot_name", "")),
         fail_fast_grace=float(grace),
         show_server_window=show,
         movies_skip=movies,
@@ -534,6 +547,10 @@ class PeerSpec:
     # and patterns whose first matches come in this order (each after the one before).
     expect_count: dict[str, int] = field(default_factory=dict)
     expect_order: list[str] = field(default_factory=list)
+    # save_slots = { "<slot>" = <fixture slot> } (stage 3 item 7): this peer's copy of the fixture saves
+    # gets the save of `fixture slot` once more in `slot` (both one-based, as the save menu counts them),
+    # before the game starts (fill_save_slots). {} leaves the copy as the fixture store has it.
+    save_slots: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -612,6 +629,79 @@ def spec_readiness(path: Path, d: dict, text: str) -> str:
     return ""
 
 
+def parse_save_slots(spec_name: str, peer: str, value: object) -> dict[int, int]:
+    """A peer's `save_slots` table: one-based slot numbers as strings, each to the one-based fixture slot
+    whose save it gets (SAVE_SLOT_MAX at most), never a slot to itself, and never a slot that is filled
+    and also copied from (fill_save_slots copies one after another in the peer's own copy, so the later
+    copy would take the filled slot's new save, not the fixture's)."""
+    if not isinstance(value, dict):
+        raise SpecError(f"{spec_name}: peer {peer}: save_slots is a table (\"<slot>\" = <fixture slot>)")
+    out: dict[int, int] = {}
+    for key, src in value.items():
+        if not re.fullmatch(r"[1-9]", str(key)) or int(key) > SAVE_SLOT_MAX:
+            raise SpecError(f"{spec_name}: peer {peer}: save_slots: slot {key!r} is not 1 to {SAVE_SLOT_MAX}")
+        if not isinstance(src, int) or isinstance(src, bool) or not 1 <= src <= SAVE_SLOT_MAX:
+            raise SpecError(f"{spec_name}: peer {peer}: save_slots: slot {key} takes a fixture slot 1 to"
+                            f" {SAVE_SLOT_MAX}, not {src!r}")
+        if src == int(key):
+            raise SpecError(f"{spec_name}: peer {peer}: save_slots: slot {key} from itself")
+        out[int(key)] = src
+    for slot in sorted(set(out) & set(out.values())):
+        raise SpecError(f"{spec_name}: peer {peer}: save_slots: slot {slot} is filled and copied from")
+    return out
+
+
+def fill_save_slots(data: Path, title: str, name_pattern: str, slots: dict[int, int]) -> list[str]:
+    """Stage 3 item 7: in a peer's own copy of the fixture saves (`data`, never the store or the owner's
+    folder), each profile's save of fixture slot m is copied into slot n for every n = m of `slots`. A
+    save is a content folder <title>/00000001/<name> with its files and a header
+    <title>/Headers/00000001/<name>.header; <name> is `name_pattern` with {index} the zero-based slot
+    (tests/skytest.toml [game] save_slot_name). The copy's files and header are renamed to the new name,
+    and the header's file name field (XCONTENT_DATA's file_name, 42 bytes at SAVE_HEADER_NAME_AT, the
+    SDK's content_manager.h) is rewritten to it: the SDK lists a content by its header's name, so a copy
+    that kept the old name would be a second entry of the old slot. A header whose field does not hold
+    the old name is refused, never guessed. Returns one line per copy."""
+    if not name_pattern or "{index}" not in name_pattern:
+        raise SpecError("save_slots needs tests/skytest.toml [game] save_slot_name (the slot's content name, with"
+                        " {index} for the zero-based slot)")
+    if not title:
+        raise SpecError("save_slots needs tests/skytest.toml [game] title_id")
+    done: list[str] = []
+    for dst_slot, src_slot in sorted(slots.items()):
+        src_name = name_pattern.format(index=src_slot - 1)
+        dst_name = name_pattern.format(index=dst_slot - 1)
+        copied = 0
+        for folder in save_folders(data, title):
+            src = folder / SAVE_CONTENT_TYPE / src_name
+            if not src.is_dir():
+                continue
+            dst = folder / SAVE_CONTENT_TYPE / dst_name
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+            for f in sorted(dst.iterdir()):
+                if f.is_file() and f.name.startswith(src_name):
+                    f.rename(dst / (dst_name + f.name[len(src_name):]))
+            header = folder / "Headers" / SAVE_CONTENT_TYPE / f"{src_name}.header"
+            if header.is_file():
+                raw = bytearray(header.read_bytes())
+                field_bytes = bytes(raw[SAVE_HEADER_NAME_AT:SAVE_HEADER_NAME_AT + SAVE_HEADER_NAME_LEN])
+                if len(field_bytes) < SAVE_HEADER_NAME_LEN or field_bytes.split(b"\0", 1)[0] != src_name.encode():
+                    raise SpecError(f"save_slots: {header} does not hold the file name {src_name} at byte"
+                                    f" {SAVE_HEADER_NAME_AT}: not copied (the header's layout is not the SDK's)")
+                if len(dst_name.encode()) > SAVE_HEADER_NAME_LEN:
+                    raise SpecError(f"save_slots: {dst_name} is longer than a header's {SAVE_HEADER_NAME_LEN} bytes")
+                raw[SAVE_HEADER_NAME_AT:SAVE_HEADER_NAME_AT + SAVE_HEADER_NAME_LEN] = \
+                    dst_name.encode().ljust(SAVE_HEADER_NAME_LEN, b"\0")
+                (header.parent / f"{dst_name}.header").write_bytes(bytes(raw))
+            copied += 1
+            done.append(f"{folder.parent.name}: slot {dst_slot} ({dst_name}) from slot {src_slot} ({src_name})")
+        if not copied:
+            raise SpecError(f"save_slots: no profile of the fixture saves has slot {src_slot} ({src_name}) to copy"
+                            f" into slot {dst_slot}")
+    return done
+
+
 def load_spec(path: Path, default_timeout: float) -> Spec:
     try:
         data = path.read_bytes()
@@ -657,6 +747,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             forbid=list(common.get("forbid", [])) + list(own.get("forbid", [])),
             expect_count={**common.get("expect_count", {}), **own.get("expect_count", {})},
             expect_order=list(own.get("expect_order", common.get("expect_order", []))),
+            save_slots=parse_save_slots(path.name, n, own.get("save_slots", common.get("save_slots", {}))),
         )
         for arg in peers[n].args:
             for ph in ARG_PLACEHOLDER.findall(arg):
@@ -678,6 +769,9 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         raise SpecError(f"{path.name}: server = \"host\" needs a server+N layout")
     if server == "host" and "S" in table and table["S"].get("args"):
         raise SpecError(f"{path.name}: a hosted server gets its arguments from the owner's game, not the spec")
+    if server == "host" and "S" in peers and peers["S"].save_slots:
+        raise SpecError(f"{path.name}: save_slots: a hosted server has no data folder of its own (Host copies the"
+                        " owner's slot into its session folder)")
     grades = d.get("grade", {})
     for gname, g in grades.items():
         if gname not in GRADES:
@@ -696,6 +790,12 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             continue
         if gname == "bandwidth":
             check_bandwidth(path.name, g, names)
+            continue
+        if gname in backend_grades.NAMES:
+            try:
+                backend_grades.check(path.name, gname, g, names)
+            except (backend_grades.GradeSpecError, re.error) as e:
+                raise SpecError(str(e)) from e
             continue
         if not isinstance(g, dict) or g.get("peer", "S" if gname == "server_frame_time" else "H") not in names:
             raise SpecError(f"{path.name}: grade {gname} names a peer not in {names}")
@@ -1624,6 +1724,11 @@ def grade_cross_peer(spec: Spec, r: PeerResult, texts: dict[str, str], repo: Pat
             reasons += why
         elif gname == "bandwidth" and g.get("peer", "S") == r.peer:
             r.graded[gname], why = grade_bandwidth(parse_log(texts.get(r.peer, ""))["lines"], g, thresholds or {})
+            reasons += why
+        elif gname in backend_grades.NAMES and g.get("peer", "H" if gname == "backend_faults" else "S") == r.peer:
+            # Stage 3 (backend_grades.py): compare joins every peer's local lines; faults and memory
+            # read their peer's log.
+            r.graded[gname], why = backend_grades.grade(gname, texts, g, r.peer)
             reasons += why
     return reasons
 
@@ -2742,6 +2847,9 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -
     if not saves.is_dir() or not figures.is_dir():
         raise SpecError(f"missing fixtures ({saves}, {figures}): run `skytest.py fixtures --from-owner`")
     shutil.copytree(saves, d / "data")
+    if spec.peers[peer].save_slots:
+        for line in fill_save_slots(d / "data", cfg.title_id, cfg.save_slot_name, spec.peers[peer].save_slots):
+            print(f"  {spec.name} {peer}: save_slots: {line}")
     shutil.copytree(figures, d / "figures")
     (d / "cache").mkdir()
     shutil.copy2(cfg.settings_template, d / "settings.toml")
@@ -3892,6 +4000,15 @@ def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: l
         if c.get("kind") != "required" or str(c.get("stage")) not in stages:
             continue
         r = ran.get(c["id"])
+        # met_by (stage 3, D14): a case that passes when each named case passed in this run (each its own
+        # evidence), and its own spec too when it has one. Without a spec it needs no run of its own.
+        parts = [p for p in c.get("met_by", []) if isinstance(p, str)]
+        for part in parts:
+            pr = ran.get(part)
+            if pr is None or pr.status != "pass":
+                open_cases.append(f"{c['id']} (met by {part}: {'not run' if pr is None else pr.status})")
+        if parts and not c.get("spec"):
+            continue
         if not c.get("spec"):
             open_cases.append(f"{c['id']} (no spec)")
         elif r is None:
@@ -5813,9 +5930,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         janitor.stop()
     guard = [{"folder": k, "before": before_state[k], "after": after_state[k],
               "unchanged": before_state[k] == after_state[k]} for k in guarded]
-    # Required cases of the stages run here that have no spec yet: named, never skipped silently.
+    # Required cases of the stages run here that have no spec yet: named, never skipped silently. A met_by
+    # case with no spec of its own needs none (checkpoint_verdict grades its parts).
     unwritten = [c["id"] for c in manifest.get("case", [])
-                 if c.get("kind") == "required" and not c.get("spec")
+                 if c.get("kind") == "required" and not c.get("spec") and not c.get("met_by")
                  and (stages is None or str(c.get("stage")) in stages)] if (a.cases in ([], ["all"])
                                                                               and queue is None) else []
     if gate is not None:
@@ -5919,7 +6037,7 @@ def cmd_list(cfg: Config, a: argparse.Namespace) -> int:
         print(f"{s.name:<32} {s.layout:<9} stage {s.stage:<4} {s.description}{ready}")
     man = load_manifest(cfg).get("case", [])
     if man:
-        todo = [c for c in man if c["id"] not in specs]
+        todo = [c for c in man if c["id"] not in specs and not c.get("met_by")]  # met_by: no spec of its own
         print(f"\nmanifest: {len(man)} case(s); {len(man) - len(todo)} with a spec, {len(todo)} still to write")
     return 0
 
@@ -5979,6 +6097,7 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
             problems.append(f"manifest: {c.get('id')}: layout {c.get('layout')} but its spec says {specs[c['id']].layout}")
         if c.get("id") in specs and specs[c["id"]].stage != str(c.get("stage")):
             problems.append(f"manifest: {c.get('id')}: stage {c.get('stage')} but its spec says {specs[c['id']].stage}")
+    problems += met_by_problems(man)
     for name in specs:
         if man and name not in ids:
             problems.append(f"{name}: a spec with no manifest entry")
@@ -6010,6 +6129,33 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
     print(f"{len(specs)} spec(s), {len(man)} manifest case(s), {len(problems)} problem(s)"
           + (f", {len(warnings)} warning(s)" if warnings else ""))
     return 1 if problems else 0
+
+
+def met_by_problems(man: list[dict]) -> list[str]:
+    """A manifest case's `met_by` (checkpoint_verdict): a non-empty list of other cases of the manifest, each
+    a required case of the same stage (a part of another stage, or one that may fail, would let the
+    case pass on less than its own evidence), none itself a met_by case."""
+    by_id = {c.get("id"): c for c in man}
+    problems = []
+    for c in man:
+        if "met_by" not in c:
+            continue
+        parts = c["met_by"]
+        if not isinstance(parts, list) or not parts or not all(isinstance(p, str) for p in parts):
+            problems.append(f"manifest: {c.get('id')}: met_by is a list of case ids")
+            continue
+        if not c.get("spec") and c.get("gate", False) is not False:
+            problems.append(f"manifest: {c.get('id')}: a met_by case with no spec of its own is not a gate case"
+                            " (put its parts in the gate)")
+        for p in parts:
+            part = by_id.get(p)
+            if p == c.get("id") or part is None:
+                problems.append(f"manifest: {c.get('id')}: met_by names {p}, which is not another case of the manifest")
+            elif part.get("kind") != "required" or str(part.get("stage")) != str(c.get("stage")):
+                problems.append(f"manifest: {c.get('id')}: met_by {p} is not a required case of stage {c.get('stage')}")
+            elif "met_by" in part:
+                problems.append(f"manifest: {c.get('id')}: met_by {p} is itself met by other cases (one level only)")
+    return problems
 
 
 def scene_problems(cfg: Config, spec: Spec) -> list[str]:
