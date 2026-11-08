@@ -762,4 +762,16 @@ bool Client::WriteOwned(KindId kind, std::span<const uint8_t> value, TimePoint n
   return true;
 }
 
+bool Client::DevWriteOwnedAs(KindId kind, EntityId entity, std::span<const uint8_t> value, TimePoint now) {
+  Impl& c = *impl_;
+  c.now = now;
+  if (!c.hello || !c.link) return false;
+  Record r;
+  r.key = RecordKey{kind, entity, 0};
+  r.revision = ++c.owned_revision[kind];
+  r.value.assign(value.begin(), value.end());
+  c.Push(msg::OwnedDelta{std::move(r)});
+  return true;
+}
+
 }  // namespace skylanders::backend

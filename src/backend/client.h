@@ -123,6 +123,11 @@ class Client {
   // kind (from 1 in each peer epoch). Sent as OwnedDelta on the state lane; while the lane is held
   // only the newest value per kind waits and goes when it opens (F1). false before StateHello.
   bool WriteOwned(KindId kind, std::span<const uint8_t> value, TimePoint now);
+  // Test only (a game's forged-write tool, e.g. Swap Force Online's dev_backend_owned_forge, stage
+  // 4 P3): one OwnedDelta keyed by `entity`, slot 0, for any kind, sent at once as a forged write
+  // would reach S, so S's admission (owned.h) must refuse it. Nothing is stored here. false before
+  // StateHello.
+  bool DevWriteOwnedAs(KindId kind, EntityId entity, std::span<const uint8_t> value, TimePoint now);
   // Receive; Replica::Service; take every ready row, resolve its entity, call its adapter and
   // answer it with Replica::OnApplied (a release that answer causes is taken in the same pump, so a
   // dependency and its dependent can apply in one pump; Sol F2, draft 4); fulfil releasable
