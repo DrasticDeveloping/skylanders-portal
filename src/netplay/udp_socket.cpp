@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <random>
 #include <utility>
 
 #ifdef _WIN32
@@ -15,6 +16,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mstcpip.h>
+#include <bcrypt.h>
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)  // the documented value (mstcpip.h, newer SDKs)
 #endif
@@ -293,6 +295,16 @@ std::optional<uint32_t> PrimaryLocalIpv4() {
   }
   ReleaseWinsock();
   return result;
+}
+
+void FillOsRandom(std::span<uint8_t> out) {
+#ifdef _WIN32
+  if (BCryptGenRandom(nullptr, out.data(), static_cast<ULONG>(out.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0) {
+    return;
+  }
+#endif
+  std::random_device rd;  // the OS source where the standard library has one
+  for (uint8_t& b : out) b = static_cast<uint8_t>(rd());
 }
 
 }  // namespace skylanders::netplay

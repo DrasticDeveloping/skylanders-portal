@@ -26,6 +26,26 @@ uint32_t RandomSessionId() {
   return id;
 }
 
+// Stage 8: from the OS random source, never 0.
+uint32_t RandomSecret() {
+  uint32_t v = 0;
+  while (v == 0) netplay::FillOsRandom({reinterpret_cast<uint8_t*>(&v), sizeof(v)});
+  return v;
+}
+uint64_t RandomNonce() {
+  uint64_t v = 0;
+  while (v == 0) netplay::FillOsRandom({reinterpret_cast<uint8_t*>(&v), sizeof(v)});
+  return v;
+}
+CookieKey RandomCookieKey() {
+  CookieKey k{};
+  netplay::FillOsRandom(k);
+  return k;
+}
+bool IsZero(const CookieKey& k) {
+  return std::all_of(k.begin(), k.end(), [](uint8_t b) { return b == 0; });
+}
+
 uint64_t ToMicros(TimePoint t) {
   return uint64_t(duration_cast<microseconds>(t.time_since_epoch()).count());
 }
@@ -66,6 +86,16 @@ bool ServerSession::Start(std::unique_ptr<netplay::Transport> transport,
   settings_.hz = std::clamp<uint32_t>(settings_.hz, 1, 0xFFFF);  // Welcome carries it as a u16
   settings_.max_clients = std::clamp(settings_.max_clients, 1, kMaxClients);
   if (settings_.session_id == 0) settings_.session_id = RandomSessionId();
+  if (settings_.join_secret == 0) settings_.join_secret = RandomSecret();
+  if (IsZero(settings_.cookie_key)) settings_.cookie_key = RandomCookieKey();
+  gate_.reset();
+  code_spent_reported_ = false;
+  if (settings_.gate) {
+    gate_ = std::make_unique<HelloGate>(
+        HelloGateSettings{settings_.join_secret, settings_.cookie_key, settings_.let_anyone_in,
+                          settings_.max_clients},
+        now);
+  }
   clock_ = ServerTickClock(settings_.hz, now);
   transport_ = std::move(transport);
   peers_.clear();
@@ -87,6 +117,7 @@ void ServerSession::Stop() {
   }
   peers_.clear();
   transport_.reset();
+  gate_.reset();
   barrier_open_ = false;
   waiting_.clear();
 }
@@ -107,6 +138,19 @@ void ServerSession::Pump(TimePoint now) {
       // No valid Hello within the timeout (one that keeps sending other things included).
       if (now - peer->created > kPeerTimeout) peer->state = PeerState::kGone;
     }
+  }
+  if (gate_) {
+    // Stage 8: pending joiners the owner did not answer in time (their next Hello hears "timed
+    // out"), and the cookie key's rotation.
+    for (const PendingJoin& j : gate_->ExpirePending(now)) {
+      ServerEvent e;
+      e.type = ServerEvent::Type::kJoinGone;
+      e.pending_id = j.id;
+      e.name = j.name;
+      e.endpoint = j.from;
+      events_.push_back(std::move(e));
+    }
+    if (gate_->CookieRotationDue(now)) gate_->RotateCookieKey(RandomCookieKey(), now);
   }
   // The pose queue, held exits and End session's gone timeout, once per Pump (a server frame);
   // what it decides goes out in this Pump.
@@ -136,6 +180,8 @@ void ServerSession::HandleDatagram(const Endpoint& from, std::span<const uint8_t
   const netplay::DatagramHeader& h = datagram->header;
   if (h.session_id != 0 && h.session_id != settings_.session_id) return;
 
+  if (h.flags & netplay::kFlagStateless) return;  // only a server sends those (stage 8)
+
   auto it = peers_.find(from);
   if (it == peers_.end()) {
     // Only a client's first datagrams (sent before it knows the session id) open a connection.
@@ -147,6 +193,8 @@ void ServerSession::HandleDatagram(const Endpoint& from, std::span<const uint8_t
     // entries, so the scan in PeerCount stays short; a counter would have to follow every state
     // change instead.
     if (peers_.size() - PeerCount() >= kMaxUnadmitted) return;
+    // Stage 8: with the gate on, only a Hello it admits opens a connection; it answered the rest.
+    if (gate_ && !AdmitThroughGate(from, bytes.size(), datagram->payload, now)) return;
     auto peer = std::make_unique<Peer>();
     peer->endpoint = from;
     peer->created = now;
@@ -282,6 +330,138 @@ void ServerSession::HandleMessage(Peer& peer, const Message& message, Lane lane,
     e.owner_flags = *flags;
     events_.push_back(std::move(e));
   }
+}
+
+bool ServerSession::CompatibleHello(const Hello& hello, const Endpoint& from, RefuseReason* reason,
+                                    std::string* text) const {
+  auto refuse = [&](RefuseReason r, const char* t) {
+    *reason = r;
+    *text = t;
+    return false;
+  };
+  if (hello.protocol_version != kProtocolVersion) {
+    *reason = RefuseReason::kVersion;
+    *text = "the server speaks protocol version " + std::to_string(kProtocolVersion);
+    return false;
+  }
+  if (hello.build_digest != settings_.build_digest) {
+    return refuse(RefuseReason::kDigest, "the server runs another build of the game");
+  }
+  if (!IsNone(hello.owner_token) && hello.owner_token != settings_.owner_token) {
+    return refuse(RefuseReason::kNotOwner, "the owner token does not match");
+  }
+  if ((hello.flags & kHelloSynthetic) != 0 && !settings_.allow_synthetic) {
+    return refuse(RefuseReason::kOther, "synthetic peers are off");
+  }
+  if ((hello.flags & kHelloSynthetic) != 0 && !netplay::IsLoopback(from.address)) {
+    return refuse(RefuseReason::kOther, "synthetic peers only on loopback");
+  }
+  return true;
+}
+
+bool ServerSession::AdmitThroughGate(const Endpoint& from, size_t size,
+                                     std::span<const uint8_t> payload, TimePoint now) {
+  // Only a Hello can open a connection; anything else from an unknown address is dropped unanswered.
+  auto messages = DecodeMessages(payload);
+  if (!messages || messages->empty()) return false;
+  const auto* hello = std::get_if<Hello>(&messages->front());
+  if (!hello) return false;
+  HelloFacts f;
+  f.datagram_bytes = size;
+  f.from = from;
+  f.client_nonce = hello->client_nonce;
+  f.cookie = hello->cookie;
+  f.secret = hello->join_secret;
+  f.name = hello->name;
+  f.figure_id = hello->figure_id;
+  f.figure_variant = hello->figure_variant;
+  RefuseReason reason = RefuseReason::kOther;
+  std::string text;
+  f.compatible = CompatibleHello(*hello, from, &reason, &text);
+  f.owner = f.compatible && !IsNone(hello->owner_token);  // compatible: the token matched
+  const HelloDecision d = gate_->Check(f, int(PeerCount()), now);
+  switch (d.verdict) {
+    case HelloVerdict::kDrop:
+      return false;
+    case HelloVerdict::kAdmit:
+      return true;
+    case HelloVerdict::kCookieReply:
+      SendStateless(from, HelloCookie{d.cookie}, size);
+      return false;
+    case HelloVerdict::kWait: {
+      SendStateless(from, JoinWait{d.pending_id}, size);
+      if (d.new_pending) {
+        ServerEvent e;
+        e.type = ServerEvent::Type::kJoinPending;
+        e.pending_id = d.pending_id;
+        e.name = hello->name;
+        e.figure_id = hello->figure_id;
+        e.figure_variant = hello->figure_variant;
+        e.endpoint = from;
+        events_.push_back(std::move(e));
+      }
+      return false;
+    }
+    case HelloVerdict::kIncompatible:
+      SendStatelessRefuse(from, *hello, reason, std::move(text), size);
+      return false;
+    case HelloVerdict::kWrongCode:
+      SendStatelessRefuse(from, *hello, RefuseReason::kWrongCode, "wrong code", size);
+      return false;
+    case HelloVerdict::kCodeSpent:
+      SendStatelessRefuse(from, *hello, RefuseReason::kCodeSpent,
+                          "this code was tried too often; ask the host for a new one", size);
+      if (!code_spent_reported_) {
+        code_spent_reported_ = true;
+        ServerEvent e;
+        e.type = ServerEvent::Type::kJoinCodeSpent;
+        events_.push_back(std::move(e));
+      }
+      return false;
+    case HelloVerdict::kBusy:
+      SendStatelessRefuse(from, *hello, RefuseReason::kBusy, "the host is busy, try again", size);
+      return false;
+    case HelloVerdict::kFull:
+      SendStatelessRefuse(from, *hello, RefuseReason::kFull, "the session is full", size);
+      return false;
+    case HelloVerdict::kNotLetIn:
+      SendStatelessRefuse(from, *hello, RefuseReason::kNotLetIn,
+                          d.timed_out ? "not let in: timed out" : "not let in", size);
+      return false;
+  }
+  return false;
+}
+
+void ServerSession::SendStateless(const Endpoint& to, const Message& message, size_t limit) {
+  if (!transport_) return;
+  const std::vector<uint8_t> payload = Encoded(message);
+  if (payload.empty()) return;
+  netplay::DatagramHeader h;
+  h.lane = Lane::kGameplay;
+  h.flags = netplay::kFlagStateless;
+  h.session_id = 0;
+  h.sender = kServerPeerId;
+  h.sequence = 1;  // a data datagram's sequence is never 0; the client never feeds it to a lane
+  std::vector<uint8_t> out;
+  // Never larger than what came in (design 3.4 step 1): no amplification from a spoofed address.
+  if (!netplay::EncodeDatagram(h, payload, out) || out.size() > limit) return;
+  transport_->Send(to, out);
+}
+
+void ServerSession::SendStatelessRefuse(const Endpoint& to, const Hello& hello, RefuseReason reason,
+                                        std::string text, size_t limit) {
+  // The text is cut so the datagram stays within `limit` (header, message header, reason, length).
+  constexpr size_t kOverhead = netplay::kDatagramHeaderSize + kMessageHeaderSize + 2;
+  const size_t room = limit > kOverhead ? limit - kOverhead : 0;
+  text = TruncateUtf8(text, std::min(room, kMaxRefuseTextBytes));
+  SendStateless(to, Refuse{reason, text}, limit);
+  ServerEvent e;
+  e.type = ServerEvent::Type::kRefusalSent;
+  e.name = hello.name;
+  e.refuse_reason = reason;
+  e.text = std::move(text);
+  e.endpoint = to;
+  events_.push_back(std::move(e));
 }
 
 void ServerSession::HandleHello(Peer& peer, const Hello& hello, TimePoint now) {
@@ -640,11 +820,31 @@ netplay::Endpoint ServerSession::LocalEndpoint() const {
   return transport_ ? transport_->LocalEndpoint() : Endpoint{};
 }
 
-std::string ServerSession::JoinCode() const {
+std::string ServerSession::JoinCode() const { return JoinCodeFor(0, 0); }
+
+std::string ServerSession::JoinCodeFor(uint32_t address, uint16_t port) const {
   Endpoint e = LocalEndpoint();
   if (e.port == 0) return {};
   if (e.address == 0) e.address = netplay::PrimaryLocalIpv4().value_or(netplay::kLoopback);
-  return EncodeJoinCode(e);
+  if (address != 0) e.address = address;
+  if (port != 0) e.port = port;
+  // Join code v2 (stage 8 item 4, D10): 1A's code is retired; its decoder answers "older version".
+  return EncodeJoinCodeV2(JoinTarget{e, settings_.join_secret});
+}
+
+void ServerSession::NewJoinSecret(uint32_t secret) {
+  settings_.join_secret = secret != 0 ? secret : RandomSecret();
+  if (gate_) gate_->NewSecret(settings_.join_secret);
+  code_spent_reported_ = false;
+}
+
+bool ServerSession::LetIn(uint32_t pending_id, TimePoint now) {
+  if (!gate_) return false;
+  return gate_->LetIn(pending_id, int(PeerCount()), now, nullptr) == HelloVerdict::kAdmit;
+}
+
+bool ServerSession::RefuseJoin(uint32_t pending_id, TimePoint now) {
+  return gate_ && gate_->Refuse(pending_id, now);
 }
 
 std::vector<PeerInfo> ServerSession::Peers() const {
@@ -721,21 +921,60 @@ bool ClientSession::Connect(std::unique_ptr<netplay::Transport> transport,
   }
   Hello h = hello;
   h.name = TruncateUtf8(h.name, kMaxNameBytes);
-  const std::vector<uint8_t> bytes = Encoded(h);
-  if (bytes.empty()) {
+  // Stage 8: the nonce the server's cookie is bound to, fresh per Connect; no cookie yet.
+  if (h.client_nonce == 0) h.client_nonce = RandomNonce();
+  h.cookie = 0;
+  if (Encoded(h).empty()) {
     error_ = "the name is not UTF-8";
     return false;
   }
+  hello_ = h;
+  cookie_rounds_ = 0;
+  join_waiting_ = false;
   transport_ = std::move(transport);
   server_ = server;
+  SendHello(now);
+  state_ = ClientState::kConnecting;
+  return true;
+}
+
+void ClientSession::SendHello(TimePoint now) {
   conn_ = std::make_unique<Connection>(
       [this](std::span<const uint8_t> d) {
         if (transport_) transport_->Send(server_, d);
       },
       now);
-  conn_->Send(Lane::kGameplay, bytes, now);
-  state_ = ClientState::kConnecting;
-  return true;
+  conn_->Send(Lane::kGameplay, Encoded(hello_), now);
+}
+
+void ClientSession::HandleStateless(std::span<const uint8_t> payload, TimePoint now) {
+  // Only a join under way takes the gate's answers; afterwards they are stale.
+  if (state_ != ClientState::kConnecting || !conn_) return;
+  auto messages = DecodeMessages(payload);
+  if (!messages) return;
+  for (const Message& m : *messages) {
+    if (const auto* c = std::get_if<HelloCookie>(&m)) {
+      // The Hello again with the cookie, on a fresh connection (sequence 1 again: the server holds
+      // nothing for this join yet). A server that keeps sending cookies is followed only so often.
+      if (++cookie_rounds_ > kMaxCookieRounds) continue;
+      hello_.cookie = c->cookie;
+      SendHello(now);
+    } else if (const auto* w = std::get_if<JoinWait>(&m)) {
+      if (!join_waiting_) {
+        join_waiting_ = true;
+        ClientEvent e;
+        e.type = ClientEvent::Type::kJoinWaiting;
+        e.pending_id = w->pending_id;
+        events_.push_back(std::move(e));
+      }
+    } else if (std::holds_alternative<Refuse>(m)) {
+      HandleMessage(m, Lane::kGameplay, now);
+      // Nothing to linger for: the server holds no connection for this join.
+      if (state_ == ClientState::kRefused) closing_since_ = now - kCloseLinger;
+      return;
+    }
+  }
+  if (conn_) conn_->SetLastReceive(now);  // the server answers: the join is alive
 }
 
 void ClientSession::Disconnect(TimePoint now) {
@@ -753,6 +992,11 @@ void ClientSession::Pump(TimePoint now) {
     if (from != server_) continue;
     auto datagram = netplay::DecodeDatagram(buffer);
     if (!datagram) continue;  // an empty datagram (too long, an error report) ends here
+    if (datagram->header.flags & netplay::kFlagStateless) {  // the gate's answer (stage 8)
+      HandleStateless(datagram->payload, now);
+      if (!conn_) break;
+      continue;
+    }
     if (session_id_ != 0 && datagram->header.session_id != session_id_) continue;
     conn_->OnDatagram(*datagram, now);
     LaneMessage m;

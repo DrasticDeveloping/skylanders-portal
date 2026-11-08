@@ -12,9 +12,10 @@ using netplay::ByteReader;
 using netplay::ByteWriter;
 
 // The variant's order is the type numbering (Hello = 1 ...), which TypeOf relies on, for the
-// contiguous run 1..kLastType; the number-block types after it (stage 1C's OwnerFlags = 50 and
-// stage 5's EnemyPoses = 30) are mapped explicitly (TypeOf, IsKnown).
-static_assert(std::variant_size_v<Message> == 28);
+// contiguous run 1..kLastType; the number-block types after it (stage 1C's OwnerFlags = 50,
+// stage 5's EnemyPoses = 30, stage 8's HelloCookie = 55 and JoinWait = 56) are mapped explicitly
+// (TypeOf, IsKnown).
+static_assert(std::variant_size_v<Message> == 30);
 static_assert(std::is_same_v<std::variant_alternative_t<0, Message>, Hello>);
 static_assert(std::is_same_v<std::variant_alternative_t<10, Message>, PlayerList>);
 static_assert(std::is_same_v<std::variant_alternative_t<11, Message>, PlayerPose>);
@@ -28,7 +29,9 @@ static_assert(std::is_same_v<std::variant_alternative_t<25, Message>, AttackPres
 constexpr uint16_t kLastType = uint16_t(MessageType::kAttackPress);
 static_assert(std::is_same_v<std::variant_alternative_t<26, Message>, OwnerFlags>);
 static_assert(std::is_same_v<std::variant_alternative_t<27, Message>, EnemyPoses>);
-constexpr size_t kBlockTypes = 2;  // OwnerFlags, EnemyPoses
+static_assert(std::is_same_v<std::variant_alternative_t<28, Message>, HelloCookie>);
+static_assert(std::is_same_v<std::variant_alternative_t<29, Message>, JoinWait>);
+constexpr size_t kBlockTypes = 4;  // OwnerFlags, EnemyPoses, HelloCookie, JoinWait
 static_assert(kLastType + kBlockTypes == std::variant_size_v<Message>);
 
 bool IsNone(const OwnerToken& token) {
@@ -41,6 +44,10 @@ const char* RefuseReasonName(RefuseReason reason) {
     case RefuseReason::kDigest: return "digest";
     case RefuseReason::kFull: return "full";
     case RefuseReason::kNotOwner: return "not owner";
+    case RefuseReason::kWrongCode: return "wrong code";
+    case RefuseReason::kBusy: return "busy";
+    case RefuseReason::kNotLetIn: return "not let in";
+    case RefuseReason::kCodeSpent: return "code spent";
     case RefuseReason::kOther: break;
   }
   return "other";
@@ -154,6 +161,8 @@ RequestKey SkipRequestKey(uint16_t peer, uint32_t generation, const SceneKey& sc
 MessageType TypeOf(const Message& message) {
   if (std::holds_alternative<OwnerFlags>(message)) return MessageType::kOwnerFlags;
   if (std::holds_alternative<EnemyPoses>(message)) return MessageType::kEnemyPoses;
+  if (std::holds_alternative<HelloCookie>(message)) return MessageType::kHelloCookie;
+  if (std::holds_alternative<JoinWait>(message)) return MessageType::kJoinWait;
   return MessageType(message.index() + 1);
 }
 
@@ -414,6 +423,9 @@ bool Fields(ByteWriter& w, const Hello& m) {
   w.Bytes(m.owner_token);
   if ((m.flags & ~kHelloFlagsKnown) != 0) return false;
   w.U8(m.flags);  // stage 4: a trailing byte, so a Hello without it reads as 0
+  w.U64(m.client_nonce);  // stage 8: trailing, all three or none
+  w.U32(m.join_secret);
+  w.U64(m.cookie);
   return true;
 }
 bool Fields(ByteWriter& w, const Welcome& m) {
@@ -602,6 +614,15 @@ bool Fields(ByteWriter& w, const BackendFrame& m) {
 // generation u32, revision u32, flags u8, died, damage taken, defeated (i32 each): 21 bytes.
 constexpr uint8_t kOwnerFlagDamage = 0x01;
 constexpr uint8_t kOwnerFlagSwapped = 0x02;
+bool Fields(ByteWriter& w, const HelloCookie& m) {
+  if (m.cookie == 0) return false;
+  w.U64(m.cookie);
+  return true;
+}
+bool Fields(ByteWriter& w, const JoinWait& m) {
+  w.U32(m.pending_id);
+  return true;
+}
 bool Fields(ByteWriter& w, const OwnerFlags& m) {
   if (m.generation == 0 || m.revision == 0) return false;
   w.U32(m.generation);
@@ -650,6 +671,11 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
         m.flags = r.U8();
         if (r.Ok() && (m.flags & ~kHelloFlagsKnown) != 0) return std::nullopt;
       }
+      if (ok && r.Ok() && r.Remaining() > 0) {  // stage 8: nonce, secret, cookie (all or none)
+        m.client_nonce = r.U64();
+        m.join_secret = r.U32();
+        m.cookie = r.U64();
+      }
       result = std::move(m);
       break;
     }
@@ -672,7 +698,7 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
     case MessageType::kRefuse: {
       Refuse m;
       const uint8_t reason = r.U8();
-      m.reason = reason >= 1 && reason <= 5 ? RefuseReason(reason) : RefuseReason::kOther;
+      m.reason = reason >= 1 && reason <= 9 ? RefuseReason(reason) : RefuseReason::kOther;
       ok = GetString(r, kMaxRefuseTextBytes, m.text);
       result = std::move(m);
       break;
@@ -929,6 +955,19 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
       result = m;
       break;
     }
+    case MessageType::kHelloCookie: {
+      HelloCookie m;
+      m.cookie = r.U64();
+      ok = m.cookie != 0;
+      result = m;
+      break;
+    }
+    case MessageType::kJoinWait: {
+      JoinWait m;
+      m.pending_id = r.U32();
+      result = m;
+      break;
+    }
     default:
       return std::nullopt;
   }
@@ -938,7 +977,8 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
 
 bool IsKnown(uint16_t type) {
   return (type >= 1 && type <= kLastType) || type == uint16_t(MessageType::kOwnerFlags) ||
-         type == uint16_t(MessageType::kEnemyPoses);
+         type == uint16_t(MessageType::kEnemyPoses) ||
+         type == uint16_t(MessageType::kHelloCookie) || type == uint16_t(MessageType::kJoinWait);
 }
 
 }  // namespace

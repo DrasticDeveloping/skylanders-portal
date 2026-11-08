@@ -86,7 +86,7 @@ add_library(skylanders_online STATIC
 target_include_directories(skylanders_online PUBLIC src)
 target_compile_features(skylanders_online PUBLIC cxx_std_23)
 if(WIN32)
-    target_link_libraries(skylanders_online PUBLIC ws2_32)
+    target_link_libraries(skylanders_online PUBLIC ws2_32 bcrypt)  # bcrypt: FillOsRandom (stage 8)
 endif()
 if(SKYLANDERS_PORTAL_MINIUPNPC)
     # Private: only igd_system.cpp includes miniupnpc. A program that links skylanders_online gets the

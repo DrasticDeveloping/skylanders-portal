@@ -58,4 +58,9 @@ class UdpSocket final : public Transport {
 // its join code.
 std::optional<uint32_t> PrimaryLocalIpv4();
 
+// Stage 8 item 4 (design 3.4): `out` filled from the OS random source (BCryptGenRandom with the
+// system's preferred generator on Windows; std::random_device elsewhere). For the join secret, the
+// cookie key, the Hello's nonce. Any thread.
+void FillOsRandom(std::span<uint8_t> out);
+
 }  // namespace skylanders::netplay

@@ -235,11 +235,11 @@ int main() {
     }
     CHECK(Join(gate, Facts({0x40000010, 1000}, 9, 0, 0x1234), 3, t0 + seconds(5)).verdict == HelloVerdict::kBusy);
     PendingJoin let{};
-    CHECK(gate.LetIn(ids[0], 3, &let) == HelloVerdict::kAdmit);
+    CHECK(gate.LetIn(ids[0], 3, t0 + seconds(5), &let) == HelloVerdict::kAdmit);
     CHECK(let.from.address == 0x40000000);
-    CHECK(gate.LetIn(ids[0], 3, &let) == HelloVerdict::kDrop);  // answered already
-    CHECK(gate.LetIn(ids[1], 4, &let) == HelloVerdict::kFull);
-    CHECK(gate.Refuse(ids[2]));
+    CHECK(gate.LetIn(ids[0], 3, t0 + seconds(5), &let) == HelloVerdict::kDrop);  // answered already
+    CHECK(gate.LetIn(ids[1], 4, t0 + seconds(5), &let) == HelloVerdict::kFull);
+    CHECK(gate.Refuse(ids[2], t0 + seconds(5)));
     // ids[3] was shown at t0 + 3 s: still there at 62 s, gone at 63 s.
     CHECK(gate.ExpirePending(t0 + seconds(62)).empty());
     std::vector<PendingJoin> expired = gate.ExpirePending(t0 + seconds(63));
@@ -248,6 +248,86 @@ int main() {
     // A full session refuses before making a pending entry.
     CHECK(Join(gate, Facts({0x40000020, 1000}, 1, 0, 0x1234), 4, t0 + seconds(70)).verdict == HelloVerdict::kFull);
     CHECK(gate.Pending().Pending().empty());
+  }
+
+  // The gate's order around the caller's own checks: limits and the cookie first (an incompatible
+  // Hello without a cookie gets only a cookie reply, so no refusal goes to an unproven address),
+  // then the caller's checks, before the owner, the secret and let in (no wrong secret is counted
+  // and no pending entry made for an incompatible joiner).
+  {
+    HelloGate gate({0x1234, Key(14), false, 4}, t0);
+    HelloFacts h = Facts({0x60000001, 1000}, 7, 0, 0x9999);
+    h.compatible = false;
+    HelloDecision first = gate.Check(h, 1, t0);
+    CHECK(first.verdict == HelloVerdict::kCookieReply);
+    h.cookie = first.cookie;
+    CHECK(gate.Check(h, 1, t0).verdict == HelloVerdict::kIncompatible);
+    CHECK(gate.WrongSecrets() == 0);
+    h.owner = true;
+    CHECK(gate.Check(h, 1, t0 + milliseconds(600)).verdict == HelloVerdict::kIncompatible);
+    h.secret = 0x1234;
+    h.owner = false;
+    CHECK(gate.Check(h, 1, t0 + milliseconds(1200)).verdict == HelloVerdict::kIncompatible);
+    CHECK(gate.Pending().Pending().empty());
+    // Undersized: dropped before anything, compatible or not.
+    HelloFacts small = h;
+    small.datagram_bytes = kMinHelloBytes - 1;
+    CHECK(gate.Check(small, 1, t0 + seconds(2)).verdict == HelloVerdict::kDrop);
+  }
+
+  // The let-in state machine as the joiner sees it: wait (a new entry once, retransmits after),
+  // then the owner's answer on its next Hello: admitted once (a later Hello of the tuple is the
+  // connection's), refused ("not let in"), timed out, or full; another nonce from the same address
+  // is another join; decisions are kept 30 s and at most 16.
+  {
+    HelloGate gate({0x1234, Key(15), false, 4}, t0);
+    TimePoint now = t0;
+    auto ask = [&](uint32_t address, uint64_t nonce, int players) {
+      now += milliseconds(600);  // within the per-source rate
+      return Join(gate, Facts({address, 1000}, nonce, 0, 0x1234), players, now);
+    };
+    HelloDecision a = ask(0x70000001, 1, 1);
+    CHECK(a.verdict == HelloVerdict::kWait && a.new_pending);
+    HelloDecision a2 = ask(0x70000001, 1, 1);
+    CHECK(a2.verdict == HelloVerdict::kWait && !a2.new_pending && a2.pending_id == a.pending_id);
+    HelloDecision b = ask(0x70000002, 1, 1);
+    HelloDecision c = ask(0x70000003, 1, 1);
+    HelloDecision e = ask(0x70000004, 1, 3);
+    CHECK(b.new_pending && c.new_pending && e.new_pending);
+    PendingJoin let{};
+    CHECK(gate.LetIn(a.pending_id, 1, now, &let) == HelloVerdict::kAdmit);
+    CHECK(gate.Refuse(b.pending_id, now));
+    CHECK(!gate.Refuse(b.pending_id, now));  // answered already
+    CHECK(gate.LetIn(e.pending_id, 4, now, &let) == HelloVerdict::kFull);
+    CHECK(gate.DecidedCount() == 3);
+    HelloDecision a3 = ask(0x70000001, 1, 1);
+    CHECK(a3.verdict == HelloVerdict::kAdmit);
+    CHECK(ask(0x70000001, 1, 1).verdict == HelloVerdict::kWait);  // used: a new entry now
+    HelloDecision b2 = ask(0x70000002, 1, 1);
+    CHECK(b2.verdict == HelloVerdict::kNotLetIn && !b2.timed_out);
+    CHECK(ask(0x70000002, 2, 1).verdict == HelloVerdict::kWait);  // a new nonce: a new join
+    CHECK(ask(0x70000004, 1, 1).verdict == HelloVerdict::kFull);
+    // c expires 60 s after it was shown; its next Hello hears "timed out".
+    now = t0 + seconds(70);
+    std::vector<PendingJoin> gone = gate.ExpirePending(now);
+    bool c_gone = false;
+    for (const PendingJoin& j : gone) c_gone = c_gone || j.id == c.pending_id;
+    CHECK(c_gone);
+    HelloDecision c2 = ask(0x70000003, 1, 1);
+    CHECK(c2.verdict == HelloVerdict::kNotLetIn && c2.timed_out);
+    // 30 s later the decisions are gone: the same tuple is a new join.
+    now += seconds(31);
+    CHECK(ask(0x70000003, 1, 1).verdict == HelloVerdict::kWait);
+    // Bounded: 20 refusals keep 16 decisions.
+    HelloGate many({0x1234, Key(16), false, 4}, t0);
+    TimePoint m = t0;
+    for (uint32_t i = 0; i < 20; ++i) {
+      m += milliseconds(100);
+      HelloDecision w = Join(many, Facts({0x71000000 + i, 1000}, 1, 0, 0x1234), 1, m);
+      REQUIRE_OR_RETURN(w.verdict == HelloVerdict::kWait);
+      CHECK(many.Refuse(w.pending_id, m));
+    }
+    CHECK(many.DecidedCount() == kMaxDecided);
   }
 
   // "Let anyone with the code in": no pending entry, admitted while there is room.

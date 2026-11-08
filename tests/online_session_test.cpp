@@ -168,6 +168,7 @@ struct World {
     return size_t(std::count_if(server_events.begin(), server_events.end(),
                                 [&](const ServerEvent& e) { return e.type == t; }));
   }
+  const HelloGate* Gate() const { return server.Gate(); }
   const ServerEvent* Last(ServerEvent::Type t) const {
     for (auto it = server_events.rbegin(); it != server_events.rend(); ++it) {
       if (it->type == t) return &*it;
@@ -197,7 +198,10 @@ void FakeNetworkSession() {
   }
   CHECK(w.server.Running());
   CHECK(w.server.Port() == 7000);
-  CHECK(DecodeJoinCode(w.server.JoinCode()) == kServerEp);
+  // Stage 8: the code is v2 (with the session's secret, drawn at Start even with the gate off).
+  const JoinCodeResult code = DecodeJoinCodeV2(w.server.JoinCode());
+  CHECK(code.status == JoinCodeStatus::kOk && code.target.server == kServerEp);
+  CHECK(code.target.secret != 0 && code.target.secret == w.server.JoinSecret());
 
   // Handshake: the owner gets 1, the others 2 and 3, in the order they join.
   Client& owner = w.Connect(MakeHello("Owner", true));
@@ -1159,8 +1163,9 @@ void LoopbackSession() {
   const uint16_t port = server.Port();
   CHECK(port != 0);
   CHECK(server.LocalEndpoint().address == skylanders::netplay::kLoopback);
-  const auto code = DecodeJoinCode(server.JoinCode());
-  CHECK(code && code->address == skylanders::netplay::kLoopback && code->port == port);
+  const JoinCodeResult code = DecodeJoinCodeV2(server.JoinCode());
+  CHECK(code.status == JoinCodeStatus::kOk && code.target.server.address == skylanders::netplay::kLoopback &&
+        code.target.server.port == port);
 
   ClientSession owner, other;
   CHECK(owner.Connect("127.0.0.1", port, MakeHello("Owner", true)));
@@ -1218,7 +1223,114 @@ void LoopbackSession() {
 
 }  // namespace
 
+// Stage 8 item 4 (design 3.4; `hello-cookie`, `let-in` and `join-code-v2` at the library): the
+// Hello gate on the fake network. The code round-trips through join code v2 into a joiner's Hello;
+// the owner gets in on its token after the cookie; a joiner with the code waits (held as a pending
+// entry, no connection) through several cookie lifetimes, then gets in on the owner's let in; a
+// wrong code, the owner's refusal, an unanswered entry and another build are refused in plain
+// words, statelessly (no connection is ever made for them).
+void FakeNetworkHelloGate() {
+  World w(88);
+  LinkConditions c;
+  c.loss_percent = 5;
+  c.delay_ms = 10;
+  w.net.SetDefault(c);
+  ServerSettings s = Settings();
+  s.gate = true;
+  s.join_secret = 0x89ABCDEF;
+  REQUIRE_OR_RETURN_VOID(w.StartServer(s));
+  CHECK(w.server.GateOn());
+  const JoinCodeResult code = DecodeJoinCodeV2(w.server.JoinCode());
+  REQUIRE_OR_RETURN_VOID(code.status == JoinCodeStatus::kOk);
+  CHECK(code.target.server == kServerEp && code.target.secret == 0x89ABCDEF);
+  // Another address and port for the code (the router's external ones), the same secret.
+  const JoinCodeResult external = DecodeJoinCodeV2(w.server.JoinCodeFor(0xCB007107, 50000));
+  CHECK(external.status == JoinCodeStatus::kOk && external.target.server.address == 0xCB007107 &&
+        external.target.server.port == 50000 && external.target.secret == 0x89ABCDEF);
+
+  Client& owner = w.Connect(MakeHello("Owner", true));
+  CHECK(w.RunUntil([&] { return owner.session->Connected(); }));
+  CHECK(owner.session->PeerId() == kOwnerPeerId);
+
+  Hello joiner = MakeHello("Joiner");
+  joiner.join_secret = code.target.secret;
+  Client& j = w.Connect(joiner);
+  CHECK(w.RunUntil([&] { return w.Count(SE::kJoinPending) == 1 && j.Count(CE::kJoinWaiting) == 1; }));
+  CHECK(w.server.ConnectionCount() == 1);  // the owner's only: a pending joiner holds no connection
+  const ServerEvent* pending = w.Last(SE::kJoinPending);
+  REQUIRE_OR_RETURN_VOID(pending != nullptr);
+  CHECK(pending->name == "Joiner" && pending->figure_id == 3 && pending->figure_variant == 0x1801);
+  const uint32_t id = pending->pending_id;
+  // 20 s of waiting outlives several cookies: still one entry, the joiner still connecting.
+  w.Run(20000ms);
+  CHECK(w.Count(SE::kJoinPending) == 1);
+  CHECK(j.session->State() == ClientState::kConnecting && j.session->JoinWaiting());
+  CHECK(w.server.ConnectionCount() == 1);
+  CHECK(w.server.LetIn(id, w.net.Now()));
+  CHECK(!w.server.LetIn(id, w.net.Now()));  // answered already
+  CHECK(w.RunUntil([&] { return j.session->Connected(); }));
+  CHECK(j.session->PeerId() == 2);
+  CHECK(w.server.PeerCount() == 2);
+
+  // A wrong code.
+  Hello guess = MakeHello("Guess");
+  guess.join_secret = 0x12345678;
+  Client& g = w.Connect(guess);
+  CHECK(w.RunUntil([&] { return g.session->State() == ClientState::kRefused; }));
+  CHECK(g.Last(CE::kRefused) && g.Last(CE::kRefused)->refuse_reason == RefuseReason::kWrongCode);
+  const uint32_t wrong = w.Gate()->WrongSecrets();  // 1, or more if a refusal was lost and resent
+  CHECK(wrong >= 1);
+
+  // Another build: refused once its cookie is valid, before the secret (nothing counted).
+  Hello other = MakeHello("Other", false, 9);
+  other.join_secret = code.target.secret;
+  Client& o = w.Connect(other);
+  CHECK(w.RunUntil([&] { return o.session->State() == ClientState::kRefused; }));
+  CHECK(o.Last(CE::kRefused) && o.Last(CE::kRefused)->refuse_reason == RefuseReason::kDigest);
+  CHECK(w.Gate()->WrongSecrets() == wrong);
+
+  // The owner's refusal.
+  Client& r = w.Connect(joiner);  // a new Connect draws a new nonce: a new join
+  CHECK(w.RunUntil([&] { return w.Count(SE::kJoinPending) == 2; }));
+  CHECK(w.server.RefuseJoin(w.Last(SE::kJoinPending)->pending_id, w.net.Now()));
+  CHECK(w.RunUntil([&] { return r.session->State() == ClientState::kRefused; }));
+  CHECK(r.Last(CE::kRefused) && r.Last(CE::kRefused)->refuse_reason == RefuseReason::kNotLetIn &&
+        r.Last(CE::kRefused)->text == "not let in");
+
+  // Unanswered: timed out 60 s after it was shown.
+  Client& t = w.Connect(joiner);
+  CHECK(w.RunUntil([&] { return w.Count(SE::kJoinPending) == 3; }));
+  CHECK(w.RunUntil([&] { return t.session->State() == ClientState::kRefused; }, 75000ms));
+  CHECK(w.Count(SE::kJoinGone) == 1);
+  CHECK(t.Last(CE::kRefused) && t.Last(CE::kRefused)->text == "not let in: timed out");
+  // None of the refused joins ever held a connection; the two players are still in.
+  CHECK(w.server.PeerCount() == 2);
+  CHECK(owner.session->Connected() && j.session->Connected());
+
+  // A new code: the old secret is wrong from now on, the new one waits.
+  w.server.NewJoinSecret(0x0BADC0DE);
+  const JoinCodeResult fresh = DecodeJoinCodeV2(w.server.JoinCode());
+  CHECK(fresh.status == JoinCodeStatus::kOk && fresh.target.secret == 0x0BADC0DE);
+  Client& stale = w.Connect(joiner);
+  CHECK(w.RunUntil([&] { return stale.session->State() == ClientState::kRefused; }));
+  CHECK(stale.Last(CE::kRefused) && stale.Last(CE::kRefused)->refuse_reason == RefuseReason::kWrongCode);
+}
+
+// The gate off (every loopback session without the game's test switch): a Hello with no secret
+// and no cookie is welcomed at once, as before stage 8; no stateless answer is ever sent.
+void FakeNetworkGateOff() {
+  World w(89);
+  REQUIRE_OR_RETURN_VOID(w.StartServer(Settings()));
+  CHECK(!w.server.GateOn() && w.server.Gate() == nullptr);
+  Client& a = w.Connect(MakeHello("Plain"));
+  CHECK(w.RunUntil([&] { return a.session->Connected(); }));
+  CHECK(a.Count(CE::kJoinWaiting) == 0);
+  CHECK(!w.server.LetIn(1, w.net.Now()) && !w.server.RefuseJoin(1, w.net.Now()));
+}
+
 int main() {
+  FakeNetworkHelloGate();
+  FakeNetworkGateOff();
   FakeNetworkSession();
   FakeNetworkStopAndQuiet();
   FakeNetworkReceiveBudget();

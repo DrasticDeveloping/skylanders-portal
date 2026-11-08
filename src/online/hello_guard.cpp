@@ -204,6 +204,8 @@ const char* HelloVerdictName(HelloVerdict verdict) {
     case HelloVerdict::kBusy: return "the host is busy, try again";
     case HelloVerdict::kAdmit: return "admitted";
     case HelloVerdict::kFull: return "full";
+    case HelloVerdict::kIncompatible: return "incompatible";
+    case HelloVerdict::kNotLetIn: return "not let in";
   }
   return "dropped";
 }
@@ -237,6 +239,12 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
     d.cookie = cookies_.Make(hello.from, hello.client_nonce, now);
     return d;
   }
+  // 4a. The caller's own checks (version, digest, a wrong owner token): only now, so a refusal goes
+  // only to a sender that proved its address, within the limits.
+  if (!hello.compatible) {
+    d.verdict = HelloVerdict::kIncompatible;
+    return d;
+  }
   // The owner (its token checked by the caller) skips the secret and let in.
   if (hello.owner) {
     d.verdict = players < settings_.max_players ? HelloVerdict::kAdmit : HelloVerdict::kFull;
@@ -256,6 +264,26 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
     d.verdict = CodeSpent() ? HelloVerdict::kCodeSpent : HelloVerdict::kWrongCode;
     return d;
   }
+  // The owner's answer to this tuple's pending entry, or its expiry (kept kDecidedLifetime).
+  std::erase_if(decided_, [now](const DecidedJoin& j) { return now >= j.until; });
+  for (auto it = decided_.begin(); it != decided_.end(); ++it) {
+    if (it->from != hello.from || it->client_nonce != hello.client_nonce) continue;
+    switch (it->decided) {
+      case Decided::kAdmitted:
+        d.verdict = players < settings_.max_players ? HelloVerdict::kAdmit : HelloVerdict::kFull;
+        decided_.erase(it);  // used: a later Hello of this tuple goes to its connection
+        return d;
+      case Decided::kFull:
+        d.verdict = HelloVerdict::kFull;
+        return d;
+      case Decided::kTimedOut:
+        d.timed_out = true;
+        [[fallthrough]];
+      case Decided::kRefused:
+        d.verdict = HelloVerdict::kNotLetIn;
+        return d;
+    }
+  }
   // 6. Let in, and 7. players.
   if (settings_.let_anyone_in) {
     d.verdict = players < settings_.max_players ? HelloVerdict::kAdmit : HelloVerdict::kFull;
@@ -273,6 +301,9 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
   join.figure_variant = hello.figure_variant;
   switch (pending_.Offer(join, now, &d.pending_id)) {
     case LetInTable::Add::kAdded:
+      d.new_pending = true;
+      d.verdict = HelloVerdict::kWait;
+      break;
     case LetInTable::Add::kRetransmit:
       d.verdict = HelloVerdict::kWait;
       break;
@@ -283,12 +314,37 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
   return d;
 }
 
-HelloVerdict HelloGate::LetIn(uint32_t id, int players, PendingJoin* out) {
+HelloVerdict HelloGate::LetIn(uint32_t id, int players, netplay::TimePoint now, PendingJoin* out) {
   std::optional<PendingJoin> join = pending_.Take(id);
   if (!join) return HelloVerdict::kDrop;
-  if (players >= settings_.max_players) return HelloVerdict::kFull;
   if (out) *out = *join;
+  if (players >= settings_.max_players) {
+    Decide(*join, Decided::kFull, now);
+    return HelloVerdict::kFull;
+  }
+  Decide(*join, Decided::kAdmitted, now);
   return HelloVerdict::kAdmit;
+}
+
+bool HelloGate::Refuse(uint32_t id, netplay::TimePoint now) {
+  std::optional<PendingJoin> join = pending_.Take(id);
+  if (!join) return false;
+  Decide(*join, Decided::kRefused, now);
+  return true;
+}
+
+std::vector<PendingJoin> HelloGate::ExpirePending(netplay::TimePoint now) {
+  std::vector<PendingJoin> expired = pending_.Expire(now);
+  for (const PendingJoin& j : expired) Decide(j, Decided::kTimedOut, now);
+  return expired;
+}
+
+void HelloGate::Decide(const PendingJoin& join, Decided decided, netplay::TimePoint now) {
+  std::erase_if(decided_, [&](const DecidedJoin& j) {
+    return now >= j.until || (j.from == join.from && j.client_nonce == join.client_nonce);
+  });
+  if (decided_.size() >= kMaxDecided) decided_.erase(decided_.begin());  // the oldest goes
+  decided_.push_back(DecidedJoin{join.from, join.client_nonce, decided, now + kDecidedLifetime});
 }
 
 }  // namespace skylanders::online
