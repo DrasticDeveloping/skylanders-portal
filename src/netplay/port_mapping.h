@@ -99,6 +99,10 @@ class IgdClient {
   virtual int AddAnyPortMapping(const PortMappingEntry& entry, uint16_t* reserved_port) = 0;
   virtual int DeletePortMapping(uint16_t external_port, const std::string& protocol) = 0;
   virtual int GetExternalIPAddress(uint32_t* address) = 0;
+  // The host's address on the interface that reached the router during discovery (dotted IPv4), the
+  // internal client PortMapper asks for; empty when unknown. The system client's threads and bounds:
+  // igd_system_detail.h.
+  virtual std::string LanAddress() const { return {}; }
 };
 
 constexpr uint32_t kMappingLeaseS = 3600;

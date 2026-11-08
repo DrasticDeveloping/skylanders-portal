@@ -68,6 +68,7 @@ endif()
 # mode has it (it stays above the figures-only return below).
 add_library(skylanders_online STATIC
     src/netplay/datagram.cpp
+    src/netplay/igd_system.cpp
     src/netplay/lanes.cpp
     src/netplay/port_mapping.cpp
     src/netplay/udp_socket.cpp
@@ -86,6 +87,13 @@ target_include_directories(skylanders_online PUBLIC src)
 target_compile_features(skylanders_online PUBLIC cxx_std_23)
 if(WIN32)
     target_link_libraries(skylanders_online PUBLIC ws2_32)
+endif()
+if(SKYLANDERS_PORTAL_MINIUPNPC)
+    # Private: only igd_system.cpp includes miniupnpc. A program that links skylanders_online gets the
+    # library (and its ws2_32, iphlpapi) on its link line; the linker takes its objects only for
+    # MakeSystemIgdClient().
+    target_link_libraries(skylanders_online PRIVATE libminiupnpc-static)
+    target_compile_definitions(skylanders_online PRIVATE SKYLANDERS_PORTAL_MINIUPNPC)
 endif()
 
 # skylanders_nav: a path planner over a navigation mesh of convex areas (islands, point lookup, A*
@@ -183,6 +191,14 @@ if(SKYLANDERS_PORTAL_TESTS)
         add_executable(skylanders_${t} tests/${t}.cpp)
         target_include_directories(skylanders_${t} PRIVATE tests)
         target_link_libraries(skylanders_${t} PRIVATE skylanders_nav)
+        add_test(NAME skylanders_${t} COMMAND skylanders_${t})
+    endforeach()
+    # The system IGD client's pure half and its bounded worker (skylanders_online): no router, no
+    # network, with or without miniupnpc.
+    foreach(t netplay_igd_system_test)
+        add_executable(skylanders_${t} tests/${t}.cpp)
+        target_include_directories(skylanders_${t} PRIVATE tests)
+        target_link_libraries(skylanders_${t} PRIVATE skylanders_online)
         add_test(NAME skylanders_${t} COMMAND skylanders_${t})
     endforeach()
 endif()
