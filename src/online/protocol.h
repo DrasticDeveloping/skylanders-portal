@@ -127,6 +127,16 @@ enum class RefuseReason : uint8_t {
 };
 const char* RefuseReasonName(RefuseReason reason);
 
+// Why a Bye was sent (stage 8: a joiner is told why its session ended). A trailing byte: a Bye
+// without it (any Bye from before it) reads as kLeave, and so does a value this build does not know.
+enum class ByeReason : uint8_t {
+  kLeave = 0,     // the sender leaves (a client's own leave)
+  kRemoved = 1,   // the server removed this client (RemoveClient: the owner's kick, a backend overflow)
+  kEnded = 2,     // the session ended: End session's drain is done for this client, or the server stopped
+  kReplaced = 3,  // the owner connected again from another address
+};
+const char* ByeReasonName(ByeReason reason);
+
 // Client to server, first: who is joining.
 struct Hello {
   uint16_t protocol_version = kProtocolVersion;
@@ -171,8 +181,9 @@ struct Refuse {
   bool operator==(const Refuse&) const = default;
 };
 
-// Either side: leaving.
+// Either side: leaving. The server says why (stage 8); a client's own Bye is kLeave.
 struct Bye {
+  ByeReason reason = ByeReason::kLeave;
   bool operator==(const Bye&) const = default;
 };
 

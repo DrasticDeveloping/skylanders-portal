@@ -113,7 +113,7 @@ void ServerSession::Stop() {
   if (!transport_) return;
   const TimePoint now = Clock::now();  // only stamps the Bye, which is never resent
   for (auto& [endpoint, peer] : peers_) {
-    if (peer->state == PeerState::kWelcomed) Post(*peer, Lane::kGameplay, Bye{}, now);
+    if (peer->state == PeerState::kWelcomed) Post(*peer, Lane::kGameplay, Bye{ByeReason::kEnded}, now);
   }
   peers_.clear();
   transport_.reset();
@@ -569,10 +569,14 @@ void ServerSession::DropPeer(Peer& peer, LeaveReason reason, TimePoint now) {
     peer.state = PeerState::kGone;
   } else {
     // Replaced: told Bye. Closed: its finals went out just before this, on the same lane; now its
-    // Bye. The connection lingers kCloseLinger to ack what is still in flight.
+    // Bye. Removed: told Bye. Each Bye says which (stage 8: the client tells its player). The
+    // connection lingers kCloseLinger to ack what is still in flight.
     if (reason == LeaveReason::kReplaced || reason == LeaveReason::kClosed ||
         reason == LeaveReason::kRemoved) {
-      Post(peer, Lane::kGameplay, Bye{}, now);
+      const ByeReason why = reason == LeaveReason::kReplaced ? ByeReason::kReplaced
+                            : reason == LeaveReason::kClosed ? ByeReason::kEnded
+                                                             : ByeReason::kRemoved;
+      Post(peer, Lane::kGameplay, Bye{why}, now);
     }
     peer.state = PeerState::kClosing;
     peer.closing_since = now;
@@ -1041,8 +1045,8 @@ void ClientSession::HandleMessage(const Message& message, Lane lane, TimePoint n
       state_ != ClientState::kDisconnecting) {
     return;
   }
-  if (std::holds_alternative<Bye>(message)) {
-    Finish(DisconnectReason::kBye);
+  if (const auto* bye = std::get_if<Bye>(&message)) {
+    Finish(DisconnectReason::kBye, bye->reason);
     return;
   }
   if (state_ == ClientState::kDisconnecting) return;
@@ -1168,12 +1172,13 @@ void ClientSession::HandleMessage(const Message& message, Lane lane, TimePoint n
   }
 }
 
-void ClientSession::Finish(DisconnectReason reason) {
+void ClientSession::Finish(DisconnectReason reason, ByeReason bye) {
   if (state_ == ClientState::kDisconnected) return;
   state_ = ClientState::kDisconnected;
   ClientEvent e;
   e.type = ClientEvent::Type::kDisconnected;
   e.disconnect_reason = reason;
+  e.bye_reason = bye;
   events_.push_back(std::move(e));
 }
 

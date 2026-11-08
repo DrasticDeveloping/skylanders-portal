@@ -374,6 +374,7 @@ void FakeNetworkSession() {
   CHECK(owner2.session->PeerId() == 1);
   CHECK(w.RunUntil([&] { return owner.session->State() == ClientState::kDisconnected; }));
   CHECK(owner.Last(CE::kDisconnected)->disconnect_reason == DisconnectReason::kBye);
+  CHECK(owner.Last(CE::kDisconnected)->bye_reason == ByeReason::kReplaced);
   bool replaced = false;
   for (const ServerEvent& x : w.server_events) {
     replaced |= x.type == SE::kPeerLeft && x.peer_id == 1 && x.leave_reason == LeaveReason::kReplaced;
@@ -403,11 +404,12 @@ void FakeNetworkStopAndQuiet() {
                               w.net.Now()));
   CHECK(w.RunUntil([&] { return lost.session->State() == ClientState::kDisconnected; }, 11000ms));
   CHECK(lost.Last(CE::kDisconnected)->disconnect_reason == DisconnectReason::kTimeout);
-  // Stop says Bye.
+  // Stop says Bye: the session ended (stage 8's notice).
   w.server.Stop();
   CHECK(!w.server.Running());
   CHECK(w.RunUntil([&] { return a.session->State() == ClientState::kDisconnected; }, 1000ms));
   CHECK(a.Last(CE::kDisconnected)->disconnect_reason == DisconnectReason::kBye);
+  CHECK(a.Last(CE::kDisconnected)->bye_reason == ByeReason::kEnded);
 }
 
 // 5000 empty datagrams (what a socket delivers for one too long to take, or an error report) from
@@ -760,6 +762,7 @@ void FakeNetworkRequests() {
   const size_t closing = IndexOf(b, CE::kSessionClosing, 0);
   CHECK(closing < tele_ds[1].first);
   CHECK(b.Last(CE::kDisconnected)->disconnect_reason == DisconnectReason::kBye);
+  CHECK(b.Last(CE::kDisconnected)->bye_reason == ByeReason::kEnded);  // End session's drain
   CHECK(server_count(SE::kEvaluateRequest, tele_key) == 0);
   size_t closed = 0, left_closed = 0;
   for (const ServerEvent& e : w.server_events) {
@@ -1140,6 +1143,8 @@ void FakeNetworkBackendFrames() {
   CHECK(w.server.RemoveClient(peer, w.net.Now()));
   CHECK(!w.server.RemoveClient(peer, w.net.Now()));
   CHECK(w.RunUntil([&] { return c.session->State() == ClientState::kDisconnected; }));
+  CHECK(c.Last(CE::kDisconnected)->disconnect_reason == DisconnectReason::kBye &&
+        c.Last(CE::kDisconnected)->bye_reason == ByeReason::kRemoved);  // stage 8: the kick's notice
   const ServerEvent* left = w.Last(SE::kPeerLeft);
   CHECK(left && left->peer_id == peer && left->leave_reason == LeaveReason::kRemoved);
   CHECK(!w.server.PeerConnected(peer));

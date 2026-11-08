@@ -1066,6 +1066,9 @@ int main() {
     CHECK(RoundTrip(Refuse{RefuseReason::kFull, "the session is full"}));
     CHECK(RoundTrip(Refuse{RefuseReason::kNotOwner, ""}));
     CHECK(RoundTrip(Bye{}));
+    for (ByeReason why : {ByeReason::kLeave, ByeReason::kRemoved, ByeReason::kEnded, ByeReason::kReplaced}) {
+      CHECK(RoundTrip(Bye{why}));
+    }
     CHECK(RoundTrip(Ping{0xFFFFFFFFFFFFFFFFull}));
     CHECK(RoundTrip(Pong{123456789, 987654321}));
     CHECK(RoundTrip(LevelRequest{"a/b/c"}));
@@ -1195,6 +1198,31 @@ int main() {
     CHECK(accepted_short == 2);
     CHECK(DecodeMessages({}).has_value());
     CHECK(DecodeMessages({})->empty());
+  }
+
+  // Stage 8: the Bye's reason, one trailing byte. A Bye without it (from before it) and one with a
+  // value this build does not know read as kLeave; an unknown reason is not written.
+  {
+    const std::vector<uint8_t> removed = {4, 0, 1, 0, 1};
+    CHECK(EncodeMessage(Bye{ByeReason::kRemoved}) == removed);
+    const std::vector<uint8_t> leave = {4, 0, 1, 0, 0};
+    CHECK(EncodeMessage(Bye{}) == leave);
+    const std::vector<uint8_t> ended = {4, 0, 1, 0, 2};
+    CHECK(EncodeMessage(Bye{ByeReason::kEnded}) == ended);
+    CHECK(EncodeMessage(Bye{ByeReason(4)}).empty());
+    const auto reads = [](const std::vector<uint8_t>& b) {
+      auto back = DecodeMessages(b);
+      if (!back || back->size() != 1) return ByeReason(0xFF);
+      const auto* got = std::get_if<Bye>(&(*back)[0]);
+      return got ? got->reason : ByeReason(0xFF);
+    };
+    CHECK(reads({4, 0, 0, 0}) == ByeReason::kLeave);  // before the byte
+    CHECK(reads({4, 0, 1, 0, 3}) == ByeReason::kReplaced);
+    CHECK(reads({4, 0, 1, 0, 9}) == ByeReason::kLeave);     // unknown
+    CHECK(reads({4, 0, 2, 0, 1, 0xEE}) == ByeReason::kRemoved);  // a later version's addition
+    CHECK(std::string(ByeReasonName(ByeReason::kRemoved)) == "removed" &&
+          std::string(ByeReasonName(ByeReason::kEnded)) == "ended" &&
+          std::string(ByeReasonName(ByeReason(9))) == "leave");
   }
 
   // A known message whose fields are shorter than its type needs is rejected even when the length

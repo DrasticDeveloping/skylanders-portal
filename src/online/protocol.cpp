@@ -53,6 +53,16 @@ const char* RefuseReasonName(RefuseReason reason) {
   return "other";
 }
 
+const char* ByeReasonName(ByeReason reason) {
+  switch (reason) {
+    case ByeReason::kRemoved: return "removed";
+    case ByeReason::kEnded: return "ended";
+    case ByeReason::kReplaced: return "replaced";
+    case ByeReason::kLeave: break;
+  }
+  return "leave";
+}
+
 const char* RefusalReasonName(RefusalReason reason) {
   switch (reason) {
     case RefusalReason::kNone: return "none";
@@ -444,7 +454,12 @@ bool Fields(ByteWriter& w, const Refuse& m) {
   w.U8(uint8_t(m.reason));
   return PutString(w, m.text, kMaxRefuseTextBytes);
 }
-bool Fields(ByteWriter&, const Bye&) { return true; }
+// Stage 8: the reason, a trailing byte (a Bye without it reads as kLeave).
+bool Fields(ByteWriter& w, const Bye& m) {
+  if (uint8_t(m.reason) > uint8_t(ByeReason::kReplaced)) return false;
+  w.U8(uint8_t(m.reason));
+  return true;
+}
 bool Fields(ByteWriter& w, const Ping& m) {
   w.U64(m.client_time_us);
   return true;
@@ -703,9 +718,15 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
       result = std::move(m);
       break;
     }
-    case MessageType::kBye:
-      result = Bye{};
+    case MessageType::kBye: {
+      Bye m;
+      if (r.Remaining() > 0) {  // stage 8's reason (absent before: kLeave; unknown: kLeave)
+        const uint8_t reason = r.U8();
+        m.reason = reason <= uint8_t(ByeReason::kReplaced) ? ByeReason(reason) : ByeReason::kLeave;
+      }
+      result = m;
       break;
+    }
     case MessageType::kPing:
       result = Ping{r.U64()};
       break;

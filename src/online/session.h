@@ -88,7 +88,7 @@ enum class LeaveReason : uint8_t {
   kReplaced,  // the owner connected again from another address
   kClosed,    // End session's drain is done for it: its finals went out, then S's Bye (version 2)
   kRemoved,   // the game removed it (RemoveClient: its backend's control overflow or overrun,
-              // stage 3); told Bye
+              // stage 3; the owner's kick, stage 8); told Bye
 };
 
 struct ServerEvent {
@@ -402,7 +402,7 @@ struct ClientEvent {
     kPlayerList,      // players
     kLevelLoad,       // generation, zone: load it, then SendLevelLoaded(generation)
     kBarrierGo,       // generation, tick: everyone has the level; it started at that server tick
-    kDisconnected,    // disconnect_reason
+    kDisconnected,    // disconnect_reason (kBye: bye_reason, why the server said it)
     // Version 2 (stage 1B).
     kWorldDecision,   // decision: S's answer to one of this client's requests
     kAppliedStep,     // applied: the steps S applied for a request (any requester's)
@@ -430,6 +430,9 @@ struct ClientEvent {
   std::string text;
   std::vector<PlayerEntry> players;
   DisconnectReason disconnect_reason = DisconnectReason::kTimeout;
+  // kDisconnected with kBye (stage 8): the server's reason (kRemoved, kEnded, kReplaced; kLeave
+  // from a server before the reason byte).
+  ByeReason bye_reason = ByeReason::kLeave;
   WorldDecision decision;
   AppliedStep applied;
   LevelEnd level_end;
@@ -536,7 +539,7 @@ class ClientSession {
   void HandleStateless(std::span<const uint8_t> payload, TimePoint now);
   // The Hello (hello_, with its cookie) on a fresh connection, at sequence 1.
   void SendHello(TimePoint now);
-  void Finish(DisconnectReason reason);
+  void Finish(DisconnectReason reason, ByeReason bye = ByeReason::kLeave);
   bool Post(netplay::Lane lane, const Message& message, TimePoint now);
 
   std::unique_ptr<netplay::Transport> transport_;
