@@ -809,7 +809,7 @@ void Version3() {
     CHECK(RoundTrip(w));
     const std::vector<uint8_t> good = EncodeMessage(w);
     REQUIRE_OR_RETURN_VOID(good.size() > 9);
-    w.backend_mode = 0x10;  // bits 2 and 3 are stage 4's; bit 4 is not known yet
+    w.backend_mode = 0x20;  // bits 2 and 3 are stage 4's, bit 4 stage 5's; bit 5 is not known yet
     CHECK(EncodeMessage(w).empty());
     std::vector<uint8_t> bad = good;
     bad[bad.size() - 9] = 0x80;  // the mode byte
