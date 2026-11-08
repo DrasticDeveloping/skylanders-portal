@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "netplay/lanes.h"
+
 // The backend's limits (D10). Two parts: the codec's bounds, constexpr and the same for every game
 // because the wire depends on them; and struct Limits, generic defaults a game replaces with its own
 // (Swap Force's: the game's src/online/backend_limits.h, from stage 2 item 7, each value with the
@@ -87,5 +89,14 @@ struct Limits {
   // `rate`, final (LM6).
   size_t max_keys_per_peer = 1024;
 };
+
+// The ranges a game's Limits must keep (council 2 B10), held by LM12 on the defaults and by each
+// game's own unit test on its limits, which are edited by hand: obligation_credit from 1 (0 would
+// hold back every obligation) to max_obligations_per_peer, and max_unacked_state_frames at most
+// netplay's kLaneWindow (past it the link answers kFull before the backend's own bound).
+inline bool ValidLimits(const Limits& l) {
+  return l.obligation_credit >= 1 && l.obligation_credit <= l.max_obligations_per_peer &&
+         l.max_unacked_state_frames <= netplay::kLaneWindow;
+}
 
 }  // namespace skylanders::backend

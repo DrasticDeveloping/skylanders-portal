@@ -2,7 +2,8 @@
 // backlog with a throttled peer, a link that answers kFull, coalescing while held, sizes and row
 // limits, the key and lease caps, the paced baseline, and the long churn with its obligation
 // credit, on FakeSession over MemoryLink. LM9, LM9b and LM11 (direct calls) are in
-// backend_world_state_test.cpp.
+// backend_world_state_test.cpp. LM12 (ValidLimits, a direct call; council 2 B10) is the last case
+// here.
 //
 // Seeds: a case whose run depends on the seed (LM1's writes) runs test::Seeds() seeds; the others
 // are deterministic on MemoryLink (their faults take no pct and no range), so a second seed would
@@ -825,6 +826,27 @@ BACKEND_TEST("LM10c", LimitPeerStopsAcking) {
       CHECK(r.S().Stats(2).credit_used == 0);
     }
   }
+}
+
+// LM12 (council 2 B10): ValidLimits, a direct call. The defaults keep the ranges; a credit of 0 or
+// above max_obligations_per_peer fails, and so does a state-lane bound above netplay's window; the
+// edges themselves pass.
+BACKEND_TEST("LM12", LimitRanges) {
+  CHECK(ValidLimits(Limits{}));
+  Limits l;
+  l.obligation_credit = 0;
+  CHECK(!ValidLimits(l));
+  l.obligation_credit = 1;
+  CHECK(ValidLimits(l));
+  l.obligation_credit = l.max_obligations_per_peer;
+  CHECK(ValidLimits(l));
+  l.obligation_credit = l.max_obligations_per_peer + 1;
+  CHECK(!ValidLimits(l));
+  l = Limits{};
+  l.max_unacked_state_frames = netplay::kLaneWindow;
+  CHECK(ValidLimits(l));
+  l.max_unacked_state_frames = netplay::kLaneWindow + 1;
+  CHECK(!ValidLimits(l));
 }
 
 }  // namespace skylanders::backend
