@@ -118,6 +118,7 @@ import backend_grades  # noqa: E402  (stage 3's backend grades: compare, faults,
 import launch_args as la  # noqa: E402
 import remote_agent  # noqa: E402
 import remote_swap_grade  # noqa: E402  (stage 4's remote_swap grade over swap_pairs.py, the ordered form)
+import exclusive_grade  # noqa: E402  (stage 4's exclusive grade: a race exactly one client wins)
 import swap_pairs  # noqa: E402
 
 STORE = ".replication-tests"
@@ -157,7 +158,7 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
 # Where a hosted server (`server = "host"`) writes its log: the owner's session folder.
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
 GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
-          "symmetry", "route", "bandwidth", "remote_swap") + backend_grades.NAMES
+          "symmetry", "route", "bandwidth", "remote_swap", "exclusive") + backend_grades.NAMES
 # The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
 # online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
 # for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
@@ -947,6 +948,12 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             try:
                 remote_swap_grade.check_remote_swap(path.name, g, names)
             except remote_swap_grade.RemoteSwapSpecError as e:
+                raise SpecError(str(e)) from e
+            continue
+        if gname == "exclusive":
+            try:
+                exclusive_grade.check_exclusive(path.name, g, names)
+            except exclusive_grade.ExclusiveSpecError as e:
                 raise SpecError(str(e)) from e
             continue
         if not isinstance(g, dict) or g.get("peer", "S" if gname == "server_frame_time" else "H") not in names:
@@ -1974,6 +1981,10 @@ def grade_cross_peer(spec: Spec, r: PeerResult, texts: dict[str, str], repo: Pat
         elif gname == "remote_swap" and not remote_swap_ordered(g) and g.get("on", "H") == r.peer:
             # `texts` holds the synthetic peers' output too (run_case), under their names.
             r.graded[gname], why = grade_remote_swap(texts, g, thresholds or {}, list(spec.peers), list(spec.synthetic))
+            reasons += why
+        elif gname == "exclusive" and g.get("peer", "S") == r.peer:
+            # exclusive_grade.py: exactly one of the named clients won the race, every other lost.
+            r.graded[gname], why = exclusive_grade.grade_exclusive(texts, g)
             reasons += why
     return reasons
 
@@ -3594,7 +3605,7 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
     """Plan 5.5 against tests/thresholds.toml, for the grades the spec names for this peer."""
     reasons = []
     for gname, g in spec.grades.items():
-        if gname in ("requests_answered", "symmetry", "save_copy", "route", "bandwidth", "remote_swap"):
+        if gname in ("requests_answered", "symmetry", "save_copy", "route", "bandwidth", "remote_swap", "exclusive"):
             continue  # graded across peers (grade_cross_peer, grade_save_copy)
         if g.get("peer", "S" if gname == "server_frame_time" else "H") != r.peer:
             continue
