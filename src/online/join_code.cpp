@@ -152,4 +152,33 @@ JoinCodeResult DecodeJoinCodeV2(std::string_view code) {
   return result;
 }
 
+std::string NormalizeJoinCodeText(std::string_view text) {
+  std::string out;
+  const size_t n = text.size();
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t c = uint8_t(text[i]);
+    if (c == ' ' || c == '-' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f') continue;
+    if (c == 0xC2 && i + 1 < n && uint8_t(text[i + 1]) == 0xA0) {  // U+00A0
+      i += 1;
+      continue;
+    }
+    if (c == 0xE2 && i + 2 < n) {
+      const uint8_t b1 = uint8_t(text[i + 1]), b2 = uint8_t(text[i + 2]);
+      const bool zero_width = b1 == 0x80 && b2 >= 0x8B && b2 <= 0x8D;  // U+200B-U+200D
+      const bool dash = b1 == 0x80 && b2 >= 0x90 && b2 <= 0x95;        // U+2010-U+2015
+      const bool minus = b1 == 0x88 && b2 == 0x92;                     // U+2212
+      if (zero_width || dash || minus) {
+        i += 2;
+        continue;
+      }
+    }
+    if (c == 0xEF && i + 2 < n && uint8_t(text[i + 1]) == 0xBB && uint8_t(text[i + 2]) == 0xBF) {  // U+FEFF
+      i += 2;
+      continue;
+    }
+    out.push_back(c >= 'a' && c <= 'z' ? char(c - 'a' + 'A') : char(c));
+  }
+  return out;
+}
+
 }  // namespace skylanders::online
