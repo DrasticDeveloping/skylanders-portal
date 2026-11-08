@@ -19,6 +19,10 @@ committed blob at HEAD; (2) every `Source:` line resolves to a manifest entry an
 by one (no wildcards); (3) it writes the payload record: each file's name, destination, size, SHA-256
 and role, which the agent and installer-clean compare against.
 
+`compare-tmp` keeps the watcher's fail-closed result (tools/tmp_payload_watch.py): a listing that is not
+the watcher's format 1, that carries watcher errors, a payload file that changed while the watcher had
+it, or an installer that exited with an error fails, and its final hashes must match the record too.
+
 Standard library only.
 """
 from __future__ import annotations
@@ -315,6 +319,55 @@ def compare_tmp(record: list[dict], seen: dict[str, dict | None], allowed_extra:
     return errors
 
 
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def check_listing(listing: object) -> list[str]:
+    """The watcher's listing (tools/tmp_payload_watch.py Listing.result) as compare-tmp needs it: its
+    format first (a listing that does not read is refused whole, `bad format: ...`), then what the
+    watcher found itself: its errors, a payload file that changed while it had it (also when the errors
+    leave it out), and an installer that exited with an error."""
+    if not isinstance(listing, dict) or listing.get("format") != 1:
+        return ["bad format: not a format 1 watcher listing"]
+    seen, extra = listing.get("seen"), listing.get("allowed_extra", {})
+    errors, changed = listing.get("errors"), listing.get("changed")
+    if not isinstance(seen, dict) or not all(
+            isinstance(k, str) and (v is None or (isinstance(v, dict) and isinstance(v.get("size"), int)
+                                                  and not isinstance(v.get("size"), bool)
+                                                  and isinstance(v.get("sha256"), str)
+                                                  and SHA256_HEX.fullmatch(v["sha256"])))
+            for k, v in seen.items()):
+        return ["bad format: `seen` is not {name: {size, sha256} or null}"]
+    if not isinstance(extra, dict) or not all(isinstance(k, str) and (v is None or isinstance(v, str))
+                                              for k, v in extra.items()):
+        return ["bad format: `allowed_extra` is not {name: hash, text or null}"]
+    if not isinstance(errors, list) or not all(isinstance(e, str) for e in errors):
+        return ["bad format: `errors` is not a list of texts (the watcher always writes one)"]
+    if not isinstance(changed, dict) or not all(isinstance(k, str) for k in changed):
+        return ["bad format: `changed` is not {name: [first, last]} (the watcher always writes one)"]
+    exit_code = listing.get("installer_exit")
+    if exit_code is not None and (not isinstance(exit_code, int) or isinstance(exit_code, bool)):
+        return ["bad format: `installer_exit` is not a number or null"]
+    out = [f"the watcher: {e}" for e in errors]
+    allowed = {k.replace("/", "\\").lower() for k in extra}
+    for name in changed:
+        if name.replace("/", "\\").lower() not in allowed and not any(e.startswith(f"{name}: changed") for e in errors):
+            out.append(f"{name}: changed while the watcher had it (the bytes setup ran may differ from the "
+                       "ones compared)")
+    if exit_code not in (None, 0):
+        out.append(f"the installer exited {exit_code}")
+    return out
+
+
+def compare_listing(record: list[dict], listing: object) -> list[str]:
+    """compare-tmp: the listing's own checks (check_listing) and, when its format reads, its final
+    hashes against the record (compare_tmp); both must pass."""
+    errors = check_listing(listing)
+    if errors and errors[0].startswith("bad format"):
+        return errors
+    return errors + compare_tmp(record, listing["seen"], listing.get("allowed_extra", {}))
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -356,8 +409,11 @@ def main(argv: list[str] | None = None) -> int:
         if a.cmd == "compare-installed":
             errors = compare_installed(record, Path(a.app), tuple(a.user_file))
         else:
-            listing = json.loads(Path(a.seen).read_text(encoding="utf-8"))
-            errors = compare_tmp(record, listing.get("seen", {}), listing.get("allowed_extra", {}))
+            try:
+                listing = json.loads(Path(a.seen).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                raise CheckError(f"{a.seen}: the watcher listing does not read ({e})") from None
+            errors = compare_listing(record, listing)
         for e in errors:
             print(f"payload: {e}", file=sys.stderr)
         print("payload: matches the record" if not errors else f"payload: {len(errors)} differences")

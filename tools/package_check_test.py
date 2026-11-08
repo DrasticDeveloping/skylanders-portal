@@ -246,6 +246,46 @@ class PackageTest(unittest.TestCase):
         less = {k: v for k, v in seen.items() if k != "settings_template.toml"}
         self.assertTrue(any("never put there" in e for e in pc.compare_tmp(rows, less, extra)))
 
+    def test_compare_tmp_cli_keeps_the_watchers_verdict(self) -> None:
+        """Sol r1 F4: final hashes that match the record do not pass a listing the watcher failed."""
+        rows = self.record()
+        rec = self.repo / "rec.json"
+        pc.write_record(rows, rec)
+        seen = {r["name"].rsplit("\\", 1)[-1]: {"size": r["size"], "sha256": r["sha256"]}
+                for r in rows if r["dest"] == "{tmp}" or r.get("extracted_to_tmp")}
+        helper = "game_xexcheck.exe"
+        good = {"format": 1, "temp": "T", "mode": "watch", "folders": ["is-AB12C.tmp"], "ignored_folders": [],
+                "seen": seen, "allowed_extra": {}, "changed": {}, "errors": [], "installer_exit": 0}
+        listing = self.repo / "seen.json"
+
+        def cli(data: object) -> int:
+            listing.write_text(json.dumps(data), encoding="utf-8")
+            return pc.main(["compare-tmp", "--record", str(rec), "--seen", str(listing)])
+
+        self.assertEqual(cli(good), 0)
+        # The helper first held other bytes, ran, then ended with the recorded ones: the watcher's
+        # listing says so in `changed` and `errors`, while the final hashes match.
+        first = {"size": seen[helper]["size"], "sha256": "1" * 64}
+        changed = {**good, "changed": {helper: [first, seen[helper]]},
+                   "errors": [f"{helper}: changed while the watcher had it (the bytes setup ran may differ "
+                              "from the ones compared)"]}
+        self.assertEqual(cli(changed), 1)
+        self.assertEqual(cli({**changed, "errors": []}), 1)  # `changed` fails it even without the error
+        self.assertEqual(cli({**good, "errors": ["<events lost: the notification buffer overflowed>"]}), 1)
+        self.assertEqual(cli({**good, "installer_exit": 2}), 1)
+        # A listing that is not the watcher's format.
+        for bad in ({**good, "format": 2}, {k: v for k, v in good.items() if k != "errors"},
+                    {k: v for k, v in good.items() if k != "changed"}, {**good, "errors": "none"},
+                    {**good, "seen": {helper: {"size": "1", "sha256": "0" * 64}}}, ["not", "a", "listing"]):
+            with self.subTest(bad=bad):
+                self.assertEqual(cli(bad), 1)
+        self.assertEqual(pc.check_listing({**good, "format": 2}), ["bad format: not a format 1 watcher listing"])
+        listing.write_text("{", encoding="utf-8")
+        self.assertEqual(pc.main(["compare-tmp", "--record", str(rec), "--seen", str(listing)]), 2)
+        # The final-hash comparison still holds on its own.
+        other = {**good, "seen": {**seen, helper: {"size": seen[helper]["size"], "sha256": "2" * 64}}}
+        self.assertEqual(cli(other), 1)
+
     def test_cli(self) -> None:
         rec = self.repo / "rec.json"
         self.assertEqual(pc.main(["check", "--repo", str(self.repo), "--record", str(rec)]), 0)
