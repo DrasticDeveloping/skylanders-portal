@@ -10,6 +10,7 @@
 
 #include "netplay/fake_network.h"
 #include "online/join_code.h"
+#include "online/pose_rate.h"
 #include "online/session.h"
 #include "test_util.h"
 
@@ -99,6 +100,20 @@ struct World {
   bool game = true;
   RefusalReason verdict = RefusalReason::kNone;
   uint32_t applied = 0;
+  // The server's pose step, as the game's session_host takes each kPlayerPose: S's rate check when
+  // `rate` is set (records_players; without it every pose is accepted), then, for an accepted pose
+  // only, AcceptPose and the backend bridge's Server::OnPrecondition (recorded in `preconditions`).
+  std::unique_ptr<PoseRateCheck> rate;
+  std::vector<std::pair<uint16_t, uint32_t>> preconditions;
+
+  void HostPose(const ServerEvent& e) {
+    if (rate && rate->Check(e.peer_id, e.pose.generation, e.pose.pose_sequence, e.pose.position, e.pose.teleports,
+                            net.Now()) == PoseRateCheck::Verdict::kTooFast) {
+      return;  // dropped: neither request table sees it
+    }
+    server.AcceptPose(e.peer_id, e.pose);
+    preconditions.emplace_back(e.peer_id, e.pose.pose_sequence);
+  }
 
   bool StartServer(const ServerSettings& s) { return server.Start(net.Bind(kServerEp), s, net.Now()); }
 
@@ -116,6 +131,7 @@ struct World {
       std::vector<ServerEvent> evaluate;
       while (server.PollEvent(e)) {
         if (e.type == ServerEvent::Type::kEvaluateRequest) evaluate.push_back(e);
+        if (e.type == ServerEvent::Type::kPlayerPose) HostPose(e);
         server_events.push_back(e);
       }
       for (const ServerEvent& x : evaluate) {
@@ -709,6 +725,68 @@ void FakeNetworkRequests() {
   CHECK(!b.session->SendWorldRequest(tele, w.net.Now()));
 }
 
+// Stage 4 (Sol F1): a pose S's rate check drops meets no pose precondition, neither in the
+// session's request table nor in the backend's (the bridge's OnPrecondition). Pose N-1 accepted,
+// pose N too fast: a request naming N stays pending until a later pose the check passes.
+void FakeNetworkRateDroppedPose() {
+  World w(4404);
+  REQUIRE_OR_RETURN_VOID(w.StartServer(Settings()));
+  w.rate = std::make_unique<PoseRateCheck>(10.0f);  // 10 units per second
+  Client& owner = w.Connect(MakeHello("Owner", true));
+  CHECK(w.RunUntil([&] { return owner.session->Connected(); }));
+  Client& b = w.Connect(MakeHello("Bee"));
+  CHECK(w.RunUntil([&] { return b.session->Connected(); }));
+  const uint16_t bee = b.session->PeerId();
+  const uint32_t g1 = w.server.RequestLevel("levels/zone_a", w.net.Now());
+  CHECK(w.RunUntil([&] { return b.session->Generation() == g1 && owner.session->Generation() == g1; }));
+
+  auto poses_seen = [&](uint32_t seq) {
+    return size_t(std::count_if(w.server_events.begin(), w.server_events.end(), [&](const ServerEvent& e) {
+      return e.type == SE::kPlayerPose && e.peer_id == bee && e.pose.pose_sequence == seq;
+    }));
+  };
+  auto bridged = [&](uint32_t seq) {
+    return std::count(w.preconditions.begin(), w.preconditions.end(), std::pair<uint16_t, uint32_t>{bee, seq});
+  };
+  auto send_pose = [&](uint32_t seq, float x) {
+    PlayerPose pose;
+    pose.pose_sequence = seq;
+    pose.generation = g1;
+    pose.position = {x, 0, 0};
+    pose.figure.figure_id = 3;
+    CHECK(b.session->SendPlayerPose(pose, w.net.Now()));
+    CHECK(w.RunUntil([&] { return poses_seen(seq) == 1; }));
+  };
+
+  send_pose(4, 0.0f);    // N-1: the peer's first pose, accepted
+  send_pose(5, 100.0f);  // N: 100 units in one pose interval, dropped by the rate check
+  CHECK(bridged(4) == 1 && bridged(5) == 0);
+
+  WorldRequest r = EnterRequest(g1, 1, 5);
+  CHECK(b.session->SendWorldRequest(r, w.net.Now()));
+  r.key.peer = bee;  // what the client and the server set it to
+  auto evaluations = [&] {
+    return std::count_if(w.server_events.begin(), w.server_events.end(), [&](const ServerEvent& e) {
+      return e.type == SE::kEvaluateRequest && e.request.key == r.key;
+    });
+  };
+  CHECK(w.RunUntil([&] { return DecisionsFor(b, r.key).size() == 1; }));
+  w.Run(150ms);  // well inside kPoseWait
+  CHECK(evaluations() == 0 && w.server.Requests().StateOf(r.key) == RequestState::kPending);
+  auto ds = DecisionsFor(b, r.key);
+  REQUIRE_OR_RETURN_VOID(ds.size() == 1);
+  CHECK(Pending(ds[0].second));
+
+  // The next pose the check passes (close to the last accepted one) meets N: the request goes on.
+  send_pose(6, 0.1f);
+  CHECK(bridged(6) == 1);
+  CHECK(w.RunUntil([&] { return DecisionsFor(b, r.key).size() == 2; }));
+  ds = DecisionsFor(b, r.key);
+  REQUIRE_OR_RETURN_VOID(ds.size() == 2);
+  CHECK(ds[1].second.outcome == DecisionOutcome::kApplied && ds[1].second.final);
+  CHECK(evaluations() == 1);
+}
+
 // A client whose SessionClosed never comes (its game hangs): after kCloseWait the server takes it
 // as gone, sends its finals and its Bye; the owner closes normally.
 void FakeNetworkCloseGone() {
@@ -1015,6 +1093,7 @@ int main() {
   FakeNetworkReceiveBudget();
   FakeNetworkHelloFlood();
   FakeNetworkRequests();
+  FakeNetworkRateDroppedPose();
   FakeNetworkCloseGone();
   FakeNetworkScenes();
   FakeNetworkBackendFrames();

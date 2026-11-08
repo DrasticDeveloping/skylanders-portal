@@ -142,9 +142,19 @@ class RequestTable {
 
   // A request or a resend of a key (its peer already set to the sender).
   void OnRequest(const WorldRequest& request, TimePoint now);
-  // A pose from `peer`. true if it is newer than the last one from that peer in the current
-  // generation (it is kept and pending keys see it at the next Service); false if it is dropped.
+  // A pose from `peer`, taken at once. true if it is newer than the last one from that peer in the
+  // current generation (it is kept and pending keys see it at the next Service); false if it is
+  // dropped.
   bool OnPose(uint16_t peer, uint32_t generation, uint32_t pose_sequence);
+  // Stage 4: receiving and accepting a pose are two steps (S's rate check sits between them).
+  // OnPoseReceived only drops duplicates: true if the pose is newer than the last one received
+  // from that peer in the current generation. Pending keys do not see it. OnPoseAccepted is the
+  // host's accept of a pose OnPoseReceived passed: pending keys see it at the next Service. false
+  // if it is of another generation, was never received (or its peer left since), or is not newer
+  // than the last one accepted. A pose that is received but never accepted (rate-dropped) meets no
+  // key's pose precondition.
+  bool OnPoseReceived(uint16_t peer, uint32_t generation, uint32_t pose_sequence);
+  bool OnPoseAccepted(uint16_t peer, uint32_t generation, uint32_t pose_sequence);
   // Once per server frame: each peer's queue (pending keys whose pose came go to evaluation, keys
   // whose pose wait ended are refused too_far), held keys whose enter never came, and End
   // session's gone timeout.
@@ -224,7 +234,8 @@ class RequestTable {
   std::map<uint16_t, std::set<Slot>> queue_;  // per peer: its pending keys, by order
   std::set<Slot> held_;                       // held keys, by arrival
   std::map<uint16_t, size_t> stored_;         // per peer: keys stored in this generation
-  std::map<uint16_t, uint32_t> last_pose_;    // per peer, in the current generation
+  std::map<uint16_t, uint32_t> last_pose_;    // per peer, in the current generation (accepted)
+  std::map<uint16_t, uint32_t> last_received_;  // per peer, in the current generation (stage 4)
   std::map<uint16_t, TimePoint> close_wait_;  // End session: the peers awaited, by deadline
   uint32_t generation_ = 0;
   uint32_t previous_generation_ = 0;  // the generation before the last change (the tomb window)

@@ -81,7 +81,9 @@ struct ServerEvent {
     kBarrierReleased,  // generation, tick (the start tick sent in BarrierGo)
     kRefusalSent,      // refuse_reason, text, name (from the Hello, if any), endpoint, peer_id
     // Version 2 (stage 1B).
-    kPlayerPose,       // peer_id, pose: only a pose newer than the last from that peer this generation
+    kPlayerPose,       // peer_id, pose: only a pose newer than the last from that peer this generation;
+                       // it meets that peer's pose preconditions only once the host gives it to
+                       // AcceptPose (stage 4: a rate-dropped pose never is)
     kPlayerAction,     // peer_id, action
     kRequestReceived,  // peer_id, request (its key's peer set to the sender), before it is decided
     kEvaluateRequest,  // peer_id, request, generation (the key's): evaluate it on the game thread
@@ -221,6 +223,12 @@ class ServerSession {
   bool SubmitEvaluation(const RequestKey& key, const EvaluationResult& result,
                         TimePoint now = Clock::now());
   const RequestTable& Requests() const { return requests_; }
+  // Stage 4: the host accepted a kPlayerPose of `peer` (S's rate check passed it, or there is
+  // none): that peer's pending requests whose pose precondition it meets go on at the next Pump.
+  // A pose the host drops is never given here, so a request naming it waits for a later accepted
+  // one (or its pose wait ends). false if it is dropped: another generation, its peer left since,
+  // or not newer than the last accepted one.
+  bool AcceptPose(uint16_t peer, const PlayerPose& pose);
   // To every client: the steps S applied for one request, or one of its late steps (`late_step`,
   // stage 1B amendment w). false if it cannot be encoded.
   bool SendAppliedStep(const AppliedStep& step, TimePoint now = Clock::now());

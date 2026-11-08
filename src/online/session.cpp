@@ -211,8 +211,9 @@ void ServerSession::HandleMessage(Peer& peer, const Message& message, Lane lane,
     DropPeer(peer, LeaveReason::kBye, now);
   } else if (const auto* pose = std::get_if<PlayerPose>(&message)) {
     // An older pose (the fast lane drops only datagrams older than the newest, not stale content)
-    // or one of another generation is dropped here.
-    if (!requests_.OnPose(peer.id, pose->generation, pose->pose_sequence)) return;
+    // or one of another generation is dropped here. Received is not accepted: pending keys see
+    // it only after the host's AcceptPose (stage 4: S's rate check sits in between).
+    if (!requests_.OnPoseReceived(peer.id, pose->generation, pose->pose_sequence)) return;
     ServerEvent e;
     e.type = ServerEvent::Type::kPlayerPose;
     e.peer_id = peer.id;
@@ -531,6 +532,11 @@ bool ServerSession::SubmitEvaluation(const RequestKey& key, const EvaluationResu
   const bool taken = requests_.SubmitEvaluation(key, result, now);
   FlushRequests(now);
   return taken;
+}
+
+bool ServerSession::AcceptPose(uint16_t peer, const PlayerPose& pose) {
+  if (!transport_) return false;
+  return requests_.OnPoseAccepted(peer, pose.generation, pose.pose_sequence);
 }
 
 bool ServerSession::SendAppliedStep(const AppliedStep& step, TimePoint now) {
