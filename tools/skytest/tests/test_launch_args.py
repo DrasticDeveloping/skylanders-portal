@@ -345,15 +345,63 @@ class ScriptTest(_Base):
 
 
 class SyntheticPeerTest(_Base):
-    def test_rules(self) -> None:
-        ok = la.build_synthetic_peer(self.ctx, ["--server=192.168.1.20:52000", f"--log_file={self.run / 'p3.log'}"],
-                                     "192.168.1.20:52000")
-        self.assertEqual(len(ok), 2)
-        self.refuses(la.build_synthetic_peer, self.ctx, ["--server=10.0.0.1:1"], "192.168.1.20:52000")
-        self.refuses(la.build_synthetic_peer, self.ctx, [], "192.168.1.20:52000")
-        self.refuses(la.build_synthetic_peer, self.ctx, ["--server=a:1", "--figures=x"], "a:1")
-        self.refuses(la.build_synthetic_peer, self.ctx, ["--server=a:1", "--log_file="], "a:1")
-        self.refuses(la.build_synthetic_peer, self.ctx, ["--server=a:1", f"--log_file={self.root / 'x.log'}"], "a:1")
+    """Stage 4's synthetic peer (role synthetic-peer): `--name value` pairs, the session address, the
+    script in the run folder and the digest contract."""
+
+    DIGEST = "ab" * 32
+
+    def line(self, **over: str) -> list[str]:
+        script = self.run / "script.txt"
+        if not script.exists():
+            script.write_text("swap 1 Wash 600\n", encoding="utf-8")
+        values = {"--server": "192.168.1.20", "--port": "52000", "--script": str(script), "--digest": self.DIGEST}
+        values.update({f"--{k}": v for k, v in over.items()})
+        return [w for k, v in values.items() if v is not None for w in (k, v)]
+
+    def test_build_writes_the_script_and_makes_the_line(self) -> None:
+        line = la.build_synthetic_peer(self.ctx, "192.168.1.20:52000", self.DIGEST, "swap 1 Wash 600\n")
+        self.assertEqual(line, ["--server", "192.168.1.20", "--port", "52000", "--script",
+                                str(self.run / "script.txt"), "--digest", self.DIGEST])
+        self.assertEqual((self.run / "script.txt").read_text(encoding="utf-8"), "swap 1 Wash 600\n")
+        # A plan's own args: the four settings are set already, anything else is off the list.
+        self.refuses(la.build_synthetic_peer, self.ctx, "a:1", self.DIGEST, "x\n", ["--port", "1"])
+        self.refuses(la.build_synthetic_peer, self.ctx, "a:1", self.DIGEST, "x\n", ["--figures", "x"])
+        self.refuses(la.build_synthetic_peer, self.ctx, "a:1", self.DIGEST, "bad\x01\n")
+        self.refuses(la.build_synthetic_peer, self.ctx, "no-port", self.DIGEST, "x\n")
+        self.refuses(la.build_synthetic_peer, self.ctx, "a:1", "", "x\n")  # the run names no digest
+
+    def test_the_rules(self) -> None:
+        ok = la.check_synthetic_args(self.ctx, self.line(), "192.168.1.20:52000", self.DIGEST)
+        self.assertEqual(len(ok), 8)
+        # Loopback: --server may be left out (the program's default is 127.0.0.1), nowhere else.
+        la.check_synthetic_args(self.ctx, self.line(server=None), "127.0.0.1:52000", self.DIGEST)
+        self.refuses(la.check_synthetic_args, self.ctx, self.line(server=None), "192.168.1.20:52000", self.DIGEST)
+        session = ("192.168.1.20:52000", self.DIGEST)
+        for what, line in {
+            "another server": self.line(server="10.0.0.1"),
+            "another port": self.line(port="52001"),
+            "no port": self.line(port=None),
+            "no script": self.line(script=None),
+            "no digest": self.line(digest=None),
+            "another digest (the contract)": self.line(digest="cd" * 32),
+            "a short digest": self.line(digest="ab" * 16),
+            "--game (an executable outside the run folder)": self.line(game=str(self.install / "game.exe")),
+            "a setting off the list": self.line(figures=str(self.run)),
+            "an empty value": self.line(port=""),
+            "a script outside the run folder": self.line(script=str(self.root / "x.txt")),
+            "a script that does not exist": self.line(script=str(self.run / "none.txt")),
+            "a name=value word": ["--server=192.168.1.20", "--port", "52000"],
+            "an odd word count": [*self.line(), "--port"],
+            "twice": [*self.line(), "--port", "52000"],
+        }.items():
+            with self.subTest(what=what):
+                self.refuses(la.check_synthetic_args, self.ctx, line, *session)
+        (self.root / "x.txt").write_text("swap 1 Wash 600\n", encoding="utf-8")
+        self.refuses(la.check_synthetic_args, self.ctx, self.line(script=str(self.root / "x.txt")), *session)
+        (self.run / "bad.txt").write_bytes(b"swap 1 Wash 600\x00\n")
+        self.refuses(la.check_synthetic_args, self.ctx, self.line(script=str(self.run / "bad.txt")), *session)
+        # The digest compares without case (the program reads either).
+        la.check_synthetic_args(self.ctx, self.line(digest=self.DIGEST.upper()), *session)
 
 
 if __name__ == "__main__":

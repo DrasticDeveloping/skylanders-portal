@@ -2146,7 +2146,8 @@ def build_files(cfg: Config) -> list[Path]:
     if not exe.is_file():
         return []
     syn = cfg.build / cfg.synthetic_exe if cfg.synthetic_exe else None
-    return [exe] + sorted(cfg.build.glob("*.dll")) + sorted((cfg.build / "routes").glob("*.toml")) +         ([syn] if syn is not None and syn.is_file() else [])
+    return [exe] + sorted(cfg.build.glob("*.dll")) + sorted((cfg.build / "routes").glob("*.toml")) + \
+        ([syn] if syn is not None and syn.is_file() else [])
 
 
 def build_rel(cfg: Config, f: Path) -> Path:
@@ -3472,22 +3473,29 @@ def prepare_synthetic(cfg: Config, spec: Spec, name: str, run: Path, snap: Path,
     """A synthetic peer's folder (its script.txt) and its command: [synthetic] exe from the snapshot
     (or the tests' launcher) and the args template with {port} (the hosted server's), {script},
     {digest} (the SHA-256 of the snapshot's game exe: the build digest the server checks in a Hello),
-    {server} (127.0.0.1: loopback only) and {peer}. Every argument is non-empty."""
+    {server} (127.0.0.1: loopback only) and {peer}. Every argument is non-empty, and the line passes
+    the launch builder's synthetic-peer rules (launch_args.check_synthetic_args: the session address,
+    the script inside the peer's fresh run folder, the digest contract); a refusal is a spec error."""
     if not cfg.synthetic_exe and not cfg.synthetic_launcher:
         raise SpecError(f"{spec.path.name}: synthetic peers need tests/skytest.toml [synthetic] exe")
     if not port:
         raise SpecError(f"{spec.path.name}: synthetic peers need a hosted server's port")
-    d = run / name
-    check_output_path(cfg, d)
-    d.mkdir(parents=True)
-    script = d / "script.txt"
+    check_output_path(cfg, run / name)
+    try:
+        d = la.make_run_folder(run.resolve(), name)
+        ctx = launch_context(cfg, d, launch_tables(cfg))
+        la.check_synthetic_script(spec.synthetic[name].script.encode("utf-8"))
+    except la.LaunchError as e:
+        raise SpecError(f"synthetic peer {name}: {e}") from None
+    script = d / la.SCRIPT_FILE
     script.write_text(spec.synthetic[name].script, encoding="utf-8")
     exe = snap / cfg.synthetic_exe if cfg.synthetic_exe else None
     if not cfg.synthetic_launcher and (exe is None or not exe.is_file()):
         raise SpecError(f"no synthetic peer at {cfg.build / cfg.synthetic_exe}: build it first")
     game = snap / cfg.exe
+    digest = file_sha256(game) if game.is_file() else ""
     subs = {"{port}": str(port), "{script}": str(script), "{server}": "127.0.0.1", "{peer}": name,
-            "{digest}": file_sha256(game) if game.is_file() else ""}
+            "{digest}": digest}
     args = []
     for a in cfg.synthetic_args:
         for ph, value in subs.items():
@@ -3495,6 +3503,10 @@ def prepare_synthetic(cfg: Config, spec: Spec, name: str, run: Path, snap: Path,
         if not a.strip():
             raise SpecError(f"{spec.path.name}: synthetic peer {name}: an argument came out empty")
         args.append(a)
+    try:
+        la.check_synthetic_args(ctx, args, f"127.0.0.1:{port}", digest)
+    except la.LaunchError as e:
+        raise SpecError(f"{spec.path.name}: synthetic peer {name}: {e}") from None
     cmd = [*cfg.synthetic_launcher, *args] if cfg.synthetic_launcher else [str(exe), *args]
     return d, cmd
 

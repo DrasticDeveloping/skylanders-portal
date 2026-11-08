@@ -56,6 +56,11 @@ launcher = [{test_skytest.toml_str(sys.executable)}, "-I", {test_skytest.toml_st
 args = ["--port", "{{port}}", "--script", "{{script}}", "--digest", "{{digest}}"]
 server_setting = "dev_synthetic_peers"
 """, encoding="utf-8")
+        # The fake game's allow list gets the server setting the runner passes for a server+N+hK case
+        # (the launch builder checks the runner's own settings too).
+        allow = self.repo / "tests" / "launch_allow.toml"
+        allow.write_text(allow.read_text(encoding="utf-8") + '[settings.dev_synthetic_peers]\nkind = "bool"\n',
+                         encoding="utf-8")
         cfg = skytest.load_config(self.repo)
         cfg.start_gap = 0.0
         self.cfg = cfg
@@ -154,6 +159,23 @@ start_after = "Online: starting as the server"
         case = self.run_cases("owns")["cases"][0]
         self.assertEqual(case["status"], "error")
         self.assertIn("runner sets it", " ".join(case["reasons"]))
+
+    def test_a_line_off_the_synthetic_peer_contract_starts_nothing(self) -> None:
+        # The launch builder's synthetic-peer rules hold for the local runner too: the digest contract
+        # (the snapshot game's SHA-256, never the peer's own --game), the session's own port.
+        self.spec("syn", self.HOSTED + 'script = "say hello\\n"\n')
+        for what, args in {
+            "--game": ["--port", "{port}", "--script", "{script}", "--game", "{script}"],
+            "another digest": ["--port", "{port}", "--script", "{script}", "--digest", "ab" * 32],
+            "another server": ["--server", "10.0.0.1", "--port", "{port}", "--script", "{script}", "--digest",
+                               "{digest}"],
+        }.items():
+            with self.subTest(what=what):
+                self.cfg.synthetic_args = args
+                case = self.run_cases("syn")["cases"][0]
+                self.assertEqual(case["status"], "error", case)
+                self.assertIn("synthetic peer h1", " ".join(case["reasons"]))
+                self.assertEqual(case["peers"], [])
 
 
 def swap(n: int, hero: str, tick: int) -> str:
