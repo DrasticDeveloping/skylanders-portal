@@ -84,6 +84,12 @@ struct Client::Impl {
   std::deque<Unsent> unsent;              // gameplay messages waiting for the lane (F1)
   std::optional<msg::Mismatch> mismatch;  // the newest Mismatch waiting for the state lane (F1)
   std::deque<ClientEvent> events;
+  // InboundLost (stage 3): the highest BaselineBegin id read, and while a loss is being repaired
+  // the id a repair baseline must be above; recoverable messages are discarded until then.
+  uint32_t last_baseline = 0;
+  std::optional<uint32_t> repair_above;
+  uint64_t discarded = 0;
+  const Record* applying = nullptr;  // the row whose adapter call is in progress
 
   ClientEvent& Event(ClientEvent::Type type) {
     ClientEvent e;
@@ -108,6 +114,20 @@ struct Client::Impl {
     ack_sent = false;
     unsent.clear();
     mismatch.reset();
+    last_baseline = 0;
+    repair_above.reset();
+    discarded = 0;
+    applying = nullptr;
+  }
+
+  // The state messages a repair baseline recreates (stage 3 section 3.2's recoverable class on a
+  // client): every row they carry is in the baseline of the subscribed scopes.
+  static bool Recoverable(const Message& m) {
+    return std::holds_alternative<msg::Delta>(m) || std::holds_alternative<msg::Tomb>(m) ||
+           std::holds_alternative<msg::Through>(m) || std::holds_alternative<msg::Manifest>(m) ||
+           std::holds_alternative<msg::BaselineBegin>(m) ||
+           std::holds_alternative<msg::BaselineRows>(m) ||
+           std::holds_alternative<msg::BaselineEnd>(m);
   }
 
   void Push(const Message& m) { queue.Push(m, now); }
@@ -203,6 +223,15 @@ struct Client::Impl {
       return;
     }
     if (!hello) return;  // every state message before StateHello is refused
+    if (repair_above && Recoverable(m)) {
+      // After InboundLost: discarded until a baseline S began after the loss (stage 3).
+      const auto* begin = std::get_if<msg::BaselineBegin>(&m);
+      if (!begin || begin->id <= *repair_above) {
+        ++discarded;
+        return;
+      }
+      repair_above.reset();
+    }
     if (auto* epoch = std::get_if<msg::EpochBegin>(&m)) {
       replica.OnEpoch(epoch->generation, epoch->lsn);
       NewGeneration(epoch->generation);
@@ -247,6 +276,7 @@ struct Client::Impl {
       // A full baseline can move S's cursor past an epoch entry it never sent (a repair that began
       // after BeginEpoch): the generation changes here then, with everything EpochBegin does.
       NewGeneration(begin->epoch);
+      last_baseline = std::max(last_baseline, begin->id);
       replica.OnBaselineBegin(begin->id, begin->at, begin->epoch, begin->scopes);
     } else if (auto* rows = std::get_if<msg::BaselineRows>(&m)) {
       for (const Record& r : rows->records) replica.OnBaselineRow(rows->id, r);
@@ -360,8 +390,11 @@ struct Client::Impl {
       case Resolution::kResolved: {
         KindAdapter* a = adapters.For(r.key.kind);
         if (!a) return RowApply::kDropped;
-        return FromAdapter(r.tomb ? a->Retire(look.handle, r.key.slot)
-                                  : a->Apply(look.handle, r.key.slot, r.value));
+        applying = &r;
+        const AdapterResult res = r.tomb ? a->Retire(look.handle, r.key.slot)
+                                         : a->Apply(look.handle, r.key.slot, r.value);
+        applying = nullptr;
+        return FromAdapter(res);
       }
       case Resolution::kPending:
       case Resolution::kAmbiguous:  // never picked; it may resolve when one of them goes
@@ -627,6 +660,24 @@ void Client::Pump(TimePoint now) {
   c.Ack(now);
   c.Flush();
 }
+
+void Client::InboundLost(TimePoint now) {
+  Impl& c = *impl_;
+  c.now = now;
+  if (!c.hello) return;
+  c.replica.DropStaging();
+  c.repair_above = c.last_baseline;
+  c.discarded = 0;
+  const uint64_t prefix = c.replica.Prefix();
+  c.SendMismatch(msg::Mismatch{prefix, 0});
+  ClientEvent& e = c.Event(ClientEvent::Type::kInboundLost);
+  e.lsn = prefix;
+  c.Flush();
+}
+
+bool Client::AwaitingRepairBaseline() const { return impl_->repair_above.has_value(); }
+uint64_t Client::DiscardedAfterLoss() const { return impl_->discarded; }
+const Record* Client::Applying() const { return impl_->applying; }
 
 const Replica& Client::State() const { return impl_->replica; }
 const ObligationHolder& Client::Obligations() const { return impl_->holder; }

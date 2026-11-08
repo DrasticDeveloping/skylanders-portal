@@ -238,6 +238,9 @@ class Replica {
   // staging is dropped, the replica and the apply queue are unchanged, and the client asks S for a
   // repair (Mismatch{at, 0}; Sol F6).
   BaselineEndResult OnBaselineEnd(uint32_t id, uint64_t at, uint64_t digest);
+  // Drops the staging map, as a failed digest does (BL10's path): the replica and the apply queue
+  // stay as they were. Client::InboundLost's first step (stage 3, future/online-3.md section 3.2).
+  void DropStaging();
   // The next row for the adapters, in order: released rows (in dependency order, then LSN order),
   // then waiting and failed rows due again (once per Service). Every row handed out is unsettled
   // until OnApplied answers it; the client answers each one in the same pump (Sol F2, draft 4).

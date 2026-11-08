@@ -987,6 +987,8 @@ bool Replica::PollEvent(ReplicaEvent& out) {
 ScopeMask Replica::Subscribed() const { return impl_->subscribed; }
 ScopeMask Replica::Staging() const { return impl_->staging ? impl_->staging->scopes : 0; }
 
+void Replica::DropStaging() { impl_->staging.reset(); }
+
 bool Replica::Completes(Scope scope, uint64_t at_lsn) const {
   const Impl& s = *impl_;
   const ScopeMask m = MaskOf(scope);
