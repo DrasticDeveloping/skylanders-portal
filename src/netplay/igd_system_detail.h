@@ -15,7 +15,9 @@
 //   never starts. A call that is running when its bound passes is abandoned: the caller gets
 //   kTimedOut at once, and every later call gets kTimedOut at once until the router has answered
 //   (or miniupnpc has given up on) the abandoned one. Destroying the client never waits: the worker
-//   finishes the call it is running, drops the rest and ends.
+//   finishes the call it is running, drops the rest and ends. A Windows socket call that is stuck
+//   keeps its worker thread, its socket and its Winsock reference (WSAStartup) until it returns;
+//   a cap on abandoned workers is a follow-up.
 // - An abandoned add can still reach the router after its caller was told kTimedOut. PortMapper
 //   never counts it as owned (it is never re-read as ours), so it is never renewed or deleted and
 //   ends with its lease (kMappingLeaseS), like every entry this session does not own.
