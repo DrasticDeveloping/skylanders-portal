@@ -39,6 +39,30 @@ if(SKYLANDERS_ALCHEMY_STB)
     target_compile_features(skylanders_alchemy PUBLIC cxx_std_23)
 endif()
 
+# miniupnpc (thirdparty/miniupnp, BSD 3-Clause, pinned to its release tag miniupnpc_2_3_3): the UPnP
+# IGD client behind src/netplay/igd_system.cpp, the router mapping of online hosting (stage 8 item 4).
+# Only its static library, built only as skylanders_online's dependency: no tests, samples, shared
+# library or install rules. A game takes its code into the exe only if it calls MakeSystemIgdClient(),
+# and that game ships licenses/miniupnpc-LICENSE.txt. OFF: MakeSystemIgdClient() returns nullptr.
+option(SKYLANDERS_PORTAL_MINIUPNPC "Build miniupnpc for the router mapping of online hosting" ON)
+if(SKYLANDERS_PORTAL_MINIUPNPC)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/miniupnp/miniupnpc/CMakeLists.txt")
+        message(FATAL_ERROR "skylanders-portal: thirdparty/miniupnp missing; run git submodule update --init --recursive (or configure with -DSKYLANDERS_PORTAL_MINIUPNPC=OFF)")
+    endif()
+    # Normal variables, not cache entries: miniupnpc's option()s keep them (CMP0077; it asks for 3.14).
+    set(UPNPC_BUILD_STATIC ON)
+    set(UPNPC_BUILD_SHARED OFF)
+    set(UPNPC_BUILD_TESTS OFF)
+    set(UPNPC_BUILD_SAMPLE OFF)
+    set(UPNPC_NO_INSTALL ON)
+    add_subdirectory(thirdparty/miniupnp/miniupnpc EXCLUDE_FROM_ALL)
+    if(WIN32)
+        # miniupnpc sets these for MSVC only; clang gets them too (they silence deprecation warnings).
+        target_compile_definitions(libminiupnpc-static PRIVATE _CRT_SECURE_NO_WARNINGS
+                                   _WINSOCK_DEPRECATED_NO_WARNINGS)
+    endif()
+endif()
+
 # skylanders_online: Swap Force Online's session (UDP sockets and lanes, the session messages, join
 # codes, the shared tick, the level barrier, the request state machine). Game-independent and without the SDK, so every build
 # mode has it (it stays above the figures-only return below).
