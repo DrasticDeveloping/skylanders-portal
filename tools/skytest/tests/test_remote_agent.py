@@ -450,6 +450,45 @@ class AgentTest(unittest.TestCase):
         self.assertFalse(self.call(c, "collect", run=r["run"], start=-1)["ok"])
         unlink_junction(folder / "D" / "alias")
 
+    def test_collection_is_counted_per_run_across_runs_and_restarts(self) -> None:
+        saved = ra.COLLECT_LIMIT
+        self.addCleanup(setattr, ra, "COLLECT_LIMIT", saved)
+        ra.COLLECT_LIMIT = 16
+        c = self.verified()
+        self.fixtures(c)
+        a = self.call(c, "start", plan=self.plan(name="runA"))["run"]
+        self.call(c, "stop")
+        (self.store / "runs" / a / "D" / "big.bin").write_bytes(b"x" * 40)
+        b = self.call(c, "start", plan=self.plan(name="runB"))["run"]  # B is the current run now
+        self.call(c, "stop")
+        got = self.call(c, "collect", run=a, path="D/big.bin", offset=0)
+        self.assertTrue(got["ok"], got)
+        self.assertEqual(len(base64.b64decode(got["data"])), 16)
+        self.assertFalse(got["eof"])
+        for off in (16, 0, 24):  # A's budget is spent, whatever is asked for
+            r = self.call(c, "collect", run=a, path="D/big.bin", offset=off)
+            self.assertFalse(r["ok"])
+            self.assertIn("collection limit", r["error"])
+        r = self.call(c, "collect", run=b, path="D/script.txt", offset=0)  # B counts on its own
+        self.assertTrue(r["ok"], r)
+        self.assertTrue(r["eof"])
+        # A restarted agent keeps the counts.
+        again = ra.Agent("127.0.0.1", 0, "127.0.0.0/8", self.mach, self.msha, token=self.token)
+        self.addCleanup(again.shutdown)
+        with self.assertRaises(ra.Refused):
+            again.op_collect({"run": a, "path": "D/big.bin", "offset": 0}, 0.0)
+        # A run with no record (an older agent's) is not collected.
+        legacy = self.store / "runs" / "legacy"
+        legacy.mkdir()
+        (legacy / "x.txt").write_text("1", encoding="utf-8")
+        with self.assertRaises(ra.Refused) as cm:
+            again.op_collect({"run": "legacy", "path": "x.txt", "offset": 0}, 0.0)
+        self.assertIn("no collection record", str(cm.exception))
+        # clean takes a run's record with it.
+        self.assertTrue(self.call(c, "clean", run=a)["ok"])
+        self.assertFalse((self.store / "collected" / f"{a}.json").exists())
+        self.assertTrue((self.store / "collected" / f"{b}.json").exists())
+
     # --- the agent's own writes stay in its store (Sol r1 F1) ----------------------------------------
 
     def test_a_staged_junction_to_an_owner_folder(self) -> None:

@@ -25,6 +25,10 @@ What it does and refuses:
   or DLL is ever uploaded. Every command line and script goes through launch_args.py; the processes
   start without a shell, suspended, in one kill-on-close job, then resume.
 - One run at a time, under a run lock file in the store that `run-local` takes too.
+- Collection is counted per run, whichever run is current: each run folder gets a record in the store's
+  `collected` folder when it is made (by `start` or `run-local`), every chunk sent is added to it before the
+  chunk leaves, and a run with no record (one an older agent left, or whose record is gone) is not
+  collected. The records survive a restart of the agent, so a retained run's 2 GiB stay spent.
 
 Operations: hello, verify, fixtures, stage, start, stop, status, collect, clean. Nothing else.
 
@@ -410,7 +414,6 @@ class Run:
     timeout_s: float
     last_heartbeat: float
     state: str = "running"
-    sent: int = 0
     store: Path | None = None
 
 
@@ -510,6 +513,7 @@ def launch_plan(mach: Machine, m: Manifest, plan: dict, lock: RunLock, now: floa
         stamp = time.strftime("%Y%m%d-%H%M%S")
         run_folder = la.make_run_folder(mach.runs(), f"{plan['name']}-{stamp}-{secrets.token_hex(2)}",
                                         mach.owner_roots)
+        write_collected(mach.store, run_folder.name, 0)
         fixtures = in_store(mach.store, "fixtures")
         lines = []
         for e in plan["entries"]:
@@ -546,6 +550,34 @@ def launch_plan(mach: Machine, m: Manifest, plan: dict, lock: RunLock, now: floa
             job.close()
         lock.release()
         raise
+
+
+def _collected_rel(name: str) -> str:
+    if not NAME.fullmatch(name):
+        raise Refused(f"run name {name!r}")
+    return f"collected/{name}.json"
+
+
+def write_collected(store: Path, name: str, sent: int) -> None:
+    """A run's collection record: how many of its bytes were sent (COLLECT_LIMIT at most)."""
+    in_store(store, "collected").mkdir(exist_ok=True)
+    write_in_store(store, _collected_rel(name), json.dumps({"sent": sent}).encode("utf-8"))
+
+
+def read_collected(store: Path, name: str) -> int:
+    """The bytes of a run already sent; a run with no record, or a record that does not read, is not
+    collected (fail closed)."""
+    p = in_store(store, _collected_rel(name))
+    try:
+        sent = json.loads(p.read_text(encoding="utf-8"))["sent"]
+    except FileNotFoundError:
+        raise Refused(f"run {name} has no collection record (an older agent's run, or its record is gone): "
+                      "it is not collected") from None
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise Refused(f"run {name}: its collection record does not read ({e})") from None
+    if not isinstance(sent, int) or isinstance(sent, bool) or sent < 0:
+        raise Refused(f"run {name}: its collection record is not a count")
+    return sent
 
 
 def end_run(run: Run, lock: RunLock, state: str) -> None:
@@ -953,15 +985,17 @@ class Agent:
         off = req.get("offset", 0)
         if not isinstance(off, int) or off < 0:
             raise Refused("offset")
-        sent = self.run.sent if self.run is not None and self.run.folder == folder else 0
+        # Counted by run, whichever run is current, and persisted before the bytes leave.
+        sent = read_collected(self.mach.store, folder.name)
         if sent >= COLLECT_LIMIT:
-            raise Refused("2 GiB of this run's files are sent already")
+            raise Refused(f"this run's collection limit ({COLLECT_LIMIT} bytes) is sent already")
         with open(in_store(self.mach.store, p.relative_to(self.mach.store).as_posix()), "rb") as f:
+            size = os.fstat(f.fileno()).st_size
             f.seek(off)
             data = f.read(min(CHUNK, COLLECT_LIMIT - sent))
-        if self.run is not None and self.run.folder == folder:
-            self.run.sent += len(data)
-        return {"offset": off, "data": base64.b64encode(data).decode("ascii"), "eof": len(data) < CHUNK}
+        if data:
+            write_collected(self.mach.store, folder.name, sent + len(data))
+        return {"offset": off, "data": base64.b64encode(data).decode("ascii"), "eof": off + len(data) >= size}
 
     def _listing(self, folder: Path, start: object) -> dict:
         """One page of the run folder's files from entry `start` on, in a fixed order: at most LIST_MAX
@@ -995,6 +1029,8 @@ class Agent:
             if not la.within(p, runs) or la.is_reparse_point(p):
                 raise Refused(f"refusing to delete {p}: not a plain run folder of the store")
             remove_in_store(self.mach.store, f"runs/{p.name}")
+            if NAME.fullmatch(p.name):
+                remove_in_store(self.mach.store, _collected_rel(p.name))
             removed.append(p.name)
         if req.get("fixtures"):
             if self._running():
