@@ -87,7 +87,7 @@ class ScriptLink final : public PeerLink {
 const auto& kTable = test::kTestTableFull;
 
 RecordKey CounterKey() {
-  return RecordKey{test::kCounter, Authored(0, 1, HashName("e1"), HashName("test")), 0};
+  return RecordKey{test::kCounter, SessionObject(1), 0};  // a session kind: a session object
 }
 
 Record Counter(uint32_t revision, uint64_t lsn) {
