@@ -22,6 +22,7 @@ constexpr std::string_view kV10 = "V10 models";
 constexpr std::string_view kV11 = "V11 noisy";
 constexpr std::string_view kV12 = "V12 grace";
 constexpr std::string_view kV13 = "V13 replicated deps";
+constexpr std::string_view kV14 = "V14 urgent";
 
 std::string Named(const KindSpec& spec) {
   return spec.name.empty() ? "kind " + std::to_string(spec.id) : std::string(spec.name);
@@ -177,6 +178,9 @@ std::vector<ValidationIssue> Validate(std::span<const KindSpec> table, const Lim
         }
       }
     }
+
+    // V14 urgent: only a replicated kind's deltas ride the state lane's batch.
+    if (spec.urgent && !Replicated(spec)) issues.Add(spec, kV14, "urgent on a kind that is not replicated");
   }
 
   // V4 cycles: a kind that reaches itself through other kinds (self edges and unknown ids are
@@ -236,7 +240,8 @@ uint64_t TableDigest(std::span<const KindSpec> table) {
     w.U8(s->models);
     w.U8(uint8_t((s->leasable ? 1 : 0) | (s->noisy ? 2 : 0) | (s->unsupported ? 4 : 0) |
                  (s->parent_missing_retryable ? 8 : 0) | (s->requires_precondition ? 16 : 0) |
-                 (s->equal != nullptr ? 32 : 0) | (s->reason_name != nullptr ? 64 : 0)));
+                 (s->equal != nullptr ? 32 : 0) | (s->reason_name != nullptr ? 64 : 0) |
+                 (s->urgent ? 128 : 0)));
     w.U16(s->max_value_bytes);
     w.U32(s->pending_grace_ms);
     w.U32(s->parent_wait_ms);

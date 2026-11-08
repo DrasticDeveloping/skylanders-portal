@@ -1,7 +1,8 @@
 // The lanes (design section 3.7; work item 3): the message codec, the batcher's FIFO with its hold
 // on kFull and the backlog cap in frames, the pacer, and the two PeerLinks of fake_network.h. These
 // have no ids in the design's test list (section 10 names the cases that run over them: LM1 to
-// LM3, LM8, PP6, ...); they carry this file's own ids, LN1 to LN10.
+// LM3, LM8, PP6, ...); they carry this file's own ids, LN1 to LN10, and the urgent flush's S2U1 and
+// S2U2 (the stage 2 follow-up item, stage 5's request).
 
 #include <array>
 #include <chrono>
@@ -482,6 +483,83 @@ BACKEND_TEST("LN10", NetplayLinkOrderedThroughLoss) {
   }
   CHECK(s.UnackedFrames(netplay::Lane::kState) == 0);
   CHECK(s.Rtt() > 0us);
+}
+
+BACKEND_TEST("S2U1", PeerQueueUrgentFrame) {
+  // A plain delta waits in the state lane's partly filled frame for the batch interval; an urgent
+  // one appended to that frame sends it at the next Flush, the plain delta and a Through appended
+  // after it with it. The next frame is plain again. A held lane holds an urgent frame as any.
+  Limits limits;
+  PeerQueue q(limits);
+  ScriptLink link;
+  TimePoint now = kStart;
+  CHECK(q.Push(msg::Delta{Row(test::kToggle, 1, 1, Val(1)), 1}, now));
+  CHECK(q.Flush(link, now).frames_sent == 0);
+  CHECK(q.Push(msg::Delta{Row(test::kProp, 2, 1, Val(2)), 2}, now + 10ms, /*urgent=*/true));
+  CHECK(q.Push(msg::Through{2}, now + 10ms));
+  auto r = q.Flush(link, now + 10ms);
+  CHECK(r.frames_sent == 1);
+  CHECK(q.Frames(netplay::Lane::kState) == 0);
+  const std::vector<Message> got = Sent(link, netplay::Lane::kState);
+  REQUIRE_OR_RETURN_VOID(got.size() == 3);
+  CHECK(std::get<msg::Delta>(got[0]).record.key.kind == test::kToggle);
+  CHECK(std::get<msg::Delta>(got[1]).record.key.kind == test::kProp);
+  CHECK(std::holds_alternative<msg::Through>(got[2]));
+  CHECK(q.Push(msg::Through{3}, now + 20ms));
+  CHECK(q.Flush(link, now + 20ms).frames_sent == 0);
+  CHECK(q.Flush(link, now + 20ms + limits.batch_interval).frames_sent == 1);
+  // Held: the urgent frame stays at the head and goes when the link takes it.
+  bool full = true;
+  link.answer = [&](netplay::Lane, std::span<const uint8_t>) {
+    return full ? LinkSend::kFull : LinkSend::kSent;
+  };
+  CHECK(q.Push(msg::Delta{Row(test::kProp, 3, 1, Val(3)), 3}, now + 1s, true));
+  r = q.Flush(link, now + 1s);
+  CHECK(r.frames_sent == 0 && r.held && q.Frames(netplay::Lane::kState) == 1);
+  full = false;
+  r = q.Flush(link, now + 1s + 10ms);
+  CHECK(r.frames_sent == 1 && q.Frames(netplay::Lane::kState) == 0);
+}
+
+BACKEND_TEST("S2U2", ServerUrgentKindFlushesAtThePump) {
+  // On the facades, with test.prop urgent: S writes a prop row between two pumps, and the next
+  // pump sends it with its Through, so the client holds it, its prefix past it, after that one
+  // step. A toggle (not urgent) written next waits in its frame for the batch interval: one step
+  // later the client does not hold it yet; a batch interval later it does.
+  std::array<KindSpec, test::lanes::kLanesTable.size()> table = test::lanes::kLanesTable;
+  for (KindSpec& spec : table) {
+    if (spec.id == test::kProp) spec.urgent = true;
+  }
+  test::lanes::Authorities authorities;
+  test::lanes::TestWorld world(table);  // outlives the session, whose client holds its adapters
+  FakeSession session(table, authorities.set);
+  session.before_client_pump = [&](uint16_t, TimePoint now) { world.Tick(now, session.Generation()); };
+  session.Join(1, world.Adapters(), PeerRole::kOwner);
+  session.LevelReady(1);
+  CHECK(session.RunUntil(
+      [&] {
+        return (session.S().Stats(1).subscription.scopes & kScopeLevel) != 0 &&
+               session.S().Stats(1).baseline == 0 &&
+               (session.C(1).State().Subscribed() & kScopeLevel) != 0;
+      },
+      5s));
+  session.Run(1s);  // quiet: the state lane empty
+  const RecordKey prop = Key(test::kProp, Ent(session.Generation(), 1));
+  CHECK(session.S().State().Put(prop, Val(5), session.Now()) == PutResult::kWritten);
+  const uint64_t prop_lsn = session.S().State().Get(prop)->lsn;
+  session.Step();
+  const Record* got = session.C(1).State().Get(prop);
+  CHECK(got && got->value == Val(5));
+  CHECK(session.C(1).State().Prefix() >= prop_lsn);
+  CHECK(session.S().Stats(1).state_frames_queued == 0);
+  // The urgent flush left the lane empty, so the toggle opens a new, plain frame.
+  const RecordKey toggle = Key(test::kToggle, Ent(session.Generation(), 2));
+  CHECK(session.S().State().Put(toggle, Val(6), session.Now()) == PutResult::kWritten);
+  session.Step();
+  CHECK(session.C(1).State().Get(toggle) == nullptr);
+  CHECK(session.S().Stats(1).state_frames_queued == 1);
+  session.Run(session.Lim().batch_interval + 20ms);
+  CHECK(session.C(1).State().Get(toggle) != nullptr);
 }
 
 }  // namespace skylanders::backend

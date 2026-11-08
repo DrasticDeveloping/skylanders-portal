@@ -1,5 +1,5 @@
 // The validator tests (design section 10, VA1 to VA15 with VA12b and VA13b): one crafted table per
-// rule V1 to V13, each hitting exactly its rule; the test table; the table digest; Replicated and
+// rule V1 to V14, each hitting exactly its rule; the test table; the table digest; Replicated and
 // Fenced, and the parts that use them.
 
 #include <algorithm>
@@ -342,6 +342,7 @@ BACKEND_TEST("VA14", TableDigestStable) {
       [](KindSpec& s) { s.parent_wait_ms = 2000; },
       [](KindSpec& s) { s.parent_missing_retryable = true; },
       [](KindSpec& s) { s.requires_precondition = true; },
+      [](KindSpec& s) { s.urgent = true; },  // stage 5's urgent flush (the flag byte's last bit)
   };
   std::set<uint64_t> seen{digest};
   for (size_t i = 0; i < changes.size(); ++i) {
@@ -425,4 +426,29 @@ BACKEND_TEST("VA15", ReplicatedPredicate) {
   a.row_lines = {shared, server_only};
   b.row_lines = {shared};
   CHECK(DiffMaps(a, b).empty());
+}
+
+BACKEND_TEST("S2U3", ValidatorUrgent) {
+  // V14: `urgent` only on a replicated kind. An effect (fast lane, flushed at every pump) and a
+  // server-only kind (never sent) are refused; a replicated state-lane kind passes.
+  KindSpec shown = Spec(1, "attack");
+  shown.urgent = true;
+  CHECK(Passes(std::array{shown}));
+  KindSpec hidden = Spec(2, "hidden");
+  hidden.write = WriteMode::kServerOnly;
+  hidden.urgent = true;
+  CHECK(OnlyRule(std::array{hidden}, "V14 urgent"));
+  KindSpec spark = Spec(3, "spark");
+  spark.tier = Tier::kEffect;
+  spark.lane = LaneUse::kFast;
+  spark.urgent = true;
+  CHECK(OnlyRule(std::array{spark}, "V14 urgent"));
+  // A table without the flag keeps the digest it had before the field: the flag takes a bit of
+  // its own, and only when set.
+  std::vector<KindSpec> table(test::kTestTable.begin(), test::kTestTable.end());
+  const uint64_t before = TableDigest(table);
+  table[test::kProp - 1].urgent = true;
+  CHECK(TableDigest(table) != before);
+  table[test::kProp - 1].urgent = false;
+  CHECK(TableDigest(table) == before);
 }

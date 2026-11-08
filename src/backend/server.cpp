@@ -146,7 +146,7 @@ struct Server::Impl {
   // ObligationAcks in `acks_due`, and no manifest is made (the next one carries the newest head).
   bool Backlogged(const Peer& p) const { return p.queue.Room(*p.link) == 0; }
 
-  void Push(Peer& p, const Message& m) { p.queue.Push(m, now); }
+  void Push(Peer& p, const Message& m, bool urgent = false) { p.queue.Push(m, now, urgent); }
 
   // ------------------------------------------------------------------------------------------
   // The gameplay lane to a peer (R2): bounded like the state lane, by the producer.
@@ -506,6 +506,9 @@ struct Server::Impl {
     // stops before it), so the proof covers exactly what went into the FIFO. (Pushing first and
     // answering false would leave the pushed item unproven: sent again at the next pump, and with
     // room for one frame only, never proven at all, a livelock.)
+    // A delta of an urgent kind (KindSpec::urgent, stage 5's request) flushes the lane at this
+    // pump: its frame is marked, and so is the Through behind the walk.
+    bool urgent = false;
     if (p.cursor + 1 >= state.Floor() && !Backlogged(p)) {
       uint64_t proven = p.cursor;
       state.Walk(
@@ -515,7 +518,10 @@ struct Server::Impl {
             if (item.type == EntryType::kEpoch) {
               Push(p, msg::EpochBegin{item.generation, item.lsn});
             } else if (item.record) {
-              Push(p, msg::Delta{*item.record, item.first_lsn});
+              const KindSpec* spec = FindKind(table, item.record->key.kind);
+              const bool now_urgent = spec != nullptr && spec->urgent;
+              Push(p, msg::Delta{*item.record, item.first_lsn}, now_urgent);
+              urgent = urgent || now_urgent;
             }
             return true;
           },
@@ -523,7 +529,7 @@ struct Server::Impl {
       p.cursor = std::max(p.cursor, proven);
     }
     if (p.cursor > p.last_through) {
-      Push(p, msg::Through{p.cursor});
+      Push(p, msg::Through{p.cursor}, urgent);
       p.last_through = p.cursor;
     }
     // 4. A manifest, at the head only, when no baseline runs, and only while the state lane has
