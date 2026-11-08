@@ -75,4 +75,81 @@ std::optional<netplay::Endpoint> DecodeJoinCode(std::string_view code) {
   return e;
 }
 
+const char* JoinCodeStatusText(JoinCodeStatus status) {
+  switch (status) {
+    case JoinCodeStatus::kOk: return "";
+    case JoinCodeStatus::kNotAJoinCode: return "not a join code";
+    case JoinCodeStatus::kOlderVersion: return "this code is from an older version";
+    case JoinCodeStatus::kNewerVersion: return "this code is from a newer version";
+  }
+  return "not a join code";
+}
+
+namespace {
+
+constexpr size_t kV2DataSymbols = kJoinCodeV2Length - 1;  // 17 symbols, 85 bits
+
+// The 85 bits as two parts: high = kind (2) | revision (3) | address (32), 37 bits; low = port
+// (16) | secret (32), 48 bits. Symbol i holds bits 84-5i .. 80-5i of the whole.
+uint32_t V2Symbol(uint64_t high, uint64_t low, size_t i) {
+  uint32_t out = 0;
+  for (int b = 0; b < 5; ++b) {
+    const int bit = 84 - int(5 * i) - b;  // most significant first
+    const uint64_t v = bit >= 48 ? (high >> (bit - 48)) & 1 : (low >> bit) & 1;
+    out = (out << 1) | uint32_t(v);
+  }
+  return out;
+}
+
+}  // namespace
+
+std::string EncodeJoinCodeV2(const JoinTarget& target) {
+  if (target.server.address == 0 || target.server.port == 0 || target.secret == 0) return {};
+  const uint64_t high = (uint64_t(kJoinCodeV2Kind) << 35) | (uint64_t(kJoinCodeV2Revision) << 32) |
+                        target.server.address;
+  const uint64_t low = (uint64_t(target.server.port) << 32) | target.secret;
+  std::array<uint32_t, kJoinCodeV2Length> v{};
+  for (size_t i = 0; i < kV2DataSymbols; ++i) v[i] = V2Symbol(high, low, i);
+  v[kV2DataSymbols] = (kBase - LuhnSum(v.data(), kV2DataSymbols, false)) % kBase;
+  std::string code;
+  for (uint32_t x : v) code.push_back(kSymbols[x]);
+  return code;
+}
+
+JoinCodeResult DecodeJoinCodeV2(std::string_view code) {
+  JoinCodeResult result;
+  std::array<uint32_t, kJoinCodeV2Length> v{};
+  size_t n = 0;
+  for (char c : code) {
+    if (c == '-' || c == ' ') continue;
+    const int x = SymbolValue(c);
+    if (x < 0 || n == kJoinCodeV2Length) return result;
+    v[n++] = uint32_t(x);
+  }
+  if (n == kJoinCodeLength) {
+    // A 1A code: valid as one (right check, kind 0, nonzero fields) means "older version".
+    if (DecodeJoinCode(code)) result.status = JoinCodeStatus::kOlderVersion;
+    return result;
+  }
+  if (n != kJoinCodeV2Length || LuhnSum(v.data(), n, true) != 0) return result;
+  uint64_t high = 0, low = 0;  // 37 and 48 bits
+  for (size_t i = 0; i < kV2DataSymbols; ++i) {
+    for (int b = 4; b >= 0; --b) {
+      high = (high << 1) | (low >> 47);
+      low = ((low << 1) | ((v[i] >> b) & 1)) & ((uint64_t(1) << 48) - 1);
+    }
+  }
+  const uint32_t kind = uint32_t(high >> 35) & 3;
+  const uint32_t revision = uint32_t(high >> 32) & 7;
+  if (kind != kJoinCodeV2Kind || revision != kJoinCodeV2Revision) {
+    result.status = JoinCodeStatus::kNewerVersion;  // another kind, or a revision of kind 1 we lack
+    return result;
+  }
+  JoinTarget t{{uint32_t(high), uint16_t(low >> 32)}, uint32_t(low)};
+  if (t.server.address == 0 || t.server.port == 0 || t.secret == 0) return result;
+  result.status = JoinCodeStatus::kOk;
+  result.target = t;
+  return result;
+}
+
 }  // namespace skylanders::online
