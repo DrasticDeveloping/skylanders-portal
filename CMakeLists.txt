@@ -45,6 +45,7 @@ endif()
 add_library(skylanders_online STATIC
     src/netplay/datagram.cpp
     src/netplay/lanes.cpp
+    src/netplay/port_mapping.cpp
     src/netplay/udp_socket.cpp
     src/online/join_code.cpp
     src/online/protocol.cpp
@@ -138,7 +139,8 @@ if(SKYLANDERS_PORTAL_TESTS)
         add_test(NAME skylanders_${t} COMMAND skylanders_${t})
     endforeach()
     # The online session (skylanders_online), on the fake network and on loopback UDP.
-    foreach(t netplay_datagram_test netplay_lanes_test netplay_udp_socket_test online_protocol_test
+    foreach(t netplay_datagram_test netplay_lanes_test netplay_port_mapping_test netplay_udp_socket_test
+              online_protocol_test
               online_join_code_test online_tick_test online_session_test online_requests_test)
         add_executable(skylanders_${t} tests/${t}.cpp)
         target_include_directories(skylanders_${t} PRIVATE tests)
