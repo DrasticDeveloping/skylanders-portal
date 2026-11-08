@@ -120,9 +120,33 @@ bool PortMapper::OwnedAfterAdd(uint16_t external_port) {
   return IsOurs(got, external_port);
 }
 
+namespace {
+
+MappingResult StoppedResult() {
+  MappingResult r;
+  r.outcome = MappingOutcome::kStopped;
+  r.message = MappingMessage(r);
+  return r;
+}
+
+}  // namespace
+
+MappingResult PortMapper::StoppedAfterAdd(uint16_t external_port) {
+  // Owned only until Remove's re-read says otherwise: Remove deletes the entry only if it still
+  // carries this session's tuple and nonce, and leaves it not owned either way.
+  owned_ = true;
+  owned_port_ = external_port;
+  Remove();
+  return StoppedResult();
+}
+
 MappingResult PortMapper::Mapped(uint16_t external_port) {
   owned_ = true;
   owned_port_ = external_port;
+  if (Stopping()) {  // before the address read: the owned entry goes now (re-read, delete)
+    Remove();
+    return StoppedResult();
+  }
   MappingResult r;
   r.outcome = MappingOutcome::kMapped;
   r.external_port = external_port;
@@ -141,10 +165,13 @@ MappingResult PortMapper::Map() {
   }
   int last_error = kUpnpOk;
   bool taken = false;
+  // The stop is read before every call below; once it is asked no further candidate is tried, and
+  // after a successful add the entry goes through Remove (StoppedAfterAdd, Mapped).
   if (igd_->Version() >= 2) {
     // IGD v2: only AddAnyPortMapping, which never changes an existing entry.
     uint32_t preferred = port_;
     for (int attempt = 0; attempt < kIgdV2Attempts && preferred <= 0xFFFF; ++attempt) {
+      if (Stopping()) return StoppedResult();
       uint16_t reserved = 0;
       const int rc = igd_->AddAnyPortMapping(Wanted(uint16_t(preferred)), &reserved);
       if (rc != kUpnpOk || reserved == 0) {
@@ -152,6 +179,7 @@ MappingResult PortMapper::Map() {
         taken = taken || IsConflict(last_error);
         break;  // the router refuses this request; asking again the same way changes nothing
       }
+      if (Stopping()) return StoppedAfterAdd(reserved);
       if (OwnedAfterAdd(reserved)) return Mapped(reserved);
       taken = true;  // the re-read shows another entry: a conflict, never renewed or deleted
       preferred = uint32_t(reserved) + 1;
@@ -160,6 +188,7 @@ MappingResult PortMapper::Map() {
     for (int k = 0; k < kIgdV1Candidates; ++k) {
       const uint32_t p = uint32_t(port_) + uint32_t(k);
       if (p > 0xFFFF) break;
+      if (Stopping()) return StoppedResult();
       PortMappingEntry existing;
       const int read = igd_->GetSpecificPortMappingEntry(uint16_t(p), "UDP", &existing);
       if (read == kUpnpOk) {
@@ -170,6 +199,7 @@ MappingResult PortMapper::Map() {
         last_error = read;  // the port cannot be shown free: not touched
         continue;
       }
+      if (Stopping()) return StoppedResult();
       const int rc = igd_->AddPortMapping(Wanted(uint16_t(p)));
       if (rc != kUpnpOk) {
         // No delete, no overwrite, no second add on this external port.
@@ -177,6 +207,7 @@ MappingResult PortMapper::Map() {
         taken = taken || IsConflict(rc);
         continue;
       }
+      if (Stopping()) return StoppedAfterAdd(uint16_t(p));
       if (OwnedAfterAdd(uint16_t(p))) return Mapped(uint16_t(p));
       taken = true;
     }
@@ -191,10 +222,14 @@ MappingResult PortMapper::Map() {
 
 bool PortMapper::Renew() {
   if (!owned_ || igd_ == nullptr) return false;
+  // A stop before any of the calls below ends the renewal with the entry still owned: the stop's
+  // Remove re-reads it and deletes it only if it is still ours.
+  if (Stopping()) return true;
   if (!OwnedAfterAdd(owned_port_)) {
     owned_ = false;  // gone or replaced: never touched again
     return false;
   }
+  if (Stopping()) return true;
   if (igd_->Version() >= 2) {
     uint16_t reserved = 0;
     if (igd_->AddAnyPortMapping(Wanted(owned_port_), &reserved) != kUpnpOk || reserved == 0) {
@@ -203,7 +238,8 @@ bool PortMapper::Renew() {
     }
     if (reserved != owned_port_) {
       // The router moved us: the new entry is ours only if the re-read says so, and then it goes
-      // (a code carries the old port); the old entry ends with its lease.
+      // (a code carries the old port); the old entry ends with its lease. This is cleanup of an
+      // entry this session added, so it runs even once the stop is asked.
       if (OwnedAfterAdd(reserved)) igd_->DeletePortMapping(reserved, "UDP");
       owned_ = false;
       return false;
@@ -212,6 +248,7 @@ bool PortMapper::Renew() {
     owned_ = false;
     return false;
   }
+  if (Stopping()) return true;  // the stop's Remove does the re-read
   if (!OwnedAfterAdd(owned_port_)) {
     owned_ = false;
     return false;
@@ -265,6 +302,8 @@ std::string MappingMessage(const MappingResult& r) {
              "forward the port by hand";
     case MappingOutcome::kNoUpnp:
       return "no router answered UPnP";
+    case MappingOutcome::kStopped:
+      return "stopped before the port was mapped (the server is ending)";
   }
   return {};
 }

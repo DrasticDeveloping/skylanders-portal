@@ -1,6 +1,7 @@
 // The port mapping rules (stage 8 item 4, design D8) on recorded router answers: a fake IGD that
 // keeps a mapping table and a log of every call, so each test can say what was and was not sent.
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -28,14 +29,14 @@ class FakeIgd : public IgdClient {
   explicit FakeIgd(int version) : version_(version) {}
   int Version() const override { return version_; }
   int GetSpecificPortMappingEntry(uint16_t port, const std::string&, PortMappingEntry* out) override {
-    calls.push_back({"get", port});
+    Log("get", port);
     auto it = table.find(port);
     if (it == table.end()) return kUpnpNoSuchEntry;
     *out = it->second;
     return kUpnpOk;
   }
   int AddPortMapping(const PortMappingEntry& e) override {
-    calls.push_back({"add", e.external_port});
+    Log("add", e.external_port);
     if (auto it = add_errors.find(e.external_port); it != add_errors.end()) return it->second;
     auto it = table.find(e.external_port);
     if (it != table.end() && it->second.internal_client != e.internal_client) return kUpnpConflictInMappingEntry;
@@ -44,7 +45,7 @@ class FakeIgd : public IgdClient {
     return kUpnpOk;
   }
   int AddAnyPortMapping(const PortMappingEntry& e, uint16_t* reserved) override {
-    calls.push_back({"addany", e.external_port});
+    Log("addany", e.external_port);
     if (addany_error) return addany_error;
     uint16_t p = e.external_port;
     while (table.count(p) && !(table[p].internal_client == e.internal_client &&
@@ -59,12 +60,20 @@ class FakeIgd : public IgdClient {
     return kUpnpOk;
   }
   int DeletePortMapping(uint16_t port, const std::string&) override {
-    calls.push_back({"delete", port});
+    Log("delete", port);
     return table.erase(port) ? kUpnpOk : kUpnpNoSuchEntry;
   }
   int GetExternalIPAddress(uint32_t* a) override {
+    Log("extip", 0);
     *a = external;
     return kUpnpOk;
+  }
+
+  // Every call is logged; the call numbered `stop_at_call` (1-based) sets `*stop` while it runs,
+  // as the server's exit would from another thread.
+  void Log(const std::string& op, uint16_t port) {
+    calls.push_back({op, port});
+    if (stop != nullptr && calls.size() == stop_at_call) stop->store(true);
   }
 
   int Count(const std::string& op, int port = -1) const {
@@ -81,7 +90,15 @@ class FakeIgd : public IgdClient {
   int addany_error = 0;
   uint16_t force_port = 0;
   uint32_t external = kIp(203, 0, 113, 7);
+  std::atomic<bool>* stop = nullptr;
+  size_t stop_at_call = 0;
 };
+
+std::vector<std::string> Ops(const FakeIgd& igd) {
+  std::vector<std::string> out;
+  for (const Call& c : igd.calls) out.push_back(c.op + " " + std::to_string(c.port));
+  return out;
+}
 
 PortMappingEntry Foreign(uint16_t port, const std::string& client, const std::string& desc) {
   PortMappingEntry e;
@@ -369,6 +386,122 @@ int main() {
     CHECK(r.message == "no router answered UPnP");
     CHECK(lease.Tick(TimePoint{} + std::chrono::hours(1)).empty());
     CHECK(!lease.Stop());
+  }
+
+  // The stop (the server's exit, Sol 8B F3): read before every IGD call of Map and Renew. Once it
+  // is asked no further read, add or candidate is tried; an entry a successful add left goes
+  // through Remove's re-read and delete, and only if it is still ours.
+  {
+    // Asked while the add runs: no further call but the removal (re-read, delete); nothing left.
+    FakeIgd igd(1);
+    std::atomic<bool> stop{false};
+    igd.stop = &stop;
+    igd.stop_at_call = 2;
+    PortMapper m(&igd, me, 52000, "s1");
+    m.SetStop(&stop);
+    const MappingResult r = m.Map();
+    CHECK(r.outcome == MappingOutcome::kStopped && !m.owned());
+    CHECK(r.message == "stopped before the port was mapped (the server is ending)");
+    CHECK((Ops(igd) == std::vector<std::string>{"get 52000", "add 52000", "get 52000", "delete 52000"}));
+    CHECK(igd.table.empty());
+    CHECK(!m.Remove() && igd.Count("delete") == 1);  // nothing owned any more
+  }
+  {
+    // Asked during the ownership re-read: owned by then, so it goes (re-read, delete) instead of
+    // the external-address read.
+    FakeIgd igd(1);
+    std::atomic<bool> stop{false};
+    igd.stop = &stop;
+    igd.stop_at_call = 3;
+    PortMapper m(&igd, me, 52000, "s2");
+    m.SetStop(&stop);
+    CHECK(m.Map().outcome == MappingOutcome::kStopped && !m.owned());
+    CHECK((Ops(igd) ==
+           std::vector<std::string>{"get 52000", "add 52000", "get 52000", "get 52000", "delete 52000"}));
+    CHECK(igd.table.empty() && igd.Count("extip") == 0);
+  }
+  {
+    // The re-read after the stop shows another program's entry: left alone, never deleted.
+    FakeIgd igd(1);
+    std::atomic<bool> stop{false};
+    igd.stop = &stop;
+    igd.stop_at_call = 2;
+    igd.race[52000] = Foreign(52000, me, "Swap Force Online someone-else");
+    igd.race[52000].internal_port = 52000;
+    PortMapper m(&igd, me, 52000, "s3");
+    m.SetStop(&stop);
+    CHECK(m.Map().outcome == MappingOutcome::kStopped && !m.owned());
+    CHECK((Ops(igd) == std::vector<std::string>{"get 52000", "add 52000", "get 52000"}));
+    CHECK(igd.table[52000].description == "Swap Force Online someone-else");
+  }
+  {
+    // In the candidate loop: the add on 52000 fails while the stop is asked; 52001 is never tried.
+    FakeIgd igd(1);
+    std::atomic<bool> stop{false};
+    igd.stop = &stop;
+    igd.stop_at_call = 2;
+    igd.add_errors[52000] = kUpnpConflictInMappingEntry;
+    PortMapper m(&igd, me, 52000, "s4");
+    m.SetStop(&stop);
+    CHECK(m.Map().outcome == MappingOutcome::kStopped && !m.owned());
+    CHECK((Ops(igd) == std::vector<std::string>{"get 52000", "add 52000"}));
+    // Asked during a pre-read that shows another device's entry: no add, no next candidate.
+    FakeIgd pre(1);
+    std::atomic<bool> stop_pre{false};
+    pre.stop = &stop_pre;
+    pre.stop_at_call = 1;
+    pre.table[52000] = Foreign(52000, "192.168.1.30", "Some Game");
+    PortMapper p(&pre, me, 52000, "s4b");
+    p.SetStop(&stop_pre);
+    CHECK(p.Map().outcome == MappingOutcome::kStopped);
+    CHECK((Ops(pre) == std::vector<std::string>{"get 52000"}));
+    CHECK(pre.table[52000].description == "Some Game");
+    // Asked before Map: nothing sent at all.
+    FakeIgd early(1);
+    std::atomic<bool> stopped{true};
+    PortMapper e(&early, me, 52000, "s4c");
+    e.SetStop(&stopped);
+    CHECK(e.Map().outcome == MappingOutcome::kStopped && early.calls.empty());
+  }
+  {
+    // IGD v2: asked while AddAnyPortMapping runs: the reserved entry is re-read and deleted.
+    FakeIgd igd(2);
+    std::atomic<bool> stop{false};
+    igd.stop = &stop;
+    igd.stop_at_call = 1;
+    PortMapper m(&igd, me, 52000, "s5");
+    m.SetStop(&stop);
+    CHECK(m.Map().outcome == MappingOutcome::kStopped && !m.owned());
+    CHECK((Ops(igd) == std::vector<std::string>{"addany 52000", "get 52000", "delete 52000"}));
+    CHECK(igd.table.empty());
+    // A v2 re-read showing another nonce while the stop is asked: no second AddAnyPortMapping.
+    FakeIgd race(2);
+    std::atomic<bool> stop_race{false};
+    race.stop = &stop_race;
+    race.stop_at_call = 2;
+    race.race[52000] = Foreign(52000, me, "Swap Force Online other");
+    PortMapper q(&race, me, 52000, "s5b");
+    q.SetStop(&stop_race);
+    CHECK(q.Map().outcome == MappingOutcome::kStopped);
+    CHECK((Ops(race) == std::vector<std::string>{"addany 52000", "get 52000"}));
+    CHECK(race.Count("delete") == 0 && race.table[52000].description == "Swap Force Online other");
+  }
+  {
+    // A renewal the stop interrupts: no renewal add, no dropped line, still owned; Stop takes it.
+    const TimePoint t0{};
+    FakeIgd igd(1);
+    std::atomic<bool> stop{false};
+    MappingLease lease(&igd, me, 48800, "s6");
+    lease.SetStop(&stop);
+    CHECK(lease.Start(t0).outcome == MappingOutcome::kMapped);
+    const int adds = igd.Count("add");
+    igd.stop = &stop;
+    igd.stop_at_call = igd.calls.size() + 1;  // during the renewal's re-read
+    CHECK(lease.Tick(t0 + std::chrono::seconds(1800)).empty() && lease.owned());
+    CHECK(igd.Count("add") == adds);
+    const size_t before = igd.calls.size();
+    CHECK(lease.Stop() && igd.table.empty());
+    CHECK(igd.calls.size() == before + 2 && igd.Count("delete", 48800) == 1);
   }
 
   return Finish("netplay_port_mapping");

@@ -21,12 +21,17 @@
 //   and nonce. A crash leaves it to its lease.
 // - NAT-PMP cannot prove a mapping is this session's, so no NAT-PMP mapping request (opcodes 1, 2) is
 //   ever sent: only the 2-byte external-address request (opcode 0) and its 12-byte answer.
+// - A stop (the server's exit, from another thread; SetStop) is read before every IGD call Map and
+//   Renew make: once it is asked, no further read, add or candidate is tried. What a successful add
+//   may have left still goes the way Remove takes an owned entry (re-read, delete only if it still
+//   carries this session's tuple and nonce), whether Map or Renew was under way (Sol 8B F3).
 //
 // The IGD calls go through IgdClient. TODO(stage 8 item 4, OQ-C5): the miniupnpc-backed IgdClient
 // (miniupnpc as a nested submodule of the portal, the council's choice) and Host's three modes; until
 // then nothing in the game creates a PortMapper.
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -117,6 +122,7 @@ enum class MappingOutcome {
   kTakenByAnotherDevice, // "the port is taken on the router by another device"
   kNatPmpOnly,           // "your router offers only NAT-PMP, which this version does not use ..."
   kNoUpnp,               // "no router answered UPnP"
+  kStopped,              // the stop came first: nothing owned, nothing this session added left
 };
 
 struct MappingResult {
@@ -135,12 +141,20 @@ class PortMapper {
   PortMapper(IgdClient* igd, std::string internal_client, uint16_t port, std::string nonce,
              bool natpmp_answered = false);
 
+  // The stop flag another thread sets when the server ends (null: never stopped). Read before each
+  // IGD call of Map and Renew; it must outlive this mapper. Set it before Map.
+  void SetStop(const std::atomic<bool>* stop) { stop_ = stop; }
+
+  // kStopped when the stop came before the mapping was done: no further candidate is tried, and an
+  // entry already added has gone through Remove's re-read and delete (owned() is false then).
   MappingResult Map();
   // Renewal at half the lease: re-reads the owned entry and renews it only if it still carries the
   // owned tuple and nonce. False (and not owned any more) otherwise: "the router dropped the port
-  // mapping: new players may not reach you".
+  // mapping: new players may not reach you". A stop ends it before its next call with the entry
+  // still owned (true), so Remove's re-read and delete take it.
   bool Renew();
-  // At End session and normal exit: deletes the entry only if a re-read still shows it is ours.
+  // At End session and normal exit: deletes the entry only if a re-read still shows it is ours. Runs
+  // whether or not the stop is asked (it is the stop's cleanup).
   bool Remove();
 
   bool owned() const { return owned_; }
@@ -154,12 +168,17 @@ class PortMapper {
  private:
   bool OwnedAfterAdd(uint16_t external_port);
   MappingResult Mapped(uint16_t external_port);
+  bool Stopping() const { return stop_ != nullptr && stop_->load(); }
+  // The stop after a successful add on `external_port`: the entry goes through Remove (re-read,
+  // delete only if ours), then kStopped.
+  MappingResult StoppedAfterAdd(uint16_t external_port);
 
   IgdClient* igd_;
   std::string internal_client_;
   uint16_t port_;
   std::string description_;
   bool natpmp_answered_;
+  const std::atomic<bool>* stop_ = nullptr;
   bool owned_ = false;
   uint16_t owned_port_ = 0;
 };
@@ -174,11 +193,13 @@ constexpr const char* kMappingDroppedMessage =
 // session and at the server's normal exit. A crash leaves it to its lease. Pure: the clock is
 // passed in, the IGD calls go through `igd` (which the caller owns and keeps alive), so the unit
 // test drives it on fake time with a fake IgdClient. Not thread-safe: one thread (the server's
-// mapping thread) calls all of it.
+// mapping thread) calls all of it; only the stop flag (SetStop) is set from another thread.
 class MappingLease {
  public:
   MappingLease(IgdClient* igd, std::string internal_client, uint16_t port, std::string nonce,
                bool natpmp_answered = false);
+  // PortMapper::SetStop: Start and Tick stop between IGD calls once it is set; Stop still runs.
+  void SetStop(const std::atomic<bool>* stop) { mapper_.SetStop(stop); }
   MappingResult Start(TimePoint now);
   // Renews when due; returns the line to show when the renewal failed (once), else empty.
   std::string Tick(TimePoint now);
