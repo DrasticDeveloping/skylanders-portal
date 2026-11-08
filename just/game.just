@@ -114,13 +114,15 @@ play-release *ARGS: build-release
 # purpose (see README.md), and the running game reads from rom/ continuously, not just at build
 # time, so your own disc dump (rom/default.xex, same version 1.0 USA/EU, plus the rest of the
 # extracted disc) has to exist on the target machine too -- bring it over separately and drop it in
-# next to the packaged executable there.
+# next to the packaged executable there. A build with a routes folder beside the exe (Swap Force
+# Online's online play files, which Host needs) gets that folder too.
 package-release: build-release
     dist=dist/{{ game }}-{{ triple }}-release && \
     rm -rf "$dist" && \
     mkdir -p "$dist" && \
     cp out/build/{{ triple }}-release/{{ exe }}{{ exe_suffix }} "$dist/" && \
-    for lib in out/build/{{ triple }}-release/*.dll out/build/{{ triple }}-release/*.so out/build/{{ triple }}-release/*.dylib {{ sdk_lib_dir }}/*.so {{ sdk_lib_dir }}/*.dylib; do [ -e "$lib" ] && cp "$lib" "$dist/"; done && \
+    if [ -d out/build/{{ triple }}-release/routes ]; then cp -R out/build/{{ triple }}-release/routes "$dist/"; fi && \
+    for lib in out/build/{{ triple }}-release/*.dll out/build/{{ triple }}-release/*.so out/build/{{ triple }}-release/*.dylib {{ sdk_lib_dir }}/*.so {{ sdk_lib_dir }}/*.dylib; do [ ! -e "$lib" ] || cp "$lib" "$dist/"; done && \
     cp {{ game }}.toml.example "$dist/{{ game }}.toml" && \
     echo "Packaged to $dist/" && \
     echo "Copy that folder to the other machine, then add your own rom/ next to {{ exe }}{{ exe_suffix }} there" && \
