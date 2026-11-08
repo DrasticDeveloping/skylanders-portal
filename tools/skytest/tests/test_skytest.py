@@ -1826,6 +1826,7 @@ class RemotePeerTest(unittest.TestCase):
             "kind": ('[peer.D]\nkind = "far"\n', "local or remote"),
             "repo": ('[peer.D]\nkind = "remote"\nargs = ["--online_route_file={repo}/tests/routes/r.toml"]\n',
                      "names this PC's checkout"),
+            "slots": ('[peer.D]\nkind = "remote"\nsave_slots = { "2" = 1 }\n', "remote: save_slots"),
         }
         for name, (extra, why) in bad.items():
             with self.subTest(name):

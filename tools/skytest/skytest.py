@@ -613,7 +613,8 @@ def peer_kind(spec_name: str, peer: str, own: dict, common: dict) -> str:
 
 def check_remote_peers(spec_name: str, peers: dict[str, "PeerSpec"], grades: dict, names: list[str]) -> None:
     """One remote peer per case at most (the agent runs one game per run plan); its settings cannot name
-    this PC's checkout ({repo}); its saves stay on the second PC, so no save_copy grade names it."""
+    this PC's checkout ({repo}); its saves stay on the second PC, so no save_copy grade names it and it
+    has no save_slots (prepare_peer fills only a local peer's copy)."""
     remote = [n for n, ps in peers.items() if ps.kind == "remote"]
     if len(remote) > 1:
         raise SpecError(f"{spec_name}: peers {', '.join(remote)} are remote: one remote peer per case (the agent"
@@ -623,6 +624,9 @@ def check_remote_peers(spec_name: str, peers: dict[str, "PeerSpec"], grades: dic
             raise SpecError(f"{spec_name}: peer {n} is remote: {{repo}} names this PC's checkout, not a file there")
         if "save_copy" in grades and n in save_copy_peers(grades["save_copy"], names):
             raise SpecError(f"{spec_name}: grade save_copy: peer {n} is remote (its saves stay on the second PC)")
+        if peers[n].save_slots:
+            raise SpecError(f"{spec_name}: peer {n} is remote: save_slots fills a copy of the saves on this PC"
+                            " (its saves stay on the second PC)")
 
 
 def peers_of(layout: str) -> list[str]:
