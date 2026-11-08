@@ -376,21 +376,51 @@ std::vector<std::filesystem::path> OwnerFigureDirs() {
   return {skylanders::DataFolder() / "Figures", skylanders::DefaultDataFolder() / "Figures"};
 }
 
-// Whether saving `file` is refused: only with a non-empty --user_data_root (a run without it plays
-// the owner's own data and saves the owner's figures as always), for a file inside one of the
-// owner's figure folders that is not this run's own (portal/data_folder.h OwnerFigureWriteRefused;
-// an explicit --user_data_root of the owner's real game folder keeps its figures).
-bool OwnerFiguresRefused(const std::filesystem::path& file) {
-  if (REXCVAR_GET(user_data_root).empty()) return false;
-  std::filesystem::path run;
-  std::vector<std::filesystem::path> owners;
+// What the guard compares with: the run's own figures folder and the owner's figure folders.
+void FiguresGuardFolders(std::filesystem::path& run, std::vector<std::filesystem::path>& owners) {
   {
     std::lock_guard<std::mutex> lock(g_figures_guard_mutex);
     run = g_run_figures_dir;
     owners = g_owner_figure_dirs;
   }
   if (owners.empty()) owners = OwnerFigureDirs();  // before InstallPortal noted them
-  return skylanders::OwnerFigureWriteRefused(file, owners, run);
+}
+
+// Whether writing (or playing) the figure file `file` is refused: only with a non-empty
+// --user_data_root (a run without it plays the owner's own data and saves the owner's figures as
+// always), for a file inside one of the owner's figure folders that is not this run's own, or in a
+// folder that holds one, such as Documents\Skylanders (portal/data_folder.h OwnerFigureFileRefused;
+// an explicit --user_data_root of the owner's real game folder keeps its figures). The game's saves
+// ask this first, and the portal menu's backup restore does (OwnerFigureFileProtected).
+bool OwnerFiguresRefused(const std::filesystem::path& file) {
+  if (REXCVAR_GET(user_data_root).empty()) return false;
+  std::filesystem::path run;
+  std::vector<std::filesystem::path> owners;
+  FiguresGuardFolders(run, owners);
+  return skylanders::OwnerFigureFileRefused(file, owners, run);
+}
+
+// The same for a folder figure files go into (portal_figures_dir, the folder of a new figure, a
+// figure's backups, the hybrid bridge's copies): refused when it is, lies in or holds an owner's
+// figure folder that is not this run's own (portal/data_folder.h OwnerFiguresDirRefused; Sol's N1:
+// an inherited portal_figures_dir of Documents\Skylanders let the menu restore over the owner's
+// figures).
+bool OwnerFolderRefused(const std::filesystem::path& folder) {
+  if (REXCVAR_GET(user_data_root).empty()) return false;
+  std::filesystem::path run;
+  std::vector<std::filesystem::path> owners;
+  FiguresGuardFolders(run, owners);
+  return skylanders::OwnerFiguresDirRefused(folder, owners, run);
+}
+
+// The guard in front of a figure file the portal writes into `folder` itself (`what`: "a new
+// figure", ...): false, with a warning, for a folder a test copy must not write into.
+bool FigureFolderWritable(const std::filesystem::path& folder, std::string_view what) {
+  if (!OwnerFolderRefused(folder)) return true;
+  REXLOG_WARN("Portal: not writing {} into {}: it is in, or holds, the owner's Figures folder and this run "
+              "has --user_data_root (a test copy)",
+              what, skylanders::Utf8Path(folder));
+  return false;
 }
 
 // The write callback's refusal, logged once per file (the game writes several blocks a second).
@@ -401,8 +431,9 @@ void LogFigureSaveRefused(int slot, const std::filesystem::path& file) {
     std::lock_guard<std::mutex> lock(mutex);
     if (!logged.insert(file).second) return;
   }
-  REXLOG_WARN("Portal: not saving slot {}'s figure file {}: it is in the owner's Figures folder and "
-              "this run has --user_data_root (a test copy); the game's changes to it stay in memory",
+  REXLOG_WARN("Portal: not saving slot {}'s figure file {}: it is in the owner's Figures folder, or in a "
+              "folder holding it, and this run has --user_data_root (a test copy); the game's changes to "
+              "it stay in memory",
               slot, skylanders::Utf8Path(file));
 }
 
@@ -424,6 +455,7 @@ void BackUpBeforeFirstSave(const std::filesystem::path& file) {
   // a scripted run's own copy in a test, so a test never writes into the owner's data folder.
   const std::filesystem::path dir =
       skylanders::portal::FigureBackupDir(file, Utf8ToPath(REXCVAR_GET(portal_figures_dir)));
+  if (!FigureFolderWritable(dir, "a figure backup")) return;  // the owner's figures guard
   const std::filesystem::path copy = skylanders::portal::BackUpFigureFile(file, dir);
   if (copy.empty()) {
     REXLOG_WARN("Portal: could not back up a figure file before saving it");
@@ -532,6 +564,15 @@ void SwitchPortalMode(std::string_view mode_text) {
     const std::string dir_utf8 = REXCVAR_GET(portal_figures_dir);
     skylanders::portal::RealPortalBridge::Options options;
     if (!dir_utf8.empty()) options.backup_dir = Utf8ToPath(dir_utf8) / "real";
+    // The owner's figures guard: a test copy keeps the copies in its own figures folder (or, should
+    // that be refused too, none: the copies then have no file).
+    if (!options.backup_dir.empty() && !FigureFolderWritable(options.backup_dir, "the real figures' copies")) {
+      std::filesystem::path run;
+      std::vector<std::filesystem::path> owners;
+      FiguresGuardFolders(run, owners);
+      const bool own = !run.empty() && !OwnerFolderRefused(run / "real");
+      options.backup_dir = own ? run / "real" : std::filesystem::path();
+    }
     options.log = [](const std::string& text) { REXLOG_INFO("{}", text); };
     options.on_arrived = [](int slot) {
       std::function<void(int)> handler;
@@ -677,13 +718,14 @@ void InstallPortal(const std::filesystem::path& default_figures_dir) {
     g_run_figures_dir = default_figures_dir;
     g_owner_figure_dirs = OwnerFigureDirs();
   }
-  // The owner's figures guard (OwnerFiguresRefused): a test copy whose portal_figures_dir (from a
-  // settings file or the command line) is one of the owner's figure folders, or inside one, uses
-  // its own instead, so New figure, the trap command, the recent list and the backups stay out of
-  // the owner's folder.
-  if (const std::string dir = REXCVAR_GET(portal_figures_dir); !dir.empty() && OwnerFiguresRefused(Utf8ToPath(dir))) {
-    REXLOG_WARN("Portal: portal_figures_dir {} is the owner's Figures folder and this run has --user_data_root "
-                "(a test copy); using {} instead",
+  // The owner's figures guard (OwnerFolderRefused): a test copy whose portal_figures_dir (from a
+  // settings file or the command line) is one of the owner's figure folders, lies inside one, or
+  // holds one (Documents\Skylanders, a drive root: the menu scans it recursively and would list,
+  // restore and save the owner's figures) uses its own instead, so New figure, the trap command,
+  // the recent list, the backups and their restore stay out of the owner's folder.
+  if (const std::string dir = REXCVAR_GET(portal_figures_dir); !dir.empty() && OwnerFolderRefused(Utf8ToPath(dir))) {
+    REXLOG_WARN("Portal: portal_figures_dir {} is, lies in or holds the owner's Figures folder and this run has "
+                "--user_data_root (a test copy); using {} instead",
                 dir, Utf8Path(default_figures_dir));
     REXCVAR_SET(portal_figures_dir, std::string());
   }
@@ -702,9 +744,10 @@ void InstallPortal(const std::filesystem::path& default_figures_dir) {
   if (portal::SoftwarePortal* software = g_software_portal.load()) {
     const std::string figure_path = REXCVAR_GET(portal_figure);
     if (!figure_path.empty() && OwnerFiguresRefused(Utf8ToPath(figure_path))) {
-      // The owner's figures guard: a test copy does not play (and save into) the owner's figure.
-      REXLOG_WARN("Portal: not placing portal_figure {}: it is in the owner's Figures folder and this run has "
-                  "--user_data_root (a test copy); running with an empty portal",
+      // The owner's figures guard: a test copy does not play (and save into) the owner's figure,
+      // nor one in a folder that holds the owner's Figures (Documents\Skylanders\x.dump).
+      REXLOG_WARN("Portal: not placing portal_figure {}: it is in the owner's Figures folder, or in a folder "
+                  "holding it, and this run has --user_data_root (a test copy); running with an empty portal",
                   figure_path);
     } else if (!figure_path.empty()) {
       if (!PlaceFigureFromFile(0, Utf8ToPath(figure_path))) {
@@ -786,6 +829,7 @@ std::optional<std::filesystem::path> CreateFigureFile(const portal::SkylanderInf
   if (dir_utf8.empty()) return std::nullopt;
 
   const std::filesystem::path game_dir = Utf8ToPath(dir_utf8) / std::string(sky.game);
+  if (!FigureFolderWritable(game_dir, "a new figure")) return std::nullopt;  // the owner's figures guard
   std::error_code ec;
   std::filesystem::create_directories(game_dir, ec);
   if (ec) return std::nullopt;
@@ -814,6 +858,7 @@ bool CreateAndPlaceVillainTrap(int slot, const portal::TrapVillain& villain) {
   if (!data) return false;
 
   const std::filesystem::path game_dir = Utf8ToPath(dir_utf8) / "Trap Team";
+  if (!FigureFolderWritable(game_dir, "a new trap")) return false;  // the owner's figures guard
   std::error_code ec;
   std::filesystem::create_directories(game_dir, ec);
   if (ec) return false;
@@ -844,6 +889,10 @@ bool IsRealPortalCopy(int slot) {
   portal::RealPortalBridge* bridge = g_bridge.load();
   return bridge && bridge->IsCopySlot(slot);
 }
+
+bool OwnerFigureFileProtected(const std::filesystem::path& file) { return OwnerFiguresRefused(file); }
+
+bool OwnerFigureFolderProtected(const std::filesystem::path& folder) { return OwnerFolderRefused(folder); }
 
 void SetRealFigureArrivedHandler(std::function<void(int slot)> handler) {
   std::lock_guard lock(g_arrived_mutex);
@@ -883,6 +932,9 @@ bool DumpRealFigureToFile(int slot, std::filesystem::path* saved_path, std::stri
           : "Unknown id" + std::to_string(id) + " variant" + std::to_string(variant);
 
   const std::filesystem::path dir = game.empty() ? Utf8ToPath(dir_utf8) : Utf8ToPath(dir_utf8) / game;
+  if (!FigureFolderWritable(dir, "a figure dump")) {
+    return Fail("the figures folder is the owner's and this run has --user_data_root (a test copy)");
+  }
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   if (ec) return Fail("could not create the figures folder");

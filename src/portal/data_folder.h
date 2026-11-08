@@ -65,6 +65,29 @@ bool OwnerFigureWriteRefused(const std::filesystem::path& file,
                              const std::vector<std::filesystem::path>& owner_figure_folders,
                              const std::filesystem::path& run_figures_folder);
 
+// The reverse: whether `folder` holds (is an ancestor of, or is) one of `owner_figure_folders` that
+// is not `run_figures_folder`, as Documents\Skylanders or a drive root holds the owner's Figures.
+// Such a folder as a figures folder would let the portal menu, which scans it recursively, list,
+// restore and write the owner's figures. Empty entries and an empty `folder` are never refused.
+bool FolderHoldsOwnerFigures(const std::filesystem::path& folder,
+                             const std::vector<std::filesystem::path>& owner_figure_folders,
+                             const std::filesystem::path& run_figures_folder);
+
+// The guard for a figures folder a test copy is configured with (portal_figures_dir): refused when
+// it lies inside an owner's figures folder (OwnerFigureWriteRefused) or holds one
+// (FolderHoldsOwnerFigures); the run's own figures folder is the exception on both sides.
+bool OwnerFiguresDirRefused(const std::filesystem::path& folder,
+                            const std::vector<std::filesystem::path>& owner_figure_folders,
+                            const std::filesystem::path& run_figures_folder);
+
+// The guard for a figure file a test copy would write (the game's saves, a backup restore, New
+// figure, a dump) or play (portal_figure): refused when it lies inside an owner's figures folder
+// (OwnerFigureWriteRefused) or the folder it lies in holds one (FolderHoldsOwnerFigures:
+// Documents\Skylanders\x.dump, Documents\x.dump). The run's own figures folder is the exception.
+bool OwnerFigureFileRefused(const std::filesystem::path& file,
+                            const std::vector<std::filesystem::path>& owner_figure_folders,
+                            const std::filesystem::path& run_figures_folder);
+
 // SharedBase maps a --user_data_root copy whose folder name is not a game's to "Skylanders" next
 // to it; true when that is one of `owner_data_folders` (DataFolder(), DefaultDataFolder()), as for
 // a copy at Documents\sf-test: such a copy would get the owner's real Figures folder, so it keeps a

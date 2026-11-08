@@ -207,6 +207,37 @@ bool OwnerFigureWriteRefused(const fs::path& file, const std::vector<fs::path>& 
   return false;
 }
 
+bool FolderHoldsOwnerFigures(const fs::path& folder, const std::vector<fs::path>& owner_figure_folders,
+                             const fs::path& run_figures_folder) {
+  if (folder.empty()) return false;
+  for (const fs::path& owner : owner_figure_folders) {
+    if (owner.empty() || !PathInside(owner, folder)) continue;
+    // OwnerFigureWriteRefused's exception: the run's own figures folder (an explicit
+    // --user_data_root of the owner's real game folder) may sit in the configured folder.
+    if (SameFolder(owner, run_figures_folder)) continue;
+    return true;
+  }
+  return false;
+}
+
+bool OwnerFiguresDirRefused(const fs::path& folder, const std::vector<fs::path>& owner_figure_folders,
+                            const fs::path& run_figures_folder) {
+  if (folder.empty()) return false;
+  return OwnerFigureWriteRefused(folder, owner_figure_folders, run_figures_folder) ||
+         FolderHoldsOwnerFigures(folder, owner_figure_folders, run_figures_folder);
+}
+
+bool OwnerFigureFileRefused(const fs::path& file, const std::vector<fs::path>& owner_figure_folders,
+                            const fs::path& run_figures_folder) {
+  if (file.empty()) return false;
+  if (OwnerFigureWriteRefused(file, owner_figure_folders, run_figures_folder)) return true;
+  // The folder the file lies in, made absolute first: a bare "x.dump" lies in the current folder.
+  std::error_code ec;
+  fs::path absolute = fs::absolute(file, ec);
+  if (ec) absolute = file;
+  return FolderHoldsOwnerFigures(absolute.parent_path(), owner_figure_folders, run_figures_folder);
+}
+
 bool CopySharesOwnersFolder(const fs::path& user_data_root, const std::vector<fs::path>& owner_data_folders) {
   // SharedBase's own rule, so the answer is about the folder SharedFiguresDir would really take: a
   // game-named folder whose parent is an owner's data folder is the owner's game folder itself.

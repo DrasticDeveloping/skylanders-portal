@@ -44,10 +44,22 @@ namespace skylanders {
 // The owner's figures guard (Swap Force Online's main safety audit): in a run with a non-empty
 // --user_data_root (a test copy), `default_figures_dir` is the run's own figures folder, and the
 // owner's are DataFolder()/Figures and DefaultDataFolder()/Figures. A figure file inside an owner's
-// folder that is not the run's own is never saved (nor backed up) and the refusal is logged once
-// per file; a `portal_figure` there is not placed; a `portal_figures_dir` there is replaced by
-// `default_figures_dir`. All with a warning. A run without --user_data_root is unchanged.
+// folder that is not the run's own, or in a folder holding one (Documents\Skylanders\x.dump), is
+// never saved (nor backed up) and the refusal is logged once per file; a `portal_figure` there is
+// not placed; a `portal_figures_dir` that is, lies in or holds an owner's folder
+// (Documents\Skylanders) is replaced by `default_figures_dir`; New figure, the trap command, a
+// dump of a real figure and the hybrid bridge's copies never write into such a folder; the portal
+// menu's backup restore asks OwnerFigureFileProtected. All with a warning. A run without
+// --user_data_root is unchanged.
 void InstallPortal(const std::filesystem::path& default_figures_dir);
+
+// The owner's figures guard for code that writes a figure file itself (the portal menu's backup
+// restore): true when this run, with a non-empty --user_data_root (a test copy), must not write
+// `file` because it lies in one of the owner's Figures folders that is not the run's own, or in a
+// folder holding one (portal/data_folder.h OwnerFigureFileRefused); for `folder`, when it is, lies
+// in or holds one (OwnerFiguresDirRefused). Always false without --user_data_root. Any thread.
+bool OwnerFigureFileProtected(const std::filesystem::path& file);
+bool OwnerFigureFolderProtected(const std::filesystem::path& folder);
 
 // For a game's OnConfigurePaths: its user data in the one data folder of every game
 // (portal/data_folder.h), <data folder>\<game> ("Spyro's Adventure", ...), unless --user_data_root

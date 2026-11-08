@@ -1,6 +1,7 @@
 // The owner's figures guards of portal/data_folder.h (Swap Force Online's main safety audit,
-// settings-figures): PathInside, OwnerFigureWriteRefused and CopySharesOwnersFolder, on folders
-// made under the temp folder (never the real Documents).
+// settings-figures): PathInside, OwnerFigureWriteRefused, FolderHoldsOwnerFigures,
+// OwnerFiguresDirRefused, OwnerFigureFileRefused and CopySharesOwnersFolder, on folders made under
+// the temp folder (never the real Documents).
 
 #include <filesystem>
 #include <system_error>
@@ -11,6 +12,9 @@
 
 namespace fs = std::filesystem;
 using skylanders::CopySharesOwnersFolder;
+using skylanders::FolderHoldsOwnerFigures;
+using skylanders::OwnerFigureFileRefused;
+using skylanders::OwnerFiguresDirRefused;
 using skylanders::OwnerFigureWriteRefused;
 using skylanders::PathInside;
 
@@ -65,6 +69,61 @@ int main() {
   CHECK(OwnerFigureWriteRefused(picked_figures / L"x.dump", owners, owner_figures));
   // A run folder inside an owner's figures folder is not the owner's folder: still refused.
   CHECK(OwnerFigureWriteRefused(owner_figures / L"Swap Force" / L"x.dump", owners, owner_figures / L"Swap Force"));
+
+  // FolderHoldsOwnerFigures (Sol's N1): a folder that holds an owner figures folder, the data
+  // folder (Documents\Skylanders), its parent, the temp root, or the owner folder itself; not one
+  // beside it, inside it, or the run's own; the run's own figures folder may sit inside it (an
+  // explicit --user_data_root of the owner's real game folder); empty is never refused.
+  CHECK(FolderHoldsOwnerFigures(owner_data, owners, run_figures));
+  CHECK(FolderHoldsOwnerFigures(t / L"Docs", owners, run_figures));
+  CHECK(FolderHoldsOwnerFigures(t, owners, run_figures));
+  CHECK(FolderHoldsOwnerFigures(owner_figures, owners, run_figures));
+  CHECK(FolderHoldsOwnerFigures(t / L"Picked", owners, run_figures));
+#ifdef _WIN32
+  CHECK(FolderHoldsOwnerFigures(t / L"DOCS" / L"skylanders\\", owners, run_figures));
+#endif
+  CHECK(FolderHoldsOwnerFigures(owner_figures / L".." / L"Pictures" / L"..", owners, run_figures));
+  CHECK(!FolderHoldsOwnerFigures(owner_figures / L"Swap Force", owners, run_figures));
+  CHECK(!FolderHoldsOwnerFigures(owner_data / L"Pictures", owners, run_figures));
+  CHECK(!FolderHoldsOwnerFigures(t / L"run", owners, run_figures));
+  CHECK(!FolderHoldsOwnerFigures(run_figures, owners, run_figures));
+  CHECK(!FolderHoldsOwnerFigures(fs::path(), owners, run_figures));
+  CHECK(!FolderHoldsOwnerFigures(owner_data, {}, run_figures));
+  CHECK(!FolderHoldsOwnerFigures(owner_data, {owner_figures}, owner_figures));
+  // The run's own exception covers its folder only: the picked owner folder under t still counts.
+  CHECK(FolderHoldsOwnerFigures(t, owners, owner_figures));
+
+  // OwnerFiguresDirRefused: portal_figures_dir inside, equal to or holding an owner figures folder
+  // is refused (Documents\Skylanders, the case Sol found); the run's own folder, one beside, and a
+  // folder elsewhere are not; the run's own owner folder is kept.
+  CHECK(OwnerFiguresDirRefused(owner_data, owners, run_figures));
+  CHECK(OwnerFiguresDirRefused(owner_figures, owners, run_figures));
+  CHECK(OwnerFiguresDirRefused(owner_figures / L"Swap Force", owners, run_figures));
+  CHECK(OwnerFiguresDirRefused(t.root_path(), owners, run_figures));
+  CHECK(!OwnerFiguresDirRefused(run_figures, owners, run_figures));
+  CHECK(!OwnerFiguresDirRefused(t / L"run", owners, run_figures));
+  CHECK(!OwnerFiguresDirRefused(owner_data / L"Pictures", owners, run_figures));
+  CHECK(!OwnerFiguresDirRefused(fs::path(), owners, run_figures));
+  CHECK(!OwnerFiguresDirRefused(owner_figures, {owner_figures}, owner_figures));
+  CHECK(!OwnerFiguresDirRefused(owner_data, {owner_figures}, owner_figures));
+
+  // OwnerFigureFileRefused: a file inside an owner figures folder, or in a folder holding one
+  // (Documents\Skylanders\x.dump, the temp root), is refused; a file in the run's own folder,
+  // beside the data folder's Figures in a folder of its own, or elsewhere is not; the explicit
+  // owner run keeps its own figures.
+  CHECK(OwnerFigureFileRefused(owner_figures / L"Swap Force" / L"Blast Zone.dump", owners, run_figures));
+  CHECK(OwnerFigureFileRefused(owner_data / L"Blast Zone.dump", owners, run_figures));
+  CHECK(OwnerFigureFileRefused(t / L"Docs" / L"x.dump", owners, run_figures));
+  CHECK(OwnerFigureFileRefused(t / L"x.dump", owners, run_figures));
+  CHECK(OwnerFigureFileRefused(t / L"Picked" / L"x.dump", owners, run_figures));
+  CHECK(!OwnerFigureFileRefused(run_figures / L"Swap Force" / L"Blast Zone.dump", owners, run_figures));
+  CHECK(!OwnerFigureFileRefused(owner_data / L"Pictures" / L"x.dump", owners, run_figures));
+  CHECK(!OwnerFigureFileRefused(t / L"run" / L"x.dump", owners, run_figures));
+  CHECK(!OwnerFigureFileRefused(fs::path(), owners, run_figures));
+  CHECK(!OwnerFigureFileRefused(owner_figures / L"Swap Force" / L"x.dump", {owner_figures}, owner_figures));
+  CHECK(!OwnerFigureFileRefused(owner_data / L"x.dump", {owner_figures}, owner_figures));
+  CHECK(!OwnerFigureFileRefused(owner_data / L"x.dump", owners, owner_figures));
+  CHECK(OwnerFigureFileRefused(t / L"x.dump", owners, owner_figures));  // the picked folder is under t
 
   // CopySharesOwnersFolder: a copy beside the owner's data folder whose name is not a game's
   // (Documents\sf-test, SharedBase -> Documents\Skylanders) shares the owner's folder; a game-named
