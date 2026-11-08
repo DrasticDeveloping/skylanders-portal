@@ -158,6 +158,14 @@ class PackageTest(unittest.TestCase):
         (self.inst / "Game.iss").write_text(ISS + 'Source: "staging\\*.dll"; DestDir: "{app}"\n', encoding="utf-8")
         with self.assertRaises(pc.CheckError):
             self.run_check()
+        # Unquoted, the same wildcard is still read (Inno Setup takes unquoted values).
+        (self.inst / "Game.iss").write_text(ISS + 'Source: staging\\*.dll; DestDir: {app}\n', encoding="utf-8")
+        with self.assertRaises(pc.CheckError):
+            self.run_check()
+        # A [Files] line in another parameter order is not skipped either.
+        (self.inst / "Game.iss").write_text(ISS + 'DestDir: "{app}"; Source: "staging\\x.dll"\n', encoding="utf-8")
+        with self.assertRaises(pc.CheckError):
+            self.run_check()
         (self.inst / "Game.iss").write_text(ISS.replace('Source: "staging\\engine.dll"; DestDir: "{app}"; Flags: ignoreversion\n', ""),
                                             encoding="utf-8")
         self.assertTrue(any("has no Source line" in e for e in self.run_check()[1]))

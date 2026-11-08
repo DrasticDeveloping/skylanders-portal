@@ -39,7 +39,7 @@ TYPES = ("pe-x64-exe", "pe-x64-dll", "toml", "text")
 PROVENANCE = re.compile(r"build:[A-Za-z0-9_.-]+|tracked|redist|licence")
 ROLES = ("game", "synthetic-peer")
 FORBIDDEN_SUFFIXES = (".xex", ".iso", ".xiso", ".sky", ".bin", ".god")
-SOURCE_LINE = re.compile(r'^\s*Source:\s*"([^"]+)"\s*;(.*)$', re.IGNORECASE)
+SOURCE_LINE = re.compile(r'^\s*Source:\s*(?:"([^"]+)"|([^";]+?))\s*;(.*)$', re.IGNORECASE)
 DEST = re.compile(r'DestDir:\s*"([^"]+)"', re.IGNORECASE)
 
 
@@ -131,16 +131,26 @@ def load_manifest(path: Path) -> list[dict]:
 
 def iss_sources(iss: Path) -> list[tuple[str, str]]:
     out = []
+    section = ""
     for no, line in enumerate(iss.read_text(encoding="utf-8-sig").splitlines(), 1):
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            section = s[1:-1].strip().lower()
+            continue
+        if section != "files" or not s or s.startswith(";"):
+            continue
+        # Every [Files] line is read, quoted or not: a line this check cannot read is a failure, not
+        # a line it skips (an unquoted wildcard Source would otherwise ship unchecked).
         m = SOURCE_LINE.match(line)
         if not m:
-            continue
-        d = DEST.search(m.group(2))
+            raise CheckError(f"{iss}:{no}: a [Files] line that does not start with Source: {s}")
+        src = m.group(1) if m.group(1) is not None else m.group(2)
+        d = DEST.search(m.group(3)) or re.search(r'DestDir:\s*([^";]+?)\s*(?:;|$)', m.group(3), re.IGNORECASE)
         if not d:
             raise CheckError(f"{iss}:{no}: a Source line without DestDir")
-        if "*" in m.group(1) or "?" in m.group(1):
-            raise CheckError(f"{iss}:{no}: a wildcard Source ({m.group(1)}): every file is named")
-        out.append((m.group(1), d.group(1)))
+        if "*" in src or "?" in src:
+            raise CheckError(f"{iss}:{no}: a wildcard Source ({src}): every file is named")
+        out.append((src, d.group(1)))
     return out
 
 
