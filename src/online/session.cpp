@@ -197,6 +197,13 @@ void ServerSession::HandleMessage(Peer& peer, const Message& message, Lane lane,
     e.generation = generation;
     events_.push_back(std::move(e));
   } else if (const auto* loaded = std::get_if<LevelLoaded>(&message)) {
+    if (loaded->generation == generation_ && generation_ != 0) {
+      ServerEvent e;
+      e.type = ServerEvent::Type::kPeerLevelLoaded;
+      e.peer_id = peer.id;
+      e.generation = loaded->generation;
+      events_.push_back(std::move(e));
+    }
     if (barrier_open_ && loaded->generation == generation_ && waiting_.erase(peer.id)) {
       CheckBarrier(now);
     }
@@ -343,7 +350,8 @@ void ServerSession::DropPeer(Peer& peer, LeaveReason reason, TimePoint now) {
   } else {
     // Replaced: told Bye. Closed: its finals went out just before this, on the same lane; now its
     // Bye. The connection lingers kCloseLinger to ack what is still in flight.
-    if (reason == LeaveReason::kReplaced || reason == LeaveReason::kClosed) {
+    if (reason == LeaveReason::kReplaced || reason == LeaveReason::kClosed ||
+        reason == LeaveReason::kRemoved) {
       Post(peer, Lane::kGameplay, Bye{}, now);
     }
     peer.state = PeerState::kClosing;
@@ -452,6 +460,13 @@ std::chrono::microseconds ServerSession::BackendRtt(uint16_t peer_id) const {
     if (peer->id == peer_id && peer->state == PeerState::kWelcomed) return peer->conn->SmoothedRtt();
   }
   return std::chrono::microseconds(0);
+}
+
+bool ServerSession::RemoveClient(uint16_t peer_id, TimePoint now) {
+  Peer* p = FindById(peer_id);
+  if (!p || p->state != PeerState::kWelcomed) return false;
+  DropPeer(*p, LeaveReason::kRemoved, now);
+  return true;
 }
 
 bool ServerSession::PeerConnected(uint16_t peer_id) const {

@@ -66,6 +66,8 @@ enum class LeaveReason : uint8_t {
   kTimeout,   // nothing from it for kPeerTimeout
   kReplaced,  // the owner connected again from another address
   kClosed,    // End session's drain is done for it: its finals went out, then S's Bye (version 2)
+  kRemoved,   // the game removed it (RemoveClient: its backend's control overflow or overrun,
+              // stage 3); told Bye
 };
 
 struct ServerEvent {
@@ -99,6 +101,9 @@ struct ServerEvent {
     // Version 3 (stage 3).
     kBackendFrame,     // peer_id, lane, frame: one backend frame from a welcomed client, in its
                        // lane's order (the bridge's inbound ring takes it at once)
+    kPeerLevelLoaded,  // peer_id, generation: the client has the current generation's level up
+                       // (its LevelLoaded; also a late joiner's, which no barrier waits for): the
+                       // backend's OnPeerLevelReady
   };
   Type type = Type::kPeerJoined;
   uint16_t peer_id = 0;
@@ -230,6 +235,10 @@ class ServerSession {
   std::chrono::microseconds BackendRtt(uint16_t peer) const;
   // `peer` is a welcomed client (the bridge's "connected" in its metric snapshot).
   bool PeerConnected(uint16_t peer) const;
+  // The game removes a welcomed client (stage 3 section 3.2: its backend's control overflow, or the
+  // backend's kPeerOverrun): told Bye, kPeerLeft with kRemoved, its keys forgotten as at any leave.
+  // false if `peer` is not a welcomed client.
+  bool RemoveClient(uint16_t peer, TimePoint now = Clock::now());
   // End session's drain: SessionClosing to every client; from now on nothing is applied.
   void EndSession(TimePoint now = Clock::now());
   bool Closing() const { return requests_.Closing(); }

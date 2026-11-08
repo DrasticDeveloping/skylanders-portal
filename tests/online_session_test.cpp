@@ -912,6 +912,26 @@ void FakeNetworkBackendFrames() {
   CHECK(w.server.BackendUnacked(peer, Lane::kState) <= skylanders::netplay::kLaneWindow);
   c.paused = false;
 
+  // A level the client reports up: kPeerLevelLoaded for the current generation only.
+  const uint32_t g = w.server.RequestLevel("levels/zone_hub", w.net.Now());
+  REQUIRE_OR_RETURN_VOID(g != 0);
+  CHECK(w.RunUntil([&] { return c.Count(CE::kLevelLoad) == 1; }));
+  CHECK(c.session->SendLevelLoaded(g, w.net.Now()));
+  CHECK(c.session->SendLevelLoaded(g + 7, w.net.Now()));  // not the current one: no event
+  CHECK(w.RunUntil([&] { return w.Count(SE::kPeerLevelLoaded) == 1; }));
+  w.RunUntil([] { return false; }, 100ms);
+  CHECK(w.Count(SE::kPeerLevelLoaded) == 1);
+  CHECK(w.Last(SE::kPeerLevelLoaded)->peer_id == peer && w.Last(SE::kPeerLevelLoaded)->generation == g);
+
+  // The game removes the client: Bye, kPeerLeft kRemoved; a second removal does nothing.
+  CHECK(w.server.RemoveClient(peer, w.net.Now()));
+  CHECK(!w.server.RemoveClient(peer, w.net.Now()));
+  CHECK(w.RunUntil([&] { return c.session->State() == ClientState::kDisconnected; }));
+  const ServerEvent* left = w.Last(SE::kPeerLeft);
+  CHECK(left && left->peer_id == peer && left->leave_reason == LeaveReason::kRemoved);
+  CHECK(!w.server.PeerConnected(peer));
+  CHECK(w.server.SendBackend(peer, Lane::kState, a, w.net.Now()) == BackendSend::kGone);
+
   // A version 2 game is refused at its Hello.
   Hello old = MakeHello("Two");
   old.protocol_version = 2;
