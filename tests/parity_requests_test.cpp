@@ -1,11 +1,11 @@
 // The parity suite (stage 2 item 4; design sections 3.9, 9 item 4 and 10; Sol r1 F2): every cell of
 // 1B's request table, on 1B's own table and on the generic one at once (tests/parity_twin.h).
 //
-// PROVISIONAL (Sol F10). The cells are 1B's own bodies, copied by tools/parity_gen_cells.py from
-// tests/online_requests_test.cpp at portal 26ef72d (work/1B-route, the newest 1B revision;
-// requests.h, requests.cpp and the test file are unchanged there since 9054072): 67 cell functions,
-// numbered RP1 to RP67 in the order of 1B's main(). Before item 4 merges the file is written again
-// from 1B's merged commit, the cells recounted, in a commit of its own. The script adds, each
+// The cells are 1B's own bodies, copied by tools/parity_gen_cells.py from
+// tests/online_requests_test.cpp at portal 3bbbcc6, 1B's merged commit on the online branch
+// (requests.h, requests.cpp and the test file are the same there as at 26ef72d and 9054072, where
+// the suite was first written; Sol F10, section 9 item 4): 67 cell functions, recounted there and
+// numbered RP1 to RP67 in the order of 1B's main(). The script adds, each
 // marked `parity:`, the generic checks of section 10's named cases and a port of Retryable's lines
 // (1B's IsRetryable has no generic twin). Beside them: RP0 (the key map), RP-a and RP-b (section
 // 3.9's order), RP8b (a pose-0 exit behind a pending enter, Opus F11), RP-c, RP-d and RP-e (the

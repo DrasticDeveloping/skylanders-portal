@@ -12,10 +12,10 @@
 // and that the same keys are evaluating. A difference is a failed check, printed with both batches,
 // unless it is one of the differences the design decides (below), which the cell must name.
 //
-// PROVISIONAL (Sol F10; both reviews' Q2): written against 1B at portal 26ef72d (work/1B-route, the
-// newest 1B revision; requests.h, requests.cpp and online_requests_test.cpp are unchanged there
-// since 9054072: 67 cell functions). Before item 4 merges it is refreshed against 1B's merged
-// commit, the cells recounted, in a commit of its own.
+// Written against 1B at portal 3bbbcc6 (1B's merged commit on the online branch; Sol F10, both
+// reviews' Q2): requests.h, requests.cpp and online_requests_test.cpp are the same there as at
+// 26ef72d and 9054072, where the suite was first written, and the cells were recounted there: 67
+// cell functions.
 //
 // D2 (the include rule) is kept: this file and parity_requests_test.cpp include online/ and
 // backend/ headers; they are test-only and live outside src/backend and outside tests/backend*, the
@@ -82,7 +82,7 @@ namespace ob = skylanders::online;
 namespace gb = skylanders::backend;
 using namespace std::chrono_literals;
 
-inline constexpr const char* kOneBRevision = "26ef72d";  // provisional (Sol F10)
+inline constexpr const char* kOneBRevision = "3bbbcc6";  // 1B's merged commit (Sol F10)
 
 // --- The parity kinds: 1B's five key types as generic kinds (section 3.9).
 
