@@ -33,6 +33,8 @@
 #include <span>
 #include <string>
 
+#include "netplay/transport.h"
+
 namespace skylanders::netplay {
 
 // --- the external address ------------------------------------------------------------------------
@@ -165,5 +167,31 @@ class PortMapper {
 std::string MappingMessage(const MappingResult& r);
 constexpr const char* kMappingDroppedMessage =
     "the router dropped the port mapping: new players may not reach you";
+
+// The owned mapping's life in one "Internet" session (stage 8 item 4, design 3.4): Start maps once
+// (PortMapper::Map), Tick renews at half the lease while the mapping is owned (a failed renewal
+// says kMappingDroppedMessage once and the mapping is never touched again), Stop deletes it at End
+// session and at the server's normal exit. A crash leaves it to its lease. Pure: the clock is
+// passed in, the IGD calls go through `igd` (which the caller owns and keeps alive), so the unit
+// test drives it on fake time with a fake IgdClient. Not thread-safe: one thread (the server's
+// mapping thread) calls all of it.
+class MappingLease {
+ public:
+  MappingLease(IgdClient* igd, std::string internal_client, uint16_t port, std::string nonce,
+               bool natpmp_answered = false);
+  MappingResult Start(TimePoint now);
+  // Renews when due; returns the line to show when the renewal failed (once), else empty.
+  std::string Tick(TimePoint now);
+  // Deletes the owned mapping (after the re-read); true if it was deleted. Idempotent.
+  bool Stop();
+  bool owned() const { return mapper_.owned(); }
+  // When the next renewal is due (only meaningful while owned()).
+  TimePoint NextRenewal() const { return next_renewal_; }
+  const PortMapper& mapper() const { return mapper_; }
+
+ private:
+  PortMapper mapper_;
+  TimePoint next_renewal_{};
+};
 
 }  // namespace skylanders::netplay

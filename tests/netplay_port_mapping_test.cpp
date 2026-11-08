@@ -1,6 +1,7 @@
 // The port mapping rules (stage 8 item 4, design D8) on recorded router answers: a fake IGD that
 // keeps a mapping table and a log of every call, so each test can say what was and was not sent.
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -308,6 +309,66 @@ int main() {
     CHECK(AddressClassMessage(AddressClass::kPublic).empty());
     CHECK(AddressClassMessage(AddressClass::kPrivate).find("double NAT") != std::string::npos);
     CHECK(AddressClassMessage(AddressClass::kUnreachable).find("cannot reach") != std::string::npos);
+  }
+
+  // The lease's lifecycle (stage 8 item 4: Host's "Internet" mode): mapped at Start, renewed at
+  // half the lease (1800 s) and not before, deleted at Stop exactly once; a renewal that finds the
+  // entry gone or replaced says the dropped line once and never touches the router's table again;
+  // nothing at all happens without an owned mapping.
+  {
+    const TimePoint t0{};
+    FakeIgd igd(1);
+    MappingLease lease(&igd, me, 48800, "n1");
+    const MappingResult r = lease.Start(t0);
+    CHECK(r.outcome == MappingOutcome::kMapped && r.external_port == 48800 && lease.owned());
+    CHECK(lease.NextRenewal() == t0 + std::chrono::seconds(1800));
+    const int adds = igd.Count("add");
+    CHECK(lease.Tick(t0 + std::chrono::seconds(1799)).empty());
+    CHECK(igd.Count("add") == adds);  // not due yet
+    CHECK(lease.Tick(t0 + std::chrono::seconds(1800)).empty());
+    CHECK(igd.Count("add") == adds + 1 && lease.owned());  // renewed: the same tuple again
+    CHECK(lease.NextRenewal() == t0 + std::chrono::seconds(3600));
+    CHECK(lease.Stop());
+    CHECK(igd.Count("delete", 48800) == 1 && igd.table.empty());
+    CHECK(!lease.Stop());  // once
+    CHECK(igd.Count("delete") == 1);
+    CHECK(lease.Tick(t0 + std::chrono::seconds(7200)).empty());  // not owned: nothing sent
+    CHECK(igd.Count("add") == adds + 1);
+  }
+  {
+    // The router dropped it, and another device took the port meanwhile: one message, no add,
+    // no delete of the other device's entry, ever.
+    const TimePoint t0{};
+    FakeIgd igd(1);
+    MappingLease lease(&igd, me, 48800, "n2");
+    CHECK(lease.Start(t0).outcome == MappingOutcome::kMapped);
+    igd.table[48800] = Foreign(48800, "192.168.1.99", "Other");
+    const int adds = igd.Count("add");
+    CHECK(lease.Tick(t0 + std::chrono::seconds(1800)) == kMappingDroppedMessage);
+    CHECK(!lease.owned() && igd.Count("add") == adds);
+    CHECK(lease.Tick(t0 + std::chrono::seconds(3600)).empty());
+    CHECK(!lease.Stop());
+    CHECK(igd.Count("delete") == 0 && igd.table.count(48800) == 1);
+  }
+  {
+    // IGD v2: the renewal is AddAnyPortMapping for the owned port (never a plain add).
+    const TimePoint t0{};
+    FakeIgd igd(2);
+    MappingLease lease(&igd, me, 48800, "n3");
+    CHECK(lease.Start(t0).outcome == MappingOutcome::kMapped);
+    CHECK(lease.Tick(t0 + std::chrono::seconds(1800)).empty() && lease.owned());
+    CHECK(igd.Count("add") == 0 && igd.Count("addany") == 2);
+    CHECK(lease.Stop() && igd.table.empty());
+  }
+  {
+    // No IGD (the system client is null until work/8-net, or no router answered): Start says so,
+    // and Tick and Stop never fail.
+    MappingLease lease(nullptr, me, 48800, "n4");
+    const MappingResult r = lease.Start(TimePoint{});
+    CHECK(r.outcome == MappingOutcome::kNoUpnp && !lease.owned());
+    CHECK(r.message == "no router answered UPnP");
+    CHECK(lease.Tick(TimePoint{} + std::chrono::hours(1)).empty());
+    CHECK(!lease.Stop());
   }
 
   return Finish("netplay_port_mapping");

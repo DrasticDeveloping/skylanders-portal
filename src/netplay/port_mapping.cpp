@@ -226,6 +226,25 @@ bool PortMapper::Remove() {
   return igd_->DeletePortMapping(owned_port_, "UDP") == kUpnpOk;
 }
 
+MappingLease::MappingLease(IgdClient* igd, std::string internal_client, uint16_t port, std::string nonce,
+                           bool natpmp_answered)
+    : mapper_(igd, std::move(internal_client), port, std::move(nonce), natpmp_answered) {}
+
+MappingResult MappingLease::Start(TimePoint now) {
+  MappingResult r = mapper_.Map();
+  next_renewal_ = now + std::chrono::seconds(kMappingLeaseS / 2);
+  return r;
+}
+
+std::string MappingLease::Tick(TimePoint now) {
+  if (!mapper_.owned() || now < next_renewal_) return {};
+  next_renewal_ = now + std::chrono::seconds(kMappingLeaseS / 2);
+  if (mapper_.Renew()) return {};
+  return kMappingDroppedMessage;  // Renew left it not owned: no second message, no more calls
+}
+
+bool MappingLease::Stop() { return mapper_.Remove(); }
+
 std::string MappingMessage(const MappingResult& r) {
   switch (r.outcome) {
     case MappingOutcome::kMapped: {
