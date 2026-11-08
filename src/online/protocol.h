@@ -74,6 +74,9 @@ enum class MessageType : uint16_t {
   kSessionClosed = 20,
   kSceneBarrier = 21,
   kBackendFrame = 22,
+  // Stage 1C's block (50-54, the 24-hour push's number blocks): types outside the contiguous run
+  // 1..kBackendFrame. TypeOf and the decoder map them explicitly.
+  kOwnerFlags = 50,
 };
 
 enum class RefuseReason : uint8_t {
@@ -536,10 +539,34 @@ struct BackendFrame {
   bool operator==(const BackendFrame&) const = default;
 };
 
+// Stage 1C (the save spike, item 4; D5, D21): the owner's own HasTakenDamage, HasSwapped and
+// PlayerDied (player keys 1, 2, 5 of CGameState for the owner's player index) and the map game keys
+// 14 (SkylanderDamageTaken) and 15 (SkylandersDefeated), as the owner's game holds them. The owner
+// to the server, gameplay lane (reliable, ordered: the lane its world requests use, so a snapshot
+// sent before a request arrives before it). A full snapshot every time, never a delta: `revision`
+// is 1 at each new generation and one more per send, so the server keeps the newest per
+// generation. Sent only with online_save_handback on; a server refuses it from any peer but the
+// owner (kNotOwner). Wire: generation u32, revision u32 (neither 0), flags u8 (0x01 damage, 0x02
+// swapped; other bits are a later version's and ignored), died, damage taken and defeated as
+// signed 32-bit values: 21 bytes. A message that ends early is invalid; bytes past it are ignored.
+struct OwnerFlags {
+  uint32_t generation = 0;
+  uint32_t revision = 0;
+  bool has_taken_damage = false;  // ePSK_Map_HasTakenDamage (player key 1)
+  bool has_swapped = false;       // ePSK_Map_HasSwapped (player key 2)
+  int32_t player_died = 0;        // ePSK_Map_PlayerDied (player key 5)
+  int32_t damage_taken = 0;       // eGSK_Map_SkylanderDamageTaken (game key 14)
+  int32_t defeated = 0;           // eGSK_Map_SkylandersDefeated (game key 15)
+  bool operator==(const OwnerFlags&) const = default;
+};
+
+// The variant's order is the type numbering for the contiguous run (Hello = 1 ... BackendFrame =
+// 22); the block types after it (OwnerFlags = 50) are mapped by TypeOf.
 using Message = std::variant<Hello, Welcome, Refuse, Bye, Ping, Pong, LevelRequest, LevelLoad,
                              LevelLoaded, BarrierGo, PlayerList, PlayerPose, PlayerAction,
                              WorldRequest, WorldDecision, AppliedStep, LevelEnd, Reaction,
-                             SessionClosing, SessionClosed, SceneBarrier, BackendFrame>;
+                             SessionClosing, SessionClosed, SceneBarrier, BackendFrame,
+                             OwnerFlags>;
 MessageType TypeOf(const Message& message);
 
 // Appends one message to `out`. false (nothing appended) if a string is over its limit or not

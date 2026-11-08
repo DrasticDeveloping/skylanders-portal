@@ -574,6 +574,99 @@ void Version2Limits() {
 }
 
 // The scene barrier (item 12) and the skip key's check field (amendment g).
+// Stage 1C item 4: OwnerFlags, type 50 (outside the contiguous run), 21 bytes of fields.
+void OwnerFlagsMessage() {
+  OwnerFlags f;
+  f.generation = 3;
+  f.revision = 7;
+  f.has_taken_damage = true;
+  f.has_swapped = false;
+  f.player_died = 2;
+  f.damage_taken = -5;  // signed values survive
+  f.defeated = 0x7FFFFFFF;
+  CHECK(RoundTrip(f));
+  f.has_swapped = true;
+  f.has_taken_damage = false;
+  CHECK(RoundTrip(f));
+  CHECK((TypeOf(Message{f}) == MessageType::kOwnerFlags));
+  CHECK((TypeOf(Message{SceneBarrier{}}) == MessageType::kSceneBarrier));  // the run is unchanged
+
+  // The wire: type 50, length 21, generation, revision, flags, then the three values.
+  {
+    OwnerFlags w;
+    w.generation = 0x01020304;
+    w.revision = 1;
+    w.has_taken_damage = true;
+    w.has_swapped = true;
+    w.player_died = 1;
+    w.damage_taken = 0;
+    w.defeated = -1;
+    const std::vector<uint8_t> b = EncodeMessage(w);
+    const std::vector<uint8_t> want = {50, 0, 21, 0, 4, 3, 2, 1, 1, 0, 0, 0, 0x03, 1, 0, 0, 0,
+                                       0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF};
+    CHECK(b == want);
+  }
+
+  // Not encoded: generation or revision 0.
+  {
+    OwnerFlags z = f;
+    z.generation = 0;
+    CHECK(EncodeMessage(z).empty());
+    z = f;
+    z.revision = 0;
+    CHECK(EncodeMessage(z).empty());
+  }
+
+  std::vector<uint8_t> b = EncodeMessage(f);
+  REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 21);
+
+  // A later version's trailing field and unknown flag bits are ignored.
+  {
+    std::vector<uint8_t> longer = b;
+    longer.push_back(0xEE);
+    longer.push_back(0xEE);
+    longer[2] = 23;  // the length covers the extra bytes
+    auto back = DecodeMessages(longer);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    CHECK((std::get<OwnerFlags>((*back)[0]) == f));
+    std::vector<uint8_t> bits = b;
+    bits[kMessageHeaderSize + 8] |= 0xF0;
+    back = DecodeMessages(bits);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    CHECK((std::get<OwnerFlags>((*back)[0]) == f));
+  }
+
+  // Invalid: cut short, generation 0, revision 0 on the wire.
+  {
+    std::vector<uint8_t> cut = b;
+    cut.pop_back();
+    cut[2] = 20;
+    CHECK(!DecodeMessages(cut).has_value());
+    std::vector<uint8_t> zero = b;
+    for (size_t i = 0; i < 4; ++i) zero[kMessageHeaderSize + i] = 0;
+    CHECK(!DecodeMessages(zero).has_value());
+    zero = b;
+    for (size_t i = 4; i < 8; ++i) zero[kMessageHeaderSize + i] = 0;
+    CHECK(!DecodeMessages(zero).has_value());
+  }
+
+  // In one datagram with a world request, the order is kept; types 51-54 (the rest of the block)
+  // are still unknown and skipped by their length.
+  {
+    std::vector<uint8_t> both;
+    REQUIRE_OR_RETURN_VOID(EncodeMessage(f, both));
+    const std::vector<uint8_t> unknown51 = {51, 0, 2, 0, 0xAA, 0xBB};
+    both.insert(both.end(), unknown51.begin(), unknown51.end());
+    REQUIRE_OR_RETURN_VOID(EncodeMessage(LevelLoaded{9}, both));
+    size_t skipped = 0;
+    auto back = DecodeMessages(both, &skipped);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 2);
+    CHECK(skipped == 1);
+    CHECK(std::holds_alternative<OwnerFlags>((*back)[0]));
+    CHECK(std::holds_alternative<LevelLoaded>((*back)[1]));
+  }
+}
+
 void Version2Scenes() {
   // Every phase and kind survives a round trip; a level-load scene has no recipient (kNone).
   const SceneKey loaded{1, EntityRef{RefKind::kNone, 2}, NameHash("Tutorial_B_Intro")};
@@ -880,6 +973,7 @@ int main() {
   Version2Limits();
   Version2Scenes();
   Version3();
+  OwnerFlagsMessage();
 
   return Finish("online_protocol");
 }

@@ -11,8 +11,10 @@ namespace skylanders::online {
 using netplay::ByteReader;
 using netplay::ByteWriter;
 
-// The variant's order is the type numbering (Hello = 1 ...), which TypeOf relies on.
-static_assert(std::variant_size_v<Message> == 22);
+// The variant's order is the type numbering (Hello = 1 ...), which TypeOf relies on, for the
+// contiguous run 1..kLastType; the number-block types after it (stage 1C's OwnerFlags = 50) are
+// mapped explicitly (TypeOf, IsKnown).
+static_assert(std::variant_size_v<Message> == 23);
 static_assert(std::is_same_v<std::variant_alternative_t<0, Message>, Hello>);
 static_assert(std::is_same_v<std::variant_alternative_t<10, Message>, PlayerList>);
 static_assert(std::is_same_v<std::variant_alternative_t<11, Message>, PlayerPose>);
@@ -21,7 +23,9 @@ static_assert(std::is_same_v<std::variant_alternative_t<19, Message>, SessionClo
 static_assert(std::is_same_v<std::variant_alternative_t<20, Message>, SceneBarrier>);
 static_assert(std::is_same_v<std::variant_alternative_t<21, Message>, BackendFrame>);
 constexpr uint16_t kLastType = uint16_t(MessageType::kBackendFrame);
-static_assert(kLastType == std::variant_size_v<Message>);
+static_assert(std::is_same_v<std::variant_alternative_t<22, Message>, OwnerFlags>);
+constexpr size_t kBlockTypes = 1;  // OwnerFlags
+static_assert(kLastType + kBlockTypes == std::variant_size_v<Message>);
 
 bool IsNone(const OwnerToken& token) {
   return std::all_of(token.begin(), token.end(), [](uint8_t b) { return b == 0; });
@@ -143,7 +147,10 @@ RequestKey SkipRequestKey(uint16_t peer, uint32_t generation, const SceneKey& sc
   return k;
 }
 
-MessageType TypeOf(const Message& message) { return MessageType(message.index() + 1); }
+MessageType TypeOf(const Message& message) {
+  if (std::holds_alternative<OwnerFlags>(message)) return MessageType::kOwnerFlags;
+  return MessageType(message.index() + 1);
+}
 
 bool IsValidUtf8(std::string_view s) {
   size_t i = 0;
@@ -507,6 +514,19 @@ bool Fields(ByteWriter& w, const BackendFrame& m) {
   w.Bytes(m.bytes);
   return true;
 }
+// generation u32, revision u32, flags u8, died, damage taken, defeated (i32 each): 21 bytes.
+constexpr uint8_t kOwnerFlagDamage = 0x01;
+constexpr uint8_t kOwnerFlagSwapped = 0x02;
+bool Fields(ByteWriter& w, const OwnerFlags& m) {
+  if (m.generation == 0 || m.revision == 0) return false;
+  w.U32(m.generation);
+  w.U32(m.revision);
+  w.U8(uint8_t((m.has_taken_damage ? kOwnerFlagDamage : 0) | (m.has_swapped ? kOwnerFlagSwapped : 0)));
+  w.U32(uint32_t(m.player_died));
+  w.U32(uint32_t(m.damage_taken));
+  w.U32(uint32_t(m.defeated));
+  return true;
+}
 // phase u8, generation u32, the scene (25 bytes), kind u8, end u8, skips u8: 33 bytes.
 bool Fields(ByteWriter& w, const SceneBarrier& m) {
   if (!ValidScenePhase(uint8_t(m.phase)) || !ValidSceneKind(uint8_t(m.kind)) ||
@@ -758,6 +778,20 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
       result = std::move(m);
       break;
     }
+    case MessageType::kOwnerFlags: {
+      OwnerFlags m;
+      m.generation = r.U32();
+      m.revision = r.U32();
+      const uint8_t flags = r.U8();
+      m.has_taken_damage = (flags & kOwnerFlagDamage) != 0;
+      m.has_swapped = (flags & kOwnerFlagSwapped) != 0;
+      m.player_died = int32_t(r.U32());
+      m.damage_taken = int32_t(r.U32());
+      m.defeated = int32_t(r.U32());
+      ok = m.generation != 0 && m.revision != 0;
+      result = m;
+      break;
+    }
     default:
       return std::nullopt;
   }
@@ -765,7 +799,9 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
   return result;
 }
 
-bool IsKnown(uint16_t type) { return type >= 1 && type <= kLastType; }
+bool IsKnown(uint16_t type) {
+  return (type >= 1 && type <= kLastType) || type == uint16_t(MessageType::kOwnerFlags);
+}
 
 }  // namespace
 

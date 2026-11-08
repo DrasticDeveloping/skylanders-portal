@@ -2847,6 +2847,7 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -
     if not saves.is_dir() or not figures.is_dir():
         raise SpecError(f"missing fixtures ({saves}, {figures}): run `skytest.py fixtures --from-owner`")
     shutil.copytree(saves, d / "data")
+    (d / "data" / ".skytest-copy").write_text("a skytest run copy\n", encoding="ascii")  # the game's dev hooks need it
     if spec.peers[peer].save_slots:
         for line in fill_save_slots(d / "data", cfg.title_id, cfg.save_slot_name, spec.peers[peer].save_slots):
             print(f"  {spec.name} {peer}: save_slots: {line}")
