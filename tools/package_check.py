@@ -235,9 +235,28 @@ def write_record(rows: list[dict], path: Path, extra: dict | None = None) -> str
     return sha256(text.encode("utf-8"))
 
 
+def unlisted_dlls(repo: Path, files: list[dict]) -> list[str]:
+    """The DLLs in a build folder the manifest stages executables or DLLs from (the folder of their
+    `from`) that no pe-x64-dll entry names. Staging copies named files only, so a library a later build
+    adds (miniupnpc, say) would otherwise be left out of the installer without a word."""
+    def key(p: Path) -> str:
+        return os.path.normcase(str(p.resolve()))
+
+    built = [f for f in files if norm_source(f["iss_source"]).startswith("staging\\")
+             and f.get("type") in ("pe-x64-exe", "pe-x64-dll")]
+    named = {key(repo / f["from"]) for f in built if f["type"] == "pe-x64-dll"}
+    folders = sorted({(repo / f["from"]).resolve().parent for f in built})
+    return [str(p) for d in folders if d.is_dir() for p in sorted(d.glob("*.dll")) if key(p) not in named]
+
+
 def stage(repo: Path, manifest: Path, staging: Path) -> list[str]:
-    """Copies exactly the manifest's staging entries (never a wildcard of the build folder)."""
+    """Copies exactly the manifest's staging entries (never a wildcard of the build folder). A DLL in
+    the build folder that no pe-x64-dll entry names fails it, before anything is copied."""
     files = load_manifest(manifest)
+    extra = unlisted_dlls(repo, files)
+    if extra:
+        raise CheckError(f"{', '.join(extra)}: in the build folder but no pe-x64-dll entry of the release-file"
+                         " manifest names it (add its entry, with its licence if it needs one)")
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True)

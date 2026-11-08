@@ -101,7 +101,7 @@ class PackageTest(unittest.TestCase):
         (r / "out" / "game.exe").write_bytes(pe(False, b"game"))
         (r / "out" / "engine.dll").write_bytes(pe(True, b"engine"))
         (r / "out" / "game_xexcheck.exe").write_bytes(pe(False, b"check"))
-        (r / "out" / "other.dll").write_bytes(pe(True, b"other"))
+        (r / "out" / "other_tool.exe").write_bytes(pe(False, b"other"))  # staged by no entry
         self.inst = inst
         self.staging = inst / "staging"
         pc.stage(r, inst / "release-files.toml", self.staging)
@@ -147,6 +147,22 @@ class PackageTest(unittest.TestCase):
     def test_a_valid_dll_not_in_the_manifest(self) -> None:
         (self.staging / "other.dll").write_bytes(pe(True, b"other"))
         self.assertTrue(any("other.dll: not in the release-file manifest" in e for e in self.run_check()[1]))
+
+    def test_a_build_dll_no_entry_names_fails_stage(self) -> None:
+        # A library a later build adds is not left out without a word: stage refuses the build folder
+        # before it copies anything, naming the DLL; with its pe-x64-dll entry it stages.
+        (self.repo / "out" / "miniupnpc.dll").write_bytes(pe(True, b"upnp"))
+        other = self.repo / "elsewhere"
+        with self.assertRaisesRegex(pc.CheckError, r"miniupnpc\.dll: in the build folder but no pe-x64-dll"):
+            pc.stage(self.repo, self.inst / "release-files.toml", other)
+        self.assertFalse(other.exists())
+        self.assertEqual(pc.main(["stage", "--repo", str(self.repo), "--staging", "elsewhere"]), 2)
+        entry = "\n[[file]]\niss_source = 'staging\\miniupnpc.dll'\ndest = '{app}'\nprovenance = 'build:upnp'\n" \
+                "type = 'pe-x64-dll'\nfrom = 'out/miniupnpc.dll'\n"
+        (self.inst / "release-files.toml").write_text(MANIFEST + entry, encoding="utf-8")
+        pc.stage(self.repo, self.inst / "release-files.toml", other)
+        self.assertTrue((other / "miniupnpc.dll").is_file())
+        self.assertFalse((other / "other_tool.exe").exists())
 
     def test_a_tracked_file_with_another_hash(self) -> None:
         (self.inst / "settings_template.toml").write_text("[General]\nskip_intro = true\n", encoding="utf-8")
