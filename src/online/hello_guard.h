@@ -23,8 +23,10 @@ namespace skylanders::online {
 // unknown address and answers its verdicts statelessly (HelloCookie, JoinWait, Refuse) until it
 // admits one; only then does a connection exist for the sender.
 //
-//   1. size: a Hello datagram under kMinHelloBytes (the joiner pads to it) or over the protocol's
-//      maximum is dropped, so a cookie reply is never larger than what came in;
+//   1. size: a Hello datagram under kMinHelloBytes or over the protocol's maximum is dropped, so a
+//      cookie reply is never larger than what came in. Nothing pads a Hello: the floor holds
+//      because its fixed fields (with stage 8's nonce, secret and cookie) make even the smallest
+//      one, with an empty name, longer than that on the wire (106 bytes; the unit test checks it);
 //   2. a known session goes to its peer (the caller's, before this gate);
 //   3. limits: a global token bucket (16 Hellos per second) and a per-source bucket (2 per second,
 //      burst 4) in a table of at most 256 sources, least recently seen evicted first; over either,
@@ -57,6 +59,9 @@ using CookieKey = std::array<uint8_t, 16>;
 // SipHash-2-4 with a 64-bit output (Aumasson and Bernstein's reference definition).
 uint64_t SipHash24(const CookieKey& key, std::span<const uint8_t> data);
 
+// The smallest Hello datagram the gate looks at. No joiner pads to it: a Hello of this build is
+// longer by its fixed fields alone (tests/online_hello_guard_test.cpp encodes the smallest one), and
+// a shorter one (an older build without the stage 8 fields) is dropped without a reply.
 constexpr size_t kMinHelloBytes = 96;
 constexpr size_t kMaxHelloBytes = 1200;  // netplay kMaxDatagramSize
 constexpr auto kCookieBucket = std::chrono::seconds(5);

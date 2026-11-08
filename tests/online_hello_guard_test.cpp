@@ -7,7 +7,9 @@
 #include <string>
 #include <vector>
 
+#include "netplay/datagram.h"
 #include "online/hello_guard.h"
+#include "online/protocol.h"
 #include "test_util.h"
 
 using namespace skylanders::online;
@@ -99,9 +101,15 @@ int main() {
     CHECK(jar.Verify(new_cookie, a, 5, t0 + seconds(605)));
   }
 
-  // Size first: a Hello under the padded minimum or over the datagram maximum gets nothing, so the
-  // cookie reply is never larger than what came in; nothing is stored for it.
+  // Size first: a Hello under the minimum or over the datagram maximum gets nothing, so the cookie
+  // reply is never larger than what came in; nothing is stored for it.
   {
+    // Nothing pads a Hello (council 8, Opus B9 a): the smallest one this build sends (an empty
+    // name, with its datagram header and message header) is longer than the floor by its fixed
+    // fields alone, so the floor never drops a real Hello.
+    const std::vector<uint8_t> smallest = EncodeMessage(Message{Hello{}});
+    CHECK(!smallest.empty());
+    CHECK(skylanders::netplay::kDatagramHeaderSize + smallest.size() >= kMinHelloBytes);
     HelloGate gate({0x1234, Key(5), false, 4}, t0);
     HelloFacts h = Facts({0x01020304, 1000}, 1, 0, 0x1234);
     h.datagram_bytes = kMinHelloBytes - 1;
