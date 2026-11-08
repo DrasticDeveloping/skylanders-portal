@@ -56,9 +56,15 @@ constexpr uint8_t kBackendModeRecordsEnemies = 0x10;
 // Stage 6 (future/online-6.md D25; cross-stage decision 1, bit 5 `records_world`): the world
 // records, leases, scenes and the session pause (online_records_world). Bit 4 is stage 5's.
 constexpr uint8_t kBackendModeRecordsWorld = 0x20;
+// Stage 7 (future/online-7.md section 3 "Settings"; cross-stage decision 1, bit 6): every stage 7
+// record, suppression and request path together (online_records_progress), so every client follows
+// S. Bits 4 and 5 are stages 5 and 6's (records_enemies, records_world); bit 7 is reserved for 1C's
+// save_handback.
+constexpr uint8_t kBackendModeRecordsProgress = 0x40;
 constexpr uint8_t kBackendModeKnown = kBackendModeRecordsPilot | kBackendModeChurn |
                                       kBackendModeRecordsPlayers | kBackendModeRequestsGeneric |
-                                      kBackendModeRecordsEnemies | kBackendModeRecordsWorld;
+                                      kBackendModeRecordsEnemies | kBackendModeRecordsWorld |
+                                      kBackendModeRecordsProgress;
 // Hello's flags (stage 4 item 2): a trailing byte, so a Hello without it reads as 0. A bit outside
 // kHelloFlagsKnown makes the message invalid.
 constexpr uint8_t kHelloSynthetic = 0x01;  // a synthetic peer (tools/headless_peer); S accepts it
