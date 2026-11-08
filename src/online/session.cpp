@@ -75,6 +75,7 @@ bool ServerSession::Start(std::unique_ptr<netplay::Transport> transport,
   barrier_open_ = false;
   server_loaded_ = false;
   waiting_.clear();
+  requests_.Reset(0);
   return true;
 }
 
@@ -107,6 +108,10 @@ void ServerSession::Pump(TimePoint now) {
       if (now - peer->created > kPeerTimeout) peer->state = PeerState::kGone;
     }
   }
+  // The pose queue, held exits and End session's gone timeout, once per Pump (a server frame);
+  // what it decides goes out in this Pump.
+  requests_.Service(now);
+  FlushRequests(now);
   for (auto& [endpoint, peer] : peers_) {
     if (peer->state != PeerState::kGone) peer->conn->Pump(now);
   }
@@ -182,6 +187,7 @@ void ServerSession::HandleMessage(Peer& peer, const Message& message, TimePoint 
       SendRefuse(peer, RefuseReason::kNotOwner, "only the owner changes the level", now, false);
       return;
     }
+    // 0 also while End session's drain is on: no generation changes during the drain.
     const uint32_t generation = RequestLevel(request->zone, now);
     if (generation == 0) return;
     ServerEvent e;
@@ -196,6 +202,44 @@ void ServerSession::HandleMessage(Peer& peer, const Message& message, TimePoint 
     }
   } else if (std::holds_alternative<Bye>(message)) {
     DropPeer(peer, LeaveReason::kBye, now);
+  } else if (const auto* pose = std::get_if<PlayerPose>(&message)) {
+    // An older pose (the fast lane drops only datagrams older than the newest, not stale content)
+    // or one of another generation is dropped here.
+    if (!requests_.OnPose(peer.id, pose->generation, pose->pose_sequence)) return;
+    ServerEvent e;
+    e.type = ServerEvent::Type::kPlayerPose;
+    e.peer_id = peer.id;
+    e.pose = *pose;
+    events_.push_back(std::move(e));
+  } else if (const auto* action = std::get_if<PlayerAction>(&message)) {
+    if (requests_.Closing()) return;  // End session: nothing is applied any more
+    ServerEvent e;
+    e.type = ServerEvent::Type::kPlayerAction;
+    e.peer_id = peer.id;
+    e.action = *action;
+    events_.push_back(std::move(e));
+  } else if (const auto* world_request = std::get_if<WorldRequest>(&message)) {
+    ServerEvent e;
+    e.type = ServerEvent::Type::kRequestReceived;
+    e.peer_id = peer.id;
+    e.request = *world_request;
+    e.request.key.peer = peer.id;  // a client speaks only for itself
+    const WorldRequest r = e.request;
+    events_.push_back(std::move(e));
+    requests_.OnRequest(r, now);
+    FlushRequests(now);
+  } else if (std::holds_alternative<SessionClosed>(message)) {
+    requests_.OnClosed(peer.id);
+    FlushRequests(now);
+  } else if (const auto* scene = std::get_if<SceneBarrier>(&message)) {
+    // A client only acknowledges; any other phase from it is dropped, and so is an ack that comes
+    // after End session began (the scene barrier has nothing left to wait for).
+    if (scene->phase != ScenePhase::kAck || requests_.Closing()) return;
+    ServerEvent e;
+    e.type = ServerEvent::Type::kSceneAck;
+    e.peer_id = peer.id;
+    e.scene = *scene;
+    events_.push_back(std::move(e));
   }
 }
 
@@ -213,6 +257,11 @@ void ServerSession::HandleHello(Peer& peer, const Hello& hello, TimePoint now) {
   const bool claims_owner = !IsNone(hello.owner_token);
   if (claims_owner && hello.owner_token != settings_.owner_token) {
     SendRefuse(peer, RefuseReason::kNotOwner, "the owner token does not match", now, true);
+    return;
+  }
+  if (requests_.Closing()) {
+    // End session's drain: a client welcomed now would never get SessionClosing nor be awaited.
+    SendRefuse(peer, RefuseReason::kOther, "the session is ending", now, true);
     return;
   }
 
@@ -278,10 +327,16 @@ void ServerSession::SendRefuse(Peer& peer, RefuseReason reason, std::string text
 void ServerSession::DropPeer(Peer& peer, LeaveReason reason, TimePoint now) {
   if (peer.state != PeerState::kWelcomed) return;
   const uint16_t id = peer.id;
+  // Its keys go: a client that comes back under the same id starts its sequences again.
+  requests_.ForgetPeer(id);
   if (reason == LeaveReason::kTimeout) {
     peer.state = PeerState::kGone;
   } else {
-    if (reason == LeaveReason::kReplaced) Post(peer, Lane::kGameplay, Bye{}, now);
+    // Replaced: told Bye. Closed: its finals went out just before this, on the same lane; now its
+    // Bye. The connection lingers kCloseLinger to ack what is still in flight.
+    if (reason == LeaveReason::kReplaced || reason == LeaveReason::kClosed) {
+      Post(peer, Lane::kGameplay, Bye{}, now);
+    }
     peer.state = PeerState::kClosing;
     peer.closing_since = now;
   }
@@ -297,12 +352,18 @@ void ServerSession::DropPeer(Peer& peer, LeaveReason reason, TimePoint now) {
 }
 
 uint32_t ServerSession::RequestLevel(std::string_view zone, TimePoint now) {
-  if (!transport_ || zone.size() > kMaxZoneBytes || !IsValidUtf8(zone)) return 0;
+  if (!transport_ || requests_.Closing() || zone.size() > kMaxZoneBytes || !IsValidUtf8(zone)) {
+    return 0;
+  }
   ++generation_;
   zone_ = std::string(zone);
   barrier_open_ = true;
   server_loaded_ = false;
   waiting_.clear();
+  // The finals owed for the older generations' keys go first, on the same ordered lane as the
+  // LevelLoad below, so a client has them before the new generation starts (invariant 3).
+  requests_.OnGenerationChange(generation_);
+  FlushRequests(now);
   for (auto& [endpoint, peer] : peers_) {
     if (peer->state != PeerState::kWelcomed) continue;
     waiting_.insert(peer->id);
@@ -341,9 +402,88 @@ void ServerSession::BroadcastPlayerList(TimePoint now) {
   }
 }
 
-void ServerSession::Post(Peer& peer, Lane lane, const Message& message, TimePoint now) {
+bool ServerSession::Post(Peer& peer, Lane lane, const Message& message, TimePoint now) {
   const std::vector<uint8_t> bytes = Encoded(message);
-  if (!bytes.empty()) peer.conn->Send(lane, bytes, now);
+  return !bytes.empty() && peer.conn->Send(lane, bytes, now) == netplay::SendResult::kSent;
+}
+
+void ServerSession::FlushRequests(TimePoint now) {
+  for (RequestOutput& o : requests_.TakeOutputs()) {
+    ServerEvent e;
+    e.peer_id = o.peer;
+    switch (o.type) {
+      case RequestOutput::Type::kDecision: {
+        Peer* p = FindById(o.peer);
+        e.type = ServerEvent::Type::kDecisionSent;
+        e.decision = o.decision;
+        e.sent = p && Post(*p, Lane::kGameplay, o.decision, now);
+        events_.push_back(std::move(e));
+        break;
+      }
+      case RequestOutput::Type::kEvaluate:
+        e.type = ServerEvent::Type::kEvaluateRequest;
+        e.request = o.request;
+        e.generation = o.request.key.generation;
+        events_.push_back(std::move(e));
+        break;
+      case RequestOutput::Type::kPeerClosed:
+        e.type = ServerEvent::Type::kPeerClosed;
+        e.gone = o.gone;
+        events_.push_back(std::move(e));
+        // Its finals went out just before this, on the same lane: it leaves like any other client
+        // (its Bye, kPeerLeft, the barrier no longer waits for it, the player list without it).
+        if (Peer* p = FindById(o.peer)) DropPeer(*p, LeaveReason::kClosed, now);
+        break;
+    }
+  }
+}
+
+bool ServerSession::SubmitEvaluation(const RequestKey& key, const EvaluationResult& result,
+                                     TimePoint now) {
+  if (!transport_) return false;
+  const bool taken = requests_.SubmitEvaluation(key, result, now);
+  FlushRequests(now);
+  return taken;
+}
+
+bool ServerSession::SendAppliedStep(const AppliedStep& step, TimePoint now) {
+  const std::vector<uint8_t> bytes = Encoded(step);
+  if (!transport_ || bytes.empty()) return false;
+  for (auto& [endpoint, peer] : peers_) {
+    if (peer->state == PeerState::kWelcomed) peer->conn->Send(Lane::kGameplay, bytes, now);
+  }
+  return true;
+}
+
+bool ServerSession::SendLevelEnd(uint16_t peer, const LevelEnd& end, TimePoint now) {
+  Peer* p = FindById(peer);
+  return p && Post(*p, Lane::kGameplay, end, now);
+}
+
+bool ServerSession::SendReaction(uint16_t peer, const Reaction& reaction, TimePoint now) {
+  Peer* p = FindById(peer);
+  return p && Post(*p, Lane::kGameplay, reaction, now);
+}
+
+bool ServerSession::SendSceneBarrier(const SceneBarrier& scene, TimePoint now) {
+  if (scene.phase == ScenePhase::kAck) return false;
+  const std::vector<uint8_t> bytes = Encoded(scene);
+  if (!transport_ || bytes.empty()) return false;
+  for (auto& [endpoint, peer] : peers_) {
+    if (peer->state == PeerState::kWelcomed) peer->conn->Send(Lane::kGameplay, bytes, now);
+  }
+  return true;
+}
+
+void ServerSession::EndSession(TimePoint now) {
+  if (!transport_ || requests_.Closing()) return;
+  std::vector<uint16_t> ids;
+  for (auto& [endpoint, peer] : peers_) {
+    if (peer->state != PeerState::kWelcomed) continue;
+    ids.push_back(peer->id);
+    Post(*peer, Lane::kGameplay, SessionClosing{}, now);
+  }
+  requests_.BeginClose(ids, now);
 }
 
 ServerSession::Peer* ServerSession::FindById(uint16_t id) {
@@ -377,6 +517,7 @@ std::vector<PeerInfo> ServerSession::Peers() const {
     info.endpoint = endpoint;
     info.rtt = peer->conn->SmoothedRtt();
     info.last_receive = peer->conn->LastReceive();
+    info.stats = peer->conn->Stats();
     out.push_back(std::move(info));
   }
   std::sort(out.begin(), out.end(),
@@ -429,6 +570,7 @@ bool ClientSession::Connect(std::unique_ptr<netplay::Transport> transport,
   zone_.clear();
   players_.clear();
   ticks_.Reset(60);
+  closing_ = false;
   error_.clear();
   if (!transport) {
     error_ = "no transport";
@@ -574,6 +716,41 @@ void ClientSession::HandleMessage(const Message& message, TimePoint now) {
     e.type = ClientEvent::Type::kPlayerList;
     e.players = list->players;
     events_.push_back(std::move(e));
+  } else if (const auto* decision = std::get_if<WorldDecision>(&message)) {
+    ClientEvent e;
+    e.type = ClientEvent::Type::kWorldDecision;
+    e.decision = *decision;
+    events_.push_back(std::move(e));
+  } else if (const auto* applied = std::get_if<AppliedStep>(&message)) {
+    ClientEvent e;
+    e.type = ClientEvent::Type::kAppliedStep;
+    e.applied = *applied;
+    events_.push_back(std::move(e));
+  } else if (const auto* end = std::get_if<LevelEnd>(&message)) {
+    ClientEvent e;
+    e.type = ClientEvent::Type::kLevelEnd;
+    e.level_end = *end;
+    events_.push_back(std::move(e));
+  } else if (const auto* reaction = std::get_if<Reaction>(&message)) {
+    ClientEvent e;
+    e.type = ClientEvent::Type::kReaction;
+    e.reaction = *reaction;
+    events_.push_back(std::move(e));
+  } else if (const auto* scene = std::get_if<SceneBarrier>(&message)) {
+    if (scene->phase == ScenePhase::kAck) return;  // the clients' phase: not the server's to send
+    ClientEvent e;
+    e.type = ClientEvent::Type::kSceneBarrier;
+    e.scene = *scene;
+    events_.push_back(std::move(e));
+  } else if (std::holds_alternative<SessionClosing>(message)) {
+    if (closing_) return;
+    // From here no request leaves this client (the Send calls refuse), so SessionClosed, sent now
+    // on the same ordered lane, is the watermark of everything it sent.
+    closing_ = true;
+    Post(Lane::kGameplay, SessionClosed{}, now);
+    ClientEvent e;
+    e.type = ClientEvent::Type::kSessionClosing;
+    events_.push_back(std::move(e));
   }
 }
 
@@ -594,6 +771,32 @@ bool ClientSession::SendLevelRequest(std::string_view zone, TimePoint now) {
 bool ClientSession::SendLevelLoaded(uint32_t generation, TimePoint now) {
   if (!Connected()) return false;
   return Post(Lane::kGameplay, LevelLoaded{generation}, now);
+}
+
+bool ClientSession::SendPlayerPose(const PlayerPose& pose, TimePoint now) {
+  if (!Connected() || closing_) return false;
+  return Post(Lane::kFast, pose, now);
+}
+
+bool ClientSession::SendPlayerAction(const PlayerAction& action, TimePoint now) {
+  if (!Connected() || closing_) return false;
+  return Post(Lane::kGameplay, action, now);
+}
+
+bool ClientSession::SendWorldRequest(const WorldRequest& request, TimePoint now) {
+  if (!Connected() || closing_) return false;
+  WorldRequest r = request;
+  r.key.peer = peer_id_;
+  return Post(Lane::kGameplay, r, now);
+}
+
+bool ClientSession::SendSceneAck(const SceneBarrier& scene, TimePoint now) {
+  if (!Connected() || closing_) return false;
+  SceneBarrier ack = scene;
+  ack.phase = ScenePhase::kAck;
+  ack.end = SceneEndReason::kNone;
+  ack.skips = 0;
+  return Post(Lane::kGameplay, ack, now);
 }
 
 bool ClientSession::Post(Lane lane, const Message& message, TimePoint now) {

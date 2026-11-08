@@ -6,7 +6,9 @@
 // extra input device that merges with the controller and keyboard like the keyboard does.
 //
 // Script: one command per line or ';'-separated, '#' starts a comment. Each command starts when
-// the previous one ends; the timeline starts when the game starts.
+// the previous one ends; the timeline starts when the game starts. A blocking command (a waitfor or
+// a registered command) holds the timeline: no press or stick move written after it plays before
+// it has returned, and the times after it count from its return.
 //   wait <seconds>
 //   tap <button>             press for 120 ms
 //   hold <button> <ms>
@@ -55,11 +57,12 @@
 //   trap <slot> <villain>    puts a new trap holding that villain (its name, e.g. Chompy Mage)
 //                            onto the slot, as the portal developer tools (F8) make one
 //   waitfor <name> <seconds> waits until a condition the game registered (RegisterScriptCondition)
-//                            holds, at most that long; the rest of the timeline moves up by the
-//                            time not needed, so what follows starts at the event, not the clock
+//                            holds, at most that long; what follows starts when it returns (met
+//                            or timed out), not by the clock
 //   quit                     ends the game
 //   <name> [<args>]          a command the game registered (RegisterScriptCommand), e.g. a
-//                            developer build's level loading; the timeline waits while it runs
+//                            developer build's level loading; the timeline waits while it runs,
+//                            presses included
 // Buttons: a b x y start back guide up down left right lb rb ls rs lt rt, or several pressed
 // together joined with + (tap back+y)
 
@@ -91,5 +94,18 @@ void InstallInputScript(rex::system::IInputSystem* input_system, rex::memory::Me
 // its line; a condition is asked every 50 ms while a waitfor waits for it.
 void RegisterScriptCommand(const std::string& name, std::function<void(const std::string& args)> run);
 void RegisterScriptCondition(const std::string& name, std::function<bool()> holds);
+
+// A left stick the game's own developer code drives (a closed-loop walk that steers toward a
+// position each frame): while `on`, it replaces the script's `stick` events on the script's virtual
+// pad; x and y in -1..1. Any thread.
+void SetScriptStick(bool on, double x, double y);
+// Buttons the game's own developer code holds (the closed-loop walk's jump): while `on`, they are
+// added to the script's own presses; XInput button bits (A is 0x1000). Any thread.
+#define SKYLANDERS_DEV_SCRIPT_BUTTONS 1
+void SetScriptButtons(bool on, uint16_t buttons);
+// Triggers the game's own developer code pulls (a route tool's RT interaction): while `on`, the
+// chosen ones are pulled all the way, added to the script's own `lt` / `rt` presses. Any thread.
+#define SKYLANDERS_DEV_SCRIPT_TRIGGERS 1
+void SetScriptTriggers(bool on, bool left, bool right);
 
 }  // namespace skylanders::dev

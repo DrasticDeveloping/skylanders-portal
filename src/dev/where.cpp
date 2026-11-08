@@ -144,9 +144,14 @@ void ReportPlayerFrame(uint32_t who, float x, float y, float z, bool relative) {
   ReportPlace(level, true, x, y, z);
 }
 
-void LogPlace(const char* why) {
+void LogPlace(const char* why, bool urgent) {
   const std::string text = PlaceText();
-  if (!text.empty()) REXLOG_INFO("Where ({}): {}", why, text);
+  if (text.empty()) return;
+  if (urgent) {
+    REXLOG_URGENT_INFO("Where ({}): {}", why, text);
+  } else {
+    REXLOG_INFO("Where ({}): {}", why, text);
+  }
 }
 
 }  // namespace skylanders::dev

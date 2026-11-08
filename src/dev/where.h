@@ -24,8 +24,9 @@ std::string PlaceText();
 std::string CurrentLevel();
 
 // Logs the "Where:" line now, with the reason ("crash", "problem note"); nothing before the first
-// report.
-void LogPlace(const char* why);
+// report. `urgent` (the crash handlers): through the SDK's LogUrgent, which never waits long for
+// room in the asynchronous log queue.
+void LogPlace(const char* why, bool urgent = false);
 
 // For a game that names its level after the level archive it opened last (Swap Force,
 // SuperChargers, Imaginators keep each level in one archive): `name_of` turns a path the game

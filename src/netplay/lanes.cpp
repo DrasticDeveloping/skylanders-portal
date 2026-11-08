@@ -18,7 +18,8 @@ SendResult Connection::Send(Lane lane, std::span<const uint8_t> payload, TimePoi
     return SendResult::kTooBig;
   }
   if (!IsReliable(lane)) {
-    Transmit(Lane::kFast, 0, fast_.next_sequence++, fast_.highest, fast_.bits, payload);
+    BytesOf(Lane::kFast).sent +=
+        Transmit(Lane::kFast, 0, fast_.next_sequence++, fast_.highest, fast_.bits, payload);
     ++stats_.sent;
     return SendResult::kSent;
   }
@@ -34,7 +35,7 @@ SendResult Connection::Send(Lane lane, std::span<const uint8_t> payload, TimePoi
   p.payload.assign(payload.begin(), payload.end());
   p.first_sent = p.last_sent = now;
   p.sends = 1;
-  TransmitData(lane, sequence, p.payload);
+  BytesOf(lane).sent += TransmitData(lane, sequence, p.payload);
   ++stats_.sent;
   return SendResult::kSent;
 }
@@ -51,8 +52,8 @@ uint32_t Connection::AckBits(const ReliableLane& l, uint32_t ack) {
   return bits;
 }
 
-void Connection::Transmit(Lane lane, uint16_t flags, uint32_t sequence, uint32_t ack,
-                          uint32_t ack_bits, std::span<const uint8_t> payload) {
+size_t Connection::Transmit(Lane lane, uint16_t flags, uint32_t sequence, uint32_t ack,
+                            uint32_t ack_bits, std::span<const uint8_t> payload) {
   DatagramHeader h;
   h.lane = lane;
   h.flags = flags;
@@ -61,13 +62,16 @@ void Connection::Transmit(Lane lane, uint16_t flags, uint32_t sequence, uint32_t
   h.sequence = sequence;
   h.ack = ack;
   h.ack_bits = ack_bits;
-  if (EncodeDatagram(h, payload, scratch_) && send_) send_(scratch_);
+  if (!EncodeDatagram(h, payload, scratch_)) return 0;
+  if (send_) send_(scratch_);
+  return scratch_.size();
 }
 
-void Connection::TransmitData(Lane lane, uint32_t sequence, std::span<const uint8_t> payload) {
+size_t Connection::TransmitData(Lane lane, uint32_t sequence, std::span<const uint8_t> payload) {
   ReliableLane& l = Reliable(lane);
-  Transmit(lane, 0, sequence, l.highest, AckBits(l, l.highest), payload);
+  const size_t size = Transmit(lane, 0, sequence, l.highest, AckBits(l, l.highest), payload);
   l.ack_due = false;  // this datagram carries the ack
+  return size;
 }
 
 void Connection::AddRttSample(microseconds sample) {
@@ -97,6 +101,7 @@ void Connection::OnDatagram(const DatagramView& v, TimePoint now) {
   last_receive_ = now;
   ++stats_.received;
   const DatagramHeader& h = v.header;
+  BytesOf(h.lane).received += kDatagramHeaderSize + v.payload.size();
 
   if (h.lane == Lane::kFast) {
     if (h.flags & kFlagAckOnly) return;
@@ -154,12 +159,12 @@ void Connection::Pump(TimePoint now) {
       if (now - p.last_sent < TimeoutFor(p)) continue;
       p.last_sent = now;
       ++p.sends;
-      TransmitData(lane, sequence, p.payload);
+      BytesOf(lane).resent += TransmitData(lane, sequence, p.payload);
       ++stats_.resent;
       resent = true;
     }
     if (l.ack_due) {
-      Transmit(lane, kFlagAckOnly, 0, l.highest, AckBits(l, l.highest), {});
+      BytesOf(lane).acks += Transmit(lane, kFlagAckOnly, 0, l.highest, AckBits(l, l.highest), {});
       ++stats_.acks_sent;
       l.ack_due = false;
     }
@@ -171,7 +176,7 @@ void Connection::Pump(TimePoint now) {
       uint32_t covered_from = l.highest > 32 ? l.highest - 32 : 1;
       for (uint32_t a : l.to_ack) {
         if (a >= covered_from) continue;
-        Transmit(lane, kFlagAckOnly, 0, a, AckBits(l, a), {});
+        BytesOf(lane).acks += Transmit(lane, kFlagAckOnly, 0, a, AckBits(l, a), {});
         ++stats_.acks_sent;
         covered_from = a > 32 ? a - 32 : 1;
       }

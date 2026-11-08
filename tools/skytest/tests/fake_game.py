@@ -2,10 +2,15 @@
 input script's commands fast, and writes the log lines the real game writes.
 
 Extra commands only this fake knows: `hang` (never quits), `crash` (logs a crash and exits 3),
-`exit <code>`. `place` logs the hub as the level, as a figure placed after a save is loaded does.
+`exit <code>`, `nopresent` (anywhere in the script: no first frame line; it is logged first otherwise,
+after FAKE_BOOT_SECONDS from the environment if set). `place` logs the hub as the level, as a figure placed after a save is loaded does.
 `online_host` writes a hosted server's log into the session folder as the real owner's game does
 (its frame-time windows with the p95 of `serverframes <ms>`, 12 by default); `online_join <addr>`
-logs the connection when the address has the owner's port."""
+logs the connection when the address has the owner's port. `savewrite` rewrites the first save under
+the data folder's <profile>/415608E9 (as a save the game writes); `savewrite backup` writes only into
+the data folder's save-backup (as the SDK does), which is no save. `serverlog <text>` appends a line
+to the hosted server's log (a [compare] case's workload); with `--render_hidden_draw=false` the
+hosted server's log says the draw skip is on, as the real server's does."""
 import os
 import sys
 import time
@@ -28,9 +33,15 @@ def main() -> int:
             log.flush()
 
         line("Skylanders: Swap Force test (build fake123); Windows")
+        script_text = open(script_path, encoding="utf-8").read()
+        boot = os.environ.get("FAKE_BOOT_SECONDS")  # the first frame line this much later (the boot token)
+        if "nopresent" not in script_text:
+            if boot:
+                time.sleep(float(boot))
+            line("Swap: game presentation interval 2 (swap word 00000200)")
         line(f"Input script: playing '{script_path}'")
         server_p95 = 12.0
-        for raw in open(script_path, encoding="utf-8").read().splitlines():
+        for raw in script_text.splitlines():
             cmd, _, rest = raw.strip().partition(" ")
             if not cmd or cmd.startswith("#"):
                 continue
@@ -68,12 +79,34 @@ def main() -> int:
                     s.write(f"[{stamp}] [info] [core] [t2] Level watch: tutorial_b: ready (request 1, a player is in it)\n")
                     s.write(f"[{stamp}] [info] [core] [t2] Online: frames 600 fps 60.0 p50 16.7 p95 {server_p95} "
                             "max 40.0 private 1500 working 900 video 410\n")
+                    if arg("render_hidden_draw") == "false":
+                        s.write(f"[{stamp}] [info] [gpu] [t3] GPU: draw skip on (render_hidden_draw off, window "
+                                "hidden): draws without memexport, resolves and presents are skipped\n")
                 line(f"Online: hosting: the server is on port {arg('online_port')}, join code ABCDEFGH")
+            elif cmd == "serverlog":
+                now = time.time()
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)) + f".{int(now % 1 * 1000):03d}"
+                with open(os.path.join(arg("user_data_root"), "Online", "session", "game.log"), "a",
+                          encoding="utf-8") as s:
+                    s.write(f"[{stamp}] [info] [core] [t2] {rest}\n")
             elif cmd == "online_join":
                 if rest.endswith(":" + rest.rsplit(":", 1)[-1]) and rest.rsplit(":", 1)[-1].isdigit():
                     line(f"Online: online_join: connected to {rest}")
                 else:
                     line(f"Online: online_join {rest}: no server", "error")
+            elif cmd == "savewrite":
+                data = arg("user_data_root")
+                if rest == "backup":
+                    os.makedirs(os.path.join(data, "save-backup", "previous"), exist_ok=True)
+                    with open(os.path.join(data, "save-backup", "previous", "package"), "wb") as f:
+                        f.write(b"old")
+                    line("Content: SWAPFORCE_0 saved; the version before it is in save-backup")
+                else:
+                    target = next(os.path.join(d, f) for d, _, files in sorted(os.walk(data))
+                                  if os.sep + "415608E9" in d for f in sorted(files))
+                    with open(target, "ab") as f:
+                        f.write(b"progress")
+                    line(f"Content: saving {os.path.relpath(target, data)} anew")
             elif cmd == "hang":
                 time.sleep(3600)
             elif cmd == "crash":

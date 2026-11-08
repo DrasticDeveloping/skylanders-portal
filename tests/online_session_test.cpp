@@ -5,12 +5,23 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "netplay/fake_network.h"
 #include "online/join_code.h"
 #include "online/session.h"
 #include "test_util.h"
+
+// REQUIRE_OR_RETURN for a function that returns nothing: a failure is counted, then it returns.
+#define REQUIRE_OR_RETURN_VOID(cond)                                       \
+  do {                                                                     \
+    if (!(cond)) {                                                         \
+      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+      ++g_failures;                                                        \
+      return;                                                              \
+    }                                                                      \
+  } while (0)
 
 using namespace skylanders::online;
 using namespace std::chrono_literals;
@@ -81,6 +92,12 @@ struct World {
   bool server_paused = false;
   std::vector<std::unique_ptr<Client>> clients;
   uint32_t next_address = 0x0A000010;
+  // The server's game thread: it answers each kEvaluateRequest on its next frame (here, right after
+  // the Pump that reported it) with `verdict`, and drops one whose generation is no longer current
+  // or that comes while End session's drain is on, as the game must.
+  bool game = true;
+  RefusalReason verdict = RefusalReason::kNone;
+  uint32_t applied = 0;
 
   bool StartServer(const ServerSettings& s) { return server.Start(net.Bind(kServerEp), s, net.Now()); }
 
@@ -95,7 +112,18 @@ struct World {
     if (!server_paused) {
       server.Pump(net.Now());
       ServerEvent e;
-      while (server.PollEvent(e)) server_events.push_back(e);
+      std::vector<ServerEvent> evaluate;
+      while (server.PollEvent(e)) {
+        if (e.type == ServerEvent::Type::kEvaluateRequest) evaluate.push_back(e);
+        server_events.push_back(e);
+      }
+      for (const ServerEvent& x : evaluate) {
+        if (!game || x.generation != server.Generation() || server.Closing()) continue;
+        EvaluationResult r;
+        r.reason = verdict;
+        if (verdict == RefusalReason::kNone) r.applied_sequence = ++applied;
+        server.SubmitEvaluation(x.request.key, r, net.Now());
+      }
     }
     for (auto& c : clients) {
       if (c->paused) continue;
@@ -133,6 +161,8 @@ struct World {
 
 using SE = ServerEvent::Type;
 using CE = ClientEvent::Type;
+
+bool Pending(const WorldDecision& d) { return d.outcome == DecisionOutcome::kPending && !d.final; }
 
 void FakeNetworkSession() {
   World w(2026);
@@ -437,6 +467,383 @@ void FakeNetworkHelloFlood() {
   CHECK(owner.session->Connected() && w.server.ConnectionCount() <= cap);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Version 2: requests through ServerSession's request table, on a lossy, reordering fake network
+// (docs/online-1B.md section 2, "The request state machine"; requests.h has the table's own
+// cell-by-cell tests).
+
+EntityRef TestTrigger(uint32_t generation) {
+  return WorldRef(generation, 2394, NameHash("JumpHint_Trigger"), NameHash("CTrigger"));
+}
+
+WorldRequest EnterRequest(uint32_t generation, uint32_t enter_sequence, uint32_t pose) {
+  WorldRequest r;
+  r.key = TriggerRequestKey(0, generation, TestTrigger(generation), TriggerEvent::kEnter, enter_sequence);
+  r.subject = SelfRef(generation);
+  r.event_bits = 0x21;
+  r.pose_sequence = pose;
+  return r;
+}
+
+// The client's view of a key: every decision for it, and where each sits in its events.
+std::vector<std::pair<size_t, WorldDecision>> DecisionsFor(const Client& c, const RequestKey& key) {
+  std::vector<std::pair<size_t, WorldDecision>> out;
+  for (size_t i = 0; i < c.events.size(); ++i) {
+    const ClientEvent& e = c.events[i];
+    if (e.type == CE::kWorldDecision && e.decision.key == key) out.emplace_back(i, e.decision);
+  }
+  return out;
+}
+
+size_t IndexOf(const Client& c, CE type, uint32_t generation) {
+  for (size_t i = 0; i < c.events.size(); ++i) {
+    if (c.events[i].type == type && c.events[i].generation == generation) return i;
+  }
+  return c.events.size();
+}
+
+void FakeNetworkRequests() {
+  World w(1234);
+  LinkConditions c;
+  c.loss_percent = 10;
+  c.duplicate_percent = 5;
+  c.reorder_percent = 10;
+  c.reorder_ms = 15;
+  c.delay_ms = 10;
+  c.jitter_ms = 5;
+  w.net.SetDefault(c);
+  REQUIRE_OR_RETURN_VOID(w.StartServer(Settings()));
+  Client& owner = w.Connect(MakeHello("Owner", true));
+  CHECK(w.RunUntil([&] { return owner.session->Connected(); }));
+  Client& b = w.Connect(MakeHello("Bee"));
+  CHECK(w.RunUntil([&] { return b.session->Connected(); }));
+  const uint16_t bee = b.session->PeerId();
+  const uint32_t g1 = w.server.RequestLevel("levels/zone_a", w.net.Now());
+  CHECK(w.RunUntil([&] { return b.session->Generation() == g1 && owner.session->Generation() == g1; }));
+
+  auto keyed = [&](WorldRequest r) {
+    r.key.peer = bee;  // what the client and the server set it to
+    return r.key;
+  };
+  auto server_count = [&](SE type, const RequestKey& key) {
+    return size_t(std::count_if(w.server_events.begin(), w.server_events.end(), [&](const ServerEvent& e) {
+      return e.type == type && e.request.key == key;
+    }));
+  };
+
+  // A request that arrives before its pose: pending; applied once the pose comes (the fast lane
+  // loses some poses, so the client keeps sending the same one, as its 20 Hz stream would).
+  const WorldRequest first = EnterRequest(g1, 1, 1);
+  const RequestKey first_key = keyed(first);
+  CHECK(b.session->SendWorldRequest(first, w.net.Now()));
+  CHECK(w.RunUntil([&] { return server_count(SE::kRequestReceived, first_key) == 1; }));
+  PlayerPose pose;
+  pose.pose_sequence = 1;
+  pose.generation = g1;
+  pose.figure.figure_id = 3;
+  CHECK(w.RunUntil([&] {
+    b.session->SendPlayerPose(pose, w.net.Now());
+    return DecisionsFor(b, first_key).size() >= 2;
+  }));
+  auto ds = DecisionsFor(b, first_key);
+  REQUIRE_OR_RETURN_VOID(ds.size() == 2);
+  CHECK(Pending(ds[0].second));
+  CHECK(ds[1].second.outcome == DecisionOutcome::kApplied && ds[1].second.final &&
+        ds[1].second.applied_sequence == w.applied);
+  CHECK(server_count(SE::kEvaluateRequest, first_key) == 1);
+  CHECK(w.Count(SE::kPlayerPose) == 1);  // the same pose again is dropped
+  CHECK(w.Last(SE::kPlayerPose)->pose == pose && w.Last(SE::kPlayerPose)->peer_id == bee);
+  // The server set the key's peer: a client cannot speak for another.
+  CHECK(w.Last(SE::kRequestReceived)->request.key.peer == bee);
+
+  // A retryable refusal, a resend with the same key that applies, and a retry of the applied key
+  // answered from the cache: one apply. Each evaluation is answered `pending` first; the second
+  // resend lands while the first is evaluating (a cached `pending`) or after it applied (a cached
+  // `applied`), whichever the network made it.
+  w.verdict = RefusalReason::kTooFar;
+  const WorldRequest second = EnterRequest(g1, 2, 1);
+  const RequestKey second_key = keyed(second);
+  CHECK(b.session->SendWorldRequest(second, w.net.Now()));
+  CHECK(w.RunUntil([&] { return DecisionsFor(b, second_key).size() == 2; }));
+  ds = DecisionsFor(b, second_key);
+  CHECK(Pending(ds[0].second));
+  CHECK(ds[1].second.outcome == DecisionOutcome::kRefused && ds[1].second.reason == RefusalReason::kTooFar &&
+        !ds[1].second.final);
+  w.verdict = RefusalReason::kNone;
+  CHECK(b.session->SendWorldRequest(second, w.net.Now()));
+  CHECK(b.session->SendWorldRequest(second, w.net.Now()));
+  CHECK(w.RunUntil([&] { return DecisionsFor(b, second_key).size() == 5; }));
+  w.Run(200ms);
+  ds = DecisionsFor(b, second_key);
+  REQUIRE_OR_RETURN_VOID(ds.size() == 5);
+  CHECK(Pending(ds[2].second) && !ds[2].second.cached);
+  WorldDecision applied_second;
+  int applied_count = 0;
+  for (size_t i = 3; i < ds.size(); ++i) {
+    const WorldDecision& d = ds[i].second;
+    if (d.outcome == DecisionOutcome::kApplied && !d.cached) {
+      applied_second = d;
+      ++applied_count;
+    }
+  }
+  CHECK(applied_count == 1);
+  // The cached one repeats the decision before it.
+  const WorldDecision& extra = ds[3].second.cached ? ds[3].second : ds[4].second;
+  WorldDecision repeat = ds[3].second.cached ? ds[2].second : ds[3].second;
+  repeat.cached = true;
+  CHECK(extra.cached && extra == repeat);
+  CHECK(server_count(SE::kEvaluateRequest, second_key) == 2);
+
+  // The applied steps go to every client; a level end and a reaction to the one named.
+  AppliedStep step;
+  step.key = second_key;
+  step.applied_sequence = applied_second.applied_sequence;
+  AppliedStepEntry entry;
+  entry.kind = StepKind::kTriggerEnter;
+  entry.targets = kTargetActivator | kTargetOther;
+  entry.trigger = TestTrigger(g1);
+  entry.event_bits = 0x21;
+  step.steps.push_back(entry);
+  CHECK(w.server.SendAppliedStep(step, w.net.Now()));
+  CHECK(w.server.SendLevelEnd(owner.session->PeerId(), LevelEnd{g1, NameHash("CLevelEnd"), SelfRef(g1)}, w.net.Now()));
+  CHECK(w.server.SendReaction(bee, Reaction{1, g1, WorldRef(g1, 9, 8, 7), ReactionOutcome::kLanded}, w.net.Now()));
+  CHECK(!w.server.SendReaction(4, Reaction{}, w.net.Now()));  // nobody is peer 4
+  CHECK(w.RunUntil([&] {
+    return owner.Count(CE::kAppliedStep) == 1 && b.Count(CE::kAppliedStep) == 1 &&
+           owner.Count(CE::kLevelEnd) == 1 && b.Count(CE::kReaction) == 1;
+  }));
+  CHECK(owner.Last(CE::kAppliedStep)->applied == step && b.Last(CE::kAppliedStep)->applied == step);
+  CHECK(b.Count(CE::kLevelEnd) == 0 && owner.Count(CE::kReaction) == 0);
+  CHECK(b.Last(CE::kReaction)->reaction.outcome == ReactionOutcome::kLanded);
+
+  // A late step of the owner's key (amendment w) goes to every client, the owner too (it decides
+  // there whether the late step is its own), and arrives with its flag.
+  AppliedStep late = step;
+  late.key.peer = owner.session->PeerId();
+  late.late_step = true;
+  late.steps.clear();
+  AppliedStepEntry late_entry;
+  late_entry.kind = StepKind::kTelegram;
+  late_entry.targets = kTargetOther;
+  late_entry.telegram.messenger = TestTrigger(g1);
+  late_entry.telegram.list_owner_hash = NameHash("CMessengerComponent");
+  late.steps.push_back(late_entry);
+  CHECK(w.server.SendAppliedStep(late, w.net.Now()));
+  CHECK(w.RunUntil([&] { return b.Count(CE::kAppliedStep) == 2 && owner.Count(CE::kAppliedStep) == 2; }));
+  CHECK(b.Last(CE::kAppliedStep)->applied == late && b.Last(CE::kAppliedStep)->applied.late_step);
+  CHECK(owner.Last(CE::kAppliedStep)->applied == late && owner.Last(CE::kAppliedStep)->applied.late_step);
+
+  // A generation change: S's final for a key in retry goes before the new LevelLoad; a first send
+  // that was in flight at the change is refused `stale` after it, with one final decision.
+  w.verdict = RefusalReason::kTooFar;
+  const WorldRequest third = EnterRequest(g1, 3, 1);
+  const RequestKey third_key = keyed(third);
+  CHECK(b.session->SendWorldRequest(third, w.net.Now()));
+  CHECK(w.RunUntil([&] { return DecisionsFor(b, third_key).size() == 2; }));
+  const WorldRequest in_flight = EnterRequest(g1, 4, 1);
+  const RequestKey in_flight_key = keyed(in_flight);
+  CHECK(b.session->SendWorldRequest(in_flight, w.net.Now()));
+  const uint32_t g2 = w.server.RequestLevel("levels/zone_b", w.net.Now());  // before it lands
+  CHECK(w.RunUntil([&] { return DecisionsFor(b, in_flight_key).size() == 1 && b.Count(CE::kLevelLoad) >= 2; }));
+  const auto third_ds = DecisionsFor(b, third_key);
+  REQUIRE_OR_RETURN_VOID(third_ds.size() == 3);
+  CHECK(third_ds[2].second.final && third_ds[2].second.server_final &&
+        third_ds[2].second.reason == RefusalReason::kTooFar);
+  const size_t load = IndexOf(b, CE::kLevelLoad, g2);
+  CHECK(third_ds[2].first < load);
+  const auto stale = DecisionsFor(b, in_flight_key);
+  CHECK(stale[0].first > load && stale[0].second.reason == RefusalReason::kStale && stale[0].second.final);
+  // The resend the client had in flight for the key in retry: the same final, cached.
+  CHECK(b.session->SendWorldRequest(third, w.net.Now()));
+  CHECK(w.RunUntil([&] { return DecisionsFor(b, third_key).size() == 4; }));
+  CHECK(DecisionsFor(b, third_key)[3].second.cached);
+
+  // The per-lane byte counters, per peer on the server and on each client.
+  using skylanders::netplay::Lane;
+  for (const PeerInfo& p : w.server.Peers()) {
+    CHECK(p.stats.Bytes(Lane::kGameplay).sent > 0);
+    CHECK(p.stats.Bytes(Lane::kGameplay).received > 0);
+    CHECK(p.stats.Bytes(Lane::kFast).received > 0);  // pings, and B's poses
+    CHECK(p.stats.BytesSent() > 0 && p.stats.BytesReceived() > 0);
+  }
+  const auto b_stats = b.session->Stats();
+  CHECK(b_stats.Bytes(Lane::kFast).sent > 0);
+  CHECK(b_stats.Bytes(Lane::kGameplay).sent > 0);
+  CHECK(b_stats.Bytes(Lane::kGameplay).received > 0);
+
+  // End session: a pending telegram gets S's final `session ended`, then the Bye; nothing more
+  // leaves a client after SessionClosing.
+  w.verdict = RefusalReason::kNone;
+  WorldRequest tele;
+  TelegramKey tk;
+  tk.messenger = WorldRef(g2, 3846, NameHash("Birdee_A_Flyoff"), NameHash("CEntity"));
+  tk.index = 2;
+  tele.key = TelegramRequestKey(0, g2, 1, tk);
+  tele.subject = SelfRef(g2);
+  tele.pose_sequence = 50;  // never sent
+  const RequestKey tele_key = keyed(tele);
+  CHECK(b.session->SendWorldRequest(tele, w.net.Now()));
+  CHECK(w.RunUntil([&] { return DecisionsFor(b, tele_key).size() == 1; }));
+  w.server.EndSession(w.net.Now());
+  CHECK(w.server.Closing() && !w.server.CloseComplete());
+  CHECK(w.RunUntil([&] { return b.session->State() == ClientState::kDisconnected &&
+                                owner.session->State() == ClientState::kDisconnected; }));
+  CHECK(w.server.CloseComplete());
+  const auto tele_ds = DecisionsFor(b, tele_key);
+  REQUIRE_OR_RETURN_VOID(tele_ds.size() == 2);
+  CHECK(tele_ds[1].second.final && tele_ds[1].second.server_final &&
+        tele_ds[1].second.reason == RefusalReason::kSessionEnded);
+  const size_t closing = IndexOf(b, CE::kSessionClosing, 0);
+  CHECK(closing < tele_ds[1].first);
+  CHECK(b.Last(CE::kDisconnected)->disconnect_reason == DisconnectReason::kBye);
+  CHECK(server_count(SE::kEvaluateRequest, tele_key) == 0);
+  size_t closed = 0, left_closed = 0;
+  for (const ServerEvent& e : w.server_events) {
+    closed += e.type == SE::kPeerClosed && !e.gone;
+    left_closed += e.type == SE::kPeerLeft && e.leave_reason == LeaveReason::kClosed;
+    if (e.type == SE::kDecisionSent) CHECK(e.sent);  // every answer went out
+  }
+  CHECK(closed == 2 && left_closed == 2);
+  CHECK(w.server.PeerCount() == 0);
+  CHECK(!b.session->SendWorldRequest(tele, w.net.Now()));
+}
+
+// A client whose SessionClosed never comes (its game hangs): after kCloseWait the server takes it
+// as gone, sends its finals and its Bye; the owner closes normally.
+void FakeNetworkCloseGone() {
+  World w(4321);
+  REQUIRE_OR_RETURN_VOID(w.StartServer(Settings()));
+  Client& owner = w.Connect(MakeHello("Owner", true));
+  Client& b = w.Connect(MakeHello("Bee"));
+  CHECK(w.RunUntil([&] { return owner.session->Connected() && b.session->Connected(); }));
+  // Barrier 1 stays open (nobody loads): the drain's leave path stops it waiting for each client.
+  const uint32_t g1 = w.server.RequestLevel("levels/zone_a", w.net.Now());
+  CHECK(w.RunUntil([&] { return b.session->Generation() == g1 && owner.session->Generation() == g1; }));
+  const WorldRequest pending = EnterRequest(g1, 1, 7);  // pose 7 never comes
+  CHECK(b.session->SendWorldRequest(pending, w.net.Now()));
+  CHECK(w.RunUntil([&] { return b.Count(CE::kWorldDecision) == 1; }));
+  CHECK(w.server.BarrierWaitingFor().size() == 2);
+  b.paused = true;
+  const auto start = w.net.Now();
+  w.server.EndSession(start);
+  // While the drain is on: no new generation (the server's own call, or the owner's LevelRequest,
+  // sent here before its SessionClosing lands), and no Hello is welcomed.
+  CHECK(w.server.RequestLevel("levels/zone_b", w.net.Now()) == 0 && w.server.Generation() == g1);
+  CHECK(owner.session->SendLevelRequest("levels/zone_c", w.net.Now()));
+  Client& late = w.Connect(MakeHello("Late"));
+  CHECK(w.RunUntil([&] { return w.server.CloseComplete(); }, 3000ms));
+  const auto took = w.net.Now() - start;
+  CHECK(took >= kCloseWait && took < kCloseWait + 100ms);
+  CHECK(w.RunUntil([&] { return late.session->State() == ClientState::kRefused; }));
+  CHECK(late.Last(CE::kRefused) && late.Last(CE::kRefused)->refuse_reason == RefuseReason::kOther &&
+        late.Last(CE::kRefused)->text == "the session is ending");
+  CHECK(w.Count(SE::kLevelRequest) == 0 && w.server.Generation() == g1);
+  CHECK(w.Count(SE::kPeerJoined) == 2);
+  bool owner_closed = false, bee_gone = false;
+  for (const ServerEvent& e : w.server_events) {
+    if (e.type != SE::kPeerClosed) continue;
+    owner_closed |= e.peer_id == kOwnerPeerId && !e.gone;
+    bee_gone |= e.peer_id == b.session->PeerId() && e.gone;
+  }
+  CHECK(owner_closed && bee_gone);
+  // Each drained client left by the leave path: kPeerClosed, then kPeerLeft (closed); the barrier
+  // waits for neither, and neither is connected any more.
+  for (const uint16_t id : {kOwnerPeerId, b.session->PeerId()}) {
+    size_t closed_at = w.server_events.size(), left_at = w.server_events.size();
+    for (size_t i = 0; i < w.server_events.size(); ++i) {
+      const ServerEvent& e = w.server_events[i];
+      if (e.peer_id != id) continue;
+      if (e.type == SE::kPeerClosed) closed_at = std::min(closed_at, i);
+      if (e.type == SE::kPeerLeft && e.leave_reason == LeaveReason::kClosed) left_at = std::min(left_at, i);
+    }
+    CHECK(closed_at < left_at && left_at < w.server_events.size());
+  }
+  CHECK(w.server.BarrierWaitingFor().empty() && w.server.PeerCount() == 0);
+  CHECK(w.RunUntil([&] { return owner.session->State() == ClientState::kDisconnected; }));
+  CHECK(owner.Last(CE::kDisconnected)->disconnect_reason == DisconnectReason::kBye);
+  // The final S owed the gone client went out (it reaches the client if it ever reads again).
+  bool final_sent = false;
+  for (const ServerEvent& e : w.server_events) {
+    final_sent |= e.type == SE::kDecisionSent && e.peer_id == b.session->PeerId() && e.decision.final &&
+                  e.decision.reason == RefusalReason::kSessionEnded && e.sent;
+  }
+  CHECK(final_sent);
+}
+
+// The scene barrier (item 12): S's open, release and end reach every client in order over a lossy
+// network; each client's ack comes back as kSceneAck with its peer id; a client cannot send S's
+// phases and S cannot send the clients'; after End session no ack is sent or reported.
+void FakeNetworkScenes() {
+  World w(77);
+  LinkConditions c;
+  c.loss_percent = 10;
+  c.duplicate_percent = 5;
+  c.reorder_percent = 10;
+  c.reorder_ms = 15;
+  c.delay_ms = 10;
+  w.net.SetDefault(c);
+  REQUIRE_OR_RETURN_VOID(w.StartServer(Settings()));
+  Client& owner = w.Connect(MakeHello("Owner", true));
+  Client& b = w.Connect(MakeHello("Bee"));
+  CHECK(w.RunUntil([&] { return owner.session->Connected() && b.session->Connected(); }));
+  const uint32_t g1 = w.server.RequestLevel("levels/zone_a", w.net.Now());
+  CHECK(w.RunUntil([&] { return b.session->Generation() == g1 && owner.session->Generation() == g1; }));
+
+  const SceneKey key{1, EntityRef{RefKind::kNone, g1}, NameHash("Tutorial_B_Intro")};
+  const SceneBarrier open{ScenePhase::kOpen, g1, key, SceneKind::kCutscene};
+  SceneBarrier release = open;
+  release.phase = ScenePhase::kRelease;
+  SceneBarrier end = open;
+  end.phase = ScenePhase::kEnd;
+  end.end = SceneEndReason::kNatural;
+  CHECK(w.server.SendSceneBarrier(open, w.net.Now()));
+  CHECK(w.server.SendSceneBarrier(release, w.net.Now()));
+  SceneBarrier ack_phase = open;
+  ack_phase.phase = ScenePhase::kAck;
+  CHECK(!w.server.SendSceneBarrier(ack_phase, w.net.Now()));  // the clients' phase
+  SceneBarrier bad = open;
+  bad.kind = SceneKind(9);
+  CHECK(!w.server.SendSceneBarrier(bad, w.net.Now()));  // not encoded
+  CHECK(w.RunUntil([&] { return owner.Count(CE::kSceneBarrier) == 2 && b.Count(CE::kSceneBarrier) == 2; }));
+  for (Client* cl : {&owner, &b}) {
+    std::vector<SceneBarrier> got;
+    for (const ClientEvent& e : cl->events) {
+      if (e.type == CE::kSceneBarrier) got.push_back(e.scene);
+    }
+    REQUIRE_OR_RETURN_VOID(got.size() == 2);
+    CHECK(got[0] == open && got[1] == release);  // in order: the gameplay lane is ordered
+  }
+
+  // Each client acks with S's key; whatever phase it passes, kAck goes out.
+  CHECK(b.session->SendSceneAck(release, w.net.Now()));
+  CHECK(owner.session->SendSceneAck(open, w.net.Now()));
+  CHECK(w.RunUntil([&] { return w.Count(SE::kSceneAck) == 2; }));
+  w.Run(100ms);
+  CHECK(w.Count(SE::kSceneAck) == 2);  // duplicated datagrams are not reported twice
+  std::vector<uint16_t> ackers;
+  for (const ServerEvent& e : w.server_events) {
+    if (e.type != SE::kSceneAck) continue;
+    ackers.push_back(e.peer_id);
+    CHECK(e.scene.phase == ScenePhase::kAck && e.scene.scene == key && e.scene.generation == g1 &&
+          e.scene.kind == SceneKind::kCutscene);
+  }
+  std::sort(ackers.begin(), ackers.end());
+  CHECK((ackers == std::vector<uint16_t>{kOwnerPeerId, b.session->PeerId()}));
+
+  CHECK(w.server.SendSceneBarrier(end, w.net.Now()));
+  CHECK(w.RunUntil([&] { return owner.Count(CE::kSceneBarrier) == 3 && b.Count(CE::kSceneBarrier) == 3; }));
+  CHECK(b.Last(CE::kSceneBarrier)->scene == end);
+
+  // End session: a client stops acking (SessionClosed was its last message).
+  w.server.EndSession(w.net.Now());
+  CHECK(w.RunUntil([&] { return b.session->Closing(); }));
+  CHECK(!b.session->SendSceneAck(open, w.net.Now()));
+  CHECK(w.RunUntil([&] { return b.session->State() == ClientState::kDisconnected &&
+                                owner.session->State() == ClientState::kDisconnected; }));
+  CHECK(w.Count(SE::kSceneAck) == 2);
+  CHECK(!b.session->SendSceneAck(open, w.net.Now()));  // not connected
+}
+
 // Real UDP sockets on 127.0.0.1 (port 0: any free one), real time.
 void LoopbackSession() {
   ServerSession server;
@@ -512,6 +919,9 @@ int main() {
   FakeNetworkStopAndQuiet();
   FakeNetworkReceiveBudget();
   FakeNetworkHelloFlood();
+  FakeNetworkRequests();
+  FakeNetworkCloseGone();
+  FakeNetworkScenes();
   LoopbackSession();
   return Finish("online_session");
 }

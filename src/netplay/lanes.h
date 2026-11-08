@@ -41,6 +41,16 @@ struct LaneMessage {
   std::vector<uint8_t> payload;
 };
 
+// The bytes of one lane, whole datagrams as they go on the wire (the kDatagramHeaderSize header
+// included), first sends and resends apart (design 1B section 5, "Traffic").
+// Bytes per lane, whole datagrams (header and payload).
+struct LaneBytes {
+  uint64_t sent = 0;      // bytes of data datagrams, first sends
+  uint64_t resent = 0;    // bytes of data datagrams sent again
+  uint64_t acks = 0;      // bytes of ack-only datagrams
+  uint64_t received = 0;  // bytes fed in (data and ack-only, duplicates and stale ones too)
+};
+
 struct ConnectionStats {
   uint64_t sent = 0;          // data datagrams, first sends
   uint64_t resent = 0;        // data datagrams sent again
@@ -51,6 +61,20 @@ struct ConnectionStats {
   uint64_t stale = 0;         // fast datagrams older than the newest, dropped
   uint64_t out_of_window = 0; // reliable datagrams too far ahead, dropped
   uint64_t refused = 0;       // Send calls that returned kWindowFull or kTooBig
+  std::array<LaneBytes, kLaneCount> lane_bytes{};  // by Lane value
+
+  const LaneBytes& Bytes(Lane lane) const { return lane_bytes[size_t(lane) % kLaneCount]; }
+  // Every lane: first sends, resends and acks.
+  uint64_t BytesSent() const {
+    uint64_t n = 0;
+    for (const LaneBytes& b : lane_bytes) n += b.sent + b.resent + b.acks;
+    return n;
+  }
+  uint64_t BytesReceived() const {
+    uint64_t n = 0;
+    for (const LaneBytes& b : lane_bytes) n += b.received;
+    return n;
+  }
 };
 
 // The lanes to one remote peer, over a send function the owner supplies. No threads and no
@@ -126,9 +150,11 @@ class Connection {
   const ReliableLane& Reliable(Lane lane) const { return reliable_[lane == Lane::kState ? 1 : 0]; }
   static bool WasReceived(const ReliableLane& l, uint32_t sequence);
   static uint32_t AckBits(const ReliableLane& l, uint32_t ack);
-  void Transmit(Lane lane, uint16_t flags, uint32_t sequence, uint32_t ack, uint32_t ack_bits,
-                std::span<const uint8_t> payload);
-  void TransmitData(Lane lane, uint32_t sequence, std::span<const uint8_t> payload);
+  // Both return the datagram's size (0 if it could not be encoded).
+  size_t Transmit(Lane lane, uint16_t flags, uint32_t sequence, uint32_t ack, uint32_t ack_bits,
+                  std::span<const uint8_t> payload);
+  size_t TransmitData(Lane lane, uint32_t sequence, std::span<const uint8_t> payload);
+  LaneBytes& BytesOf(Lane lane) { return stats_.lane_bytes[size_t(lane) % kLaneCount]; }
   void HandleAck(ReliableLane& l, uint32_t ack, uint32_t bits, TimePoint now);
   void AddRttSample(std::chrono::microseconds sample);
   std::chrono::microseconds TimeoutFor(const Pending& p) const;

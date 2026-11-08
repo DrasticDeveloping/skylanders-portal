@@ -40,7 +40,7 @@ if(SKYLANDERS_ALCHEMY_STB)
 endif()
 
 # skylanders_online: Swap Force Online's session (UDP sockets and lanes, the session messages, join
-# codes, the shared tick, the level barrier). Game-independent and without the SDK, so every build
+# codes, the shared tick, the level barrier, the request state machine). Game-independent and without the SDK, so every build
 # mode has it (it stays above the figures-only return below).
 add_library(skylanders_online STATIC
     src/netplay/datagram.cpp
@@ -48,6 +48,7 @@ add_library(skylanders_online STATIC
     src/netplay/udp_socket.cpp
     src/online/join_code.cpp
     src/online/protocol.cpp
+    src/online/requests.cpp
     src/online/session.cpp
     src/online/tick.cpp
 )
@@ -56,6 +57,15 @@ target_compile_features(skylanders_online PUBLIC cxx_std_23)
 if(WIN32)
     target_link_libraries(skylanders_online PUBLIC ws2_32)
 endif()
+
+# skylanders_nav: a path planner over a navigation mesh of convex areas (islands, point lookup, A*
+# over the areas, a funnel over the shared edges) for the developer navto command. Game-independent,
+# no SDK, nothing on disk: the game fills the mesh from memory.
+add_library(skylanders_nav STATIC
+    src/nav/nav_planner.cpp
+)
+target_include_directories(skylanders_nav PUBLIC src)
+target_compile_features(skylanders_nav PUBLIC cxx_std_23)
 
 # skylanders_portal_figures: only the figure files (catalog, names, elements, stats), for programs
 # without the SDK such as the Core of Light launcher. On Windows it needs no SDK tree: AES and MD5
@@ -122,10 +132,17 @@ if(SKYLANDERS_PORTAL_TESTS)
     endforeach()
     # The online session (skylanders_online), on the fake network and on loopback UDP.
     foreach(t netplay_datagram_test netplay_lanes_test netplay_udp_socket_test online_protocol_test
-              online_join_code_test online_tick_test online_session_test)
+              online_join_code_test online_tick_test online_session_test online_requests_test)
         add_executable(skylanders_${t} tests/${t}.cpp)
         target_include_directories(skylanders_${t} PRIVATE tests)
         target_link_libraries(skylanders_${t} PRIVATE skylanders_online)
+        add_test(NAME skylanders_${t} COMMAND skylanders_${t})
+    endforeach()
+    # The navmesh planner (skylanders_nav), on hand-built meshes.
+    foreach(t nav_planner_test)
+        add_executable(skylanders_${t} tests/${t}.cpp)
+        target_include_directories(skylanders_${t} PRIVATE tests)
+        target_link_libraries(skylanders_${t} PRIVATE skylanders_nav)
         add_test(NAME skylanders_${t} COMMAND skylanders_${t})
     endforeach()
 endif()
