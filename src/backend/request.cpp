@@ -966,6 +966,11 @@ void RequestTable::BeginClose(TimePoint now) {
 }
 
 void RequestTable::ForgetPeer(uint16_t peer, TimePoint now) {
+  // The peer's leases first: their end writes (S2-L2) read the holder's role from its lease's key,
+  // which goes just below. Nothing is sent for a holder that left, so the order changes nothing
+  // else.
+  leases_.OnPeerLeft(peer);
+  DrainLeaseEnds(now);
   std::erase_if(entries_, [&](const auto& entry) { return entry.first.peer == peer; });
   for (auto it = children_.begin(); it != children_.end();) {
     if (it->first.peer == peer) {
@@ -978,8 +983,6 @@ void RequestTable::ForgetPeer(uint16_t peer, TimePoint now) {
   std::erase_if(held_, [&](const Slot& s) { return s.second.peer == peer; });
   stored_.erase(peer);
   precondition_.erase(peer);
-  leases_.OnPeerLeft(peer);
-  DrainLeaseEnds(now);
 }
 
 }  // namespace skylanders::backend

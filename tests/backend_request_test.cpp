@@ -2,7 +2,7 @@
 // (RM1 to RM11 with RM5b to RM5f) and lease expiry (LE1 to LE8). The table's own cases run on direct
 // calls (backend_request_harness.h); the ones that need the client (completion at at_lsn, the
 // rejoin) run on FakeSession through the lanes harness's Rig. The stage 2 follow-up item's lease
-// cases (S2L1a to S2L2e, then S2L3a to S2L3c on the facades) close the file.
+// cases (S2L1a to S2L2f, then S2L3a to S2L3c on the facades) close the file.
 
 #include <algorithm>
 #include <array>
@@ -1104,6 +1104,32 @@ BACKEND_TEST("S2L2e", LeaseEndWritesImpureOrRefused) {
   CHECK(t.Final(ka) && t.Final(ka)->reason == Reason::kLeaseExpired);
   CHECK(t.Final(kb) && t.Final(kb)->reason == Reason::kLeaseExpired);
   CHECK(t.LeaseEnds(la).size() == 1 && t.LeaseEnds(lb).size() == 1);
+}
+
+BACKEND_TEST("S2L2f", LeaseEndWritesOfAHolderThatLeftKeepItsRole) {
+  // A holder that leaves is still named with its own role in OnLeaseEnd's context: ForgetPeer
+  // revokes its leases before it forgets its keys, which hold the role (an owner here, not the
+  // guest a missing key would give).
+  TableRig t;
+  HeldOnGrant(t);
+  std::vector<PeerRole> roles;
+  t.authority.end = [&roles](const Lease& l, LeaseEndReason, const DecideContext& c) {
+    roles.push_back(c.peer_role);
+    return std::vector<Write>{Write{HeldKey(l.spec.entity), Val(0), false}};
+  };
+  const EntityId e = Ent(kGen, 1);
+  const Request r = t.Make(lanes::OwnerRun(kProp, e), 1);
+  t.Send(r, PeerRole::kOwner);
+  const uint32_t lease = t.LeaseOf(r.key);
+  REQUIRE_OR_RETURN_VOID(lease != 0);
+  t.requests.ForgetPeer(kPeer, t.now);
+  t.Take();
+  REQUIRE_OR_RETURN_VOID(t.authority.ends.size() == 1 && roles.size() == 1);
+  CHECK(t.authority.ends[0].second == LeaseEndReason::kRevokedPeerLeft);
+  CHECK(roles[0] == PeerRole::kOwner);
+  CHECK(t.state.Get(HeldKey(e))->value == Val(0));
+  CHECK(t.requests.KeysOf(kPeer, kEpoch) == 0);  // its keys still go
+  CHECK(t.LeaseEnds(lease).empty());             // and nothing is sent to it
 }
 
 // S2-L3 on the facades: the holder resends its unresolved report inside the live term.
