@@ -79,6 +79,9 @@ PLAN_KEYS = {"name", "timeout_s", "server", "entries"}
 ENTRY_KEYS = {"role", "peer", "args", "script", "hidden"}
 FIXTURE_NAME = re.compile(r"(saves|figures)(/[A-Za-z0-9 _().'+-]{1,100})+")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+# A run plan's name: its run folder adds "-<stamp>-<4 hex>" (21 characters) and must stay a NAME, or
+# collect and clean could not name it.
+PLAN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
 
 
 class Refused(Exception):
@@ -260,8 +263,8 @@ def check_plan(plan: object, m: Manifest) -> dict:
     """A run plan: one game and at most two synthetic peers, each named by role, never by path."""
     if not isinstance(plan, dict) or set(plan) - PLAN_KEYS:
         raise Refused(f"a run plan has only {sorted(PLAN_KEYS)}")
-    if not isinstance(plan.get("name"), str) or not NAME.fullmatch(plan["name"]):
-        raise Refused("a run plan needs a name")
+    if not isinstance(plan.get("name"), str) or not PLAN_NAME.fullmatch(plan["name"]):
+        raise Refused("a run plan needs a name (at most 40 letters, digits, '.', '_' or '-')")
     t = plan.get("timeout_s", 600)
     if not isinstance(t, (int, float)) or isinstance(t, bool) or not 0 < t <= MAX_RUN_S:
         raise Refused(f"timeout_s: 1 to {MAX_RUN_S}")

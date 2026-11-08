@@ -41,6 +41,10 @@ normalized fatal line or crash site, the circuit breaker starts no further case 
                                                             case start (entries added run next); results,
                                                             report.md and findings.md are written after
                                                             every case either way
+               [--remote HOST:PORT --remote-manifest FILE   the remote agent on the second PC (its token
+                [--remote-token-file FILE]]                 typed, or read from the file) runs a spec's
+                                                            `kind = "remote"` peer; the RC's payload record
+                                                            is what it verifies its install against
     skytest.py list [--gate [--stage S]]                    the cases and the manifest's state; with
                                                             --gate the gate cases and their expected
                                                             minutes, the per-build ones apart with their
@@ -85,8 +89,10 @@ Standard library only; run with `python -I`.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import fnmatch
+import getpass
 import hashlib
 import json
 import math
@@ -106,6 +112,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import winjob  # noqa: E402
 import backend_grades  # noqa: E402  (stage 3's backend grades: compare, faults, memory)
 import launch_args as la  # noqa: E402
+import remote_agent  # noqa: E402
 
 STORE = ".replication-tests"
 CLIENTS = ["H", "D", "E", "F"]
@@ -377,6 +384,9 @@ class Config:
     # tests/script_commands.toml. No game starts without them (launch_tables).
     launch_allow: Path | None = None
     script_commands: Path | None = None
+    # `test --remote HOST:PORT`: the remote agent that runs a spec's `kind = "remote"` peer on the second
+    # PC (RemoteTarget). None: such a case is a capacity result (it needs the second PC).
+    remote: "RemoteTarget | None" = None
 
 
 def main_store(repo: Path) -> Path:
@@ -531,6 +541,9 @@ class PeerSpec:
     # gets the save of `fixture slot` once more in `slot` (both one-based, as the save menu counts them),
     # before the game starts (fill_save_slots). {} leaves the copy as the fixture store has it.
     save_slots: dict[int, int] = field(default_factory=dict)
+    # Where the peer's game runs (stage 8 item 6): "local" (this PC), or "remote" (the second PC, through
+    # its remote agent: `test --remote`; one client of D, E, F per case at most).
+    kind: str = "local"
 
 
 @dataclass
@@ -579,6 +592,37 @@ class Spec:
     sha256: str = ""
     # [unit]: a unit case's test binary, its pass line and ctests (load_unit_spec).
     unit: dict = field(default_factory=dict)
+
+
+PEER_KINDS = ("local", "remote")
+
+
+def peer_kind(spec_name: str, peer: str, own: dict, common: dict) -> str:
+    """A peer's `kind` (its own table only): "local", or "remote" for a client other than H (S is the
+    server, H the owner's client whose game hosts it: both stay on this PC)."""
+    if "kind" in common:
+        raise SpecError(f"{spec_name}: [peer.all] has no kind (a remote peer says so in its own table)")
+    kind = own.get("kind", "local")
+    if kind not in PEER_KINDS:
+        raise SpecError(f"{spec_name}: peer {peer}: kind = {kind!r} (local or remote)")
+    if kind == "remote" and peer in ("S", "H"):
+        raise SpecError(f'{spec_name}: peer {peer} runs on this PC (the server and the owner\'s client); kind ='
+                        ' "remote" is for D, E or F')
+    return kind
+
+
+def check_remote_peers(spec_name: str, peers: dict[str, "PeerSpec"], grades: dict, names: list[str]) -> None:
+    """One remote peer per case at most (the agent runs one game per run plan); its settings cannot name
+    this PC's checkout ({repo}); its saves stay on the second PC, so no save_copy grade names it."""
+    remote = [n for n, ps in peers.items() if ps.kind == "remote"]
+    if len(remote) > 1:
+        raise SpecError(f"{spec_name}: peers {', '.join(remote)} are remote: one remote peer per case (the agent"
+                        " on the second PC runs one game per run)")
+    for n in remote:
+        if any("{repo}" in a for a in peers[n].args):
+            raise SpecError(f"{spec_name}: peer {n} is remote: {{repo}} names this PC's checkout, not a file there")
+        if "save_copy" in grades and n in save_copy_peers(grades["save_copy"], names):
+            raise SpecError(f"{spec_name}: grade save_copy: peer {n} is remote (its saves stay on the second PC)")
 
 
 def peers_of(layout: str) -> list[str]:
@@ -728,6 +772,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             expect_count={**common.get("expect_count", {}), **own.get("expect_count", {})},
             expect_order=list(own.get("expect_order", common.get("expect_order", []))),
             save_slots=parse_save_slots(path.name, n, own.get("save_slots", common.get("save_slots", {}))),
+            kind=peer_kind(path.name, n, own, common),
         )
         for arg in peers[n].args:
             for ph in ARG_PLACEHOLDER.findall(arg):
@@ -843,6 +888,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             if a.split("=", 1)[0] == f"--{SCENE_SETTING}":
                 raise SpecError(f"{path.name}: peer {n} sets --{SCENE_SETTING} in its args beside the spec's"
                                 f" scenes key: the key says it (the runner passes --{SCENE_SETTING} itself)")
+    check_remote_peers(path.name, peers, grades, names)
     return Spec(
         name=d["name"], path=path, layout=d["layout"], stage=str(d["stage"]),
         description=d.get("description", ""), timeout=float(d.get("timeout", default_timeout)),
@@ -2871,6 +2917,240 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -
     return d, args
 
 
+# --- the remote peer (stage 8 item 6: a client on the second PC, through tools/skytest/remote_agent.py) -
+#
+# A spec's `kind = "remote"` peer runs on the second PC under its remote agent. The runner sends a run
+# plan (one game, by role), and the agent builds and checks the command line with the same launch builder
+# against its verified install, store and fixtures. RemotePeer stands in for the peer's process in
+# run_case: its poll() is the heartbeat (the agent ends a run after three missed ones) and pulls the
+# game's log into the local peer folder, where fail fast and the grades read it like any other.
+
+REMOTE_STATUS_S = 2.0  # how often a remote peer's poll asks the agent (well inside the agent's 5 s heartbeat)
+REMOTE_LOG_CHUNKS = 8  # 1 MiB chunks of the remote game's log one poll pulls at most
+REMOTE_AGENT_ARGS = ("portal_mode", "audio_mute")  # the agent passes these itself (remote_agent.launch_plan)
+REMOTE_SKIP = ("cache/",)  # what collect leaves on the second PC: the peer's shader cache
+
+
+class RemoteError(Exception):
+    """A request the remote agent refused (its reason)."""
+
+
+@dataclass
+class RemoteTarget:
+    host: str
+    port: int
+    token: bytes
+    manifest: str      # the RC's payload record, which the agent verifies its install against
+    counter: int = 0   # the last request counter sent: every new connection goes on above it
+
+
+def remote_target(where: str, token_file: str | None, manifest_file: str | None,
+                  ask=getpass.getpass) -> RemoteTarget:
+    """`--remote HOST:PORT`, `--remote-manifest FILE` and the agent's token (32 hex digits, from
+    `--remote-token-file` or typed: the agent shows it on the second PC's console)."""
+    host, sep, port = where.rpartition(":")
+    if not sep or not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise SystemExit(f"--remote {where!r}: HOST:PORT (where the agent on the second PC listens)")
+    if not manifest_file:
+        raise SystemExit("--remote needs --remote-manifest: the RC's payload record the agent was started with")
+    try:
+        manifest = Path(manifest_file).read_text(encoding="utf-8")
+        text = Path(token_file).read_text(encoding="utf-8") if token_file else \
+            ask("The remote agent's token (on the second PC's console): ")
+    except OSError as e:
+        raise SystemExit(f"--remote: {e}") from None
+    try:
+        token = bytes.fromhex(text.strip())
+    except ValueError:
+        token = b""
+    if len(token) != 16:
+        raise SystemExit("the remote agent's token is 32 hex digits (128 bits), as its console shows it")
+    return RemoteTarget(host.strip("[]"), int(port), token, manifest)
+
+
+def remote_plan_name(case: str) -> str:
+    """A run plan's name from the case's: the agent's run folder adds 21 characters to it and must stay a
+    64-character name the agent's collect and clean accept."""
+    return re.sub(r"[^A-Za-z0-9._-]", "-", case).lstrip("._-")[:40] or "case"
+
+
+class RemotePeer:
+    """A remote peer, driven like a local process by run_case: poll() asks the agent at most every
+    REMOTE_STATUS_S and pulls the new part of the game's log into the local peer folder; kill() stops the
+    run; wait() polls until it ended; collect() fetches the run's files and cleans its folder on the
+    second PC. A lost connection ends it with a problem the peer fails on (the agent ends the game three
+    missed heartbeats later)."""
+
+    def __init__(self, client, target: RemoteTarget, run_name: str, peer: str, folder: Path,
+                 command: list[str], every: float = REMOTE_STATUS_S) -> None:
+        self.client, self.target, self.run_name, self.peer = client, target, run_name, peer
+        self.folder, self.command, self.every = folder, command, every
+        self.returncode: int | None = None
+        self.state = "running"
+        self.problems: list[str] = []
+        self._asked: float | None = None
+        self._log = folder / "game.log"
+
+    def _call(self, op: str, **kw) -> dict:
+        r = self.client.call(op, **kw)
+        self.target.counter = self.client.counter
+        if not r.get("ok"):
+            raise RemoteError(str(r.get("error", "refused")))
+        return r
+
+    def _lost(self, e: Exception) -> None:
+        if self.returncode is None:
+            self.problems.append(f"the connection to the remote agent was lost ({e}); the agent ends the game"
+                                 " after three missed heartbeats")
+            self.returncode, self.state = 1, "lost"
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        now = time.monotonic()
+        if self._asked is not None and now - self._asked < self.every:
+            return None
+        self._asked = now
+        try:
+            st = self._call("status")
+            self.pull_log()
+            if st.get("run") != self.run_name:
+                self.problems.append(f"the remote agent runs {st.get('run')!r}, not this case's {self.run_name}")
+                self.returncode, self.state = 1, "gone"
+            elif st.get("state") != "running":
+                self.state = str(st.get("state"))
+                if self.state not in ("exited", "stopped"):  # the heartbeat or the run-time limit ended it
+                    self.problems.append(f"the remote agent ended the run ({self.state})")
+                self.pull_log()
+                self.returncode = self._exit_code()
+        except RemoteError as e:
+            self.problems.append(f"the remote agent refused a status ({e})")
+            self.returncode, self.state = 1, "refused"
+        except (OSError, ValueError) as e:
+            self._lost(e)
+        return self.returncode
+
+    def pull_log(self) -> None:
+        """The game's log as far as it is written on the second PC, appended to the local copy."""
+        have = self._log.stat().st_size if self._log.exists() else 0
+        for _ in range(REMOTE_LOG_CHUNKS):
+            try:
+                r = self._call("collect", run=self.run_name, path=f"{self.peer}/game.log", offset=have)
+            except RemoteError:
+                return  # no log yet
+            data = base64.b64decode(r.get("data", ""), validate=True)
+            if data:
+                with open(self._log, "ab") as f:
+                    f.write(data)
+                have += len(data)
+            if r.get("eof", True) or not data:
+                return
+
+    def _exit_code(self) -> int:
+        try:
+            r = self._call("collect", run=self.run_name, path="exit.json", offset=0)
+            code = json.loads(base64.b64decode(r.get("data", ""), validate=True).decode("utf-8"))["codes"][0]
+        except (RemoteError, ValueError, KeyError, IndexError, TypeError):
+            code = None
+        if not isinstance(code, int):
+            if self.state != "stopped":  # a stopped run's game may not have its code yet: it was ended
+                self.problems.append(f"the remote run ended ({self.state}) without an exit code")
+            return 1
+        return code
+
+    def kill(self) -> None:
+        if self.returncode is not None:
+            return
+        try:
+            self._call("stop")
+        except RemoteError:
+            pass  # it ended meanwhile: the next poll says how
+        except (OSError, ValueError) as e:
+            self._lost(e)
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        end = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if end is not None and time.monotonic() >= end:
+                raise subprocess.TimeoutExpired(self.command, timeout)
+            time.sleep(0.25)
+        return self.returncode
+
+    def collect(self) -> None:
+        """After the run: every file of the peer's folder on the second PC but its shader cache, and the run's
+        exit record, into the local peer folder (the log whole again); then the folder there is cleaned.
+        A file that does not come back is a problem the peer fails on."""
+        try:
+            if self.state in ("lost", "running"):
+                return
+            for f in self._call("collect", run=self.run_name)["files"]:
+                rel = str(f["path"])
+                sub = rel[len(self.peer) + 1:] if rel.startswith(self.peer + "/") else rel
+                if sub != rel or rel == "exit.json":
+                    if not any(sub.startswith(s) for s in REMOTE_SKIP):
+                        self._fetch(rel, sub)
+            self._call("clean", run=self.run_name)
+        except RemoteError as e:
+            self.problems.append(f"collecting the remote run failed: {e}")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            self.problems.append(f"collecting the remote run failed ({e})")
+        finally:
+            self.client.close()
+
+    def _fetch(self, rel: str, sub: str) -> None:
+        parts = sub.split("/")
+        if not sub or ":" in sub or "\\" in sub or any(x in ("", ".", "..") for x in parts):
+            raise ValueError(f"the agent listed {rel!r}, which is no plain path inside the run")
+        dest = self.folder.joinpath(*parts)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        off = 0
+        with open(dest, "wb") as out:
+            while True:
+                r = self._call("collect", run=self.run_name, path=rel, offset=off)
+                data = base64.b64decode(r.get("data", ""), validate=True)
+                out.write(data)
+                off += len(data)
+                if r.get("eof", True) or not data:
+                    return
+
+
+def start_remote(cfg: Config, spec: Spec, peer: str, run: Path, port: int) -> RemotePeer:
+    """Starts a `kind = "remote"` peer through the agent: verifies the install there if the agent has not
+    yet, then sends the run plan (one game, by role). Its settings are the runner's defaults, the scene
+    policy and the spec's, without the two the agent passes itself; its script names {figures} relative
+    to its run folder (the game's working directory there) and {join} with this PC's address as the agent
+    sees it, on the hosted session's port."""
+    target = cfg.remote
+    d = run / peer
+    check_output_path(cfg, d)
+    d.mkdir()
+    try:
+        client = remote_agent.Client(target.host, target.port, target.token,
+                                     counter=max(time.time_ns(), target.counter), timeout=60.0)
+    except OSError as e:
+        raise SpecError(f"peer {peer}: the remote agent at {target.host}:{target.port} does not answer ({e})") from None
+    rp = RemotePeer(client, target, "", peer, d, [])
+    try:
+        if not rp._call("hello").get("verified"):
+            rp._call("verify", manifest=target.manifest)
+        join = f"{client.sock.getsockname()[0]}:{port}" if port else ""
+        args = [a for a in [*cfg.default_args, *scene_args(cfg, spec), *show_server_args(cfg, spec, peer),
+                            *spec.peers[peer].args] if a[2:].split("=", 1)[0] not in REMOTE_AGENT_ARGS]
+        plan = {"name": remote_plan_name(spec.name),
+                "timeout_s": min(remote_agent.MAX_RUN_S, int(spec.timeout) + 120),
+                "entries": [{"role": "game", "peer": peer, "args": args,
+                             "script": peer_script(spec, peer, Path("figures"), join)}]}
+        (d / "remote-plan.json").write_text(json.dumps(plan, indent=1), encoding="utf-8")
+        rp.run_name = str(rp._call("start", plan=plan)["run"])
+    except RemoteError as e:
+        client.close()
+        raise SpecError(f"peer {peer}: the remote agent refused: {e}") from None
+    except (OSError, ValueError, KeyError) as e:
+        client.close()
+        raise SpecError(f"peer {peer}: the remote agent's connection failed ({e})") from None
+    rp.command = [f"remote {target.host}:{target.port}", *args]
+    return rp
+
 
 def parse_log(text: str) -> dict:
     out = {"levels": [], "fps": [], "longest": [], "private": 0, "working": 0, "errors": 0, "build": "",
@@ -3164,6 +3444,11 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         res.status = "capacity"
         res.reasons = [f"needs {len(names)} games at once, this run allows {max_games} (--max-games)"]
         return res
+    remote = [n for n in starts if spec.peers[n].kind == "remote"]
+    if remote and cfg.remote is None:
+        res.status = "capacity"
+        res.reasons = [f"peer {', '.join(remote)} runs on the second PC: no remote agent (`test --remote HOST:PORT`)"]
+        return res
     run = make_run_dir(cfg, folder if folder is not None else cfg.store / "runs" / f"{stamp}-{spec.name}")
     res.folder = str(run)
     exe = snap / cfg.exe
@@ -3173,11 +3458,12 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
     save_grade = spec.grades.get("save_copy")
     save_title = str(save_grade.get("title", cfg.title_id)) if save_grade is not None else ""
     saves_before: dict[str, dict[str, str]] = {}
+    remotes: dict[str, RemotePeer] = {}  # the started remote peers (kind = "remote")
     try:
         # Every peer's folder first (copies take a moment), then all games start close together, and
         # a spec error in a later peer starts no game at all.
         port = free_loopback_port() if hosted else 0
-        prepared = {n: prepare_peer(cfg, spec, n, run, port) for n in starts}
+        prepared = {n: prepare_peer(cfg, spec, n, run, port) for n in starts if n not in remote}
         # save_copy: each named peer's save copy as it is before any game starts.
         if save_grade is not None:
             saves_before = {n: save_state(run / n / "data", save_title) for n in save_copy_peers(save_grade, names)}
@@ -3197,6 +3483,12 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                 # holds across every case running at once (StartPacer); the games already started
                 # are watched meanwhile.
                 pacer.wait_turn(note_ends)
+                if n in remote:  # on the second PC: no boot token or job of this machine
+                    remotes[n] = procs[n] = start_remote(cfg, spec, n, run, port)
+                    results[n].command = remotes[n].command
+                    started[n] = time.monotonic()
+                    results[n].started_after_s = round(started[n] - t_start, 1)
+                    continue
                 # PS15: the machine's boot token (no other runner's game boots meanwhile), held until
                 # this game's first frame line, its exit or BOOT_TIMEOUT_S (BootHold.watch).
                 hold = pacer.machine_turn(note_ends)
@@ -3265,8 +3557,13 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             for n, hold in holds:  # every game ended: each token is free, its outcome known
                 hold.release()
                 results[n].boot = hold.outcome or "ended before its first frame line"
+        for rp in remotes.values():  # ended (killed and waited for above): their files come back
+            rp.collect()
     except (SpecError, OSError) as e:
-        # Every game started so far went with the job when it closed.
+        # Every game started so far went with the job when it closed; a remote one is stopped.
+        for rp in remotes.values():
+            rp.kill()
+            rp.client.close()
         res.status, res.reasons = "error", [str(e)]
         return res
     saves_after = {n: save_state(run / n / "data", save_title) for n in saves_before}
@@ -3281,6 +3578,9 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         r.frame_p95_ms, r.peak_video_mb = parsed["frame_p95"], parsed["video"]
         r.startup_stall_s = parsed["startup_stall"]
         grade_peer(spec, r, text, parsed)
+        if n in remotes and remotes[n].problems:  # a lost agent or a file that did not come back
+            r.reasons += remotes[n].problems
+            r.status = "fail"
         if spec.grades:
             limit = frame_rate_limit(r.command, run / n / "settings.toml")
             extra = grade_thresholds(spec, r, parsed, thresholds or {}, limit, baseline)
@@ -4586,8 +4886,9 @@ def timed_grades(spec: Spec) -> list[str]:
 
 
 def runs_alone(spec: Spec) -> bool:
-    """Whether the scheduler runs a case alone: `exclusive = true`, or a time or load grade (timed_grades)."""
-    return spec.exclusive or bool(timed_grades(spec))
+    """Whether the scheduler runs a case alone: `exclusive = true`, a time or load grade (timed_grades),
+    or a remote peer (the agent on the second PC runs one game at a time)."""
+    return spec.exclusive or bool(timed_grades(spec)) or any(p.kind == "remote" for p in spec.peers.values())
 
 
 def case_games(spec: Spec, max_games: int) -> int:
@@ -5732,6 +6033,8 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     # neither); a game case the queue adds later takes them as it starts (game_snapshot).
     if any(starts_games(sp) for sp in specs):
         check_disc(cfg)
+    if getattr(a, "remote", None):
+        cfg.remote = remote_target(a.remote, getattr(a, "remote_token_file", None), getattr(a, "remote_manifest", None))
     max_games = a.max_games or default_max_games()
     jobs = getattr(a, "jobs", None)
     jobs = 1 if jobs is None else int(jobs)
@@ -6468,6 +6771,12 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--queue", default=None, metavar="FILE", help="also run the cases this file names (one name or"
                    " glob per line, # comments); it is re-read before each case starts, and entries added to it"
                    " run next (a lane's list: one command per lane)")
+    t.add_argument("--remote", default=None, metavar="HOST:PORT", help="the remote agent on the second PC"
+                   " (tools/skytest/remote_agent.py serve) that runs a spec's kind = \"remote\" peer")
+    t.add_argument("--remote-manifest", default=None, metavar="FILE", help="with --remote: the RC's payload"
+                   " record (package_check.py), which the agent verifies its install against")
+    t.add_argument("--remote-token-file", default=None, metavar="FILE", help="with --remote: a file with the"
+                   " agent's token (else it is asked for: the agent shows it on its console)")
     t.set_defaults(fn=cmd_test)
     ls = sub.add_parser("list")
     ls.add_argument("--gate", action="store_true", help="the gate cases and their expected minutes (from each"

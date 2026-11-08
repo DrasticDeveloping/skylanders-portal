@@ -310,6 +310,7 @@ class AgentTest(unittest.TestCase):
             "two games": self.plan(entries=[game, {**game, "peer": "E"}]),
             "three synthetic": self.plan(server="10.0.0.1:5", entries=[game, syn("P3"), syn("P4"), syn("P5")]),
             "plan key": {**self.plan(), "exe": "x"},
+            "long name": {**self.plan(), "name": "x" * 41},  # its run folder's name would pass 64
         }
         for what, plan in cases.items():
             with self.subTest(what=what):
