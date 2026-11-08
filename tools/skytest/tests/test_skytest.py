@@ -2508,6 +2508,15 @@ class RequestsAnsweredTest(unittest.TestCase):
         log += "\n" + rq(f"request 1:1 enter {self.E1}") + "\n" + rq(f"request {self.E1} not sent (End session)")
         graded, reasons = skytest.grade_requests_answered(log, set())
         self.assertEqual((graded["keys"], graded["left_out_not_sent"], reasons), (1, 1, []))
+        # Sol council batch r2 C1: a key that got an answer (pending, then a retryable too_far)
+        # and whose resend was `not sent` is graded, and fails with no final.
+        e3 = "2/1/enter/3/w00000999.1a2b3c4d.5e6f7a8c"
+        log += "\n" + "\n".join([rq(f"request 1:3 enter {e3}"), rq(f"decided {e3} pending"),
+                                 rq(f"refused {e3} (too_far)"),
+                                 rq(f"request {e3} not sent (End session or no connection)")])
+        graded, reasons = skytest.grade_requests_answered(log, set())
+        self.assertEqual((graded["keys"], graded["left_out_not_sent"]), (2, 1))
+        self.assertEqual(reasons, [f"grade requests_answered: 1 key(s) without a final decision: {e3}"])
 
     def test_a_peer_gone_at_close_is_left_out_and_no_request_is_not_reached(self) -> None:
         log = rq(f"request 1:1 enter {self.E1}")
@@ -2814,6 +2823,88 @@ class RouteTest(unittest.TestCase):
             checklist, why = skytest.load_route_checklist(Path(d) / "missing.toml")
             self.assertIsNone(checklist)
             self.assertTrue(why.startswith("the route file missing.toml cannot be read"))
+
+    def test_every_request_key_ends_applied_or_expected(self) -> None:
+        # Council 1B, Opus O5: H's keys from its own request lines, their ends from S's decisions.
+        h_keys = ["2/1/enter/1/wA", "2/1/touch/1/wA", "2/1/enter/2/wB", "2/1/enter/3/wC", "2/1/exit/3/wC",
+                  "2/1/telegram/4/wD#0.x", "2/1/enter/5/wE"]
+        client = self.client() + "\n" + "\n".join(rq(f"request 1:{k.split('/')[3]} {k.split('/')[2]} {k}")
+                                                 for k in h_keys)
+        client += "\n" + rq("request 2/1/enter/5/wE not sent (End session or no connection)")
+        server = self.server() + "\n" + "\n".join([
+            rq("decided 2/1/enter/1/wA pending"),
+            rq("refused 2/1/enter/1/wA (too_far)"),         # retryable: the resend below applies it
+            rq("decided 2/1/enter/1/wA applied seq 4"),
+            rq("decided 2/1/touch/1/wA applied seq 5"),
+            rq("already applied 2/1/touch/1/wA"),           # a cached repeat changes nothing
+            rq("replay 1.2:2/1/enter/2/wB Fence_Trigger#77 by PeerPuppet_1#3830 flags 0x3D"),
+            rq("refused 2/1/enter/2/wB (already fired)"),
+            rq("refused 2/1/enter/3/wC (unresolved)"),
+            rq("refused 2/1/exit/3/wC (enter refused)"),
+            rq("final 2/1/telegram/4/wD#0.x refused (unsupported)"),
+        ])
+        route = ROUTE_FILE + ('\n[[expected_refusal]]\nreason = "already fired"\nkind = "enter"\n'
+                              'name = "Fence_Trigger"\nwhy = "H walks back through it"\n')
+        g = {"file": "x", "clients": ["H"]}
+        graded, reasons = skytest.grade_route({"S": server, "H": client}, self.checklist(route), g)
+        self.assertEqual(reasons, [
+            "grade route: 3 request key(s) of H refused on the server and not listed as an expected refusal:"
+            " 2/1/enter/3/wC (unresolved), 2/1/exit/3/wC (enter refused), 2/1/telegram/4/wD#0.x (unsupported)"])
+        self.assertEqual(graded["requests"]["H"], {"keys": 6, "applied": 2, "expected_refusals": 1,
+                                                   "unexpected_refusals": 3, "without_end": 0,
+                                                   "left_out_not_sent": 1})
+        self.assertTrue(graded["violation"])
+        # Listing both refusals accepts the exit that followed its enter's refusal as well.
+        route += ('\n[[expected_refusal]]\nreason = "unresolved"\nwhy = "w"\n'
+                  '\n[[expected_refusal]]\nreason = "unsupported"\nkind = "telegram"\nwhy = "w"\n')
+        graded, reasons = skytest.grade_route({"S": server, "H": client}, self.checklist(route), g)
+        self.assertEqual(reasons, [])
+        self.assertEqual(graded["requests"]["H"]["expected_refusals"], 4)
+        # Sol council batch C1: S answered the key (pending, then a retryable too_far), the resend
+        # logged `not sent` as the session closed, and S never decided it. It is not left out: it
+        # fails as a key without an end.
+        c1_client = client + "\n" + rq("request 1:6 enter 2/1/enter/6/wF") + "\n" + rq(
+            "request 2/1/enter/6/wF not sent (End session or no connection)")
+        c1_server = server + "\n" + rq("decided 2/1/enter/6/wF pending") + "\n" + rq(
+            "refused 2/1/enter/6/wF (too_far)")
+        graded, reasons = skytest.grade_route({"S": c1_server, "H": c1_client}, self.checklist(route), g)
+        self.assertEqual(graded["requests"]["H"]["left_out_not_sent"], 1)  # only wE, which S never saw
+        self.assertEqual(graded["requests"]["H"]["without_end"], 1)
+        self.assertEqual(reasons, ["grade route: 1 request key(s) of H without an end on the server: 2/1/enter/6/wF"])
+        # A name that does not match S's replay name, or a kind that differs, does not accept it.
+        wrong = route.replace('name = "Fence_Trigger"', 'name = "Fence_Trigger#78"')
+        _, reasons = skytest.grade_route({"S": server, "H": client}, self.checklist(wrong), g)
+        self.assertEqual(reasons, ["grade route: 1 request key(s) of H refused on the server and not listed as an"
+                                   " expected refusal: 2/1/enter/2/wB (already fired; Fence_Trigger#77)"])
+        # A key S never decided (only a retryable refusal) has no end; `requesters` narrows the peers.
+        _, reasons = skytest.grade_route({"S": server.replace(rq("decided 2/1/enter/1/wA applied seq 4"), ""),
+                                          "H": client}, self.checklist(route), g)
+        self.assertEqual(reasons, ["grade route: 1 request key(s) of H without an end on the server: 2/1/enter/1/wA"])
+        graded, reasons = skytest.grade_route({"S": server, "H": client, "D": self.client()}, self.checklist(route),
+                                              {"file": "x", "clients": ["H", "D"], "requesters": ["D"]})
+        self.assertEqual(reasons, [])
+        self.assertEqual(list(graded["requests"]), ["D"])
+        # A touch refused `enter refused` while its enter was later applied (a resend) was lost.
+        lost = server.replace(rq("decided 2/1/touch/1/wA applied seq 5"), rq("refused 2/1/touch/1/wA (enter refused)"))
+        lost = lost.replace(rq("already applied 2/1/touch/1/wA"), "")
+        _, reasons = skytest.grade_route({"S": lost, "H": client}, self.checklist(route), g)
+        self.assertEqual(reasons, ["grade route: 1 request key(s) of H refused on the server and not listed as an"
+                                   " expected refusal: 2/1/touch/1/wA (enter refused)"])
+
+    def test_expected_refusal_rows_are_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "r.toml"
+            for row, why in (('reason = "already fired"', "expected_refusal 1 needs a `reason` and a `why`"),
+                             ('reason = "x"\nwhy = "y"\nkind = "jump"', "expected_refusal 1: kind 'jump' is not one"
+                              " of enter, exit, touch, telegram, skip"),
+                             ('reason = "x"\nwhy = "y"\nname = ""', "expected_refusal 1: `name` must be a nonempty"
+                              " name")):
+                f.write_text(ROUTE_FILE + "\n[[expected_refusal]]\n" + row + "\n", encoding="utf-8")
+                checklist, got = skytest.load_route_checklist(f)
+                self.assertIsNone(checklist)
+                self.assertEqual(got, "the route file r.toml: " + why)
+        with self.assertRaises(skytest.SpecError):
+            skytest.check_route("s", {"file": "tests/routes/x.toml", "requesters": ["S"]}, ["S", "H"])
 
     def test_cross_peer_reads_the_route_file_from_the_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as d:

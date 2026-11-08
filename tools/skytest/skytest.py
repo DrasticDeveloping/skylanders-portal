@@ -111,7 +111,7 @@ FPS = re.compile(r"Input script: ([\d.]+) guest FPS \((\d+) frames in ([\d.]+) s
                  r"(\d+) over 50 ms")
 WHERE = re.compile(r"Where: (\w+) at (-?[\d.]+) (-?[\d.]+) (-?[\d.]+)")
 MEMORY = re.compile(r"Input script: memory (\d+) MB private, (\d+) MB working set")
-BUILD = re.compile(r"\(build (\w+)\)")
+BUILD = re.compile(r"\(build ([\w-]+)\)")  # "<commit>" or "<commit>-dirty-<hash>" (cmake/game_build_stamp.cmake)
 # The online code's frame-time event (stage 1A): every 10 s on the server and on a client in a session.
 FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+) max ([\d.]+) "
                     r"private (-?\d+) working (-?\d+) video (-?\d+)")
@@ -132,6 +132,7 @@ ROUND_TRIP = re.compile(r"\(round trip (\d+) us\)")
 # The request lifecycle lines (stage 1B item 9; docs/online-1B.md section 5; the game's
 # session/session_host.cpp LogRequest and LogDecision, the same text on S and on the requester). A
 # key is "<generation>/<peer>/<kind>/<sequence>/<what>" (session_host.h RequestKeyText).
+REQUEST_KINDS = ("enter", "exit", "touch", "telegram", "skip")
 REQ_KEY = r"(\d+/\d+/(?:enter|exit|touch|telegram|skip)/\d+/\S+)"
 REQUEST_LINE = re.compile(r"Online: request (\d+):(\d+) (enter|exit|touch|telegram|skip) " + REQ_KEY)
 DECIDED_APPLIED = re.compile(r"Online: decided " + REQ_KEY + r" applied seq (\d+)")
@@ -947,14 +948,18 @@ def grade_requests_answered(text: str, gone_peers: set[str]) -> tuple[dict, list
     applied twice, or applied and finally refused, or left with none. Cached answers repeat a
     decision and are counted apart, and so are the retryable refusals (the key was resent or S made
     the reason final later). On S's log the keys of a peer S logged `peer <n> gone at close` for are
-    left out (that peer's finals could not reach it), and on any log a key with no final that has a
-    `request <key> not sent` line (End session beat its send, so no answer can come)."""
+    left out (that peer's finals could not reach it), and on any log a key with a
+    `request <key> not sent` line and no answer of any kind on that log (End session beat its send,
+    so no answer can come); a key with any answer (even pending or a retryable refusal) is graded."""
     keys: dict[str, None] = {}
     finals: dict[str, list[str]] = {}
     applied: dict[str, int] = {}
     cached = retried = 0
     unlogged = 0
     not_sent: set[str] = set()
+    # Keys this log shows any answer for (pending, cached and retryable included): such a key is
+    # graded even with a `not sent` line (Sol council batch r2 C1, as in route_requests).
+    any_answer: set[str] = set()
     for line in text.splitlines():
         if m := REQUEST_LINE.search(line):
             keys.setdefault(m.group(4), None)
@@ -966,6 +971,7 @@ def grade_requests_answered(text: str, gone_peers: set[str]) -> tuple[dict, list
         if not d:
             continue
         key, what, reason = d
+        any_answer.add(key)
         if what.startswith("cached"):
             cached += 1
             continue
@@ -981,7 +987,7 @@ def grade_requests_answered(text: str, gone_peers: set[str]) -> tuple[dict, list
         if key not in keys:
             unlogged += 1
     left_out = [k for k in keys if key_peer(k) in gone_peers]
-    unsent = [k for k in keys if key_peer(k) not in gone_peers and k in not_sent and not finals.get(k)]
+    unsent = [k for k in keys if key_peer(k) not in gone_peers and k in not_sent and k not in any_answer]
     graded_keys = [k for k in keys if key_peer(k) not in gone_peers and k not in unsent]
     none = [k for k in graded_keys if not finals.get(k)]
     several = [k for k in graded_keys if len(finals.get(k, [])) > 1]
@@ -1118,8 +1124,9 @@ def grade_symmetry(text: str, g: dict) -> tuple[dict, list[str]]:
 
 def check_route(spec_name: str, g: object, names: list[str]) -> None:
     """A route grade's options: `file` (the route file, relative to the game checkout; required),
-    `peer` (the server's log, default S) and `clients` (the clients whose level-guard lines must show
-    no level left by itself; default every client)."""
+    `peer` (the server's log, default S), `clients` (the clients whose level-guard lines must show
+    no level left by itself; default every client) and `requesters` (the clients whose request keys
+    must each end applied on the server or as an expected refusal; default `clients`)."""
     if not isinstance(g, dict):
         raise SpecError(f"{spec_name}: grade route must be a table")
     f = g.get("file")
@@ -1132,6 +1139,9 @@ def check_route(spec_name: str, g: object, names: list[str]) -> None:
     clients = g.get("clients", [n for n in names if n != "S"])
     if not isinstance(clients, list) or any(c not in names or c == "S" for c in clients):
         raise SpecError(f"{spec_name}: grade route: `clients` must name clients of {names}")
+    requesters = g.get("requesters", clients)
+    if not isinstance(requesters, list) or any(c not in names or c == "S" for c in requesters):
+        raise SpecError(f"{spec_name}: grade route: `requesters` must name clients of {names}")
 
 
 def route_name_matches(want: str, seen: str) -> bool:
@@ -1146,8 +1156,9 @@ def route_name_matches(want: str, seen: str) -> bool:
 def load_route_checklist(path: Path) -> tuple[dict | None, str]:
     """The route checklist of a route file (tests/routes/<level>.toml): [level_end] (class, optional
     recipient and next_zone), the triggers whose class is request or two_player, [[encounter]]
-    (manager), [[checkpoint]] (trigger, optional expect, a pattern on S), [[scene]] (name). Returns the
-    checklist and "" or None and why it cannot be read."""
+    (manager), [[checkpoint]] (trigger, optional expect, a pattern on S), [[scene]] (name),
+    [[expected_refusal]] (reason and why, optional kind and name: a refusal a requester's key may end
+    with). Returns the checklist and "" or None and why it cannot be read."""
     try:
         d = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as e:
@@ -1155,6 +1166,18 @@ def load_route_checklist(path: Path) -> tuple[dict | None, str]:
     end = d.get("level_end", {})
     if not isinstance(end, dict) or not isinstance(end.get("class"), str) or not end["class"]:
         return None, f"the route file {path.name} has no [level_end] class (X11 names it)"
+    refusals = d.get("expected_refusal", [])
+    if not isinstance(refusals, list):
+        return None, f"the route file {path.name}: expected_refusal must be an array of tables ([[expected_refusal]])"
+    for i, x in enumerate(refusals, 1):
+        if (not isinstance(x, dict) or not isinstance(x.get("reason"), str) or not x["reason"].strip()
+                or not isinstance(x.get("why"), str) or not x["why"].strip()):
+            return None, f"the route file {path.name}: expected_refusal {i} needs a `reason` and a `why`"
+        if x.get("kind", "") not in ("", *REQUEST_KINDS):
+            return None, (f"the route file {path.name}: expected_refusal {i}: kind {x['kind']!r} is not one of"
+                          f" {', '.join(REQUEST_KINDS)}")
+        if "name" in x and (not isinstance(x["name"], str) or not x["name"].strip()):
+            return None, f"the route file {path.name}: expected_refusal {i}: `name` must be a nonempty name"
     return {
         "level_end": end,
         "triggers": [t["name"] for t in d.get("trigger", []) if isinstance(t, dict) and isinstance(t.get("name"), str)
@@ -1163,7 +1186,108 @@ def load_route_checklist(path: Path) -> tuple[dict | None, str]:
                        and isinstance(e.get("manager"), str)],
         "checkpoints": [c for c in d.get("checkpoint", []) if isinstance(c, dict) and isinstance(c.get("trigger"), str)],
         "scenes": [c["name"] for c in d.get("scene", []) if isinstance(c, dict) and isinstance(c.get("name"), str)],
+        "expected_refusals": refusals,
     }, ""
+
+
+def key_ref(key: str) -> str:
+    """The world ref of a request key (its last part: the trigger's or messenger's ref)."""
+    return key.split("/", 4)[4]
+
+
+def route_requests(texts: dict[str, str], server_lines: list[str], checklist: dict,
+                   requesters: list[str]) -> tuple[dict, list[str]]:
+    """The route grade's request side (council 1B, Opus O5): every key a requester logged a
+    `request` line for (its own log: the keys it sent) must end applied on the server, or with a
+    refusal of the route file's [[expected_refusal]] list. A key's end is S's last decision that is
+    not a cached repeat, a `pending` or a retryable refusal (a too_far the client resent and S then
+    applied ends applied). A touch or exit refused with `enter refused` is accepted only when its
+    enter key ended with an expected refusal (not when that enter ended applied: the touch or exit
+    was then lost). A key the requester logged `not sent` for (End
+    session beat its send) and S never saw at all (no replay, no decision of any kind) is left out
+    and counted. An expected refusal matches
+    by `reason` (the refusal reason S logs), `kind` when given, and `name` when given: the name S's
+    replay line gave the same ref (`replay <peer>.<n>:<key> <Name#id> by`), case folded, `Name` or
+    `Name#id`; a ref S never replayed has no name and matches no row with a `name`."""
+    ends: dict[str, tuple[str, str]] = {}
+    ref_names: dict[str, str] = {}
+    # Every key S showed any sign of (a replay, or any decision, pending, cached or retryable
+    # included): a `not sent` key S saw is still graded (Sol council batch C1: a resend refused by a
+    # closing session after S's pending or too_far must not hide an unapplied request).
+    seen_on_s: set[str] = set()
+    for line in server_lines:
+        if m := REPLAY_LINE.search(line):
+            key = m.group(1).split(":", 1)[-1]
+            if key.count("/") >= 4:
+                ref_names.setdefault(key_ref(key), m.group(2))
+                seen_on_s.add(key)
+            continue
+        d = decision_of(line)
+        if not d:
+            continue
+        key, what, reason = d
+        seen_on_s.add(key)
+        if what.startswith("cached") or what == "pending":
+            continue
+        if what == "refused" and not refusal_final(key, reason):
+            continue
+        ends[key] = ("applied", "") if what == "applied" else ("refused", reason)
+
+    def expected(key: str, reason: str) -> bool:
+        name = ref_names.get(key_ref(key))
+        for x in checklist.get("expected_refusals", []):
+            if x["reason"].strip().casefold() != reason.casefold():
+                continue
+            if x.get("kind") and x["kind"] != key_kind(key):
+                continue
+            if x.get("name") and not (name and route_name_matches(x["name"].strip(), name)):
+                continue
+            return True
+        return False
+
+    def accepted(key: str) -> bool | None:
+        """True: applied or an expected refusal; False: another refusal; None: no end on S."""
+        end = ends.get(key)
+        if end is None:
+            return None
+        if end[0] == "applied":
+            return True
+        if key_kind(key) in ("touch", "exit") and end[1] == "enter refused":
+            # Only an enter that itself ended as an expected refusal: an enter that ended applied
+            # (a resend after too_far) with its touch or exit refused on the way lost that key.
+            g, peer, _, seq, ref = key.split("/", 4)
+            enter = "/".join((g, peer, "enter", seq, ref))
+            return ends.get(enter, ("",))[0] == "refused" and accepted(enter) is True
+        return expected(key, end[1])
+
+    graded: dict = {}
+    reasons: list[str] = []
+    for peer in requesters:
+        keys: dict[str, None] = {}
+        not_sent: set[str] = set()
+        for line in texts.get(peer, "").splitlines():
+            if m := REQUEST_LINE.search(line):
+                keys.setdefault(m.group(4), None)
+            elif m := REQUEST_NOT_SENT.search(line):
+                not_sent.add(m.group(1))
+        unsent = [k for k in keys if k in not_sent and k not in seen_on_s]
+        graded_keys = [k for k in keys if k not in unsent]
+        verdicts = {k: accepted(k) for k in graded_keys}
+        none = [k for k, v in verdicts.items() if v is None]
+        wrong = [k for k, v in verdicts.items() if v is False]
+        graded[peer] = {"keys": len(graded_keys),
+                        "applied": sum(1 for k in graded_keys if ends.get(k, ("",))[0] == "applied"),
+                        "expected_refusals": sum(1 for k in graded_keys if verdicts[k] and ends[k][0] == "refused"),
+                        "unexpected_refusals": len(wrong), "without_end": len(none), "left_out_not_sent": len(unsent)}
+        if none:
+            reasons.append(f"grade route: {len(none)} request key(s) of {peer} without an end on the server: "
+                           f"{', '.join(none[:3])}{' ...' if len(none) > 3 else ''}")
+        if wrong:
+            shown = ", ".join(f"{k} ({ends[k][1]}{'; ' + ref_names[key_ref(k)] if key_ref(k) in ref_names else ''})"
+                              for k in wrong[:3])
+            reasons.append(f"grade route: {len(wrong)} request key(s) of {peer} refused on the server and not listed"
+                           f" as an expected refusal: {shown}{' ...' if len(wrong) > 3 else ''}")
+    return graded, reasons
 
 
 def grade_route(texts: dict[str, str], checklist: dict, g: dict) -> tuple[dict, list[str]]:
@@ -1179,7 +1303,9 @@ def grade_route(texts: dict[str, str], checklist: dict, g: dict) -> tuple[dict, 
     client of `clients` may leave the level by itself: its level guard passes only the session's own
     request, a request while not connected, or a joiner's continue from its title, it runs no level end
     of its own, and it played the server's level end of [level_end]'s class and generation exactly once
-    (`level end <class> from the server played here (generation <g>, ...`)."""
+    (`level end <class> from the server played here (generation <g>, ...`). Every request key of
+    `requesters` (default `clients`) ends applied on the server or as an expected refusal of the file
+    (route_requests)."""
     server = texts.get(g.get("peer", "S"), "")
     lines = server.splitlines()
     end = checklist["level_end"]
@@ -1285,6 +1411,9 @@ def grade_route(texts: dict[str, str], checklist: dict, g: dict) -> tuple[dict, 
             if m := CLIENT_NATIVE_END.search(line):
                 reasons.append(f"grade route: client {peer} ran its own level end ({m.group(1)} to {m.group(2)})")
                 break
+    clients = g.get("clients", [p for p in texts if p != "S"])
+    graded["requests"], why = route_requests(texts, lines, checklist, g.get("requesters", clients))
+    reasons += why
     if reasons:
         graded["violation"] = True
     return graded, reasons
