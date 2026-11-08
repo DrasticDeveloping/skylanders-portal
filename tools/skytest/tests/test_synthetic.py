@@ -196,11 +196,20 @@ class RemoteSwapGradeTest(unittest.TestCase):
     def test_swap_pairs_filters(self) -> None:
         import swap_pairs
         logs = {1: swap(1, "Wash", 600), 2: body(1, "Wash", 1, 610), 3: ""}
-        r = swap_pairs.grade_swap_pairs(logs, receivers={2})
+        r = swap_pairs.grade_swap_pairs(logs, {1: 1}, receivers={2})
         self.assertTrue(r.passed, r.failures)
         self.assertEqual((r.swaps, r.expected), (1, 1))
-        r = swap_pairs.grade_swap_pairs(logs, swappers={2})
-        self.assertEqual((r.swaps, r.expected), (0, 0))
+        # Peer 1 outside `swappers`: its swap line is never read, so the ordered swap has no reference.
+        r = swap_pairs.grade_swap_pairs(logs, {1: 1}, receivers={2}, swappers={2})
+        self.assertFalse(r.passed)
+        self.assertEqual((r.swaps, r.expected), (0, 1))
+        self.assertTrue(any("missing reference" in f for f in r.failures), r.failures)
+        # A receiver-only peer's own swap, outside `swappers`, is neither graded nor unexpected.
+        logs[2] += "\n" + swap(1, "Blast", 700)
+        r = swap_pairs.grade_swap_pairs(logs, {1: 1}, receivers={2}, swappers={1})
+        self.assertTrue(r.passed, r.failures)
+        r = swap_pairs.grade_swap_pairs(logs, {1: 1}, receivers={2})
+        self.assertTrue(any("not ordered by the case" in f for f in r.failures), r.failures)
 
 
 class AmendmentVerdictTest(unittest.TestCase):

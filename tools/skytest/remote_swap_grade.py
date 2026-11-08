@@ -16,9 +16,9 @@ carry it as the swapper's key. Only the named swappers' swaps are graded, each o
 other than its swapper (a receiver's own swap is not a key; a swapper outside `receivers` is never asked
 to show one). The grade fails, each with its own line, when: a swapper or receiver never connected (no
 peer id), a swapper logged fewer swaps than `swaps` (counted per swapper: ten swaps by one peer never
-stand for another's), the pair count is not the swaps logged x the receivers other than their swapper,
-or any pair fails swap_pairs.py's own rules (missing, duplicate, wrong body, over max_ms, pressure
-pairs).
+stand for another's), the pair count is not the swaps ordered x the receivers other than their swapper,
+or any pair fails swap_pairs.py's own rules (missing, duplicate, wrong body, over max_ms, a swap line
+past the ordered count, a slot-free line: this form names no pressure pair).
 
 Standard library only; run with python -I.
 """
@@ -102,13 +102,21 @@ def grade_remote_swap(texts: dict[str, str], g: dict, thresholds: dict, names: l
 
     # Only the named swappers' swaps are keys and only the named receivers receive: a swapper that is
     # not a receiver is never asked to show another's swap, and a receiver's own swap is not graded.
-    res = swap_pairs.grade_swap_pairs(logs, max_ms=max_ms, receivers={ids[r] for r in receivers},
-                                      swappers={ids[s] for s in swappers})
+    # The case's order for swap_pairs.py is `swaps` per swapper that has a receiver other than itself
+    # (a swapper with none is held to its count above and has no pairs); a swap line past the count is
+    # one the case did not order and fails there.
+    rec_ids = sorted({ids[r] for r in receivers})
+    ordered = {ids[s]: swaps for s in swappers if any(r != s for r in receivers)}
+    res = swap_pairs.Result()
+    try:
+        res = swap_pairs.grade_swap_pairs(logs, ordered, rec_ids, max_ms=max_ms, swappers=set(ordered))
+    except ValueError as e:
+        why.append(f"grade remote_swap: {e}")
     # Receivers per swapper: the named receivers other than the swapper itself.
-    expected = sum(len(seen[ids[s]]) * sum(1 for r in receivers if r != s) for s in swappers)
+    expected = sum(swaps * sum(1 for r in receivers if r != s) for s in swappers)
     graded.update({"expected": expected, "graded": res.graded, "max_lag_ms": round(res.max_lag_ms, 1),
                    "pressure_pairs": res.pressure_pairs})
-    if expected == 0:
+    if not any(seen.values()):
         why.append("grade remote_swap: no swap was graded (not reached)")
     if res.expected != expected:
         why.append(f"grade remote_swap: {res.expected} pair(s) found, {expected} expected")

@@ -1924,15 +1924,30 @@ def grade_remote_swap(texts: dict[str, str], g: dict, thresholds: dict, names: l
         else:
             ids[n] = pid
     logs = {ids[n]: texts.get(n, "") for n in ids}
-    res = swap_pairs.grade_swap_pairs(logs, max_ms=max_ms, hz=hz,
-                                      receivers={ids[n] for n in receivers if n in ids},
-                                      swappers={ids[n] for n in swappers if n in ids})
-    graded = {"max_ms": max_ms, "swaps": res.swaps, "expected_pairs": res.expected, "graded_pairs": res.graded,
+    rec_ids = sorted({ids[n] for n in receivers if n in ids})
+    # This form orders a minimum, not a count per swapper: the swaps each swapper logged (one per key)
+    # become the case's order for swap_pairs.py, whose rules then hold for every one of them (every
+    # pair graded, a slot-free line only on a pressure pair the case names). A swapper with no swap or
+    # no receiver other than itself has no pairs; `min_swaps` holds the total.
+    counts: dict[int, int] = {}
+    for n in swappers:
+        if n in ids:
+            counts[ids[n]] = len({(m.group(1), m.group(3), m.group(4)) for line in texts.get(n, "").splitlines()
+                                  if (m := swap_pairs.SWAP_RE.search(line))})
+    swaps = sum(counts.values())
+    ordered = {p: c for p, c in counts.items() if c and any(r != p for r in rec_ids)}
+    res = swap_pairs.Result()
+    if ordered:
+        try:
+            res = swap_pairs.grade_swap_pairs(logs, ordered, rec_ids, max_ms=max_ms, hz=hz, swappers=set(ordered))
+        except ValueError as e:
+            reasons.append(f"grade remote_swap: {e}")
+    graded = {"max_ms": max_ms, "swaps": swaps, "expected_pairs": res.expected, "graded_pairs": res.graded,
               "pressure_pairs": res.pressure_pairs, "max_lag_ms": round(res.max_lag_ms, 1),
               "peers": {n: ids.get(n) for n in dict.fromkeys(receivers + swappers)}}
     min_swaps = int(g.get("min_swaps", 1))
-    if res.swaps < min_swaps:
-        reasons.append(f"grade remote_swap: not reached ({res.swaps} swap(s), the spec orders {min_swaps})")
+    if swaps < min_swaps:
+        reasons.append(f"grade remote_swap: not reached ({swaps} swap(s), the spec orders {min_swaps})")
     if res.failures:
         graded["violation"] = True
         reasons += [f"grade remote_swap: {f}" for f in res.failures[:12]]
