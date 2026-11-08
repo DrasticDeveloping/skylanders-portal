@@ -31,7 +31,7 @@
 //            others), duplicate                                   a frame, before the backend reads
 //                                                                 it, so S never sees a kill (Sol F1)
 //   apply    fail, stuck, despawn (inside Apply), late <ms>      a KindAdapter decorator
-//            (spawn after the row)                                (WrapAdapter); late is asked by the
+//            (spawn after the row), hold <ms> (stage 3)           (WrapAdapter); late is asked by the
 //                                                                 harness that spawns (SpawnDelay)
 //   pump     stall <ms> (a peer that stops pumping: a loading     the harness asks Stalled
 //            screen)
@@ -57,6 +57,18 @@
 // and a missing amount, with the word's position; a rule list round-trips through its text (FI1,
 // FI2).
 //
+// Stage 3 (future/online-3.md sections 3.7 and 5.4):
+// - `apply:hold ms=<n>`: the decorator takes the row and answers kFailed ("in flight") for n ms
+//   without calling the adapter, then calls it; repeated handouts of the held key during the hold
+//   answer kFailed without counting as matches. CancelHolds (the bridge's EpochBegin and detach)
+//   ends every hold without an adapter call; when its time is up (or at once, for detach) the
+//   event `hold released after cancel (no apply)` follows.
+// - `newer` (apply rules only, with kind= and key=): matches only a row whose revision is above the
+//   revision the peer had settled for that key when the rule was armed (Arm's settled_revision),
+//   read from the revision source (SetApplyRevisionSource; Client::Applying). Without a source a
+//   `newer` rule never matches. In the canonical form it follows slot=.
+// - Arm adds a rule while the injector runs: its nth counts matches from the moment it is armed.
+//
 // `full`, `disconnect` and `stall` fire once (their onset); `throttle` fires once per link, when it
 // first applies; every other action fires once per match. A throttled link passes its frames at
 // the rate through a bottleneck buffer of one second of the rate (at least one frame) and answers
@@ -80,6 +92,7 @@ enum class FaultAction : uint8_t {
   kDespawn,     // apply
   kLate,        // apply
   kStall,       // pump
+  kHold,        // apply (stage 3)
 };
 std::string_view FaultLayerName(FaultLayer layer);     // "link", "peer", "message", ...
 std::string_view FaultActionName(FaultAction action);  // "drop", "delay", ...
@@ -107,6 +120,7 @@ struct FaultRule {
   uint32_t percent = 100;  // the chance a match fires
   std::optional<uint32_t> from_ms, to_ms;
   uint32_t after_baseline_rows = 0;  // 0: no such condition
+  bool newer = false;                // apply only: a revision above the one settled at arming
   bool operator==(const FaultRule&) const = default;
 };
 
@@ -130,6 +144,8 @@ struct FaultEvent {
 };
 // "Online: backend fault <rule n> <layer>:<action> <what>".
 std::string FaultLine(const FaultEvent& event);
+// "Online: backend fault <rule n> armed <rule text>": the line of a rule Arm added (stage 3).
+std::string FaultArmedLine(size_t rule_number, const FaultRule& rule);
 
 class FaultInjector {
  public:
@@ -162,6 +178,21 @@ class FaultInjector {
   std::optional<Duration> SpawnDelay(uint16_t peer, const RecordKey& key);
   // pump:stall: whether `peer` skips its pump now.
   bool Stalled(uint16_t peer);
+
+  // Stage 3. Adds `rule` while the injector runs and returns its number (from 1, as the line
+  // writes it); its matches are counted from now. `settled_revision` is the revision the peer
+  // had settled for the rule's key at arming (a `newer` rule matches only above it; nullopt: none
+  // settled, any revision matches). nullopt return: a `newer` rule without kind= and key=.
+  std::optional<size_t> Arm(FaultRule rule, std::optional<uint32_t> settled_revision);
+  // The revision of the row whose adapter call is in progress (Client::Applying), for `newer`.
+  void SetApplyRevisionSource(std::function<std::optional<uint32_t>()> source);
+  // apply:hold: ends every hold now without calling the adapter (`why`: "epoch", "detach"). Each
+  // ended hold gives the event `hold released after cancel (no apply) ... (<why>)` when its time
+  // is up (Advance), or at once with `release_now` (detach: nothing advances after it).
+  void CancelHolds(std::string_view why, bool release_now);
+  // Holds running (not cancelled) and cancelled holds whose release event has not come yet.
+  size_t ActiveHolds() const;
+  size_t CancelledHolds() const;
 
   bool PollEvent(FaultEvent& out);
   const std::vector<FaultRule>& Rules() const;

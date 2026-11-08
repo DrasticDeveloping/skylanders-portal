@@ -29,12 +29,13 @@ enum Word : uint32_t {
   kWordTo = 1u << 10,
   kWordAfter = 1u << 11,
   kWordId = 1u << 12,
+  kWordNewer = 1u << 13,
 };
 constexpr uint32_t kFrameWords = kWordLane | kWordDir | kWordPeer | kWordType | kWordKind |
                                  kWordKey | kWordSlot | kWordId | kWordNth | kWordPct | kWordFrom |
                                  kWordTo | kWordAfter;
-constexpr uint32_t kApplyWords =
-    kWordPeer | kWordKind | kWordKey | kWordSlot | kWordNth | kWordPct | kWordFrom | kWordTo;
+constexpr uint32_t kApplyWords = kWordPeer | kWordKind | kWordKey | kWordSlot | kWordNth | kWordPct |
+                                 kWordFrom | kWordTo | kWordNewer;
 
 enum class Amount : uint8_t { kNone, kMs, kDelay, kBps };
 
@@ -64,6 +65,7 @@ constexpr ActionSpec kActions[] = {
     {FaultLayer::kApply, FaultAction::kStuck, "stuck", kApplyWords, Amount::kNone},
     {FaultLayer::kApply, FaultAction::kDespawn, "despawn", kApplyWords, Amount::kNone},
     {FaultLayer::kApply, FaultAction::kLate, "late", kApplyWords, Amount::kMs},
+    {FaultLayer::kApply, FaultAction::kHold, "hold", kApplyWords, Amount::kMs},
     {FaultLayer::kPump, FaultAction::kStall, "stall",
      kWordPeer | kWordNth | kWordPct | kWordFrom | kWordTo, Amount::kMs},
 };
@@ -195,6 +197,16 @@ bool ParseRule(const std::vector<Token>& words, FaultRule& rule, FaultParseError
   for (size_t w = 1; w < words.size(); ++w) {
     const Token& t = words[w];
     const size_t eq = t.text.find('=');
+    if (eq == std::string_view::npos && t.text == "newer") {
+      // A flag word (stage 3): apply rules only.
+      if ((spec->words & kWordNewer) == 0) {
+        return Fail(error, t.position,
+                    "unknown word 'newer' for " + std::string(FaultLayerName(spec->layer)) + ":" +
+                        std::string(spec->name));
+      }
+      rule.newer = true;
+      continue;
+    }
     if (eq == std::string_view::npos) {
       // A bare amount after the action.
       if (!set_amount(t.text, t.position)) return false;
@@ -311,6 +323,9 @@ bool ParseRule(const std::vector<Token>& words, FaultRule& rule, FaultParseError
   if (rule.from_ms && rule.to_ms && *rule.to_ms < *rule.from_ms) {
     return Fail(error, head.position, "window ends before it starts");
   }
+  if (rule.newer && (rule.kind.empty() || rule.key.empty())) {
+    return Fail(error, head.position, "newer needs kind= and key=");
+  }
   return true;
 }
 
@@ -384,6 +399,7 @@ std::string_view FaultActionName(FaultAction action) {
     case FaultAction::kDespawn: return "despawn";
     case FaultAction::kLate: return "late";
     case FaultAction::kStall: return "stall";
+    case FaultAction::kHold: return "hold";
   }
   return "?";
 }
@@ -428,6 +444,7 @@ std::string FormatFaultRule(const FaultRule& rule) {
   if (!rule.kind.empty()) word("kind", rule.kind);
   if (!rule.key.empty()) word("key", rule.key);
   if (rule.slot) word("slot", std::to_string(*rule.slot));
+  if (rule.newer) s += " newer";
   if (rule.obligation) word("id", std::to_string(*rule.obligation));
   if (rule.nth) word("nth", std::to_string(rule.nth));
   if (rule.percent != 100) word("pct", std::to_string(rule.percent));
@@ -474,6 +491,10 @@ std::string FaultLine(const FaultEvent& event) {
   return s;
 }
 
+std::string FaultArmedLine(size_t rule_number, const FaultRule& rule) {
+  return "Online: backend fault " + std::to_string(rule_number) + " armed " + FormatFaultRule(rule);
+}
+
 // --- The injector's state, shared by its decorators.
 
 class FaultLink;
@@ -487,6 +508,45 @@ struct FaultInjector::Impl {
   std::deque<FaultEvent> events;
   std::vector<FaultLink*> links;
   std::map<uint16_t, TimePoint> stall_until;
+  // Stage 3: `newer`'s floor per rule (the revision settled at arming; nullopt: none), the
+  // revision source, and apply:hold's holds, per peer and key.
+  std::vector<std::optional<uint32_t>> newer_floor;
+  std::function<std::optional<uint32_t>()> apply_revision;
+  struct Hold {
+    size_t rule = 0;  // index from 0
+    TimePoint until{};
+    std::string why;  // set when cancelled
+  };
+  std::map<std::pair<uint16_t, RecordKey>, Hold> holds;
+  std::vector<std::pair<std::pair<uint16_t, RecordKey>, Hold>> cancelled;
+
+  // `newer`: the row in progress is above the floor armed for rule i.
+  bool NewerMatches(size_t i) const {
+    if (!rules[i].newer) return true;
+    if (!apply_revision) return false;
+    const std::optional<uint32_t> rev = apply_revision();
+    if (!rev) return false;
+    const std::optional<uint32_t> floor = i < newer_floor.size() ? newer_floor[i] : std::nullopt;
+    return !floor || *rev > *floor;
+  }
+  void ReleaseCancelled(bool all) {
+    for (auto it = cancelled.begin(); it != cancelled.end();) {
+      if (!all && now < it->second.until) {
+        ++it;
+        continue;
+      }
+      FaultEvent e;
+      e.rule = it->second.rule + 1;
+      e.layer = FaultLayer::kApply;
+      e.action = FaultAction::kHold;
+      e.peer = it->first.first;
+      e.at = now;
+      e.what = "released after cancel (no apply) peer " + std::to_string(it->first.first) + " " +
+               KeyText(it->first.second) + " (" + it->second.why + ")";
+      events.push_back(std::move(e));
+      it = cancelled.erase(it);
+    }
+  }
 
   bool Chance(uint32_t percent) {
     if (percent >= 100) return true;
@@ -902,20 +962,35 @@ class FaultAdapter final : public KindAdapter {
     if (identity_) {
       if (auto id = identity_->IdOf(h)) key.entity = *id;
     }
+    // apply:hold (stage 3): a held key answers "in flight" until its time is up, then the adapter
+    // runs; the handouts in between are not matches.
+    const auto held = inj_.holds.find({peer_, key});
+    if (held != inj_.holds.end()) {
+      if (inj_.now < held->second.until) return AdapterResult::kFailed;
+      inj_.holds.erase(held);
+      return inner_.Apply(h, slot, value);
+    }
     for (size_t i = 0; i < inj_.rules.size(); ++i) {
       const FaultRule& r = inj_.rules[i];
       if (r.layer != FaultLayer::kApply || r.action == FaultAction::kLate) continue;
       if (r.peer && *r.peer != peer_) continue;
-      if (!inj_.InWindow(r) || !inj_.KeyMatches(r, key)) continue;
-      if (!inj_.Hit(i, peer_, "peer " + std::to_string(peer_) + " " + inj_.KeyText(key))) {
-        continue;
-      }
+      if (!inj_.InWindow(r) || !inj_.KeyMatches(r, key) || !inj_.NewerMatches(i)) continue;
+      std::string what = "peer " + std::to_string(peer_) + " " + inj_.KeyText(key);
+      if (r.action == FaultAction::kHold) what += " " + std::to_string(r.amount) + " ms";
+      if (!inj_.Hit(i, peer_, std::move(what))) continue;
       switch (r.action) {
         case FaultAction::kFail: return AdapterResult::kFailed;
         case FaultAction::kStuck: return AdapterResult::kOk;  // the native keeps its own value
         case FaultAction::kDespawn:
           if (despawn_) despawn_(h);
           return AdapterResult::kGone;
+        case FaultAction::kHold: {
+          FaultInjector::Impl::Hold hold;
+          hold.rule = i;
+          hold.until = inj_.now + std::chrono::milliseconds(r.amount);
+          inj_.holds[{peer_, key}] = std::move(hold);
+          return AdapterResult::kFailed;  // "in flight"
+        }
         default: break;
       }
     }
@@ -941,6 +1016,7 @@ FaultInjector::FaultInjector(std::vector<FaultRule> rules, uint64_t seed,
   impl_->matched.assign(rules.size(), 0);
   impl_->fired.assign(rules.size(), 0);
   impl_->rules = std::move(rules);
+  impl_->newer_floor.assign(rules.size(), std::nullopt);
   impl_->rng = seed;
   impl_->table = table;
   impl_->start = start;
@@ -952,6 +1028,7 @@ FaultInjector::~FaultInjector() = default;
 void FaultInjector::Advance(TimePoint now) {
   if (now > impl_->now) impl_->now = now;
   for (FaultLink* link : impl_->links) link->Release();
+  impl_->ReleaseCancelled(false);
 }
 
 TimePoint FaultInjector::Now() const { return impl_->now; }
@@ -999,6 +1076,35 @@ bool FaultInjector::Stalled(uint16_t peer) {
   }
   return false;
 }
+
+std::optional<size_t> FaultInjector::Arm(FaultRule rule, std::optional<uint32_t> settled_revision) {
+  Impl& s = *impl_;
+  if (rule.newer && (rule.layer != FaultLayer::kApply || rule.kind.empty() || rule.key.empty())) {
+    return std::nullopt;
+  }
+  s.rules.push_back(std::move(rule));
+  s.matched.push_back(0);
+  s.fired.push_back(0);
+  s.newer_floor.push_back(settled_revision);
+  return s.rules.size();
+}
+
+void FaultInjector::SetApplyRevisionSource(std::function<std::optional<uint32_t>()> source) {
+  impl_->apply_revision = std::move(source);
+}
+
+void FaultInjector::CancelHolds(std::string_view why, bool release_now) {
+  Impl& s = *impl_;
+  for (auto& [where, hold] : s.holds) {
+    hold.why = std::string(why);
+    s.cancelled.emplace_back(where, std::move(hold));
+  }
+  s.holds.clear();
+  s.ReleaseCancelled(release_now);
+}
+
+size_t FaultInjector::ActiveHolds() const { return impl_->holds.size(); }
+size_t FaultInjector::CancelledHolds() const { return impl_->cancelled.size(); }
 
 bool FaultInjector::PollEvent(FaultEvent& out) {
   if (impl_->events.empty()) return false;
