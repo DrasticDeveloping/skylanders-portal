@@ -60,6 +60,8 @@ COMMANDS = """
 level = "none"
 online_host = "none"
 dev_secret_dump = "refused"
+save_import = "read_path"
+save_dump = "read_write_paths"
 """
 
 
@@ -293,6 +295,31 @@ class ScriptTest(_Base):
     def test_unclassified_registered_command(self) -> None:
         self.assertIn("table", self.refuses(self.check, "dev_new_tool 1 2"))
         self.assertIn("refused", self.refuses(self.check, "dev_secret_dump"))
+
+    def test_registered_commands_with_paths(self) -> None:
+        # read_path (save_import <path> <slot>): the file before the last word, read inside the run
+        # folder (it may not exist yet) or an existing file in a read root; read_write_paths (save_dump
+        # <file> <out>): the first word read so, the second written inside the run folder.
+        routes = self.install / "routes" / "unsupported.toml"
+        for good in ("save_import handover.xsg 0", 'save_import "hand over.xsg" 1', f"save_import {routes} 2",
+                     "save_dump in.xsg out.txt --inventory", f"save_dump {routes} dump.txt"):
+            with self.subTest(good=good):
+                self.check(good)
+        (self.root / "elsewhere.xsg").write_bytes(b"\0")
+        (self.owner / "Swap Force" / "x.xsg").write_bytes(b"\0")
+        for bad, why in ((f"save_import {self.root / 'elsewhere.xsg'} 0", "outside"),
+                         ("save_import ..\\..\\elsewhere.xsg 0", "outside"),
+                         (f"save_import {self.owner / 'Swap Force' / 'x.xsg'} 0", "outside"),
+                         ("save_import x.xsg", "cannot parse"),
+                         (f"save_dump in.xsg {self.root / 'out.txt'}", "outside"),
+                         (f"save_dump in.xsg {self.install / 'routes' / 'out.txt'}", "outside"),
+                         (f"save_dump {self.root / 'elsewhere.xsg'} out.txt", "outside"),
+                         ("save_dump in.xsg", "two words")):
+            with self.subTest(bad=bad):
+                self.assertIn(why, self.refuses(self.check, bad))
+        junction(self.run / "j", self.owner)
+        self.refuses(self.check, "save_import j\\x.xsg 0")
+        self.refuses(self.check, "save_dump in.xsg j\\out.txt")
 
     def test_lines_the_game_refuses(self) -> None:
         for bad in ("tap q", "hold a", "player 5", "dump 82000000 5000", "save 1 2", "place 16 x", "fps 0",

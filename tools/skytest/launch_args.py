@@ -242,13 +242,25 @@ BUILTIN_COMMANDS = {
     "remove": "none", "putback": "none", "trap": "none", "waitfor": "none", "quit": "none",
     "save": "write_path", "shot": "write_path", "place": "figure_path", "renderdoc": "refused",
 }
-REGISTERED_CLASSES = ("none", "refused")
+# The game's registered commands (RegisterScriptCommand), by what they do with a path. The game hands
+# such a command the rest of its line; a relative path is resolved against the game's working
+# directory, which the builder sets to the run folder.
+#   none              no path
+#   read_path         `<path> <word>`: everything before the last word is one file the game reads,
+#                     outer double quotes dropped (Swap Force Online's save_import <path> <slot>,
+#                     save_import_dev.h ParseDevImportArgs)
+#   read_write_paths  `<file> <out> ...`: the first word is a file the game reads, the second one it
+#                     writes (save_dump <file> <out> [--inventory], save_dump.cpp DumpCommand)
+#   refused           never in a validated run
+# A read path lies inside the run folder (it may not exist yet: a file the run makes) or is an
+# existing file inside a read root; a written path lies inside the run folder.
+REGISTERED_CLASSES = ("none", "read_path", "read_write_paths", "refused")
 
 
 @dataclass
 class CommandTable:
-    """The game's registered commands (RegisterScriptCommand), each classified: `none` (takes no path)
-    or `refused`. A registered command with no row is refused, as is any name the game does not know."""
+    """The game's registered commands (RegisterScriptCommand), each classified by REGISTERED_CLASSES. A
+    registered command with no row is refused, as is any name the game does not know."""
     registered: dict[str, str]
     conditions: frozenset[str] | None = None
 
@@ -259,7 +271,7 @@ class CommandTable:
         for name, cls in (data.get("commands") or {}).items():
             if cls not in REGISTERED_CLASSES:
                 raise LaunchError(f"{origin}: command {name} is {cls!r}; registered commands are "
-                                  f"{' or '.join(REGISTERED_CLASSES)} (none takes a path today)")
+                                  f"{', '.join(REGISTERED_CLASSES)}")
             if name in BUILTIN_COMMANDS:
                 raise LaunchError(f"{origin}: {name} is a portal command (the portal's meaning wins)")
             reg[name] = cls
@@ -520,7 +532,42 @@ def check_script(text: str, ctx: RunContext, script_dir: Path | None = None) -> 
         elif c.name == "place":
             dest = _rest_after(c.rest, 1)
             contained(ctx, dest, where, ctx.figures, ctx.run_folder, must_exist=True)
+        elif c.cls == "read_path":
+            path = _path_before_last_word(c.rest)
+            if path is None:
+                raise LaunchError(f"{where}: the game cannot parse {c.rest.strip()!r} (<path> <word>)")
+            _registered_read(ctx, path, where)
+        elif c.cls == "read_write_paths":
+            if len(c.words) < 2:
+                raise LaunchError(f"{where}: the game reads <file> <out> (two words)")
+            _registered_read(ctx, c.words[0], where)
+            contained(ctx, c.words[1], where, ctx.run_folder, ctx.run_folder)
     return cmds
+
+
+def _path_before_last_word(rest: str) -> str | None:
+    """A read_path command's file as the game takes it (save_import_dev.h ParseDevImportArgs): spaces
+    trimmed, everything before the last space, one pair of outer double quotes dropped."""
+    a = rest.strip(" ")
+    sp = a.rfind(" ")
+    if sp < 0:
+        return None
+    path = a[:sp].rstrip(" ")
+    if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+        path = path[1:-1]
+    return path or None
+
+
+def _registered_read(ctx: RunContext, text: str, what: str) -> Path:
+    """A file a registered command reads: inside the run folder (it may be one the run makes), else an
+    existing file inside a read root."""
+    try:
+        return contained(ctx, text, what, ctx.run_folder, ctx.run_folder)
+    except LaunchError as outside:
+        try:
+            return _read_contained(ctx, text, what)
+        except LaunchError:
+            raise outside from None
 
 
 # --- the argument check ---------------------------------------------------------------------------
