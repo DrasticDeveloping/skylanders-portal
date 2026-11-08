@@ -17,7 +17,8 @@ What it does and refuses:
   authenticated connection closes after 30 s. Closing a connection never ends a run by itself: three
   missed heartbeats (15 s without a valid request) do.
 - Bounds: a request at most 64 KiB, at most 200 requests a minute, logs back in 1 MiB chunks, at most
-  2 GiB per run.
+  2 GiB per run; a reply at most 2 MiB (a file listing comes in pages), which the runner's side checks
+  before it reads a reply's body, and a reply complete within an absolute deadline.
 - It starts only the executables the RC's payload record gives a launch role (`game`,
   `synthetic-peer`), at the fixed install, each hashed against the record before every start; a request
   names a role, never a path. One run plan is one game and at most two synthetic peers. No executable
@@ -69,6 +70,15 @@ HEARTBEAT_S = 5.0
 MISSED_HEARTBEATS = 3
 REQUESTS_PER_MINUTE = 200
 CHUNK = 1 << 20
+# A reply frame at most (its counter, MAC and body): a collect chunk is CHUNK bytes as base64 (4/3, so
+# 1,398,104 bytes) in a small JSON object. The runner refuses a larger declared length unread.
+MAX_REPLY = 2 << 20
+# A file listing comes in pages of at most LIST_MAX entries and LIST_BYTES of JSON, well inside MAX_REPLY.
+LIST_MAX = 4096
+LIST_BYTES = 1 << 20
+# A reply must be complete within this long of its request (the slowest is `start`, which copies up to
+# 64 MiB of fixtures); the socket timeout only bounds each single read.
+REPLY_DEADLINE_S = 120.0
 COLLECT_LIMIT = 2 << 30
 FIXTURE_LIMIT = 64 << 20
 MAX_RUN_S = 4 * 3600
@@ -557,6 +567,27 @@ def end_run(run: Run, lock: RunLock, state: str) -> None:
     lock.release()
 
 
+def walk_files(folder: Path):
+    """Every regular file under `folder` with its size, in a fixed order; a junction, link or other
+    reparse point is neither entered nor listed."""
+    stack = [folder]
+    while stack:
+        d = stack.pop()
+        with os.scandir(d) as it:
+            entries = sorted(it, key=lambda e: e.name)
+        subdirs = []
+        for e in entries:
+            p = Path(e.path)
+            if _reparse(p):
+                continue
+            st = e.stat(follow_symlinks=False)
+            if stat.S_ISDIR(st.st_mode):
+                subdirs.append(p)
+            elif stat.S_ISREG(st.st_mode):
+                yield p, st.st_size
+        stack.extend(reversed(subdirs))
+
+
 # --- the agent ------------------------------------------------------------------------------------
 
 
@@ -708,7 +739,10 @@ class Agent:
             c.last_request = now
             if self.run is not None:
                 self.run.last_heartbeat = now
-            c.out += encode_frame(self.token, counter, reply)
+            frame = encode_frame(self.token, counter, reply)
+            if len(frame) - 4 > MAX_REPLY:  # the runner would refuse it unread
+                frame = encode_frame(self.token, counter, {"ok": False, "error": "the reply passes the reply limit"})
+            c.out += frame
             self.sel.modify(c.sock, selectors.EVENT_READ | selectors.EVENT_WRITE, c)
             self._write(c)
 
@@ -908,12 +942,7 @@ class Agent:
     def op_collect(self, req: dict, now: float) -> dict:
         folder = self._run_folder(req.get("run"))
         if req.get("path") is None:
-            files = []
-            for root, _, names in os.walk(folder):
-                for n in names:
-                    p = Path(root) / n
-                    files.append({"path": p.relative_to(folder).as_posix(), "size": p.stat().st_size})
-            return {"files": files}
+            return self._listing(folder, req.get("start", 0))
         try:
             p = la.contained(la.RunContext("rc", self.mach.store, folder, self.mach.install / "rom", Path(),
                                            self.mach.allow, self.mach.commands, self.mach.install,
@@ -933,6 +962,24 @@ class Agent:
         if self.run is not None and self.run.folder == folder:
             self.run.sent += len(data)
         return {"offset": off, "data": base64.b64encode(data).decode("ascii"), "eof": len(data) < CHUNK}
+
+    def _listing(self, folder: Path, start: object) -> dict:
+        """One page of the run folder's files from entry `start` on, in a fixed order: at most LIST_MAX
+        entries and LIST_BYTES of JSON; `next` is the first entry of the next page, or None."""
+        if not isinstance(start, int) or isinstance(start, bool) or start < 0:
+            raise Refused("start")
+        files: list[dict] = []
+        used = 0
+        for i, (p, size) in enumerate(walk_files(folder)):
+            if i < start:
+                continue
+            entry = {"path": p.relative_to(folder).as_posix(), "size": size}
+            cost = len(json.dumps(entry, separators=(",", ":"))) + 1
+            if files and (len(files) >= LIST_MAX or used + cost > LIST_BYTES):
+                return {"files": files, "next": i}
+            files.append(entry)
+            used += cost
+        return {"files": files, "next": None}
 
     def op_clean(self, req: dict, now: float) -> dict:
         if self.lock.busy():
@@ -963,25 +1010,42 @@ class Agent:
 class Client:
     """The runner's connection to an agent."""
 
-    def __init__(self, host: str, port: int, token: bytes, counter: int | None = None, timeout: float = 10.0) -> None:
+    def __init__(self, host: str, port: int, token: bytes, counter: int | None = None, timeout: float = 10.0,
+                 reply_deadline: float = REPLY_DEADLINE_S) -> None:
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.token = token
         self.counter = counter if counter is not None else time.time_ns()
+        self.timeout = timeout
+        self.reply_deadline = reply_deadline
 
     def call(self, op: str, **kw) -> dict:
+        """One request and its reply. The reply's declared length is checked against MAX_REPLY before
+        any of its body is read, and the whole reply must arrive within reply_deadline; a reply that
+        fails either closes the connection (its framing is lost)."""
         self.counter += 1
         self.sock.sendall(encode_frame(self.token, self.counter, {"op": op, **kw}))
-        head = self._exact(4)
-        n = struct.unpack(">I", head)[0]
-        got = decode_payload(self.token, self._exact(n))
+        end = time.monotonic() + self.reply_deadline
+        try:
+            n = struct.unpack(">I", self._exact(4, end))[0]
+            if n < CTR_LEN + MAC_LEN or n > MAX_REPLY:
+                raise ConnectionError(f"the agent's reply declares {n} bytes (a reply is {CTR_LEN + MAC_LEN} "
+                                      f"to {MAX_REPLY}): refused unread")
+            got = decode_payload(self.token, self._exact(n, end))
+        except OSError:
+            self.sock.close()
+            raise
         if got is None or got[0] != self.counter:
             raise ConnectionError("the agent's reply does not verify")
         return json.loads(got[1].decode("utf-8"))
 
-    def _exact(self, n: int) -> bytes:
+    def _exact(self, n: int, end: float) -> bytes:
         buf = bytearray()
         while len(buf) < n:
-            b = self.sock.recv(n - len(buf))
+            left = end - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(f"the agent's reply was not complete within {self.reply_deadline:g} s")
+            self.sock.settimeout(min(self.timeout, left))
+            b = self.sock.recv(min(n - len(buf), 1 << 16))
             if not b:
                 raise ConnectionError("the agent closed the connection")
             buf += b

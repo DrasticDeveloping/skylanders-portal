@@ -423,6 +423,33 @@ class AgentTest(unittest.TestCase):
         self.assertFalse((self.store / "run.lock").exists())
         self.assertTrue((self.store / "runs" / done["run"] / "exit.json").is_file())
 
+    def test_a_listing_comes_in_bounded_pages(self) -> None:
+        saved = ra.LIST_MAX
+        self.addCleanup(setattr, ra, "LIST_MAX", saved)
+        ra.LIST_MAX = 2
+        c = self.verified()
+        self.fixtures(c)
+        r = self.call(c, "start", plan=self.plan())
+        self.call(c, "stop")
+        folder = self.store / "runs" / r["run"]
+        for i in range(5):
+            (folder / "D" / f"out{i}.txt").write_text(str(i), encoding="utf-8")
+        junction(folder / "D" / "alias", self.owner)  # neither entered nor listed
+        (self.owner / "secret.txt").write_text("owner", encoding="utf-8")
+        seen, start = [], 0
+        while True:
+            page = self.call(c, "collect", run=r["run"], start=start)
+            self.assertLessEqual(len(page["files"]), 2)
+            seen += [f["path"] for f in page["files"]]
+            if page["next"] is None:
+                break
+            start = page["next"]
+        self.assertEqual(len(seen), len(set(seen)))
+        self.assertTrue({f"D/out{i}.txt" for i in range(5)} <= set(seen))
+        self.assertFalse(any("alias" in p or "secret" in p for p in seen))
+        self.assertFalse(self.call(c, "collect", run=r["run"], start=-1)["ok"])
+        unlink_junction(folder / "D" / "alias")
+
     # --- the agent's own writes stay in its store (Sol r1 F1) ----------------------------------------
 
     def test_a_staged_junction_to_an_owner_folder(self) -> None:
@@ -460,6 +487,61 @@ class AgentTest(unittest.TestCase):
         (self.install / "swapforcerecompiled.exe").write_bytes(b"MZ gam3")
         with self.assertRaises(ra.Refused):
             ra.run_local(self.mach, "local2", self.msha)
+
+
+class ClientTest(unittest.TestCase):
+    """The runner's side bounds what an agent (or anything answering on its port) sends back (Sol r1 F2):
+    a fake server on loopback stands in."""
+
+    token = bytes(range(16))
+
+    def fake_server(self, reply: bytes, trickle: bool = False) -> int:
+        lsock = socket.create_server(("127.0.0.1", 0))
+        done = threading.Event()
+        self.addCleanup(done.set)
+        self.addCleanup(lsock.close)
+
+        def serve() -> None:
+            conn, _ = lsock.accept()
+            with conn:
+                conn.recv(65536)
+                conn.sendall(reply)
+                while not done.is_set():
+                    if trickle:
+                        try:
+                            conn.sendall(b"x")
+                        except OSError:
+                            return
+                    done.wait(0.1)
+
+        threading.Thread(target=serve, daemon=True).start()
+        return lsock.getsockname()[1]
+
+    def test_an_oversized_reply_header_is_refused_before_its_body(self) -> None:
+        port = self.fake_server(struct.pack(">I", 0xFFFFFFF0))  # a header and no body, the connection kept open
+        c = ra.Client("127.0.0.1", port, self.token, counter=1, timeout=5.0)
+        t0 = time.monotonic()
+        with self.assertRaises(ConnectionError) as cm:
+            c.call("hello")
+        self.assertLess(time.monotonic() - t0, 1.0)  # at once: it never waited for the body
+        self.assertIn("refused unread", str(cm.exception))
+        port = self.fake_server(struct.pack(">I", ra.MAX_REPLY + 1))
+        with self.assertRaises(ConnectionError):
+            ra.Client("127.0.0.1", port, self.token, counter=1, timeout=5.0).call("hello")
+
+    def test_a_trickled_reply_meets_the_absolute_deadline(self) -> None:
+        port = self.fake_server(struct.pack(">I", 100000), trickle=True)  # every read succeeds, slowly
+        c = ra.Client("127.0.0.1", port, self.token, counter=1, timeout=5.0, reply_deadline=0.8)
+        t0 = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            c.call("hello")
+        self.assertLess(time.monotonic() - t0, 2.0)
+
+    def test_a_full_collect_chunk_fits_a_reply(self) -> None:
+        data = base64.b64encode(b"\xff" * ra.CHUNK).decode("ascii")
+        frame = ra.encode_frame(self.token, 2 ** 63, {"ok": True, "offset": 2 ** 40, "data": data, "eof": False})
+        self.assertLessEqual(len(frame) - 4, ra.MAX_REPLY)
+        self.assertLess(ra.LIST_BYTES + 1024, ra.MAX_REPLY)
 
 
 class StoreTest(unittest.TestCase):

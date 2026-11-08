@@ -3118,11 +3118,11 @@ class RemotePeer:
             if self.state in ("lost", "running"):
                 return
             try:
-                listing = self._call("collect", patient=True, run=self.run_name)
+                files = self._listing()
             except OSError:  # the agent closed the connection while it was idle: once more on a new one
                 self._reconnect()
-                listing = self._call("collect", patient=True, run=self.run_name)
-            for f in listing["files"]:
+                files = self._listing()
+            for f in files:
                 rel = str(f["path"])
                 sub = rel[len(self.peer) + 1:] if rel.startswith(self.peer + "/") else rel
                 if sub != rel or rel == "exit.json":
@@ -3135,6 +3135,20 @@ class RemotePeer:
             self.problems.append(f"collecting the remote run failed ({e})")
         finally:
             self.client.close()
+
+    def _listing(self) -> list[dict]:
+        """Every file of the run, page by page (the agent bounds each listing reply, remote_agent.LIST_MAX)."""
+        files: list[dict] = []
+        start = 0
+        while True:
+            r = self._call("collect", patient=True, run=self.run_name, **({"start": start} if start else {}))
+            files += r["files"]
+            nxt = r.get("next")
+            if nxt is None:
+                return files
+            if not isinstance(nxt, int) or isinstance(nxt, bool) or nxt <= start:
+                raise ValueError(f"the agent's file listing does not advance (next {nxt!r} after {start})")
+            start = nxt
 
     def _fetch(self, rel: str, sub: str) -> None:
         parts = sub.split("/")
