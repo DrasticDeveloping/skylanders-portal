@@ -166,6 +166,19 @@ class Client {
   // and the held obligations' waits, OB5) stands still while it is stopped (Replica's
   // SetWorldStopped).
   void SetWorldStopped(bool stopped, TimePoint now);
+  // Where the row Applying() names came from at its revision: installed by a baseline's swap, or
+  // received as a delta (ApplyOrigin; stage 6, Sol F3). Kept by the replica from receipt or
+  // installation through every retry, so it holds also when the adapter call comes pumps after the
+  // baseline (an entity that resolved later, a kFailed answer), when a repair's BaselineBegin, rows
+  // and BaselineEnd all came in one pump, and for a delta read after a BaselineEnd in the same
+  // pump (kDelta). kNone outside such a call, as Applying() is nullptr then.
+  ApplyOrigin ApplyingOrigin() const;
+  // The first origin of the row Applying() names: the one its key entered the apply queue with,
+  // not changed by a later revision until the key settles or is erased (Replica::FirstOrigin). A
+  // baseline's row that a delta revision replaced before its first successful apply is kBaseline
+  // here and kDelta in ApplyingOrigin(); an adapter deciding about a key it does not hold yet reads
+  // this one (stage 6, F3's remaining hole). kNone outside such a call.
+  ApplyOrigin ApplyingFirstOrigin() const;
   const Replica& State() const;
   // The client's obligation entries and its side of the credit account (item 4; for tests and
   // the invariant checker).

@@ -99,6 +99,8 @@ struct Client::Impl {
   std::optional<uint32_t> repair_above;
   uint64_t discarded = 0;
   const Record* applying = nullptr;  // the row whose adapter call is in progress
+  ApplyOrigin applying_origin = ApplyOrigin::kNone;  // its origin (Sol F3)
+  ApplyOrigin applying_first_origin = ApplyOrigin::kNone;  // its key's first origin (F3)
 
   ClientEvent& Event(ClientEvent::Type type) {
     ClientEvent e;
@@ -129,6 +131,8 @@ struct Client::Impl {
     repair_above.reset();
     discarded = 0;
     applying = nullptr;
+    applying_origin = ApplyOrigin::kNone;
+    applying_first_origin = ApplyOrigin::kNone;
   }
 
   // The state messages a repair baseline recreates (stage 3 section 3.2's recoverable class on a
@@ -407,7 +411,7 @@ struct Client::Impl {
   // ------------------------------------------------------------------------------------------
   // The adapters.
 
-  RowApply ApplyRow(const Record& r) {
+  RowApply ApplyRow(const Record& r, ApplyOrigin origin, ApplyOrigin first_origin) {
     const KindSpec* spec = FindKind(table, r.key.kind);
     if (!spec || spec->unsupported) return RowApply::kDropped;
     if (spec->write != WriteMode::kApplied) return RowApply::kApplied;  // mirrored: kept, shown
@@ -417,9 +421,13 @@ struct Client::Impl {
         KindAdapter* a = adapters.For(r.key.kind);
         if (!a) return RowApply::kDropped;
         applying = &r;
+        applying_origin = origin;
+        applying_first_origin = first_origin;
         const AdapterResult res = r.tomb ? a->Retire(look.handle, r.key.slot)
                                          : a->Apply(look.handle, r.key.slot, r.value);
         applying = nullptr;
+        applying_origin = ApplyOrigin::kNone;
+        applying_first_origin = ApplyOrigin::kNone;
         return FromAdapter(res);
       }
       case Resolution::kPending:
@@ -438,12 +446,14 @@ struct Client::Impl {
     // after the next Service; the guard stops the loop if a replica hands one out twice.
     std::set<std::pair<RecordKey, uint32_t>> unsettled;
     Record r;
-    while (replica.TakeReady(r)) {
+    ApplyOrigin origin = ApplyOrigin::kNone;
+    while (replica.TakeReady(r, origin)) {
       if (!unsettled.emplace(r.key, r.revision).second) {
         replica.OnApplied(r.key, r.revision, RowApply::kWaiting, now);
         break;
       }
-      const RowApply result = ApplyRow(r);
+      // The entry is out (unsettled) while its adapter runs, so its first origin is still there.
+      const RowApply result = ApplyRow(r, origin, replica.FirstOrigin(r.key));
       replica.OnApplied(r.key, r.revision, result, now);
       if (result == RowApply::kApplied || result == RowApply::kDropped) {
         unsettled.erase({r.key, r.revision});
@@ -721,6 +731,8 @@ void Client::InboundLost(TimePoint now) {
 bool Client::AwaitingRepairBaseline() const { return impl_->repair_above.has_value(); }
 uint64_t Client::DiscardedAfterLoss() const { return impl_->discarded; }
 const Record* Client::Applying() const { return impl_->applying; }
+ApplyOrigin Client::ApplyingOrigin() const { return impl_->applying_origin; }
+ApplyOrigin Client::ApplyingFirstOrigin() const { return impl_->applying_first_origin; }
 
 void Client::SetWorldStopped(bool stopped, TimePoint now) {
   impl_->replica.SetWorldStopped(stopped, now);

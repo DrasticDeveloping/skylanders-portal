@@ -809,7 +809,7 @@ void Version3() {
     CHECK(RoundTrip(w));
     const std::vector<uint8_t> good = EncodeMessage(w);
     REQUIRE_OR_RETURN_VOID(good.size() > 9);
-    w.backend_mode = 0x20;  // bits 2 and 3 are stage 4's, bit 4 stage 5's; bit 5 is not known yet
+    w.backend_mode = 0x40;  // bits 2-3 are stage 4's, 4 stage 5's, 5 stage 6's; bit 6 is not known yet
     CHECK(EncodeMessage(w).empty());
     std::vector<uint8_t> bad = good;
     bad[bad.size() - 9] = 0x80;  // the mode byte
@@ -822,6 +822,18 @@ void Version3() {
     CHECK(!DecodeMessages(v2).has_value());
   }
   CHECK(kProtocolVersion == 3);
+}
+
+// Stage 6 (future/online-6.md D25): bit 5 `records_world` is known and round-trips with the others,
+// stage 5's bit 4 among them.
+void Stage6() {
+  Welcome w{3, 1, 60, 2, 7, "levels/zone_hub"};
+  w.backend_mode = kBackendModeRecordsPilot | kBackendModeRecordsPlayers | kBackendModeRecordsWorld;
+  CHECK(RoundTrip(w));
+  w.backend_mode = kBackendModeRecordsEnemies | kBackendModeRecordsWorld;
+  CHECK(RoundTrip(w));
+  CHECK(kBackendModeRecordsWorld == 0x20);
+  CHECK((kBackendModeKnown & kBackendModeRecordsWorld) != 0);
 }
 
 // Stage 4 (docs/online-4.md D5, sections 4.2 to 4.4): the two mode bits, Hello's trailing flags,
@@ -902,8 +914,8 @@ void Stage5() {
     CHECK(RoundTrip(w));
     CHECK(kBackendModeRecordsEnemies == 0x10);
     CHECK((kBackendModeKnown & kBackendModeRecordsEnemies) != 0);
-    // A bit above stage 5's is still unknown, so the Welcome is not encoded.
-    w.backend_mode = 0x20;
+    // A bit above stages 5 and 6's is still unknown, so the Welcome is not encoded.
+    w.backend_mode = 0x40;
     CHECK(EncodeMessage(w).empty());
   }
   // OccurrenceAccept: one key and the most keys round-trip; empty and over the limit are not
@@ -1195,6 +1207,7 @@ int main() {
   OwnerFlagsMessage();
   Stage4();
   Stage5();
+  Stage6();
 
   return Finish("online_protocol");
 }

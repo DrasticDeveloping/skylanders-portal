@@ -540,6 +540,14 @@ struct Replica::Impl {
     uint64_t first_lsn = 0;  // the smallest first change while unsettled (Sol r2 N1)
     QState state = QState::kReady;
     bool from_baseline = false;  // queued by a baseline swap: ordered by key, not by LSN
+    // The revision's origin (ApplyOrigin): not the order above, since a delta staged during a
+    // baseline goes in with the swap (key order) but stays kDelta (stage 6, Sol F3).
+    ApplyOrigin origin = ApplyOrigin::kDelta;
+    // The origin the key had when it entered the queue: set once, kept through every later
+    // revision until the entry settles or is erased (a new entry starts over). An adapter that
+    // meets the key for the first time reads this one: a baseline's open row stays kBaseline when a
+    // delta revision replaces it before its first successful apply (stage 6, F3's remaining hole).
+    ApplyOrigin first_origin = ApplyOrigin::kDelta;
     bool late = false;           // past its grace: the fence no longer waits for it
     bool has_grace = false;      // the grace clock runs from the first kWaiting or kFailed
     TimePoint grace_start{};
@@ -556,7 +564,18 @@ struct Replica::Impl {
     uint32_t epoch = 0;
     ScopeMask scopes = 0;
     uint64_t digest = kBaselineDigestSeed;
-    std::map<RecordKey, std::pair<Record, uint64_t>> rows;  // record, first_lsn
+    // Per key: the newest record, its first_lsn and where that record came from (a BaselineRows
+    // record, or a delta read while the scope stages; Sol F3).
+    struct Row {
+      Record rec;
+      uint64_t first_lsn = 0;
+      ApplyOrigin origin = ApplyOrigin::kBaseline;
+      // Whether a BaselineRows record for the key was staged, whichever record won: the key was
+      // in the baseline's snapshot, so the swap queues it with first origin kBaseline even when a
+      // delta read while staging carries the newest revision (F3's remaining hole, staged).
+      bool carried = false;
+    };
+    std::map<RecordKey, Row> rows;
   };
 
   std::span<const KindSpec> table;
@@ -636,8 +655,11 @@ struct Replica::Impl {
 
   // Onto the apply queue: held for a fenced kind, ready otherwise. A row replacing an unsettled
   // entry keeps the smaller first_lsn and the entry's grace clock (and so its lateness) until the
-  // entry settles (Sol r2 N1).
-  void Enqueue(const Record& r, uint64_t first_lsn, bool from_baseline) {
+  // entry settles (Sol r2 N1). Its origin is the row's own, except that the same revision of the
+  // same row keeps the origin it was first queued with (ApplyOrigin; Sol F3). `first_origin` is
+  // the key's origin if this row starts a new entry; an unsettled entry keeps its own.
+  void Enqueue(const Record& r, uint64_t first_lsn, bool from_baseline, ApplyOrigin origin,
+               ApplyOrigin first_origin) {
     const KindSpec* spec = FindKind(table, r.key.kind);
     const bool fenced = spec && Fenced(*spec);
     auto [it, added] = queue.try_emplace(r.key);
@@ -645,8 +667,11 @@ struct Replica::Impl {
     if (!added) {
       Leave(e);
       e.first_lsn = std::min(e.first_lsn, first_lsn);
+      if (e.rec.revision != r.revision || e.rec.tomb != r.tomb) e.origin = origin;
     } else {
       e.first_lsn = first_lsn;
+      e.origin = origin;
+      e.first_origin = first_origin;
     }
     e.rec = r;
     e.from_baseline = from_baseline;
@@ -752,12 +777,21 @@ struct Replica::Impl {
     return ApplyResult::kStaged;
   }
 
-  void Stage(const Record& r, uint64_t first_lsn) {
-    auto [it, added] = staging->rows.try_emplace(r.key, r, first_lsn);
+  // A staged record keeps its origin with it: the newest record wins, and the origin is that
+  // record's (a revision received twice keeps the first; Sol F3). A BaselineRows record marks the
+  // key carried, also when it loses to a newer delta read while staging.
+  void Stage(const Record& r, uint64_t first_lsn, ApplyOrigin origin) {
+    const bool carried = origin == ApplyOrigin::kBaseline;
+    auto [it, added] =
+        staging->rows.try_emplace(r.key, Staging::Row{r, first_lsn, origin, carried});
     if (added) return;
-    auto& [stored, first] = it->second;
-    first = std::min(first, first_lsn);
-    if (Newer(r, &stored, r.epoch)) stored = r;
+    Staging::Row& stored = it->second;
+    stored.first_lsn = std::min(stored.first_lsn, first_lsn);
+    stored.carried = stored.carried || carried;
+    if (Newer(r, &stored.rec, r.epoch)) {
+      stored.rec = r;
+      stored.origin = origin;
+    }
   }
 
   ApplyResult Receive(const Record& r, uint64_t first_lsn) {
@@ -773,7 +807,7 @@ struct Replica::Impl {
       return ApplyResult::kWrongEpoch;
     }
     if (staging && (staging->scopes & MaskOf(spec->scope)) != 0) {
-      Stage(r, first_lsn);
+      Stage(r, first_lsn, ApplyOrigin::kDelta);
       return ApplyResult::kStaged;
     }
     auto stored = rows.find(r.key);
@@ -781,7 +815,7 @@ struct Replica::Impl {
       return ApplyResult::kStale;
     }
     SetRow(r);
-    Enqueue(r, first_lsn, false);
+    Enqueue(r, first_lsn, false, ApplyOrigin::kDelta, ApplyOrigin::kDelta);
     if (Fenced(*spec)) {
       TryRelease();
       return queue.at(r.key).state == QState::kHeld ? ApplyResult::kHeld : ApplyResult::kApplied;
@@ -849,7 +883,7 @@ void Replica::OnBaselineRow(uint32_t id, const Record& r) {
   if (r.value.size() > spec->max_value_bytes || r.value.size() > kMaxValueBytes) return;
   if (r.epoch != (spec->scope == Scope::kLevel ? s.epoch : 0)) return;
   // A baseline row's first change is its own LSN (section 3.5, "Replacing an unsettled entry").
-  s.Stage(r, r.lsn);
+  s.Stage(r, r.lsn, ApplyOrigin::kBaseline);
 }
 
 BaselineEndResult Replica::OnBaselineEnd(uint32_t id, uint64_t at, uint64_t digest) {
@@ -882,7 +916,8 @@ BaselineEndResult Replica::OnBaselineEnd(uint32_t id, uint64_t at, uint64_t dige
   for (const auto& [key, v] : st.rows) order.emplace_back(s.graph.DepthOf(key.kind), key);
   std::ranges::sort(order);
   for (const auto& [depth, key] : order) {
-    const auto& [r, first] = st.rows.at(key);
+    const Impl::Staging::Row& staged = st.rows.at(key);
+    const Record& r = staged.rec;
     auto old = s.rows.find(key);
     if (old == s.rows.end()) {
       ++out.diff.added;
@@ -892,7 +927,8 @@ BaselineEndResult Replica::OnBaselineEnd(uint32_t id, uint64_t at, uint64_t dige
       ++out.diff.unchanged;
     }
     s.SetRow(r);
-    s.Enqueue(r, first, true);
+    s.Enqueue(r, staged.first_lsn, true, staged.origin,
+              staged.carried ? ApplyOrigin::kBaseline : staged.origin);
   }
   // A baseline that covers every scope the peer holds (the join's, a repair) proves `at`.
   const ScopeMask before = s.subscribed;
@@ -903,13 +939,20 @@ BaselineEndResult Replica::OnBaselineEnd(uint32_t id, uint64_t at, uint64_t dige
 }
 
 bool Replica::TakeReady(Record& out) {
+  ApplyOrigin origin = ApplyOrigin::kNone;
+  return TakeReady(out, origin);
+}
+
+bool Replica::TakeReady(Record& out, ApplyOrigin& origin) {
   Impl& s = *impl_;
+  origin = ApplyOrigin::kNone;
   if (!s.ready.empty()) {
     const RecordKey key = std::get<3>(*s.ready.begin());
     Impl::Entry& e = s.queue.at(key);
     s.Leave(e);
     s.Enter(e, Impl::QState::kOut);
     out = e.rec;
+    origin = e.origin;
     return true;
   }
   while (!s.due.empty()) {
@@ -921,6 +964,7 @@ bool Replica::TakeReady(Record& out) {
     if (e.state != Impl::QState::kWaiting && e.state != Impl::QState::kFailed) continue;
     s.Enter(e, Impl::QState::kOut);
     out = e.rec;
+    origin = e.origin;
     return true;
   }
   return false;
@@ -1068,6 +1112,16 @@ std::optional<uint64_t> Replica::FirstLsn(const RecordKey& key) const {
   auto it = impl_->queue.find(key);
   if (it == impl_->queue.end()) return std::nullopt;
   return it->second.first_lsn;
+}
+
+ApplyOrigin Replica::Origin(const RecordKey& key) const {
+  auto it = impl_->queue.find(key);
+  return it == impl_->queue.end() ? ApplyOrigin::kNone : it->second.origin;
+}
+
+ApplyOrigin Replica::FirstOrigin(const RecordKey& key) const {
+  auto it = impl_->queue.find(key);
+  return it == impl_->queue.end() ? ApplyOrigin::kNone : it->second.first_origin;
 }
 
 void Replica::ForEach(const std::function<void(const Record&)>& f) const {
