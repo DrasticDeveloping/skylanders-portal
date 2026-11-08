@@ -130,12 +130,21 @@ package-release: build-release
 # Windows installer with Inno Setup (ISCC.exe). Windows only -- see docs/releasing.md. Checks both
 # common Inno Setup 6 install locations (Program Files, from its official installer running
 # elevated, and the per-user AppData location winget can use instead).
+#
+# A game with installer/release-files.toml (Swap Force Online, stage 8 item 8) stages exactly the
+# files that manifest names and runs the contents check, which writes the payload record
+# (installer/Output/payload-record.json) before ISCC runs; any other game stages as before.
 package-installer: build-release
     rm -rf installer/staging && \
-    mkdir -p installer/staging && \
-    cp out/build/win-amd64-release/{{ exe }}.exe installer/staging/ && \
-    cp out/build/win-amd64-release/{{ game }}_xexcheck.exe installer/staging/ && \
-    for lib in out/build/win-amd64-release/*.dll; do [ -e "$lib" ] && cp "$lib" installer/staging/; done && \
+    mkdir -p installer/staging installer/Output && \
+    if [ -f installer/release-files.toml ]; then \
+        python -I thirdparty/skylanders-portal/tools/package_check.py stage --repo . && \
+        python -I thirdparty/skylanders-portal/tools/package_check.py check --repo . --record installer/Output/payload-record.json || exit 1; \
+    else \
+        cp out/build/win-amd64-release/{{ exe }}.exe installer/staging/ && \
+        cp out/build/win-amd64-release/{{ game }}_xexcheck.exe installer/staging/ && \
+        for lib in out/build/win-amd64-release/*.dll; do [ -e "$lib" ] && cp "$lib" installer/staging/; done; \
+    fi && \
     iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe" && \
     [ -e "$iscc" ] || iscc="$USERPROFILE/AppData/Local/Programs/Inno Setup 6/ISCC.exe" && \
     [ -e "$iscc" ] || (echo "ISCC.exe not found -- install Inno Setup 6 (winget install JRSoftware.InnoSetup)" && exit 1) && \
