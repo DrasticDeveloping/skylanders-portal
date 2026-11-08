@@ -151,6 +151,11 @@ class Client {
   // `newer` matcher reads its revision; stage 3 section 3.7); nullptr outside such a call (an
   // effect's apply included).
   const Record* Applying() const;
+  // S2-L4: the bridge reports the client's world stopped (its pause service pushed pause mode 0
+  // for a `session` or `join` reason) or running again. Every pending_grace_ms clock (the rows'
+  // and the held obligations' waits, OB5) stands still while it is stopped (Replica's
+  // SetWorldStopped).
+  void SetWorldStopped(bool stopped, TimePoint now);
   const Replica& State() const;
   // The client's obligation entries and its side of the credit account (item 4; for tests and
   // the invariant checker).

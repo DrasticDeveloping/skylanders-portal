@@ -645,4 +645,25 @@ BACKEND_TEST("OB14", ObligationDoneForAnUnsentId) {
   CHECK(ledger.Ignored() == 2);
 }
 
+BACKEND_TEST("S2L4b", ObligationGraceStandsStillWhileWorldStopped) {
+  // OB5 under a stopped world (S2-L4): the obligation's entity never resolves, but the client's
+  // world is stopped for 20 s, four times the 5 s grace: it is still held, not refused. After the
+  // resume the grace runs from where it stood and the refusal comes at 5 s, as in OB5.
+  ObRig r;
+  r.Join(1);
+  CHECK(r.WaitLevel(1));
+  r.C(1).SetWorldStopped(true, r.Now());
+  const uint64_t id = r.S().Oblige(1, EventKey(1, 1), Val(1));
+  r.Run(20s);
+  CHECK(!r.Ended(id).has_value());
+  const ObligationHolder::Entry* held = r.C(1).Obligations().Find(id);
+  CHECK(held && !held->reported);
+  r.C(1).SetWorldStopped(false, r.Now());
+  r.Run(4500ms);
+  CHECK(!r.Ended(id).has_value());
+  CHECK(r.RunUntil([&] { return r.Ended(id).has_value(); }, 2s));
+  CHECK(r.Ended(id) == ObligationEnd::kRefused);
+  r.CheckBounds();
+}
+
 }  // namespace

@@ -487,13 +487,15 @@ struct Client::Impl {
         continue;
       }
       if (!wait) continue;
+      // The grace counts world-runnable time (S2-L4): it stands still while the world is stopped.
+      const TimePoint world = replica.WorldTime(now);
       if (!e->waiting) {
         e->waiting = true;
-        e->waiting_since = now;
+        e->waiting_since = world;
       }
       const uint32_t grace_ms = spec && spec->pending_grace_ms ? spec->pending_grace_ms
                                                                : limits.pending_grace_ms;
-      if (now - e->waiting_since >= std::chrono::milliseconds(grace_ms)) {
+      if (world - e->waiting_since >= std::chrono::milliseconds(grace_ms)) {
         holder.End(id, ObligationEnd::kRefused, now);  // OB5
       }
     }
@@ -709,6 +711,10 @@ void Client::InboundLost(TimePoint now) {
 bool Client::AwaitingRepairBaseline() const { return impl_->repair_above.has_value(); }
 uint64_t Client::DiscardedAfterLoss() const { return impl_->discarded; }
 const Record* Client::Applying() const { return impl_->applying; }
+
+void Client::SetWorldStopped(bool stopped, TimePoint now) {
+  impl_->replica.SetWorldStopped(stopped, now);
+}
 
 const Replica& Client::State() const { return impl_->replica; }
 const ObligationHolder& Client::Obligations() const { return impl_->holder; }

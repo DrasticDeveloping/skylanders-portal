@@ -805,3 +805,61 @@ BACKEND_TEST("LM9b", LimitsNoisyHoldDroppedByRemoveAndApplyAll) {
     CHECK(s.Head() == head);
   }
 }
+
+// ---- S2-L4: the grace clocks stand still while the world is stopped -----------------------------
+
+BACKEND_TEST("S2L4a", ReplicaGraceStandsStillWhileWorldStopped) {
+  // A row waiting from 0 with a 5 s grace; the world stops at 1 s and runs again at 40 s: the row
+  // is not late at 30 s nor at 43.999 s (4.999 s of world-runnable time), late at 44 s. A row whose
+  // first wait comes inside a stop starts its clock at the resume. A repeated report changes
+  // nothing.
+  Replica r(TableA(), {});
+  CHECK(Subscribe(r, 0, 1));
+  auto row = [](uint32_t n, uint64_t lsn) {
+    Record rec;
+    rec.key = LevelKey(kProp, n);
+    rec.revision = 1;
+    rec.epoch = 1;
+    rec.lsn = lsn;
+    rec.value = V(1);
+    return rec;
+  };
+  Record out;
+  r.OnRecord(row(1, 1), 1);
+  CHECK(r.TakeReady(out));
+  r.OnApplied(out.key, 1, RowApply::kWaiting, kT0);
+  CHECK(!r.WorldStopped());
+  CHECK(r.WorldTime(kT0 + 1s) == kT0 + 1s);
+  r.SetWorldStopped(true, kT0 + 1s);
+  CHECK(r.WorldStopped());
+  CHECK(r.WorldTime(kT0 + 30s) == kT0 + 1s);
+  ReplicaEvent e;
+  r.Service(kT0 + 30s);
+  CHECK(!r.PollEvent(e));
+  r.SetWorldStopped(true, kT0 + 31s);  // repeated: the stop still counts from 1 s
+  r.SetWorldStopped(false, kT0 + 40s);
+  CHECK(!r.WorldStopped());
+  CHECK(r.WorldTime(kT0 + 40s) == kT0 + 1s);
+  r.Service(kT0 + 43999ms);
+  CHECK(!r.PollEvent(e));
+  r.Service(kT0 + 44s);
+  CHECK(r.PollEvent(e) && e.type == ReplicaEvent::Type::kRowLate && e.row == LevelKey(kProp, 1));
+  CHECK(!r.PollEvent(e));
+  // The second row's first wait comes during a stop (from 50 s to 70 s): its clock starts at 70 s.
+  r.SetWorldStopped(true, kT0 + 50s);
+  r.OnRecord(row(2, 2), 2);
+  CHECK(r.TakeReady(out) && out.key == LevelKey(kProp, 2));
+  r.OnApplied(out.key, 1, RowApply::kFailed, kT0 + 55s);
+  r.Service(kT0 + 69s);
+  CHECK(!r.PollEvent(e));
+  r.SetWorldStopped(false, kT0 + 70s);
+  r.Service(kT0 + 74999ms);
+  CHECK(!r.PollEvent(e));
+  r.Service(kT0 + 75s);
+  CHECK(r.PollEvent(e) && e.type == ReplicaEvent::Type::kRowLate && e.row == LevelKey(kProp, 2) &&
+        e.last == RowApply::kFailed);
+  // Reset keeps the report (the game's state, not the session's).
+  r.SetWorldStopped(true, kT0 + 80s);
+  r.Reset();
+  CHECK(r.WorldStopped());
+}
