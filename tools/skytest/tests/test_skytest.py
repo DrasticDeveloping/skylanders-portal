@@ -893,6 +893,101 @@ quit
             skytest.load_spec(self.spec("unknown", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n'
                                         'args = ["--online_route_file={figures}/r.toml"]\n'), 10)
 
+    # --- stage 8 P5: a run with no settings file, a case's own build copy -----------------------------
+
+    def test_settings_file_none_starts_the_game_with_no_settings_file(self) -> None:
+        self.spec("bare", 'layout = "solo"\nstage = "8"\n[peer.H]\nsettings_file = "none"\n' + self.HUB +
+                  'expect = ["Where: town_state10"]\n')
+        self.spec("templated", 'layout = "solo"\nstage = "8"\n[peer.H]\n' + self.HUB)
+        cases = {c["case"]: c for c in self.run_cases("bare", "templated")["cases"]}
+        for name, has_file in (("bare", False), ("templated", True)):
+            case = cases[name]
+            self.assertEqual(case["status"], "pass", case)
+            settings = Path(case["folder"]) / "H" / "settings.toml"
+            self.assertEqual(settings.is_file(), has_file, name)
+            self.assertIn(f"--config_file={settings.resolve()}", case["peers"][0]["command"])
+
+    def test_settings_file_is_checked(self) -> None:
+        bad = {
+            "a value": ('layout = "solo"\nstage = "8"\n[peer.H]\nsettings_file = "owner"\nscript = "quit\\n"\n',
+                        "template or none"),
+            "hosted S": ('layout = "server+1"\nstage = "8"\nserver = "host"\n[peer.S]\nsettings_file = "none"\n'
+                         '[peer.H]\nscript = "quit\\n"\n', "from Host"),
+        }
+        for name, (body, why) in bad.items():
+            with self.subTest(name):
+                with self.assertRaisesRegex(skytest.SpecError, why):
+                    skytest.load_spec(self.spec(name.replace(" ", "-"), body), 10)
+        # [peer.all] gives it to every client; a hosted S takes nothing from [peer.all].
+        s = skytest.load_spec(self.spec("all", 'layout = "server+2"\nstage = "8"\nserver = "host"\n[peer.all]\n'
+                                        'settings_file = "none"\nscript = "quit\\n"\n'), 10)
+        self.assertEqual({n: p.settings_file for n, p in s.peers.items()}, {"S": "template", "H": "none", "D": "none"})
+
+    def routes_in_the_build(self) -> None:
+        routes = self.cfg.build / "routes"
+        routes.mkdir()
+        (routes / "unsupported.toml").write_text("# the [[telegram]] tables below\n[policy]\nformat = 1\nentries = 1\n\n"
+                                                 "[[telegram]]\nkey = \"A#0\"\n", encoding="utf-8")
+        (routes / "tutorial_b.toml").write_text("[[trigger]]\nname = \"x\"\n", encoding="utf-8")
+        self.cfg.launcher = [*self.cfg.launcher, "--fake_exe={exe}"]  # the fake game ignores it: the command shows it
+
+    def test_build_copy_runs_the_case_from_its_own_copy(self) -> None:
+        self.routes_in_the_build()
+        self.spec("copied", 'layout = "server+1"\nstage = "8"\nstandin_seconds = 1\n'
+                  '[build_copy]\nremove = [\'routes\\tutorial_b.toml\']\n'
+                  'truncate = [{ file = \'routes\\unsupported.toml\', before = ["[[trigger]]", "[[telegram]]"] }]\n'
+                  '[peer.H]\n' + self.HUB)
+        self.spec("shared", 'layout = "solo"\nstage = "8"\n[peer.H]\n' + self.HUB)
+        r = self.run_cases("copied", "shared")
+        cases = {c["case"]: c for c in r["cases"]}
+        snap = Path(r["snapshot"])
+        copy = Path(cases["copied"]["folder"]).resolve() / "build"
+        for name, exe in (("copied", copy / "game.exe"), ("shared", snap / "game.exe")):
+            self.assertEqual(cases[name]["status"], "pass", cases[name])
+            for p in cases[name]["peers"]:  # every game of the case, the stand-in server too
+                self.assertIn(f"--fake_exe={exe}", p["command"], (name, p["peer"]))
+        self.assertEqual((copy / "game.exe").read_bytes(), b"MZ fake")
+        self.assertFalse((copy / "routes" / "tutorial_b.toml").exists())
+        self.assertEqual((copy / "routes" / "unsupported.toml").read_text(encoding="utf-8"),
+                         "# the [[telegram]] tables below\n[policy]\nformat = 1\nentries = 1\n\n")
+        # The shared snapshot is whole.
+        self.assertTrue((snap / "routes" / "tutorial_b.toml").is_file())
+        self.assertTrue((snap / "routes" / "unsupported.toml").read_text(encoding="utf-8").endswith('key = "A#0"\n'))
+        self.assertFalse((Path(cases["shared"]["folder"]) / "build").exists())
+
+    def test_a_build_copy_that_breaks_a_rule_starts_no_game(self) -> None:
+        self.routes_in_the_build()
+        self.spec("missing", 'layout = "solo"\nstage = "8"\n[build_copy]\nremove = ["routes/hub.toml"]\n'
+                  '[peer.H]\n' + self.HUB)
+        self.spec("nocut", 'layout = "solo"\nstage = "8"\n[build_copy]\n'
+                  'truncate = [{ file = "routes/unsupported.toml", before = "[[trigger]]" }]\n[peer.H]\n' + self.HUB)
+        cases = {c["case"]: c for c in self.run_cases("missing", "nocut")["cases"]}
+        for name, why in (("missing", "does not exist"), ("nocut", "change nothing")):
+            case = cases[name]
+            self.assertEqual(case["status"], "error", case)
+            self.assertIn("[build_copy]", case["reasons"][0])
+            self.assertIn(why, case["reasons"][0])
+            self.assertEqual(case["peers"], [])
+            self.assertFalse((Path(case["folder"]) / "build").exists())
+            self.assertFalse((Path(case["folder"]) / "H").exists())
+
+    def test_build_copy_is_checked(self) -> None:
+        for name, body in {
+            "climbs": '[build_copy]\nremove = ["..\\\\x.toml"]\n',
+            "absolute": "[build_copy]\nremove = ['C:\\x.toml']\n",
+            "empty": "[build_copy]\n",
+            "unknown": '[build_copy]\nremove = ["a.toml"]\nrename = ["b"]\n',
+        }.items():
+            with self.subTest(name):
+                with self.assertRaisesRegex(skytest.SpecError, r"\[build_copy\]"):
+                    skytest.load_spec(self.spec(name, 'layout = "solo"\nstage = "8"\n' + body +
+                                                '[peer.H]\nscript = "quit\\n"\n'), 10)
+        with self.assertRaisesRegex(skytest.SpecError, "build_copy"):
+            skytest.load_spec(self.spec("unitcopy", 'layout = "unit"\nstage = "8"\n[unit]\nbinary = "x.exe"\n'
+                                        'pass_line = "ok"\n[build_copy]\nremove = ["a.toml"]\n', scenes=False), 10)
+        s = skytest.load_spec(self.spec("plain", 'layout = "solo"\nstage = "8"\n[peer.H]\nscript = "quit\\n"\n'), 10)
+        self.assertIsNone(s.build_copy)
+
     def env_run(self, name: str, **flags) -> tuple[dict, str]:
         """cmd_test on one case with extra flags: (results.json, what it printed)."""
         a = argparse.Namespace(cases=[name], stage=None, max_games=5, **flags)
@@ -1827,6 +1922,10 @@ class RemotePeerTest(unittest.TestCase):
             "repo": ('[peer.D]\nkind = "remote"\nargs = ["--online_route_file={repo}/tests/routes/r.toml"]\n',
                      "names this PC's checkout"),
             "slots": ('[peer.D]\nkind = "remote"\nsave_slots = { "2" = 1 }\n', "remote: save_slots"),
+            # Stage 8 P5's two runner keys are for this PC's games: the agent runs its verified install and
+            # copies that install's settings template.
+            "settings": ('[peer.D]\nkind = "remote"\nsettings_file = "none"\n', "settings_file is for a local peer"),
+            "build copy": ('[peer.D]\nkind = "remote"\n[build_copy]\nremove = ["routes/x.toml"]\n', "verified install"),
         }
         for name, (extra, why) in bad.items():
             with self.subTest(name):

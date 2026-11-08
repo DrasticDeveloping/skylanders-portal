@@ -17,6 +17,11 @@ one game budget ([defaults] machine_games, default 4: slot files in the main che
 .replication-tests/slots/): a case waits for its slots, an exclusive or timed case takes them all, and
 one game boots at a time machine-wide. When 3 cases of any runner on one build stop on the same
 normalized fatal line or crash site, the circuit breaker starts no further case on that build.
+Two keys are off unless a spec names them: a peer's `settings_file = "none"` starts its game with no
+settings file (--config_file names the run folder's settings.toml, which is not there: the game's
+compiled-in defaults); a spec's [build_copy] (`remove`, `truncate` with `file` and `before`) runs the
+case's games from its own copy of the build snapshot, made fresh in the case's run folder, with those
+files removed or cut at a marker line (launch_args.copy_build); the shared snapshot never changes.
 
     skytest.py test [CASE ...] [--stage S] [--max-games N]   run cases (a name, a glob, or all)
                [--gate]                                     only the manifest's daily gate cases (gate =
@@ -618,6 +623,13 @@ class PeerSpec:
     # Where the peer's game runs (stage 8 item 6): "local" (this PC), or "remote" (the second PC, through
     # its remote agent: `test --remote`; one client of D, E, F per case at most).
     kind: str = "local"
+    # settings_file = "template" (the default: the run folder gets a copy of [game] settings_template) or
+    # "none" (Swap Force Online stage 8 P5 defaults-release: no settings file, --config_file names where it
+    # would be, and the game starts on its compiled-in defaults; launch_args.RunContext.no_settings).
+    settings_file: str = "template"
+
+
+SETTINGS_FILE_VALUES = ("template", "none")
 
 
 @dataclass
@@ -683,9 +695,28 @@ class Spec:
     unit: dict = field(default_factory=dict)
     # server+N+hK: the synthetic peers by name (h1, h2), never games (load_synthetic).
     synthetic: dict[str, SyntheticSpec] = field(default_factory=dict)
+    # [build_copy] (Swap Force Online stage 8 P5 route-missing): the case's games run from its own copy of
+    # the build snapshot with these files removed or cut short (case_build_copy, launch_args.copy_build);
+    # None: from the shared snapshot, as every other case.
+    build_copy: la.BuildEdits | None = None
 
 
 PEER_KINDS = ("local", "remote")
+
+
+def peer_settings_file(spec_name: str, peer: str, own: dict, common: dict, server: str, kind: str) -> str:
+    """A peer's `settings_file` (its own table, else [peer.all]): "template" or "none". A hosted server's
+    settings come from Host (it copies the owner's file, or makes an empty one), and a remote peer's agent
+    copies its verified install's template, so neither takes the key."""
+    value = own.get("settings_file", common.get("settings_file", "template"))
+    if value not in SETTINGS_FILE_VALUES:
+        raise SpecError(f"{spec_name}: peer {peer}: settings_file = {value!r} ({' or '.join(SETTINGS_FILE_VALUES)})")
+    if "settings_file" in own and peer == "S" and server == "host":
+        raise SpecError(f"{spec_name}: peer S: a hosted server's settings come from Host, not settings_file")
+    if value != "template" and kind == "remote":
+        raise SpecError(f"{spec_name}: peer {peer} is remote: its agent copies the install's settings template"
+                        " (settings_file is for a local peer)")
+    return value
 
 
 def peer_kind(spec_name: str, peer: str, own: dict, common: dict) -> str:
@@ -965,6 +996,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             if not isinstance(t.get("expect_count", {}), dict) or not isinstance(t.get("expect_order", []), list):
                 raise SpecError(f"{path.name}: peer {n}: expect_count is a table (pattern = count), expect_order a"
                                 " list of patterns")
+        kind = peer_kind(path.name, n, own, common)
         peers[n] = PeerSpec(
             name=n,
             script=script,
@@ -974,7 +1006,8 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             expect_count={**common.get("expect_count", {}), **own.get("expect_count", {})},
             expect_order=list(own.get("expect_order", common.get("expect_order", []))),
             save_slots=parse_save_slots(path.name, n, own.get("save_slots", common.get("save_slots", {}))),
-            kind=peer_kind(path.name, n, own, common),
+            kind=kind,
+            settings_file=peer_settings_file(path.name, n, own, common, d.get("server", "standin"), kind),
         )
         for arg in peers[n].args:
             for ph in ARG_PLACEHOLDER.findall(arg):
@@ -1117,6 +1150,16 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
                 raise SpecError(f"{path.name}: peer {n} sets --{SCENE_SETTING} in its args beside the spec's"
                                 f" scenes key: the key says it (the runner passes --{SCENE_SETTING} itself)")
     check_remote_peers(path.name, peers, grades, names)
+    build_copy = None
+    if "build_copy" in d:
+        try:
+            build_copy = la.parse_build_edits(d["build_copy"], f"{path.name}: [build_copy]")
+        except la.LaunchError as e:
+            raise SpecError(str(e)) from None
+        remote = [n for n, p in peers.items() if p.kind == "remote"]
+        if remote:
+            raise SpecError(f"{path.name}: [build_copy]: peer {', '.join(remote)} is remote and runs the second PC's"
+                            " verified install, not a copy of this build")
     return Spec(
         name=d["name"], path=path, layout=d["layout"], stage=str(d["stage"]),
         description=d.get("description", ""), timeout=float(d.get("timeout", default_timeout)),
@@ -1124,7 +1167,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         server=server, grades=grades, compare=compare, fail_fast=fail_fast, show_server_window=show,
         exclusive=exclusive, tolerate=list(tolerate), not_ready=not_ready, scenes=scenes,
         scenes_reason=scenes_reason.strip(), breaker=breaker, sha256=hashlib.sha256(data).hexdigest(),
-        synthetic=synthetic,
+        synthetic=synthetic, build_copy=build_copy,
     )
 
 
@@ -1147,7 +1190,7 @@ UNIT_SUMMARY = re.compile(r"^(\d+) (\w+) tests, (\d+) failed, (\d+) ms")
 # The keys that say how games run or are graded (a unit case starts none). `breaker` among them: a unit
 # case never counts toward the circuit breaker nor is stopped by it (C7 guards the build's games).
 GAME_ONLY_KEYS = ("peer", "grade", "measure", "compare", "server", "standin_seconds", "fail_fast",
-                  "show_server_window", "tolerate", "scenes", "scenes_reason", "breaker")
+                  "show_server_window", "tolerate", "scenes", "scenes_reason", "breaker", "build_copy")
 
 
 def build_relative(name: str, what: str, value: object) -> str:
@@ -2317,6 +2360,25 @@ def snapshot_complete(snap: Path, files: list[Path], cfg: Config | None = None) 
         return False
 
 
+def case_build_copy(cfg: Config, spec: Spec, snap: Path, run: Path) -> Path:
+    """A case's own copy of the build snapshot (its [build_copy], launch_args.copy_build), made fresh in
+    the case's run folder: inside the store, beside the peers' folders, deleted with the run by the store's
+    janitor (tools/test_store_janitor.py judges everything in runs/<stamp>-<case>/ as that run). The case's
+    games start from it, and a hosted server too (Host starts its own exe). The shared snapshot is never
+    changed. A refusal is a spec error: no game of the case starts."""
+    dest = run / la.BUILD_COPY_DIR
+    check_output_path(cfg, dest)
+    try:
+        copy = la.copy_build(snap.resolve(), run.resolve() / la.BUILD_COPY_DIR, spec.build_copy,
+                             store=cfg.store.resolve(), exe=cfg.exe)
+    except (la.LaunchError, OSError) as e:
+        raise SpecError(f"[build_copy]: {e}") from None
+    done = [f"removed {f}" for f in spec.build_copy.remove] + \
+        [f"{f} cut before {' or '.join(m)}" for f, m in spec.build_copy.truncate]
+    print(f"  {spec.name}: its own build copy {copy}: {', '.join(done)}", flush=True)
+    return copy
+
+
 def snapshot_unit(cfg: Config, binary: str) -> Path:
     """A unit case's test binary and the DLLs beside it, copied into a snapshot of their own (keyed
     by the files, as the game's is), so a rebuild during the run changes nothing. Returns the
@@ -2583,6 +2645,12 @@ def peer_script(spec: Spec, peer: str, figures: Path, join: str = "", joincode: 
 def peer_args(cfg: Config, args: list[str]) -> list[str]:
     """A peer's spec args as the game gets them: {repo} is the checkout under test (G3, stage 1B)."""
     return [a.replace("{repo}", cfg.repo.as_posix()) for a in args]
+
+
+def launcher_words(launcher: list[str], exe: Path) -> list[str]:
+    """[game] launcher (only the runner's own tests set one) with {exe}: the game exe the case runs, the
+    shared snapshot's or the case's own build copy's ([build_copy]), so a test can see which."""
+    return [w.replace("{exe}", str(exe)) for w in launcher]
 
 
 # The ports this runner process handed to hosted servers: never one twice, so cases run at once
@@ -3246,14 +3314,16 @@ def launch_tables(cfg: Config) -> tuple[la.AllowList, la.CommandTable]:
         raise SpecError(f"the launch tables do not read: {e}") from None
 
 
-def launch_context(cfg: Config, folder: Path, tables: tuple[la.AllowList, la.CommandTable]) -> la.RunContext:
+def launch_context(cfg: Config, folder: Path, tables: tuple[la.AllowList, la.CommandTable],
+                   no_settings: bool = False) -> la.RunContext:
     """A development run's context for the launch builder: the worktree's store, the peer's fresh run
     folder, the configured disc (resolved: a worktree's rom\\ is a junction to the main checkout's),
-    the settings template, and the checkout's tests/routes/ as the one place besides the run folder a
-    read-path setting (--online_route_file={repo}/tests/routes/...) may point."""
+    the settings template (none for a peer with settings_file = "none"), and the checkout's
+    tests/routes/ as the one place besides the run folder a read-path setting
+    (--online_route_file={repo}/tests/routes/...) may point."""
     return la.RunContext(kind="dev", store=cfg.store.resolve(), run_folder=folder, rom=cfg.rom.resolve(),
                          template=cfg.settings_template, allow=tables[0], commands=tables[1],
-                         read_roots=[(cfg.repo / "tests" / "routes").resolve()])
+                         read_roots=[(cfg.repo / "tests" / "routes").resolve()], no_settings=no_settings)
 
 
 def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -> tuple[Path, list[str]]:
@@ -3270,7 +3340,7 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -
     tables = launch_tables(cfg)
     try:
         d = la.make_run_folder(run.resolve(), peer)
-        ctx = launch_context(cfg, d, tables)
+        ctx = launch_context(cfg, d, tables, no_settings=spec.peers[peer].settings_file == "none")
         script = peer_script(spec, peer, ctx.figures, f"127.0.0.1:{port}" if port else "", JOIN_CODE_STANDIN)
         runner = [*cfg.default_args, *scene_args(cfg, spec), *show_server_args(cfg, spec, peer),
                   *([f"--online_port={port}"] if port and peer == "H" else []),
@@ -4276,6 +4346,11 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
     droot_title = str(droot_grade.get("title", cfg.title_id)) if droot_grade is not None else ""
     droot: DataRootWatch | None = None
     try:
+        # [build_copy]: the case's own copy of the snapshot, before any peer's folder; every game of the
+        # case (and the synthetic peers' digest) comes from it.
+        if spec.build_copy:
+            snap = case_build_copy(cfg, spec, snap, run)
+            exe = snap / cfg.exe
         # Every peer's folder first (copies take a moment), then all games start close together, and
         # a spec error in a later peer starts no game at all.
         port = free_loopback_port() if hosted else 0
@@ -4305,7 +4380,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                 # this game's first frame line, its exit or BOOT_TIMEOUT_S (BootHold.watch).
                 hold = pacer.machine_turn(note_ends)
                 d, args = prepared[n]
-                cmd = [*cfg.launcher, *args] if cfg.launcher else [str(exe), *args]
+                cmd = [*launcher_words(cfg.launcher, exe), *args] if cfg.launcher else [str(exe), *args]
                 results[n].command = cmd
                 # The game starts suspended, joins the job, and only then runs: it never runs outside
                 # the job. If any step fails it is ended before the error goes on.

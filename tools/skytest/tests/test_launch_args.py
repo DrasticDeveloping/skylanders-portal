@@ -6,6 +6,7 @@ Run: python -I -m unittest discover -s tools/skytest/tests -p "test_launch_args.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -402,6 +403,187 @@ class SyntheticPeerTest(_Base):
         self.refuses(la.check_synthetic_args, self.ctx, self.line(script=str(self.run / "bad.txt")), *session)
         # The digest compares without case (the program reads either).
         la.check_synthetic_args(self.ctx, self.line(digest=self.DIGEST.upper()), *session)
+
+
+class NoSettingsTest(_Base):
+    """A run with no settings file (RunContext.no_settings, a spec's settings_file = "none"): --config_file
+    names the run folder's settings.toml while no file is there; every other config_file rule holds."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ctx.no_settings = True
+
+    def test_no_file_and_the_run_folder_path(self) -> None:
+        args = self.build()
+        self.assertIn(f"--config_file={self.run / 'settings.toml'}", args)
+        self.assertFalse((self.run / "settings.toml").exists())
+        self.assertEqual(sum(a.startswith("--config_file=") for a in args), 1)
+        la.check_args(self.ctx, args)
+
+    def test_a_file_there_is_refused(self) -> None:
+        args = self.build()
+        (self.run / "settings.toml").write_text("[General]\n", encoding="utf-8")
+        self.assertIn("needs no file there", self.refuses(la.check_args, self.ctx, args))
+
+    def test_the_other_config_file_rules_still_hold(self) -> None:
+        args = self.build()
+        self.assertIn("only the run folder's", self.refuses(la.check_args, self.ctx,
+                                                            self._swap(args, "config_file", str(self.run / "mine.toml"))))
+        self.refuses(la.check_args, self.ctx, self._swap(args, "config_file", str(self.store / "settings.toml")))
+        self.refuses(la.check_args, self.ctx, self._swap(args, "config_file", str(self.run / "x" / "settings.toml")))
+        self.assertIn("empty", self.refuses(la.check_args, self.ctx, self._swap(args, "config_file", "")))
+        self.assertIn("0 times", self.refuses(la.check_args, self.ctx,
+                                              [a for a in args if not a.startswith("--config_file=")]))
+
+    def test_off_by_default(self) -> None:
+        # A template run (the default) still needs the copy the builder made.
+        self.ctx.no_settings = False
+        args = self.build()
+        self.assertTrue((self.run / "settings.toml").is_file())
+        (self.run / "settings.toml").unlink()
+        self.assertIn("does not exist", self.refuses(la.check_args, self.ctx, args))
+
+    def _swap(self, args: list[str], name: str, value: str) -> list[str]:
+        return [f"--{name}={value}" if a.startswith(f"--{name}=") else a for a in args]
+
+
+class BuildCopyTest(unittest.TestCase):
+    """A case's own copy of the build snapshot ([build_copy], launch_args.copy_build)."""
+
+    POLICY = (b"# `entries` counts the [[trigger]] and [[telegram]] tables below\r\n"
+              b"[policy]\r\nformat = 1\r\nentries = 1\r\n\r\n  [[telegram]]  \r\nkey = \"A#0\"\r\n")
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.store = self.root / "store"
+        self.snap = self.store / "snapshots" / "abc123"
+        (self.snap / "routes").mkdir(parents=True)
+        (self.snap / "game.exe").write_bytes(b"MZ game")
+        (self.snap / "runtime.dll").write_bytes(b"MZ dll")
+        (self.snap / "routes" / "unsupported.toml").write_bytes(self.POLICY)
+        (self.snap / "routes" / "tutorial_b.toml").write_bytes(b"[[trigger]]\nname = \"x\"\n")
+        self.run = self.store / "runs" / "20990101-000000-case"
+        self.run.mkdir(parents=True)
+        self.owner = self.root / "Owner" / "Documents" / "Skylanders"
+        self.owner.mkdir(parents=True)
+        self.before = {p.relative_to(self.snap).as_posix(): p.read_bytes() for p in self.snap.rglob("*") if p.is_file()}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def edits(self, **table) -> la.BuildEdits:
+        return la.parse_build_edits(table or {
+            "remove": ["routes\\tutorial_b.toml"],
+            "truncate": [{"file": "routes/unsupported.toml", "before": ["[[trigger]]", "[[telegram]]"]}]})
+
+    def copy(self, edits: la.BuildEdits | None = None, dest: Path | None = None, snap: Path | None = None) -> Path:
+        return la.copy_build(snap or self.snap, dest or self.run / la.BUILD_COPY_DIR, edits or self.edits(),
+                             store=self.store, exe="game.exe", owner_roots=[self.owner])
+
+    def refuses(self, fn, *a, **kw) -> str:
+        with self.assertRaises(la.LaunchError) as cm:
+            fn(*a, **kw)
+        return str(cm.exception)
+
+    def assert_snapshot_unchanged(self) -> None:
+        now = {p.relative_to(self.snap).as_posix(): p.read_bytes() for p in self.snap.rglob("*") if p.is_file()}
+        self.assertEqual(now, self.before)
+
+    def test_the_copy(self) -> None:
+        d = self.copy()
+        self.assertEqual(d, self.run / "build")
+        self.assertEqual((d / "game.exe").read_bytes(), b"MZ game")
+        self.assertEqual((d / "runtime.dll").read_bytes(), b"MZ dll")
+        self.assertFalse((d / "routes" / "tutorial_b.toml").exists())
+        # Cut at the header line (outer whitespace aside), not at the comment that mentions it.
+        self.assertEqual((d / "routes" / "unsupported.toml").read_bytes(),
+                         self.POLICY[:self.POLICY.index(b"  [[telegram]]")])
+        self.assert_snapshot_unchanged()
+        # Copies, never links: a cut or a write in the copy never reaches the snapshot.
+        for rel in ("game.exe", "runtime.dll"):
+            self.assertFalse(os.path.samefile(d / rel, self.snap / rel))
+            self.assertEqual(os.stat(self.snap / rel).st_nlink, 1)
+        # Fresh per case: a second copy into the same place is refused.
+        self.assertIn("exists already", self.refuses(self.copy))
+
+    def test_the_spec_table(self) -> None:
+        e = self.edits()
+        self.assertEqual(e.remove, ("routes/tutorial_b.toml",))
+        self.assertEqual(e.truncate, (("routes/unsupported.toml", ("[[trigger]]", "[[telegram]]")),))
+        self.assertEqual(la.parse_build_edits({"truncate": [{"file": "a.toml", "before": "[x]"}]}).truncate,
+                         (("a.toml", ("[x]",)),))
+        bad = {
+            "not a table": [],
+            "no file": {},
+            "empty lists": {"remove": [], "truncate": []},
+            "unknown key": {"remove": ["a.toml"], "copy": ["b"]},
+            "remove not a list": {"remove": "a.toml"},
+            "absolute": {"remove": ["C:\\x\\a.toml"]},
+            "root": {"remove": ["\\routes\\a.toml"]},
+            "climbs out": {"remove": ["routes\\..\\..\\a.toml"]},
+            "dot": {"remove": [".\\a.toml"]},
+            "unc": {"remove": ["\\\\server\\share\\a.toml"]},
+            "stream": {"remove": ["a.toml:x"]},
+            "device": {"remove": ["routes\\nul.toml"]},
+            "trailing dot": {"remove": ["a."]},
+            "empty name": {"remove": [""]},
+            "not a string": {"remove": [3]},
+            "twice": {"remove": ["routes\\a.toml"], "truncate": [{"file": "ROUTES/a.toml", "before": ["[x]"]}]},
+            "truncate not a list": {"truncate": {"file": "a.toml", "before": ["[x]"]}},
+            "truncate unknown key": {"truncate": [{"file": "a.toml", "before": ["[x]"], "after": "y"}]},
+            "no markers": {"truncate": [{"file": "a.toml", "before": []}]},
+            "marker with whitespace": {"truncate": [{"file": "a.toml", "before": [" [x]"]}]},
+            "empty marker": {"truncate": [{"file": "a.toml", "before": [""]}]},
+            "marker on two lines": {"truncate": [{"file": "a.toml", "before": ["[x]\n[y]"]}]},
+            "marker not a string": {"truncate": [{"file": "a.toml", "before": [1]}]},
+        }
+        for name, table in bad.items():
+            with self.subTest(name):
+                self.refuses(la.parse_build_edits, table)
+
+    def test_refusals_write_nothing(self) -> None:
+        cases = {
+            "a file not in the snapshot": (la.parse_build_edits({"remove": ["routes/hub.toml"]}), "does not exist"),
+            "a folder": (la.parse_build_edits({"remove": ["routes"]}), "not a file"),
+            "the exe": (la.parse_build_edits({"remove": ["game.exe"]}), "the game exe"),
+            "no marker line": (la.parse_build_edits({"truncate": [{"file": "routes/unsupported.toml",
+                                                                    "before": ["[[nothing]]"]}]}), "change nothing"),
+        }
+        for name, (edits, why) in cases.items():
+            with self.subTest(name):
+                self.assertIn(why, self.refuses(self.copy, edits))
+                self.assertFalse((self.run / "build").exists())
+        self.assert_snapshot_unchanged()
+
+    def test_places_outside_the_rules(self) -> None:
+        outside = self.root / "elsewhere"
+        outside.mkdir()
+        self.assertIn("test store", self.refuses(self.copy, dest=outside / "build"))
+        self.assertIn("overlap", self.refuses(self.copy, dest=self.snap / "build"))
+        self.refuses(self.copy, dest=self.run / "missing" / "build")  # its folder must exist
+        other = self.root / "snap2"
+        shutil.copytree(self.snap, other)
+        self.assertIn("not inside the test store", self.refuses(self.copy, snap=other))
+        owner_store = self.owner / "store"
+        (owner_store / "runs").mkdir(parents=True)
+        shutil.copytree(self.snap, owner_store / "snap")
+        self.assertIn("owner's data", self.refuses(
+            la.copy_build, owner_store / "snap", owner_store / "runs" / "build", self.edits(), store=owner_store,
+            exe="game.exe", owner_roots=[self.owner]))
+        self.assertFalse((self.run / "build").exists())
+
+    def test_a_snapshot_with_a_junction_is_refused(self) -> None:
+        junction(self.snap / "routes" / "link", self.owner)
+        self.assertIn("reparse", self.refuses(self.copy))
+        self.assertFalse((self.run / "build").exists())
+
+    def test_cut_before_line_ends(self) -> None:
+        self.assertEqual(la.cut_before(b"a\n[x]\nb\n", ("[x]",), "f"), b"a\n")
+        self.assertEqual(la.cut_before(b"a\r[x]\rb", ("[x]",), "f"), b"a\r")
+        self.assertEqual(la.cut_before(b"[x]\nb", ("[x]",), "f"), b"")
+        self.assertEqual(la.cut_before(b"# [x]\n\t[x] \nb", ("[x]",), "f"), b"# [x]\n")
+        self.refuses(la.cut_before, b"a [x]\n", ("[x]",), "f")
 
 
 if __name__ == "__main__":
