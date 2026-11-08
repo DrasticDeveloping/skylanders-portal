@@ -142,6 +142,7 @@ quit
         run = Path(case["folder"])
         for peer in ("S", "H", "D"):
             self.assertTrue((run / peer / "data" / "B13EBABEBABEBABE" / "SAVE.xsg").is_file())
+            self.assertTrue((run / peer / "data" / ".skytest-copy").is_file(), "the run copy's marker")
             self.assertFalse((run / peer / "data" / "cache").exists(), "the owner's cache is not copied")
             self.assertTrue((run / peer / "game.log").is_file())
         self.assertIn("--window_hidden=true", next(p for p in case["peers"] if p["peer"] == "S")["command"])
