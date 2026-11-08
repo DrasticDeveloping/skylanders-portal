@@ -163,6 +163,27 @@ int main() {
     CHECK(gate.Check(Facts({0x0D000003, 2000}, 1, 0, 0), 0, t0).verdict == HelloVerdict::kCookieReply);
   }
 
+  // Council 8, Opus B3: a loopback source (the owner's own game) skips the global bucket and keeps
+  // its own. A flood of spoofed Hellos from 1,000 addresses empties the global bucket, so another
+  // network source is dropped, but the owner's loopback Hello still gets its cookie and gets in;
+  // its source bucket still holds it to its burst of 4.
+  {
+    HelloGate gate({0x1234, Key(18), false, 4}, t0);
+    for (uint32_t i = 0; i < 1000; ++i) gate.Check(Facts({0x50000000 + i, 1000}, i, 0, 0), 0, t0);
+    CHECK(gate.Check(Facts({0x0D000004, 2000}, 1, 0, 0), 0, t0).verdict == HelloVerdict::kDrop);
+    HelloFacts owner = Facts({skylanders::netplay::kLoopback, 5000}, 1, 0, 0);
+    owner.owner = true;
+    CHECK(Join(gate, owner, 0, t0).verdict == HelloVerdict::kAdmit);
+    int answered = 0;
+    for (uint64_t n = 2; n < 10; ++n) {
+      answered += gate.Check(Facts({skylanders::netplay::kLoopback, 5000}, n, 0, 0), 0, t0).verdict !=
+                  HelloVerdict::kDrop;
+    }
+    CHECK(answered == 2);  // the burst's other two, then dropped
+    // Another loopback address (127.0.0.2) is loopback too.
+    CHECK(gate.Check(Facts({0x7F000002, 5000}, 1, 0, 0), 0, t0).verdict == HelloVerdict::kCookieReply);
+  }
+
   // The source table stays at 256 entries under 10,000 sources.
   {
     HelloGate gate({0x1234, Key(9), false, 4}, t0);

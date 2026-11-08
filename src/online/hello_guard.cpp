@@ -226,13 +226,18 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
   if (hello.datagram_bytes < kMinHelloBytes || hello.datagram_bytes > kMaxHelloBytes) return d;
   // 3. Limits: a blocked source first (no token spent on it), then the source's bucket, then the
   // global one: a source over its own limit spends no global token, so one address flooding
-  // cannot use up the whole server's 16 a second and keep every other joiner out.
+  // cannot use up the whole server's 16 a second and keep every other joiner out. A loopback
+  // source (this PC: the owner's own game) keeps its source bucket but skips the global one
+  // (council 8, Opus B3): a datagram from the network cannot carry a 127/8 source, so a flood of
+  // spoofed Hellos from random addresses, each with a fresh source row and burst, drains the
+  // global bucket for everyone else but can never starve the owner's game on Local network or
+  // Internet.
   if (const SourceTable::Source* s = sources_.Find(hello.from.address); s && now < s->blocked_until) {
     return d;
   }
   SourceTable::Source& source = sources_.Touch(hello.from.address, now);
   if (!source.bucket.Take(now)) return d;
-  if (!global_.Take(now)) return d;
+  if (!netplay::IsLoopback(hello.from.address) && !global_.Take(now)) return d;
   // 4. The cookie.
   if (!cookies_.Verify(hello.cookie, hello.from, hello.client_nonce, now)) {
     d.verdict = HelloVerdict::kCookieReply;

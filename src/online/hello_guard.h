@@ -28,7 +28,8 @@ namespace skylanders::online {
 //   2. a known session goes to its peer (the caller's, before this gate);
 //   3. limits: a global token bucket (16 Hellos per second) and a per-source bucket (2 per second,
 //      burst 4) in a table of at most 256 sources, least recently seen evicted first; over either,
-//      or from a source blocked for wrong secrets, dropped without a reply;
+//      or from a source blocked for wrong secrets, dropped without a reply. A loopback source (the
+//      owner's own game; the network cannot spoof 127/8) has only its source bucket;
 //   4. the cookie: without a valid one, a stateless reply carrying one (nothing stored);
 //   4a. the caller's own stateless checks (HelloFacts::compatible: protocol version, build digest,
 //      a wrong owner token, a synthetic peer it does not take): refused with the caller's reason;
