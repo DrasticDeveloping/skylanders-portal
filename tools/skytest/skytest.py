@@ -120,6 +120,8 @@ import remote_agent  # noqa: E402
 import remote_swap_grade  # noqa: E402  (stage 4's remote_swap grade over swap_pairs.py, the ordered form)
 import exclusive_grade  # noqa: E402  (stage 4's exclusive grade: a race exactly one client wins)
 import swap_pairs  # noqa: E402
+import memory_growth  # noqa: E402  (stage 5's soak grade)
+import occurrence_outcomes  # noqa: E402  (stage 5's occurrence grade)
 
 STORE = ".replication-tests"
 CLIENTS = ["H", "D", "E", "F"]
@@ -158,7 +160,8 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
 # Where a hosted server (`server = "host"`) writes its log: the owner's session folder.
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
 GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
-          "symmetry", "route", "bandwidth", "remote_swap", "exclusive") + backend_grades.NAMES
+          "symmetry", "route", "bandwidth", "remote_swap", "exclusive", "occurrence_outcomes",
+          "memory_growth") + backend_grades.NAMES
 # The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
 # online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
 # for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
@@ -955,6 +958,12 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
                 exclusive_grade.check_exclusive(path.name, g, names)
             except exclusive_grade.ExclusiveSpecError as e:
                 raise SpecError(str(e)) from e
+            continue
+        if gname in ("occurrence_outcomes", "memory_growth"):
+            # Stage 5's grades, each in its own module (its check_spec says what it takes).
+            module = occurrence_outcomes if gname == "occurrence_outcomes" else memory_growth
+            if why := module.check_spec(g, names):
+                raise SpecError(f"{path.name}: grade {gname}: {why}")
             continue
         if not isinstance(g, dict) or g.get("peer", "S" if gname == "server_frame_time" else "H") not in names:
             raise SpecError(f"{path.name}: grade {gname} names a peer not in {names}")
@@ -2000,6 +2009,14 @@ def grade_cross_peer(spec: Spec, r: PeerResult, texts: dict[str, str], repo: Pat
         elif gname == "exclusive" and g.get("peer", "S") == r.peer:
             # exclusive_grade.py: exactly one of the named clients won the race, every other lost.
             r.graded[gname], why = exclusive_grade.grade_exclusive(texts, g)
+            reasons += why
+        elif gname == "occurrence_outcomes" and g.get("peer", "S") == r.peer:
+            # Stage 5: one outcome per S occurrence on each client, S's claim lines (occurrence_outcomes.py).
+            r.graded[gname], why = occurrence_outcomes.grade_spec(texts, g, list(spec.peers))
+            reasons += why
+        elif gname == "memory_growth" and g.get("anchor_peer", "H") == r.peer:
+            # Stage 5's soak: private memory's slope on each graded peer (memory_growth.py), once per run.
+            r.graded[gname], why = memory_growth.grade_spec(texts, g, list(spec.peers))
             reasons += why
     return reasons
 
