@@ -175,5 +175,37 @@ int main() {
     CHECK(DecodeJoinCodeV2(u).status == JoinCodeStatus::kNotAJoinCode);
   }
 
+  // A code as typed or pasted (F4 > Online > Join): NormalizeJoinCodeText gives the bare symbols,
+  // whatever the dashes, spaces, line ends and case, and the pasted look-alikes of a dash or a space.
+  {
+    const JoinTarget a{{0xCB007107, 50000}, 0x89ABCDEF};
+    CHECK(NormalizeJoinCodeText("8SC0-721Y-3A24-TQKF-FQ") == "8SC0721Y3A24TQKFFQ");
+    CHECK(NormalizeJoinCodeText(" 8sc0-721y-3a24-tqkf-fq\r\n") == "8SC0721Y3A24TQKFFQ");
+    CHECK(NormalizeJoinCodeText("8sc0721y3a24tqkffq") == "8SC0721Y3A24TQKFFQ");
+    CHECK(NormalizeJoinCodeText("\t8SC0 - 721Y\n3A24 TQKF\v\fFQ") == "8SC0721Y3A24TQKFFQ");
+    // U+FEFF (byte order mark), U+2013 (en dash), U+00A0 (no-break space), U+2212 (minus), U+2010
+    // (hyphen), U+200B (zero width space).
+    CHECK(NormalizeJoinCodeText("\xEF\xBB\xBF" "8SC0\xE2\x80\x93" "721Y\xC2\xA0" "3A24\xE2\x88\x92" "TQKF"
+                                "\xE2\x80\x90" "F\xE2\x80\x8B" "Q") == "8SC0721Y3A24TQKFFQ");
+    const JoinCodeResult r = DecodeJoinCodeV2(NormalizeJoinCodeText("8sc0\xE2\x80\x94" "721y-3a24-tqkf-fq\n"));
+    CHECK(r.status == JoinCodeStatus::kOk && r.target == a);
+    // I, L and O stay for the decoder, which reads them as 1, 1 and 0.
+    CHECK(NormalizeJoinCodeText("il-o") == "ILO");
+    CHECK(DecodeJoinCodeV2(NormalizeJoinCodeText("8r2m-o256-b4oo-oooo-1j")).target ==
+          (JoinTarget{{0xC0A80114, 52000}, 0x00000001}));
+    // The refusals keep their reason through it.
+    CHECK(DecodeJoinCodeV2(NormalizeJoinCodeText("60n0-0h9j-s0v ")).status == JoinCodeStatus::kOlderVersion);
+    CHECK(DecodeJoinCodeV2(NormalizeJoinCodeText("gsc0 721y 3a24 tqkf f6")).status == JoinCodeStatus::kNewerVersion);
+    // Anything else stays, so the decoder refuses it: a stray symbol, other UTF-8, half a sequence.
+    CHECK(NormalizeJoinCodeText("8SC0_721Y") == "8SC0_721Y");
+    CHECK(DecodeJoinCodeV2(NormalizeJoinCodeText("8SC0_721Y-3A24-TQKF-FQ")).status == JoinCodeStatus::kNotAJoinCode);
+    CHECK(NormalizeJoinCodeText("\xC3\xA4") == "\xC3\xA4");
+    CHECK(NormalizeJoinCodeText("AB\xE2\x80") == "AB\xE2\x80");
+    CHECK(NormalizeJoinCodeText("A\xC2") == "A\xC2");
+    CHECK(NormalizeJoinCodeText("").empty());
+    CHECK(NormalizeJoinCodeText(" -\t\r\n").empty());
+    CHECK(DecodeJoinCodeV2(NormalizeJoinCodeText(" - ")).status == JoinCodeStatus::kNotAJoinCode);
+  }
+
   return Finish("online_join_code");
 }

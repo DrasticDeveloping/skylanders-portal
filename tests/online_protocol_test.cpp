@@ -867,13 +867,14 @@ void Stage4() {
     h.flags = kHelloSynthetic;
     CHECK(RoundTrip(h));
     std::vector<uint8_t> b = EncodeMessage(h);
-    REQUIRE_OR_RETURN_VOID(!b.empty());
+    REQUIRE_OR_RETURN_VOID(b.size() > 21);
+    // Stage 8's nonce, secret and cookie (20 bytes) follow the flags byte.
     std::vector<uint8_t> bad = b;
-    bad.back() = 0x02;
+    bad[bad.size() - 21] = 0x02;
     CHECK(!DecodeMessages(bad).has_value());
     h.flags = 0x80;
     CHECK(EncodeMessage(h).empty());
-    b.pop_back();
+    b.resize(b.size() - 21);
     const uint16_t len = uint16_t(b.size() - kMessageHeaderSize);
     b[2] = uint8_t(len & 0xFF);
     b[3] = uint8_t(len >> 8);
@@ -1065,6 +1066,9 @@ int main() {
     CHECK(RoundTrip(Refuse{RefuseReason::kFull, "the session is full"}));
     CHECK(RoundTrip(Refuse{RefuseReason::kNotOwner, ""}));
     CHECK(RoundTrip(Bye{}));
+    for (ByeReason why : {ByeReason::kLeave, ByeReason::kRemoved, ByeReason::kEnded, ByeReason::kReplaced}) {
+      CHECK(RoundTrip(Bye{why}));
+    }
     CHECK(RoundTrip(Ping{0xFFFFFFFFFFFFFFFFull}));
     CHECK(RoundTrip(Pong{123456789, 987654321}));
     CHECK(RoundTrip(LevelRequest{"a/b/c"}));
@@ -1083,15 +1087,67 @@ int main() {
     const std::vector<uint8_t> want = {9, 0, 4, 0, 4, 3, 2, 1};
     CHECK(b == want);
     // Hello: version, digest, figure id and variant, name (length byte and bytes), owner token,
-    // and stage 4's trailing flags byte, written even when 0.
+    // stage 4's trailing flags byte, written even when 0, and stage 8's nonce (8), secret (4) and
+    // cookie (8), written even when 0.
     auto h = EncodeMessage(SampleHello());
-    CHECK(h.size() == kMessageHeaderSize + 2 + 32 + 2 + 2 + 1 + SampleHello().name.size() + 16 + 1);
-    REQUIRE_OR_RETURN(!h.empty());
-    CHECK(h.back() == 0);
+    CHECK(h.size() == kMessageHeaderSize + 2 + 32 + 2 + 2 + 1 + SampleHello().name.size() + 16 + 1 + 20);
+    REQUIRE_OR_RETURN(h.size() > 21);
+    CHECK(h[h.size() - 21] == 0);
     Hello synthetic = SampleHello();
     synthetic.flags = kHelloSynthetic;
     const auto s = EncodeMessage(synthetic);
-    CHECK(s.size() == h.size() && !s.empty() && s.back() == kHelloSynthetic);
+    CHECK(s.size() == h.size() && s.size() > 21 && s[s.size() - 21] == kHelloSynthetic);
+    // Stage 8: the gate's fields, little-endian, after the flags.
+    Hello gated = SampleHello();
+    gated.client_nonce = 0x0102030405060708ULL;
+    gated.join_secret = 0x89ABCDEF;
+    gated.cookie = 0x1112131415161718ULL;
+    const auto g = EncodeMessage(gated);
+    REQUIRE_OR_RETURN(g.size() == h.size());
+    const std::vector<uint8_t> tail(g.end() - 20, g.end());
+    const std::vector<uint8_t> want_tail = {8, 7, 6, 5, 4, 3, 2, 1, 0xEF, 0xCD, 0xAB, 0x89,
+                                            0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11};
+    CHECK(tail == want_tail);
+    CHECK(RoundTrip(gated));
+    // A Hello with the flags but without stage 8's fields (stage 4's) reads them as 0; one cut in
+    // the middle of them is invalid.
+    std::vector<uint8_t> stage4(g.begin(), g.end() - 20);
+    stage4[2] = uint8_t((stage4.size() - kMessageHeaderSize) & 0xFF);
+    stage4[3] = uint8_t((stage4.size() - kMessageHeaderSize) >> 8);
+    auto back4 = DecodeMessages(stage4);
+    REQUIRE_OR_RETURN(back4 && back4->size() == 1);
+    const auto* h4 = std::get_if<Hello>(&(*back4)[0]);
+    REQUIRE_OR_RETURN(h4 != nullptr);
+    CHECK(h4->client_nonce == 0 && h4->join_secret == 0 && h4->cookie == 0);
+    std::vector<uint8_t> cut(g.begin(), g.end() - 4);
+    cut[2] = uint8_t((cut.size() - kMessageHeaderSize) & 0xFF);
+    cut[3] = uint8_t((cut.size() - kMessageHeaderSize) >> 8);
+    CHECK(!DecodeMessages(cut).has_value());
+    // The stateless answers (stage 8's block, 55 and 56).
+    const auto c = EncodeMessage(HelloCookie{0x0102030405060708ULL});
+    const std::vector<uint8_t> want_cookie = {55, 0, 8, 0, 8, 7, 6, 5, 4, 3, 2, 1};
+    CHECK(c == want_cookie);
+    CHECK(EncodeMessage(HelloCookie{0}).empty());  // 0 means "no cookie"
+    const std::vector<uint8_t> zero_cookie = {55, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    CHECK(!DecodeMessages(zero_cookie).has_value());
+    const auto jw = EncodeMessage(JoinWait{0x01020304});
+    const std::vector<uint8_t> want_wait = {56, 0, 4, 0, 4, 3, 2, 1};
+    CHECK(jw == want_wait);
+    CHECK(RoundTrip(HelloCookie{77}));
+    CHECK(RoundTrip(JoinWait{3}));
+    CHECK((TypeOf(Message{HelloCookie{1}}) == MessageType::kHelloCookie));
+    CHECK((TypeOf(Message{JoinWait{}}) == MessageType::kJoinWait));
+    // The gate's refusals keep their reasons; 10 and up still read as "other".
+    for (uint8_t r = 6; r <= 9; ++r) {
+      const std::vector<uint8_t> refuse = {3, 0, 2, 0, r, 0};
+      auto got = DecodeMessages(refuse);
+      REQUIRE_OR_RETURN(got && got->size() == 1);
+      CHECK(uint8_t(std::get<Refuse>((*got)[0]).reason) == r);
+    }
+    const std::vector<uint8_t> ten = {3, 0, 2, 0, 10, 0};
+    auto got10 = DecodeMessages(ten);
+    REQUIRE_OR_RETURN(got10 && got10->size() == 1);
+    CHECK(std::get<Refuse>((*got10)[0]).reason == RefuseReason::kOther);
   }
 
   // Limits: a name over 32 bytes, a zone over 128, bad UTF-8, too many players: not encoded.
@@ -1142,6 +1198,31 @@ int main() {
     CHECK(accepted_short == 2);
     CHECK(DecodeMessages({}).has_value());
     CHECK(DecodeMessages({})->empty());
+  }
+
+  // Stage 8: the Bye's reason, one trailing byte. A Bye without it (from before it) and one with a
+  // value this build does not know read as kLeave; an unknown reason is not written.
+  {
+    const std::vector<uint8_t> removed = {4, 0, 1, 0, 1};
+    CHECK(EncodeMessage(Bye{ByeReason::kRemoved}) == removed);
+    const std::vector<uint8_t> leave = {4, 0, 1, 0, 0};
+    CHECK(EncodeMessage(Bye{}) == leave);
+    const std::vector<uint8_t> ended = {4, 0, 1, 0, 2};
+    CHECK(EncodeMessage(Bye{ByeReason::kEnded}) == ended);
+    CHECK(EncodeMessage(Bye{ByeReason(4)}).empty());
+    const auto reads = [](const std::vector<uint8_t>& b) {
+      auto back = DecodeMessages(b);
+      if (!back || back->size() != 1) return ByeReason(0xFF);
+      const auto* got = std::get_if<Bye>(&(*back)[0]);
+      return got ? got->reason : ByeReason(0xFF);
+    };
+    CHECK(reads({4, 0, 0, 0}) == ByeReason::kLeave);  // before the byte
+    CHECK(reads({4, 0, 1, 0, 3}) == ByeReason::kReplaced);
+    CHECK(reads({4, 0, 1, 0, 9}) == ByeReason::kLeave);     // unknown
+    CHECK(reads({4, 0, 2, 0, 1, 0xEE}) == ByeReason::kRemoved);  // a later version's addition
+    CHECK(std::string(ByeReasonName(ByeReason::kRemoved)) == "removed" &&
+          std::string(ByeReasonName(ByeReason::kEnded)) == "ended" &&
+          std::string(ByeReasonName(ByeReason(9))) == "leave");
   }
 
   // A known message whose fields are shorter than its type needs is rejected even when the length

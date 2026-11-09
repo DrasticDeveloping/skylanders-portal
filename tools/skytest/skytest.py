@@ -17,6 +17,11 @@ one game budget ([defaults] machine_games, default 4: slot files in the main che
 .replication-tests/slots/): a case waits for its slots, an exclusive or timed case takes them all, and
 one game boots at a time machine-wide. When 3 cases of any runner on one build stop on the same
 normalized fatal line or crash site, the circuit breaker starts no further case on that build.
+Two keys are off unless a spec names them: a peer's `settings_file = "none"` starts its game with no
+settings file (--config_file names the run folder's settings.toml, which is not there: the game's
+compiled-in defaults); a spec's [build_copy] (`remove`, `truncate` with `file` and `before`) runs the
+case's games from its own copy of the build snapshot, made fresh in the case's run folder, with those
+files removed or cut at a marker line (launch_args.copy_build); the shared snapshot never changes.
 
     skytest.py test [CASE ...] [--stage S] [--max-games N]   run cases (a name, a glob, or all)
                [--gate]                                     only the manifest's daily gate cases (gate =
@@ -551,9 +556,28 @@ def check_output_path(cfg: Config, path: Path) -> None:
 
 # What a spec's `args` may name: the game checkout the runner tests (its repository root, as
 # forward slashes), e.g. --online_route_file={repo}/tests/routes/tutorial_b.toml. Scripts take
-# {figures}, {peer} and {join} instead (peer_script).
+# {figures}, {peer}, {join} and {joincode} instead (peer_script).
 ARG_PLACEHOLDERS = ("{repo}",)
 ARG_PLACEHOLDER = re.compile(r"\{[A-Za-z_]+\}")
+# Stage 8 item 4 (join code v2): a client's script may name {joincode}, the hosted session's join code
+# with its secret. {join} is the server's address:port and carries no secret, so a server whose Hello
+# gate is on (dev_hello_gate_loopback on loopback) refuses it "wrong code". The code exists only once
+# the owner's game has started its server, so the runner reads it from the hosted server's log line
+# (the game's src/online/server/server_role.cpp, InstallServerRole:
+#   REXLOG_INFO("Online: the server listens on port {}, join code {}", started->port, started->join_code);
+# the code as the portal's EncodeJoinCodeV2 makes it: 18 symbols of JOIN_CODE_SYMBOLS, no dashes) and
+# starts a client whose script names {joincode} only then, with the code in its script (run_case,
+# start_joiners). Fails closed: with no such line (the server did not start, a build before stage 8), or
+# a line whose code is not 18 such symbols, that client never starts and fails; it never joins with an
+# empty or guessed code.
+JOIN_CODE_PLACEHOLDER = "{joincode}"
+JOIN_CODE_SYMBOLS = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # the portal's join_code.cpp kSymbols (Crockford)
+JOIN_CODE_V2 = re.compile(f"[{JOIN_CODE_SYMBOLS}]{{18}}")
+SERVER_JOIN_CODE = re.compile(r"Online: the server listens on port \d+, join code (\S*)")
+# What the launch builder checks in a {joincode} script before the code exists (prepare_peer): one word
+# that no join code is (U is not a symbol), swapped for the code when it comes (fill_join_code). A spec
+# may not write it itself.
+JOIN_CODE_STANDIN = "JOINCODE-NOT-KNOWN-YET-U"
 # The plan's daily gate: each stage names a 30-minute subset (docs/online-fork-plan.md 5.4).
 GATE_MINUTES = 30
 # A manifest case's `gate`: true is the daily gate; "per-build" runs once per build in an idle slot
@@ -599,6 +623,13 @@ class PeerSpec:
     # Where the peer's game runs (stage 8 item 6): "local" (this PC), or "remote" (the second PC, through
     # its remote agent: `test --remote`; one client of D, E, F per case at most).
     kind: str = "local"
+    # settings_file = "template" (the default: the run folder gets a copy of [game] settings_template) or
+    # "none" (Swap Force Online stage 8 P5 defaults-release: no settings file, --config_file names where it
+    # would be, and the game starts on its compiled-in defaults; launch_args.RunContext.no_settings).
+    settings_file: str = "template"
+
+
+SETTINGS_FILE_VALUES = ("template", "none")
 
 
 @dataclass
@@ -664,9 +695,28 @@ class Spec:
     unit: dict = field(default_factory=dict)
     # server+N+hK: the synthetic peers by name (h1, h2), never games (load_synthetic).
     synthetic: dict[str, SyntheticSpec] = field(default_factory=dict)
+    # [build_copy] (Swap Force Online stage 8 P5 route-missing): the case's games run from its own copy of
+    # the build snapshot with these files removed or cut short (case_build_copy, launch_args.copy_build);
+    # None: from the shared snapshot, as every other case.
+    build_copy: la.BuildEdits | None = None
 
 
 PEER_KINDS = ("local", "remote")
+
+
+def peer_settings_file(spec_name: str, peer: str, own: dict, common: dict, server: str, kind: str) -> str:
+    """A peer's `settings_file` (its own table, else [peer.all]): "template" or "none". A hosted server's
+    settings come from Host (it copies the owner's file, or makes an empty one), and a remote peer's agent
+    copies its verified install's template, so neither takes the key."""
+    value = own.get("settings_file", common.get("settings_file", "template"))
+    if value not in SETTINGS_FILE_VALUES:
+        raise SpecError(f"{spec_name}: peer {peer}: settings_file = {value!r} ({' or '.join(SETTINGS_FILE_VALUES)})")
+    if "settings_file" in own and peer == "S" and server == "host":
+        raise SpecError(f"{spec_name}: peer S: a hosted server's settings come from Host, not settings_file")
+    if value != "template" and kind == "remote":
+        raise SpecError(f"{spec_name}: peer {peer} is remote: its agent copies the install's settings template"
+                        " (settings_file is for a local peer)")
+    return value
 
 
 def peer_kind(spec_name: str, peer: str, own: dict, common: dict) -> str:
@@ -681,6 +731,58 @@ def peer_kind(spec_name: str, peer: str, own: dict, common: dict) -> str:
         raise SpecError(f'{spec_name}: peer {peer} runs on this PC (the server and the owner\'s client); kind ='
                         ' "remote" is for D, E or F')
     return kind
+
+
+def check_join_code_peers(spec_name: str, peers: dict[str, "PeerSpec"], server: str) -> None:
+    """{joincode} (JOIN_CODE_PLACEHOLDER) only in the script of a local client other than H, in a hosted
+    case: the code is the hosted server's (server = "host"), H is the owner whose game starts that server,
+    and a remote peer's script goes to the second PC when the run starts, before the code exists. No
+    script writes the stand-in itself (fill_join_code swaps every one of them)."""
+    for n, ps in peers.items():
+        if JOIN_CODE_STANDIN in ps.script:
+            raise SpecError(f"{spec_name}: peer {n}'s script has {JOIN_CODE_STANDIN}, the runner's stand-in for"
+                            " {joincode}")
+        if JOIN_CODE_PLACEHOLDER not in ps.script:
+            continue
+        if server != "host":
+            raise SpecError(f'{spec_name}: peer {n}: {{joincode}} is a hosted server\'s join code: say server = "host"')
+        if n == "H":
+            raise SpecError(f"{spec_name}: peer H hosts the session; {{joincode}} is for a client that joins (D, E, F)")
+        if ps.kind == "remote":
+            raise SpecError(f"{spec_name}: peer {n} is remote: its script goes to the second PC before the join code"
+                            " exists; {joincode} is for a local client")
+
+
+def uses_join_code(spec: "Spec", peer: str) -> bool:
+    """The peer's script names {joincode}: it starts once the hosted server logged its code (run_case)."""
+    ps = spec.peers.get(peer)
+    return peer != "S" and ps is not None and JOIN_CODE_PLACEHOLDER in ps.script
+
+
+def join_code_from(lines: list[str]) -> tuple[str, str]:
+    """The session's join code from a hosted server's log lines, at the first SERVER_JOIN_CODE line:
+    (code, "") when its code is a join code v2 (JOIN_CODE_V2), ("", why) when it is not; ("", "") while
+    no such line came."""
+    for line in lines:
+        m = SERVER_JOIN_CODE.search(line)
+        if not m:
+            continue
+        if JOIN_CODE_V2.fullmatch(m.group(1)):
+            return m.group(1), ""
+        return "", f"S logged its join code as {m.group(1)!r}, not a join code v2 (18 symbols, no dashes)"
+    return "", ""
+
+
+def fill_join_code(script: Path, code: str) -> None:
+    """The session's join code into a prepared peer's input script (prepare_peer wrote it with
+    JOIN_CODE_STANDIN, which the launch builder checked): only a join code v2, whose 18 symbols hold no
+    space, `;` or `#` that could change the script's commands, and only where the stand-in stands."""
+    if not JOIN_CODE_V2.fullmatch(code):
+        raise SpecError(f"{code!r} is not a join code v2 (18 symbols, no dashes); {script} keeps no guess")
+    text = script.read_bytes().decode("utf-8")
+    if JOIN_CODE_STANDIN not in text:
+        raise SpecError(f"{script} has no {JOIN_CODE_STANDIN} for the join code (it was not prepared for one)")
+    script.write_bytes(text.replace(JOIN_CODE_STANDIN, code).encode("utf-8"))
 
 
 def check_remote_peers(spec_name: str, peers: dict[str, "PeerSpec"], grades: dict, names: list[str]) -> None:
@@ -894,6 +996,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             if not isinstance(t.get("expect_count", {}), dict) or not isinstance(t.get("expect_order", []), list):
                 raise SpecError(f"{path.name}: peer {n}: expect_count is a table (pattern = count), expect_order a"
                                 " list of patterns")
+        kind = peer_kind(path.name, n, own, common)
         peers[n] = PeerSpec(
             name=n,
             script=script,
@@ -903,7 +1006,8 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             expect_count={**common.get("expect_count", {}), **own.get("expect_count", {})},
             expect_order=list(own.get("expect_order", common.get("expect_order", []))),
             save_slots=parse_save_slots(path.name, n, own.get("save_slots", common.get("save_slots", {}))),
-            kind=peer_kind(path.name, n, own, common),
+            kind=kind,
+            settings_file=peer_settings_file(path.name, n, own, common, d.get("server", "standin"), kind),
         )
         for arg in peers[n].args:
             for ph in ARG_PLACEHOLDER.findall(arg):
@@ -928,6 +1032,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
     if server == "host" and "S" in peers and peers["S"].save_slots:
         raise SpecError(f"{path.name}: save_slots: a hosted server has no data folder of its own (Host copies the"
                         " owner's slot into its session folder)")
+    check_join_code_peers(path.name, peers, server)
     synthetic = load_synthetic(path.name, d, names, server)
     grades = d.get("grade", {})
     for gname, g in grades.items():
@@ -1045,6 +1150,16 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
                 raise SpecError(f"{path.name}: peer {n} sets --{SCENE_SETTING} in its args beside the spec's"
                                 f" scenes key: the key says it (the runner passes --{SCENE_SETTING} itself)")
     check_remote_peers(path.name, peers, grades, names)
+    build_copy = None
+    if "build_copy" in d:
+        try:
+            build_copy = la.parse_build_edits(d["build_copy"], f"{path.name}: [build_copy]")
+        except la.LaunchError as e:
+            raise SpecError(str(e)) from None
+        remote = [n for n, p in peers.items() if p.kind == "remote"]
+        if remote:
+            raise SpecError(f"{path.name}: [build_copy]: peer {', '.join(remote)} is remote and runs the second PC's"
+                            " verified install, not a copy of this build")
     return Spec(
         name=d["name"], path=path, layout=d["layout"], stage=str(d["stage"]),
         description=d.get("description", ""), timeout=float(d.get("timeout", default_timeout)),
@@ -1052,7 +1167,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         server=server, grades=grades, compare=compare, fail_fast=fail_fast, show_server_window=show,
         exclusive=exclusive, tolerate=list(tolerate), not_ready=not_ready, scenes=scenes,
         scenes_reason=scenes_reason.strip(), breaker=breaker, sha256=hashlib.sha256(data).hexdigest(),
-        synthetic=synthetic,
+        synthetic=synthetic, build_copy=build_copy,
     )
 
 
@@ -1075,7 +1190,7 @@ UNIT_SUMMARY = re.compile(r"^(\d+) (\w+) tests, (\d+) failed, (\d+) ms")
 # The keys that say how games run or are graded (a unit case starts none). `breaker` among them: a unit
 # case never counts toward the circuit breaker nor is stopped by it (C7 guards the build's games).
 GAME_ONLY_KEYS = ("peer", "grade", "measure", "compare", "server", "standin_seconds", "fail_fast",
-                  "show_server_window", "tolerate", "scenes", "scenes_reason", "breaker")
+                  "show_server_window", "tolerate", "scenes", "scenes_reason", "breaker", "build_copy")
 
 
 def build_relative(name: str, what: str, value: object) -> str:
@@ -2245,6 +2360,25 @@ def snapshot_complete(snap: Path, files: list[Path], cfg: Config | None = None) 
         return False
 
 
+def case_build_copy(cfg: Config, spec: Spec, snap: Path, run: Path) -> Path:
+    """A case's own copy of the build snapshot (its [build_copy], launch_args.copy_build), made fresh in
+    the case's run folder: inside the store, beside the peers' folders, deleted with the run by the store's
+    janitor (tools/test_store_janitor.py judges everything in runs/<stamp>-<case>/ as that run). The case's
+    games start from it, and a hosted server too (Host starts its own exe). The shared snapshot is never
+    changed. A refusal is a spec error: no game of the case starts."""
+    dest = run / la.BUILD_COPY_DIR
+    check_output_path(cfg, dest)
+    try:
+        copy = la.copy_build(snap.resolve(), run.resolve() / la.BUILD_COPY_DIR, spec.build_copy,
+                             store=cfg.store.resolve(), exe=cfg.exe)
+    except (la.LaunchError, OSError) as e:
+        raise SpecError(f"[build_copy]: {e}") from None
+    done = [f"removed {f}" for f in spec.build_copy.remove] + \
+        [f"{f} cut before {' or '.join(m)}" for f, m in spec.build_copy.truncate]
+    print(f"  {spec.name}: its own build copy {copy}: {', '.join(done)}", flush=True)
+    return copy
+
+
 def snapshot_unit(cfg: Config, binary: str) -> Path:
     """A unit case's test binary and the DLLs beside it, copied into a snapshot of their own (keyed
     by the files, as the game's is), so a rebuild during the run changes nothing. Returns the
@@ -2501,15 +2635,22 @@ def fail_fast_patterns(spec: Spec, peer: str) -> list[str]:
     return [rx for rx, _ in peer_fatal_lines(spec, peer)]
 
 
-def peer_script(spec: Spec, peer: str, figures: Path, join: str = "") -> str:
+def peer_script(spec: Spec, peer: str, figures: Path, join: str = "", joincode: str = "") -> str:
     if peer == "S":
         return STANDIN_SERVER_SCRIPT.format(seconds=int(spec.standin_seconds))
-    return spec.peers[peer].script.replace("{figures}", str(figures)).replace("{peer}", peer).replace("{join}", join)
+    return (spec.peers[peer].script.replace("{figures}", str(figures)).replace("{peer}", peer)
+            .replace("{join}", join).replace(JOIN_CODE_PLACEHOLDER, joincode))
 
 
 def peer_args(cfg: Config, args: list[str]) -> list[str]:
     """A peer's spec args as the game gets them: {repo} is the checkout under test (G3, stage 1B)."""
     return [a.replace("{repo}", cfg.repo.as_posix()) for a in args]
+
+
+def launcher_words(launcher: list[str], exe: Path) -> list[str]:
+    """[game] launcher (only the runner's own tests set one) with {exe}: the game exe the case runs, the
+    shared snapshot's or the case's own build copy's ([build_copy]), so a test can see which."""
+    return [w.replace("{exe}", str(exe)) for w in launcher]
 
 
 # The ports this runner process handed to hosted servers: never one twice, so cases run at once
@@ -3173,21 +3314,25 @@ def launch_tables(cfg: Config) -> tuple[la.AllowList, la.CommandTable]:
         raise SpecError(f"the launch tables do not read: {e}") from None
 
 
-def launch_context(cfg: Config, folder: Path, tables: tuple[la.AllowList, la.CommandTable]) -> la.RunContext:
+def launch_context(cfg: Config, folder: Path, tables: tuple[la.AllowList, la.CommandTable],
+                   no_settings: bool = False) -> la.RunContext:
     """A development run's context for the launch builder: the worktree's store, the peer's fresh run
     folder, the configured disc (resolved: a worktree's rom\\ is a junction to the main checkout's),
-    the settings template, and the checkout's tests/routes/ as the one place besides the run folder a
-    read-path setting (--online_route_file={repo}/tests/routes/...) may point."""
+    the settings template (none for a peer with settings_file = "none"), and the checkout's
+    tests/routes/ as the one place besides the run folder a read-path setting
+    (--online_route_file={repo}/tests/routes/...) may point."""
     return la.RunContext(kind="dev", store=cfg.store.resolve(), run_folder=folder, rom=cfg.rom.resolve(),
                          template=cfg.settings_template, allow=tables[0], commands=tables[1],
-                         read_roots=[(cfg.repo / "tests" / "routes").resolve()])
+                         read_roots=[(cfg.repo / "tests" / "routes").resolve()], no_settings=no_settings)
 
 
 def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -> tuple[Path, list[str]]:
     """A local peer's own run folder and command line, made by the launch builder (launch_args.build_game,
     design D21): the copies of the fixture saves and figures, the settings template's copy, the input
     script (checked command by command, every path inside the folder), and the settings, checked as a
-    whole. A refusal is a spec error: no game of the case starts."""
+    whole. A refusal is a spec error: no game of the case starts. A {joincode} script is written with
+    JOIN_CODE_STANDIN, which run_case swaps for the session's code (fill_join_code) before the peer
+    starts."""
     check_output_path(cfg, run / peer)
     saves, figures = fixture_dirs(cfg)
     if not saves.is_dir() or not figures.is_dir():
@@ -3195,8 +3340,8 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -
     tables = launch_tables(cfg)
     try:
         d = la.make_run_folder(run.resolve(), peer)
-        ctx = launch_context(cfg, d, tables)
-        script = peer_script(spec, peer, ctx.figures, f"127.0.0.1:{port}" if port else "")
+        ctx = launch_context(cfg, d, tables, no_settings=spec.peers[peer].settings_file == "none")
+        script = peer_script(spec, peer, ctx.figures, f"127.0.0.1:{port}" if port else "", JOIN_CODE_STANDIN)
         runner = [*cfg.default_args, *scene_args(cfg, spec), *show_server_args(cfg, spec, peer),
                   *([f"--online_port={port}"] if port and peer == "H" else []),
                   *synthetic_server_args(cfg, spec, peer)]
@@ -4201,6 +4346,11 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
     droot_title = str(droot_grade.get("title", cfg.title_id)) if droot_grade is not None else ""
     droot: DataRootWatch | None = None
     try:
+        # [build_copy]: the case's own copy of the snapshot, before any peer's folder; every game of the
+        # case (and the synthetic peers' digest) comes from it.
+        if spec.build_copy:
+            snap = case_build_copy(cfg, spec, snap, run)
+            exe = snap / cfg.exe
         # Every peer's folder first (copies take a moment), then all games start close together, and
         # a spec error in a later peer starts no game at all.
         port = free_loopback_port() if hosted else 0
@@ -4225,23 +4375,12 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                     ended[name] = time.monotonic()
 
         with winjob.Job() as job:
-            for n in starts:
-                # Games booting in the same instant crashed and froze each other in a test
-                # (stage 0, five at once); real sessions never start them together either. The gap
-                # holds across every case running at once (StartPacer); the games already started
-                # are watched meanwhile.
-                pacer.wait_turn(note_ends)
-                if n in remote:  # on the second PC: no boot token or job of this machine
-                    remotes[n] = procs[n] = start_remote(cfg, spec, n, run, port)
-                    results[n].command = remotes[n].command
-                    started[n] = time.monotonic()
-                    results[n].started_after_s = round(started[n] - t_start, 1)
-                    continue
+            def start_local(n: str) -> None:
                 # PS15: the machine's boot token (no other runner's game boots meanwhile), held until
                 # this game's first frame line, its exit or BOOT_TIMEOUT_S (BootHold.watch).
                 hold = pacer.machine_turn(note_ends)
                 d, args = prepared[n]
-                cmd = [*cfg.launcher, *args] if cfg.launcher else [str(exe), *args]
+                cmd = [*launcher_words(cfg.launcher, exe), *args] if cfg.launcher else [str(exe), *args]
                 results[n].command = cmd
                 # The game starts suspended, joins the job, and only then runs: it never runs outside
                 # the job. If any step fails it is ended before the error goes on.
@@ -4271,7 +4410,44 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                 procs[n] = p
                 started[n] = time.monotonic()
                 results[n].started_after_s = round(started[n] - t_start, 1)
+
+            # Stage 8 item 4: a client whose script names {joincode} starts once the hosted server
+            # logged its join code (start_joiners below), never before.
+            joiners = [n for n in starts if n not in remote and uses_join_code(spec, n)]
+            for n in starts:
+                if n in joiners:
+                    continue
+                # Games booting in the same instant crashed and froze each other in a test
+                # (stage 0, five at once); real sessions never start them together either. The gap
+                # holds across every case running at once (StartPacer); the games already started
+                # are watched meanwhile.
+                pacer.wait_turn(note_ends)
+                if n in remote:  # on the second PC: no boot token or job of this machine
+                    remotes[n] = procs[n] = start_remote(cfg, spec, n, run, port)
+                    results[n].command = remotes[n].command
+                    started[n] = time.monotonic()
+                    results[n].started_after_s = round(started[n] - t_start, 1)
+                    continue
+                start_local(n)
             deadline = time.monotonic() + spec.timeout
+            # {joincode}: the hosted server's log, read for its join code until the joiners started.
+            join_tail = LogTail(peer_log_path(run, "S", hosted)) if joiners else None
+            join_waits = list(joiners)
+            not_started: dict[str, str] = {}  # a joiner that will not start, and why
+
+            def start_joiners() -> None:
+                code, problem = join_code_from(join_tail.new_lines())
+                if problem:  # fails closed: no joiner starts with a code that is not one
+                    not_started.update({n: f"never started: {problem}" for n in join_waits})
+                    join_waits.clear()
+                    return
+                if not code:
+                    return
+                while join_waits:
+                    n = join_waits.pop(0)
+                    fill_join_code(prepared[n][0] / la.SCRIPT_FILE, code)
+                    pacer.wait_turn(note_ends)
+                    start_local(n)
             # server+N+hK: each synthetic peer waits for its start condition in its start peer's log.
             syn_waits = {n: (LogTail(peer_log_path(run, s.start_peer, hosted)), re.compile(s.start_after))
                          for n, s in spec.synthetic.items()}
@@ -4310,6 +4486,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                     start_synthetic()
                 if droot is not None:
                     droot.check()  # a phase line: that phase's end snapshot
+                if join_waits and not (watch is not None and watch.hit):  # no new game after a fatal line
+                    start_joiners()
                 if watch is not None and time.monotonic() >= next_check:
                     next_check = time.monotonic() + FAIL_FAST_POLL
                     # Checked through the grace too: a hit whose log was replaced meanwhile is dropped.
@@ -4317,6 +4495,9 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                         if watch.check({**procs, **syn_procs}) else deadline
                     early = stop_at < deadline  # else the timeout comes first: a timeout as before
                 time.sleep(min(0.5, max(0.0, stop_at - time.monotonic())))
+            # {joincode}: a joiner still waiting when the run ended never got the code (fails closed).
+            not_started.update({n: "never started: S never logged its join code (/"
+                                   f"{SERVER_JOIN_CODE.pattern}/), so {{joincode}} had no value" for n in join_waits})
             stopped = ""
             if early and watch is not None and watch.hit and any(p.poll() is None for p in procs.values()):
                 stopped = f"stopped early: {watch.hit[0]} {watch.hit[1]} (fail fast)"
@@ -4382,6 +4563,9 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         r.frame_p95_ms, r.peak_video_mb = parsed["frame_p95"], parsed["video"]
         r.startup_stall_s = parsed["startup_stall"]
         grade_peer(spec, r, text, parsed)
+        if n in not_started:  # a {joincode} joiner the run never started (start_joiners)
+            r.reasons.insert(0, not_started[n])
+            r.status = "fail"
         if n in remotes and remotes[n].problems:  # a lost agent or a file that did not come back
             r.reasons += remotes[n].problems
             r.status = "fail"

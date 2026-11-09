@@ -9,7 +9,9 @@ to return one unless every test-data rule of docs/RULES.md holds:
 - each runner-owned setting exactly once, every root canonical (no reparse point on any component, no
   `\\\\?\\`, UNC, device or stream path) and inside the fresh run folder the builder made, outside every
   owner data folder, the install and the disc;
-- `--config_file` the settings file the builder copied from the template into the run folder;
+- `--config_file` the settings file the builder copied from the template into the run folder, or, for a
+  run with no settings file (RunContext.no_settings), that same path where no file exists, so the game
+  starts on its compiled-in defaults;
 - `--game_data_root` exactly the verified install's `rom\\` (an RC run) or the runner's disc (development);
 - exactly one `--portal_mode=software`; `--audio_mute=true` on a hidden run;
 - every other setting on the explicit per-setting allow list (no prefix rule), its value checked
@@ -298,6 +300,16 @@ class RunContext:
     install: Path | None = None    # an RC run: the verified install folder
     read_roots: list[Path] = field(default_factory=list)   # where read-path settings may point
     owner_roots: list[Path] | None = None
+    # A run with no settings file (a spec's `settings_file = "none"`, Swap Force Online stage 8 P5
+    # defaults-release): the builder copies no template, and --config_file names the run folder's
+    # settings.toml while no file is there. The SDK then loads nothing (rexglue-sdk src/ui/rex_app.cpp
+    # SetupEnvironment loads the config only if it exists; cvar.cpp LoadConfig and logging.cpp
+    # ParseCategoryLevelsFromConfig return on a missing file), so every setting is its compiled-in default
+    # or the command line's; a settings page the game saves later (portal settings_file.cpp StoreSetting,
+    # rexglue-sdk SaveConfig) creates the file there, inside the run folder. Never an empty value (the
+    # game would drop its whole command line) and never the game's default (swapforcerecomp.toml beside
+    # the exe), which an absent --config_file would mean.
+    no_settings: bool = False
 
     @property
     def figures(self) -> Path:
@@ -634,9 +646,13 @@ def check_args(ctx: RunContext, args: list[str]) -> None:
         raise LaunchError("refusing a hidden run without --audio_mute=true")
     for key in ROOT_SETTINGS:
         contained(ctx, values[key][0], f"--{key}", ctx.run_folder)
-    cfg = canonical(values["config_file"][0], ctx.run_folder, "--config_file", must_exist=True)
+    cfg = canonical(values["config_file"][0], ctx.run_folder, "--config_file", must_exist=not ctx.no_settings)
     if _norm(cfg) != _norm(ctx.run_folder / SETTINGS_FILE):
-        raise LaunchError(f"--config_file {cfg}: only the settings file the builder copied into the run folder")
+        raise LaunchError(f"--config_file {cfg}: only the settings file the builder copied into the run folder"
+                          if not ctx.no_settings else
+                          f"--config_file {cfg}: a run with no settings file names only the run folder's {SETTINGS_FILE}")
+    if ctx.no_settings and os.path.lexists(cfg):
+        raise LaunchError(f"--config_file {cfg}: a run with no settings file needs no file there (one is)")
     script = canonical(values["input_script"][0], ctx.run_folder, "--input_script", must_exist=True)
     check_script(decode_script(script.read_bytes()), ctx, script.parent)
     rom = values["game_data_root"][0]
@@ -671,7 +687,8 @@ def build_game(ctx: RunContext, spec_args: list[str], script_text: str, *, fixtu
                runner_args: list[str] | None = None) -> list[str]:
     """Prepares the run folder (fixture copies, the settings copy, the script) and returns the game's
     settings, or raises LaunchError. `runner_args` are the runner's own fixed settings (the defaults,
-    scenes, window); they pass the same allow list as the spec's."""
+    scenes, window); they pass the same allow list as the spec's. With ctx.no_settings no settings file
+    is made: --config_file names where it would be (RunContext.no_settings)."""
     for a in spec_args:
         name, _ = split_setting(a)
         if name in RUNNER_OWNED:
@@ -683,7 +700,8 @@ def build_game(ctx: RunContext, spec_args: list[str], script_text: str, *, fixtu
         (ctx.run_folder / "data").mkdir(exist_ok=True)
     (ctx.run_folder / "cache").mkdir(exist_ok=True)
     settings = ctx.run_folder / SETTINGS_FILE
-    shutil.copyfile(ctx.template, settings)
+    if not ctx.no_settings:
+        shutil.copyfile(ctx.template, settings)
     data = script_text.encode("utf-8")
     script = ctx.run_folder / SCRIPT_FILE
     check_script(decode_script(data), ctx)  # before anything lands in the folder under the script's name
@@ -701,6 +719,174 @@ def build_game(ctx: RunContext, spec_args: list[str], script_text: str, *, fixtu
     ]
     check_args(ctx, args)
     return args
+
+
+# --- a case's own build copy -----------------------------------------------------------------------
+#
+# A spec may run its games from a copy of the build snapshot with files removed or cut short (a spec's
+# [build_copy] table; Swap Force Online stage 8 P5 route-missing: routes\tutorial_b.toml removed,
+# routes\unsupported.toml removed or cut before its first entry table). The shared snapshot is never
+# changed, since every other case runs from it. The copy:
+# - is made fresh for one case, in a folder that does not exist yet, inside the test store and outside
+#   the snapshot and the owner's data (the runner puts it in the case's run folder, so the store's
+#   janitor deletes it with the run);
+# - holds copies of the snapshot's files, never links (a hard link would let a cut reach the snapshot),
+#   and is refused if the snapshot holds a junction, link or other reparse point;
+# - changes only files the spec names, each a regular file inside the snapshot, never the game exe; a
+#   path that leaves the snapshot (a drive, a root, `..`, a stream, a device name) is refused;
+# - cuts a file at the first line that is one of the spec's markers (the line's text without its outer
+#   whitespace, so a comment that mentions a header is no cut), keeping the bytes before that line; a
+#   file with no such line is refused, since the cut would change nothing.
+BUILD_COPY_DIR = "build"
+BUILD_COPY_KEYS = ("remove", "truncate")
+BUILD_TRUNCATE_KEYS = ("file", "before")
+_BUILD_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+
+
+@dataclass(frozen=True)
+class BuildEdits:
+    """A spec's [build_copy]: files removed from the case's copy, and files cut at a marker line."""
+    remove: tuple[str, ...] = ()
+    truncate: tuple[tuple[str, tuple[str, ...]], ...] = ()  # (file, markers)
+
+    def __bool__(self) -> bool:
+        return bool(self.remove or self.truncate)
+
+    def files(self) -> list[str]:
+        return [*self.remove, *(f for f, _ in self.truncate)]
+
+
+def build_member(text: object, what: str) -> str:
+    """A file of the build named relative to the snapshot (routes\\x.toml or routes/x.toml), as
+    `routes/x.toml`; refused unless every component is a plain name (letters, digits, `_`, `.`, `-`, not
+    starting with a dot, not ending in one), so it cannot leave the snapshot."""
+    if not isinstance(text, str) or not text:
+        raise LaunchError(f"{what}: a file of the build, relative to it (routes\\x.toml)")
+    check_path_text(text, what)
+    w = PureWindowsPath(text)
+    if w.drive or w.root:
+        raise LaunchError(f"{what}: {text!r} must be relative to the build")
+    parts = re.split(r"[\\/]", text)
+    for part in parts:
+        if part in ("", ".", "..") or not _BUILD_NAME.fullmatch(part) or part.endswith("."):
+            raise LaunchError(f"{what}: {text!r} must name a file inside the build (plain names, no '..')")
+    return "/".join(parts)
+
+
+def parse_build_edits(table: object, origin: str = "build_copy") -> BuildEdits:
+    """A spec's [build_copy] table:
+        remove = ['routes\\tutorial_b.toml']
+        truncate = [{ file = 'routes\\unsupported.toml', before = ['[[trigger]]', '[[telegram]]'] }]
+    at least one file, none named twice (a file is removed or cut, not both)."""
+    if not isinstance(table, dict):
+        raise LaunchError(f"{origin}: a table (remove, truncate)")
+    unknown = sorted(set(table) - set(BUILD_COPY_KEYS))
+    if unknown:
+        raise LaunchError(f"{origin}: does not know {', '.join(unknown)} ({', '.join(BUILD_COPY_KEYS)})")
+    remove = table.get("remove", [])
+    if not isinstance(remove, list):
+        raise LaunchError(f"{origin}: remove is a list of files of the build")
+    removed = tuple(build_member(r, f"{origin}.remove") for r in remove)
+    cuts: list[tuple[str, tuple[str, ...]]] = []
+    entries = table.get("truncate", [])
+    if not isinstance(entries, list):
+        raise LaunchError(f"{origin}: truncate is a list of {{ file, before }} tables")
+    for t in entries:
+        if not isinstance(t, dict):
+            raise LaunchError(f"{origin}: truncate is a list of {{ file, before }} tables")
+        unknown = sorted(set(t) - set(BUILD_TRUNCATE_KEYS))
+        if unknown:
+            raise LaunchError(f"{origin}.truncate: does not know {', '.join(unknown)} ({', '.join(BUILD_TRUNCATE_KEYS)})")
+        f = build_member(t.get("file"), f"{origin}.truncate.file")
+        before = t.get("before")
+        if isinstance(before, str):
+            before = [before]
+        if not isinstance(before, list) or not before:
+            raise LaunchError(f"{origin}.truncate {f}: before is a marker line or a list of them")
+        for m in before:
+            if not isinstance(m, str) or not m or m != m.strip() or any(c in m for c in "\r\n"):
+                raise LaunchError(f"{origin}.truncate {f}: marker {m!r} must be one line's text without outer"
+                                  " whitespace (lines are compared without it)")
+        cuts.append((f, tuple(before)))
+    edits = BuildEdits(removed, tuple(cuts))
+    if not edits:
+        raise LaunchError(f"{origin}: names no file (remove or truncate)")
+    seen: set[str] = set()
+    for f in edits.files():
+        if f.lower() in seen:
+            raise LaunchError(f"{origin}: {f} is named twice (a file is removed or cut, once)")
+        seen.add(f.lower())
+    return edits
+
+
+def cut_before(data: bytes, markers: tuple[str, ...], what: str) -> bytes:
+    """The bytes before the first line whose text without outer ASCII whitespace is one of `markers`
+    (lines end at LF, CR LF or CR). Refused when no line is."""
+    want = {m.encode("utf-8") for m in markers}
+    pos = 0
+    for line in data.splitlines(keepends=True):
+        if line.strip() in want:
+            return data[:pos]
+        pos += len(line)
+    raise LaunchError(f"{what}: no line is {' or '.join(markers)} (the cut would change nothing)")
+
+
+def copy_build(snapshot: Path, dest: Path, edits: BuildEdits, *, store: Path, exe: str,
+               owner_roots: list[Path] | None = None) -> Path:
+    """The case's own copy of the build snapshot at `dest` (which must not exist yet), with `edits`
+    applied, as the rules above say. Returns the copy's folder; raises LaunchError before writing
+    anything when a rule does not hold."""
+    owners = owner_data_roots() if owner_roots is None else owner_roots
+    store_c = canonical(str(store), store, "the test store", must_exist=True)
+    snap = canonical(str(snapshot), store_c, "the build snapshot", must_exist=True)
+    if not within(snap, store_c) or _norm(snap) == _norm(store_c):
+        raise LaunchError(f"the build snapshot {snap} is not inside the test store {store_c}")
+    if os.path.lexists(dest):
+        raise LaunchError(f"the build copy {dest} exists already (a case's copy is made fresh)")
+    d = canonical(str(dest), store_c, "the build copy")
+    if not within(d, store_c) or _norm(d) == _norm(store_c):
+        raise LaunchError(f"the build copy {d} is not inside the test store {store_c}")
+    if within(d, snap) or within(snap, d):
+        raise LaunchError(f"the build copy {d} and the snapshot {snap} overlap")
+    _refuse_owner(d, owners, "the build copy")
+    exe_key = _norm(snap / exe)
+    named: dict[str, str] = {}
+    for rel in edits.files():
+        what = f"build_copy {rel}"
+        p = canonical(str(snap / rel), snap, what, must_exist=True)
+        if not within(p, snap) or _norm(p) == _norm(snap):
+            raise LaunchError(f"{what}: {p} is outside the snapshot {snap}")
+        if not p.is_file():
+            raise LaunchError(f"{what}: {p} is not a file of the snapshot")
+        if _norm(p) == exe_key:
+            raise LaunchError(f"{what}: the game exe itself (the case would start nothing)")
+        named[_norm(p)] = rel
+    cuts = {_norm(snap / f): cut_before((snap / f).read_bytes(), markers, f"build_copy {f}")
+            for f, markers in edits.truncate}
+    removed = {_norm(snap / f) for f in edits.remove}
+    # Every entry of the snapshot is a plain file or folder before anything is written.
+    for root, dirs, files in os.walk(snap):
+        for n in dirs + files:
+            if is_reparse_point(Path(root) / n):
+                raise LaunchError(f"the build snapshot holds {Path(root) / n}, a junction, link or other reparse"
+                                  " point (a case's copy copies files only)")
+    d.mkdir()
+    for root, dirs, files in os.walk(snap):
+        src_dir = Path(root)
+        out_dir = d / src_dir.relative_to(snap)
+        for n in dirs:
+            (out_dir / n).mkdir()
+        for n in files:
+            src = src_dir / n
+            key = _norm(src)
+            if key in removed:
+                continue
+            if key in cuts:
+                (out_dir / n).write_bytes(cuts[key])
+            else:
+                shutil.copyfile(src, out_dir / n, follow_symlinks=False)
+                shutil.copystat(src, out_dir / n, follow_symlinks=False)
+    return d
 
 
 # --- the synthetic peer (stage 4's program, launch role `synthetic-peer`) ---------------------------

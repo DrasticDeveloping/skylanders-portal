@@ -14,6 +14,7 @@
 
 #include "netplay/lanes.h"
 #include "netplay/transport.h"
+#include "online/hello_guard.h"
 #include "online/protocol.h"
 #include "online/requests.h"
 #include "online/tick.h"
@@ -37,6 +38,9 @@ constexpr size_t kMaxUnadmitted = 16;
 // pumps it. Every Transport::Receive call takes one datagram (an undeliverable one comes back
 // empty), so the bound holds for long datagrams and error reports too.
 constexpr int kMaxReceivePerPump = 4096;
+// Stage 8: how many HelloCookie answers one Connect follows (a cookie lives 5 to 10 s, so a join
+// that waits the full minute for the owner's let in needs about a dozen).
+constexpr int kMaxCookieRounds = 32;
 
 // Both sessions are driven by their owner: Pump(now) often (every frame, or every couple of
 // milliseconds on a pump thread) receives, answers, resends and times out; nothing runs on a thread
@@ -59,6 +63,19 @@ struct ServerSettings {
   // dev_synthetic_peers, off by default) and it comes from a loopback address (127.x); otherwise
   // it is refused kOther.
   bool allow_synthetic = false;
+  // Stage 8 item 4 (design 3.4, D10; the backlog's spoofed Hello): the Hello gate. Off, a Hello
+  // opens a connection as before (every loopback session the game starts without its test switch).
+  // On, a datagram from an unknown address opens a connection only when it is a Hello the gate
+  // (hello_guard.h) admits: size, limits, the cookie, the checks HandleHello makes (version,
+  // digest, owner token, synthetic), the owner or the secret, let in, players. Until then every
+  // answer is stateless (HelloCookie, JoinWait, Refuse in a kFlagStateless datagram, never larger
+  // than the Hello) and nothing is held for the sender but its pending entry.
+  bool gate = false;
+  // The join code's secret (join code v2). 0: drawn from the OS random source at Start, never 0.
+  // Drawn with the gate off too, so JoinCode always names one; only the gate checks it.
+  uint32_t join_secret = 0;
+  CookieKey cookie_key{};      // all zero: drawn at Start (and at each rotation)
+  bool let_anyone_in = false;  // the session option "let anyone with the code in" (off: D15)
 };
 
 // What SendBackend did with a frame (stage 3 section 3.2). kFull: the lane's window holds
@@ -71,7 +88,7 @@ enum class LeaveReason : uint8_t {
   kReplaced,  // the owner connected again from another address
   kClosed,    // End session's drain is done for it: its finals went out, then S's Bye (version 2)
   kRemoved,   // the game removed it (RemoveClient: its backend's control overflow or overrun,
-              // stage 3); told Bye
+              // stage 3; the owner's kick, stage 8); told Bye
 };
 
 struct ServerEvent {
@@ -117,6 +134,13 @@ struct ServerEvent {
     kOccurrenceAccept,  // peer_id, occurrence_accept: the client's owners took these retained rows
     kAttackPress,       // peer_id, attack_press: an attack press or release, outside replay; not
                         // reported once End session began
+    // Stage 8 item 4 (the Hello gate on).
+    kJoinPending,      // pending_id, name, figure_id, figure_variant, endpoint: a joiner with the
+                       // right code waits for the owner's LetIn or RefuseJoin (never a player slot)
+    kJoinGone,         // pending_id, name, endpoint: its entry expired unanswered (the joiner hears
+                       // "not let in: timed out" on its next Hello)
+    kJoinCodeSpent,    // the code's wrong-secret budget is spent: no new joiner until NewJoinSecret
+                       // (once per secret)
   };
   Type type = Type::kPeerJoined;
   uint16_t peer_id = 0;
@@ -144,6 +168,7 @@ struct ServerEvent {
   bool synthetic = false;                         // kPeerJoined (stage 4): a synthetic peer
   OccurrenceAccept occurrence_accept;             // kOccurrenceAccept (stage 5)
   AttackPress attack_press;                       // kAttackPress (stage 5)
+  uint32_t pending_id = 0;                        // kJoinPending, kJoinGone (stage 8)
 };
 
 struct PeerInfo {
@@ -221,9 +246,24 @@ class ServerSession {
   uint32_t SessionId() const { return settings_.session_id; }
   netplay::Endpoint LocalEndpoint() const;
   uint16_t Port() const { return LocalEndpoint().port; }
-  // The join code for the bound address and port; bound to every address (0.0.0.0), the machine's
-  // primary address (loopback without a network).
+  // The join code (v2, with the session's secret) for the bound address and port; bound to every
+  // address (0.0.0.0), the machine's primary address (loopback without a network).
   std::string JoinCode() const;
+  // Stage 8 item 4: the code for another address and port (the router's external ones on
+  // "Internet"); a zero address or port takes JoinCode's. Empty if the session is not running.
+  std::string JoinCodeFor(uint32_t address, uint16_t port) const;
+  uint32_t JoinSecret() const { return settings_.join_secret; }
+  // A new code: a new secret (0: drawn from the OS random source); the gate's wrong-secret budget
+  // starts again. Players already in are unaffected; a pending joiner with the old secret stays
+  // pending.
+  void NewJoinSecret(uint32_t secret = 0);
+  // The owner's answer to a pending joiner (kJoinPending). LetIn: its next Hello is admitted (true),
+  // or it hears "full" (false, the session is full). RefuseJoin: its next Hello hears "not let in".
+  // false: no such entry (answered, expired) or the gate is off.
+  bool LetIn(uint32_t pending_id, TimePoint now = Clock::now());
+  bool RefuseJoin(uint32_t pending_id, TimePoint now = Clock::now());
+  bool GateOn() const { return gate_ != nullptr; }
+  const HelloGate* Gate() const { return gate_.get(); }
   // Version 2. The game thread's result for a kEvaluateRequest of `key` (on the pump thread, from
   // its queue): the decision and what follows go out now. false if it is dropped (the key is no
   // longer evaluating: its generation ended, End session began, its peer left).
@@ -299,6 +339,18 @@ class ServerSession {
   };
 
   void HandleDatagram(const netplay::Endpoint& from, std::span<const uint8_t> bytes, TimePoint now);
+  // Stage 8: the gate's verdict on a first datagram from `from` (`size` bytes); true: admitted, a
+  // connection may be made. Every other verdict is answered statelessly here.
+  bool AdmitThroughGate(const netplay::Endpoint& from, size_t size, std::span<const uint8_t> payload,
+                        TimePoint now);
+  // HandleHello's checks that need no state (version, digest, owner token, synthetic): true when
+  // they pass, else the refusal's reason and text.
+  bool CompatibleHello(const Hello& hello, const netplay::Endpoint& from, RefuseReason* reason,
+                       std::string* text) const;
+  // One message to `to` outside any connection (kFlagStateless), at most `limit` bytes on the wire.
+  void SendStateless(const netplay::Endpoint& to, const Message& message, size_t limit);
+  void SendStatelessRefuse(const netplay::Endpoint& to, const Hello& hello, RefuseReason reason,
+                           std::string text, size_t limit);
   void HandleMessage(Peer& peer, const Message& message, netplay::Lane lane, TimePoint now);
   void HandleHello(Peer& peer, const Hello& hello, TimePoint now);
   void SendRefuse(Peer& peer, RefuseReason reason, std::string text, TimePoint now, bool close);
@@ -321,6 +373,8 @@ class ServerSession {
   bool server_loaded_ = false;
   std::set<uint16_t> waiting_;
   RequestTable requests_;
+  std::unique_ptr<HelloGate> gate_;  // settings_.gate (stage 8)
+  bool code_spent_reported_ = false;
   std::string error_;
 };
 
@@ -348,7 +402,7 @@ struct ClientEvent {
     kPlayerList,      // players
     kLevelLoad,       // generation, zone: load it, then SendLevelLoaded(generation)
     kBarrierGo,       // generation, tick: everyone has the level; it started at that server tick
-    kDisconnected,    // disconnect_reason
+    kDisconnected,    // disconnect_reason (kBye: bye_reason, why the server said it)
     // Version 2 (stage 1B).
     kWorldDecision,   // decision: S's answer to one of this client's requests
     kAppliedStep,     // applied: the steps S applied for a request (any requester's)
@@ -363,6 +417,9 @@ struct ClientEvent {
     kPlayerPoseShown,    // pose_shown: another player's pose
     // Stage 5.
     kEnemyPoses,         // enemy_poses: S's enemy poses for this client (fast lane, 10 Hz)
+    // Stage 8 item 4: S's gate holds this join for the owner's let in (its first JoinWait;
+    // pending_id). The client keeps connecting: a Welcome or a Refuse follows.
+    kJoinWaiting,
   };
   Type type = Type::kConnected;
   uint16_t peer_id = 0;
@@ -373,6 +430,9 @@ struct ClientEvent {
   std::string text;
   std::vector<PlayerEntry> players;
   DisconnectReason disconnect_reason = DisconnectReason::kTimeout;
+  // kDisconnected with kBye (stage 8): the server's reason (kRemoved, kEnded, kReplaced; kLeave
+  // from a server before the reason byte).
+  ByeReason bye_reason = ByeReason::kLeave;
   WorldDecision decision;
   AppliedStep applied;
   LevelEnd level_end;
@@ -386,6 +446,7 @@ struct ClientEvent {
   PlayerActionShown action_shown;                 // kPlayerActionShown (stage 4)
   PlayerPoseShown pose_shown;                     // kPlayerPoseShown (stage 4)
   EnemyPoses enemy_poses;                         // kEnemyPoses (stage 5)
+  uint32_t pending_id = 0;                        // kJoinWaiting (stage 8)
 };
 
 // The client side: one server, a ping every kPingInterval for the tick estimate and liveness.
@@ -399,6 +460,10 @@ class ClientSession {
   // Opens a UDP socket (on 127.0.0.1 for a loopback server, else on every address, any free
   // port) and sends `hello` (its name cut to kMaxNameBytes) to server_address:port. false if the
   // address is not IPv4, the socket cannot be opened or the Hello cannot be encoded (Error()).
+  // Stage 8: a Hello without a nonce gets one from the OS random source; a server's HelloCookie
+  // makes the client send the Hello again with it (on a fresh connection, at most
+  // kMaxCookieRounds times), and its JoinWait (kJoinWaiting) keeps the join alive while the owner
+  // decides.
   bool Connect(std::string_view server_address, uint16_t port, const Hello& hello,
                TimePoint now = Clock::now());
   // The same over a transport the caller made (the fake network in tests, or a socket bound
@@ -451,6 +516,8 @@ class ClientSession {
 
   ClientState State() const { return state_; }
   bool Connected() const { return state_ == ClientState::kConnected; }
+  // Stage 8: S's gate holds this join for the owner's let in (a JoinWait came, no Welcome yet).
+  bool JoinWaiting() const { return state_ == ClientState::kConnecting && join_waiting_; }
   uint16_t PeerId() const { return peer_id_; }
   bool IsOwner() const { return Connected() && peer_id_ == kOwnerPeerId; }
   uint32_t SessionId() const { return session_id_; }
@@ -468,7 +535,11 @@ class ClientSession {
 
  private:
   void HandleMessage(const Message& message, netplay::Lane lane, TimePoint now);
-  void Finish(DisconnectReason reason);
+  // Stage 8: a kFlagStateless datagram from the server (its gate's answer) while connecting.
+  void HandleStateless(std::span<const uint8_t> payload, TimePoint now);
+  // The Hello (hello_, with its cookie) on a fresh connection, at sequence 1.
+  void SendHello(TimePoint now);
+  void Finish(DisconnectReason reason, ByeReason bye = ByeReason::kLeave);
   bool Post(netplay::Lane lane, const Message& message, TimePoint now);
 
   std::unique_ptr<netplay::Transport> transport_;
@@ -487,6 +558,9 @@ class ClientSession {
   TimePoint next_ping_{};
   TimePoint closing_since_{};
   std::deque<ClientEvent> events_;
+  Hello hello_;               // as sent (stage 8: resent with the gate's cookie)
+  int cookie_rounds_ = 0;
+  bool join_waiting_ = false;
   std::string error_;
 };
 

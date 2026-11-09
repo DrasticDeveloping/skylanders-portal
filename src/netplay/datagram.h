@@ -39,6 +39,11 @@ constexpr size_t kLaneCount = 3;
 
 // The datagram carries only acks; its sequence is 0 and its payload empty.
 constexpr uint16_t kFlagAckOnly = 0x0001;
+// Stage 8 item 4 (the Hello gate, design 3.4): a server's answer sent outside any connection (a
+// cookie, a wait, a refusal before anything is held for the sender). Sequence 1, no acks; the
+// client takes its messages directly while it connects and never feeds it to its connection. A
+// server drops a client datagram that carries it.
+constexpr uint16_t kFlagStateless = 0x0002;
 
 struct DatagramHeader {
   Lane lane = Lane::kGameplay;

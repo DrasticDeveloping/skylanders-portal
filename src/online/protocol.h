@@ -108,6 +108,9 @@ enum class MessageType : uint16_t {
   // Stage 1C's block (50-54, the 24-hour push's number blocks): types outside the contiguous run
   // 1..kLastType (protocol.cpp). TypeOf and the decoder map them explicitly.
   kOwnerFlags = 50,
+  // Stage 8's block (55-59): the Hello gate's stateless answers (design 3.4, D10).
+  kHelloCookie = 55,
+  kJoinWait = 56,
 };
 
 enum class RefuseReason : uint8_t {
@@ -116,8 +119,23 @@ enum class RefuseReason : uint8_t {
   kFull = 3,      // every place is taken
   kNotOwner = 4,  // a wrong owner token, or a request only the owner may make
   kOther = 5,     // also what an unknown reason reads as
+  // Stage 8 item 4 (the Hello gate, design 3.4): refusals in plain words for a joiner.
+  kWrongCode = 6,  // the join code's secret does not match
+  kBusy = 7,       // every pending place is taken: try again
+  kNotLetIn = 8,   // the owner refused it, or did not let it in within the time ("timed out")
+  kCodeSpent = 9,  // too many wrong codes: no new joiner until the owner makes a new code
 };
 const char* RefuseReasonName(RefuseReason reason);
+
+// Why a Bye was sent (stage 8: a joiner is told why its session ended). A trailing byte: a Bye
+// without it (any Bye from before it) reads as kLeave, and so does a value this build does not know.
+enum class ByeReason : uint8_t {
+  kLeave = 0,     // the sender leaves (a client's own leave)
+  kRemoved = 1,   // the server removed this client (RemoveClient: the owner's kick, a backend overflow)
+  kEnded = 2,     // the session ended: End session's drain is done for this client, or the server stopped
+  kReplaced = 3,  // the owner connected again from another address
+};
+const char* ByeReasonName(ByeReason reason);
 
 // Client to server, first: who is joining.
 struct Hello {
@@ -128,6 +146,13 @@ struct Hello {
   std::string name;        // UTF-8, at most kMaxNameBytes
   OwnerToken owner_token{};
   uint8_t flags = 0;       // kHello* bits (stage 4); trailing on the wire
+  // Stage 8 item 4 (design 3.4, D10), trailing after flags, all three or none (a Hello without
+  // them reads as 0): the joiner's nonce (fresh per Connect, from the OS random source), the join
+  // code's secret (0: none; the owner presents its token instead) and the cookie from S's
+  // HelloCookie (0: none yet). S checks them only with its Hello gate on (ServerSettings::gate).
+  uint64_t client_nonce = 0;
+  uint32_t join_secret = 0;
+  uint64_t cookie = 0;
   bool operator==(const Hello&) const = default;
 };
 
@@ -156,8 +181,9 @@ struct Refuse {
   bool operator==(const Refuse&) const = default;
 };
 
-// Either side: leaving.
+// Either side: leaving. The server says why (stage 8); a client's own Bye is kLeave.
 struct Bye {
+  ByeReason reason = ByeReason::kLeave;
   bool operator==(const Bye&) const = default;
 };
 
@@ -677,14 +703,32 @@ struct EnemyPoses {
   bool operator==(const EnemyPoses&) const = default;
 };
 
+// Stage 8 item 4 (design 3.4, the cookie): S's stateless answer to a Hello without a valid
+// cookie, sent before S holds anything for the sender (a datagram outside any connection,
+// netplay kFlagStateless). The joiner sends its Hello again with this cookie and the same nonce.
+// Wire: cookie u64, never 0.
+struct HelloCookie {
+  uint64_t cookie = 0;
+  bool operator==(const HelloCookie&) const = default;
+};
+
+// Stage 8 item 4 (let in): S's stateless answer to a cookie-valid Hello with the right secret that
+// waits for the owner's let in (a pending entry, never a player slot). The joiner keeps sending
+// its Hello until a Welcome or a Refuse comes. Wire: pending id u32.
+struct JoinWait {
+  uint32_t pending_id = 0;
+  bool operator==(const JoinWait&) const = default;
+};
+
 // The variant's order is the type numbering for the contiguous run (Hello = 1 ... AttackPress =
-// 26); the block types after it (OwnerFlags = 50, EnemyPoses = 30) are mapped by TypeOf.
+// 26); the block types after it (OwnerFlags = 50, EnemyPoses = 30, HelloCookie = 55, JoinWait =
+// 56) are mapped by TypeOf.
 using Message = std::variant<Hello, Welcome, Refuse, Bye, Ping, Pong, LevelRequest, LevelLoad,
                              LevelLoaded, BarrierGo, PlayerList, PlayerPose, PlayerAction,
                              WorldRequest, WorldDecision, AppliedStep, LevelEnd, Reaction,
                              SessionClosing, SessionClosed, SceneBarrier, BackendFrame,
                              PlayerActionShown, PlayerPoseShown, OccurrenceAccept, AttackPress,
-                             OwnerFlags, EnemyPoses>;
+                             OwnerFlags, EnemyPoses, HelloCookie, JoinWait>;
 MessageType TypeOf(const Message& message);
 
 // Appends one message to `out`. false (nothing appended) if a string is over its limit or not

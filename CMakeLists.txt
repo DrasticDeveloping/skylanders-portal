@@ -39,11 +39,36 @@ if(SKYLANDERS_ALCHEMY_STB)
     target_compile_features(skylanders_alchemy PUBLIC cxx_std_23)
 endif()
 
+# miniupnpc (thirdparty/miniupnp, BSD 3-Clause, pinned to its release tag miniupnpc_2_3_3): the UPnP
+# IGD client behind src/netplay/igd_system.cpp, the router mapping of online hosting (stage 8 item 4).
+# Only its static library, built only as skylanders_online's dependency: no tests, samples, shared
+# library or install rules. A game takes its code into the exe only if it calls MakeSystemIgdClient(),
+# and that game ships licenses/miniupnpc-LICENSE.txt. OFF: MakeSystemIgdClient() returns nullptr.
+option(SKYLANDERS_PORTAL_MINIUPNPC "Build miniupnpc for the router mapping of online hosting" ON)
+if(SKYLANDERS_PORTAL_MINIUPNPC)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/miniupnp/miniupnpc/CMakeLists.txt")
+        message(FATAL_ERROR "skylanders-portal: thirdparty/miniupnp missing; run git submodule update --init --recursive (or configure with -DSKYLANDERS_PORTAL_MINIUPNPC=OFF)")
+    endif()
+    # Normal variables, not cache entries: miniupnpc's option()s keep them (CMP0077; it asks for 3.14).
+    set(UPNPC_BUILD_STATIC ON)
+    set(UPNPC_BUILD_SHARED OFF)
+    set(UPNPC_BUILD_TESTS OFF)
+    set(UPNPC_BUILD_SAMPLE OFF)
+    set(UPNPC_NO_INSTALL ON)
+    add_subdirectory(thirdparty/miniupnp/miniupnpc EXCLUDE_FROM_ALL)
+    if(WIN32)
+        # miniupnpc sets these for MSVC only; clang gets them too (they silence deprecation warnings).
+        target_compile_definitions(libminiupnpc-static PRIVATE _CRT_SECURE_NO_WARNINGS
+                                   _WINSOCK_DEPRECATED_NO_WARNINGS)
+    endif()
+endif()
+
 # skylanders_online: Swap Force Online's session (UDP sockets and lanes, the session messages, join
 # codes, the shared tick, the level barrier, the request state machine). Game-independent and without the SDK, so every build
 # mode has it (it stays above the figures-only return below).
 add_library(skylanders_online STATIC
     src/netplay/datagram.cpp
+    src/netplay/igd_system.cpp
     src/netplay/lanes.cpp
     src/netplay/port_mapping.cpp
     src/netplay/udp_socket.cpp
@@ -61,7 +86,14 @@ add_library(skylanders_online STATIC
 target_include_directories(skylanders_online PUBLIC src)
 target_compile_features(skylanders_online PUBLIC cxx_std_23)
 if(WIN32)
-    target_link_libraries(skylanders_online PUBLIC ws2_32)
+    target_link_libraries(skylanders_online PUBLIC ws2_32 bcrypt)  # bcrypt: FillOsRandom (stage 8)
+endif()
+if(SKYLANDERS_PORTAL_MINIUPNPC)
+    # Private: only igd_system.cpp includes miniupnpc. A program that links skylanders_online gets the
+    # library (and its ws2_32, iphlpapi) on its link line; the linker takes its objects only for
+    # MakeSystemIgdClient().
+    target_link_libraries(skylanders_online PRIVATE libminiupnpc-static)
+    target_compile_definitions(skylanders_online PRIVATE SKYLANDERS_PORTAL_MINIUPNPC)
 endif()
 
 # skylanders_nav: a path planner over a navigation mesh of convex areas (islands, point lookup, A*
@@ -161,6 +193,14 @@ if(SKYLANDERS_PORTAL_TESTS)
         target_link_libraries(skylanders_${t} PRIVATE skylanders_nav)
         add_test(NAME skylanders_${t} COMMAND skylanders_${t})
     endforeach()
+    # The system IGD client's pure half and its bounded worker (skylanders_online): no router, no
+    # network, with or without miniupnpc.
+    foreach(t netplay_igd_system_test)
+        add_executable(skylanders_${t} tests/${t}.cpp)
+        target_include_directories(skylanders_${t} PRIVATE tests)
+        target_link_libraries(skylanders_${t} PRIVATE skylanders_online)
+        add_test(NAME skylanders_${t} COMMAND skylanders_${t})
+    endforeach()
 endif()
 
 # skylanders_portal_rex: ReXGlue glue (settings, XAM handler, F6 overlay, USB portal, audio).
@@ -189,6 +229,7 @@ if(TARGET rex::runtime)
         src/portal_rex/title_music.cpp
         src/portal_rex/png_file.cpp
         src/portal_rex/problem_note.cpp
+        src/portal_rex/text_entry.cpp
         src/portal/usb/usb_portal.cpp
         src/portal/usb/xbox360_portal.cpp
         src/portal_rex/sdl_audio_sink.cpp

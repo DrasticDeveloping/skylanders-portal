@@ -67,6 +67,10 @@ struct Setting {
   // With an action: it runs with the menu left open, and what it changes is saved with Y like the
   // other rows (F4 > Tastatur's "put every key back").
   bool keep_open = false;
+  // With an action: whether it can run now, asked each frame the row is shown (UI thread; keep it
+  // cheap). false: the row is greyed and A does nothing (F4 > Online > Join while a session runs).
+  // Empty: always.
+  std::function<bool()> available;
 };
 
 struct SettingsPage {

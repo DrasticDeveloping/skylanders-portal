@@ -132,15 +132,24 @@ SourceTable::Source& SourceTable::Touch(uint32_t address, netplay::TimePoint now
     return it->second.source;
   }
   if (entries_.size() >= kMaxSources) {
-    // The least recently seen source that is not blocked; if every one is blocked, the least
-    // recently seen of all.
-    auto victim = std::prev(lru_.end());
+    // The least recently seen source that is neither blocked nor holding wrong-secret strikes; else
+    // the least recently seen one that is not blocked; if every one is blocked, the least recently
+    // seen of all. Rows with strikes go last but one (council 8, Opus B4): spoofed Hellos from new
+    // addresses (rows that never have a strike: a strike needs a valid cookie) cannot push out the
+    // row of a sender with strikes, so its count is never reset that way.
+    auto victim = lru_.end();
+    auto unblocked = lru_.end();
     for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {
-      if (entries_.at(*it).source.blocked_until <= now) {
+      const Source& s = entries_.at(*it).source;
+      if (s.blocked_until > now) continue;
+      if (s.wrong_secrets == 0) {
         victim = std::prev(it.base());
         break;
       }
+      if (unblocked == lru_.end()) unblocked = std::prev(it.base());
     }
+    if (victim == lru_.end()) victim = unblocked;
+    if (victim == lru_.end()) victim = std::prev(lru_.end());
     entries_.erase(*victim);
     lru_.erase(victim);
   }
@@ -165,6 +174,10 @@ LetInTable::Add LetInTable::Offer(const PendingJoin& join, netplay::TimePoint no
     }
   }
   if (pending_.size() >= kMaxPendingJoins) return Add::kBusy;
+  const auto from_address = std::count_if(pending_.begin(), pending_.end(), [&](const PendingJoin& p) {
+    return p.from.address == join.from.address;
+  });
+  if (size_t(from_address) >= kMaxPendingPerAddress) return Add::kBusy;
   PendingJoin entry = join;
   entry.id = next_id_++;
   if (next_id_ == 0) next_id_ = 1;
@@ -204,6 +217,8 @@ const char* HelloVerdictName(HelloVerdict verdict) {
     case HelloVerdict::kBusy: return "the host is busy, try again";
     case HelloVerdict::kAdmit: return "admitted";
     case HelloVerdict::kFull: return "full";
+    case HelloVerdict::kIncompatible: return "incompatible";
+    case HelloVerdict::kNotLetIn: return "not let in";
   }
   return "dropped";
 }
@@ -224,30 +239,54 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
   if (hello.datagram_bytes < kMinHelloBytes || hello.datagram_bytes > kMaxHelloBytes) return d;
   // 3. Limits: a blocked source first (no token spent on it), then the source's bucket, then the
   // global one: a source over its own limit spends no global token, so one address flooding
-  // cannot use up the whole server's 16 a second and keep every other joiner out.
+  // cannot use up the whole server's 16 a second and keep every other joiner out. A loopback
+  // source (this PC: the owner's own game) keeps its source bucket but skips the global one
+  // (council 8, Opus B3): a datagram from the network cannot carry a 127/8 source, so a flood of
+  // spoofed Hellos from random addresses, each with a fresh source row and burst, drains the
+  // global bucket for everyone else but can never starve the owner's game on Local network or
+  // Internet.
   if (const SourceTable::Source* s = sources_.Find(hello.from.address); s && now < s->blocked_until) {
     return d;
   }
   SourceTable::Source& source = sources_.Touch(hello.from.address, now);
   if (!source.bucket.Take(now)) return d;
-  if (!global_.Take(now)) return d;
+  if (!netplay::IsLoopback(hello.from.address) && !global_.Take(now)) return d;
   // 4. The cookie.
   if (!cookies_.Verify(hello.cookie, hello.from, hello.client_nonce, now)) {
     d.verdict = HelloVerdict::kCookieReply;
     d.cookie = cookies_.Make(hello.from, hello.client_nonce, now);
     return d;
   }
-  // The owner (its token checked by the caller) skips the secret and let in.
-  if (hello.owner) {
-    d.verdict = players < settings_.max_players ? HelloVerdict::kAdmit : HelloVerdict::kFull;
+  // 4a. The caller's own checks (version, digest, a wrong owner token): only now, so a refusal goes
+  // only to a sender that proved its address, within the limits.
+  if (!hello.compatible) {
+    d.verdict = HelloVerdict::kIncompatible;
     return d;
   }
-  // 5. The secret; only cookie-valid attempts count, so a spoofer cannot spend them.
-  if (CodeSpent()) {
+  // The owner (its token checked by the caller) skips the secret and let in. Its Hello that replaces
+  // the owner's own connection (the session drops the old one when it welcomes this one) takes no
+  // new place, so a full session still lets the owner's game back in at once (Sol 8B F2).
+  if (hello.owner) {
+    const int taken = players - (hello.replaces_owner && players > 0 ? 1 : 0);
+    d.verdict = taken < settings_.max_players ? HelloVerdict::kAdmit : HelloVerdict::kFull;
+    return d;
+  }
+  // Decisions kept past kDecidedLifetime go before the secret is weighed.
+  std::erase_if(decided_, [now](const DecidedJoin& j) { return now >= j.until; });
+  // 5. The secret; only cookie-valid attempts count, so a spoofer cannot spend them. A join already
+  // under way (Sol 8B F1) keeps the secret it was verified with: a tuple with a pending entry or a
+  // kept decision whose Hello carries that secret skips the current secret and its budget, so the
+  // owner's New code or a spent budget does not strand a joiner already waiting or already
+  // answered (Host: joiners waiting stay and can still be let in). Only such a tuple gets past:
+  // cookie-proven, at most kMaxPendingJoins + kMaxDecided of them, each bounded in time; a Hello
+  // with an old code from any other tuple (another nonce or address) is a wrong code.
+  const bool under_way =
+      hello.secret != 0 && VerifiedBefore(hello.from, hello.client_nonce, hello.secret);
+  if (!under_way && CodeSpent()) {
     d.verdict = HelloVerdict::kCodeSpent;
     return d;
   }
-  if (hello.secret != settings_.secret || settings_.secret == 0) {
+  if (!under_way && (hello.secret != settings_.secret || settings_.secret == 0)) {
     ++wrong_secrets_;
     if (++source.wrong_secrets >= kWrongSecretsPerSource) {
       source.blocked_until = now + kWrongSecretBlock;
@@ -255,6 +294,25 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
     }
     d.verdict = CodeSpent() ? HelloVerdict::kCodeSpent : HelloVerdict::kWrongCode;
     return d;
+  }
+  // The owner's answer to this tuple's pending entry, or its expiry (kept kDecidedLifetime).
+  for (auto it = decided_.begin(); it != decided_.end(); ++it) {
+    if (it->from != hello.from || it->client_nonce != hello.client_nonce) continue;
+    switch (it->decided) {
+      case Decided::kAdmitted:
+        d.verdict = players < settings_.max_players ? HelloVerdict::kAdmit : HelloVerdict::kFull;
+        decided_.erase(it);  // used: a later Hello of this tuple goes to its connection
+        return d;
+      case Decided::kFull:
+        d.verdict = HelloVerdict::kFull;
+        return d;
+      case Decided::kTimedOut:
+        d.timed_out = true;
+        [[fallthrough]];
+      case Decided::kRefused:
+        d.verdict = HelloVerdict::kNotLetIn;
+        return d;
+    }
   }
   // 6. Let in, and 7. players.
   if (settings_.let_anyone_in) {
@@ -271,8 +329,12 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
   join.name = hello.name;
   join.figure_id = hello.figure_id;
   join.figure_variant = hello.figure_variant;
+  join.secret = hello.secret;  // a retransmit keeps the entry's own (Offer leaves it alone)
   switch (pending_.Offer(join, now, &d.pending_id)) {
     case LetInTable::Add::kAdded:
+      d.new_pending = true;
+      d.verdict = HelloVerdict::kWait;
+      break;
     case LetInTable::Add::kRetransmit:
       d.verdict = HelloVerdict::kWait;
       break;
@@ -283,12 +345,49 @@ HelloDecision HelloGate::Check(const HelloFacts& hello, int players, netplay::Ti
   return d;
 }
 
-HelloVerdict HelloGate::LetIn(uint32_t id, int players, PendingJoin* out) {
+HelloVerdict HelloGate::LetIn(uint32_t id, int players, netplay::TimePoint now, PendingJoin* out) {
   std::optional<PendingJoin> join = pending_.Take(id);
   if (!join) return HelloVerdict::kDrop;
-  if (players >= settings_.max_players) return HelloVerdict::kFull;
   if (out) *out = *join;
+  if (players >= settings_.max_players) {
+    Decide(*join, Decided::kFull, now);
+    return HelloVerdict::kFull;
+  }
+  Decide(*join, Decided::kAdmitted, now);
   return HelloVerdict::kAdmit;
+}
+
+bool HelloGate::Refuse(uint32_t id, netplay::TimePoint now) {
+  std::optional<PendingJoin> join = pending_.Take(id);
+  if (!join) return false;
+  Decide(*join, Decided::kRefused, now);
+  return true;
+}
+
+std::vector<PendingJoin> HelloGate::ExpirePending(netplay::TimePoint now) {
+  std::vector<PendingJoin> expired = pending_.Expire(now);
+  for (const PendingJoin& j : expired) Decide(j, Decided::kTimedOut, now);
+  return expired;
+}
+
+void HelloGate::Decide(const PendingJoin& join, Decided decided, netplay::TimePoint now) {
+  std::erase_if(decided_, [&](const DecidedJoin& j) {
+    return now >= j.until || (j.from == join.from && j.client_nonce == join.client_nonce);
+  });
+  if (decided_.size() >= kMaxDecided) decided_.erase(decided_.begin());  // the oldest goes
+  decided_.push_back(
+      DecidedJoin{join.from, join.client_nonce, decided, join.secret, now + kDecidedLifetime});
+}
+
+bool HelloGate::VerifiedBefore(const netplay::Endpoint& from, uint64_t client_nonce,
+                               uint32_t secret) const {
+  for (const PendingJoin& p : pending_.Pending()) {
+    if (p.from == from && p.client_nonce == client_nonce && p.secret == secret) return true;
+  }
+  for (const DecidedJoin& j : decided_) {
+    if (j.from == from && j.client_nonce == client_nonce && j.secret == secret) return true;
+  }
+  return false;
 }
 
 }  // namespace skylanders::online

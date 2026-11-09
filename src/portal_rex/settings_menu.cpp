@@ -37,6 +37,7 @@
 #include "portal_rex/menu_draw.h"
 #include "portal_rex/portal_menu_input.h"
 #include "portal_rex/problem_note.h"
+#include "portal_rex/text_entry.h"
 #include "portal_rex/settings_file.h"
 
 // The game's volume, 0-100 % (SwapForceRecomp #68: only Windows' mixer could turn a game down): the
@@ -896,7 +897,7 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
     if (a.down) row_ = (row_ + 1) % rows;
     const Setting& s = page->settings[std::min(row_, rows - 1)];
     if (s.action) {
-      if (a.accept) RunAction(s);
+      if (a.accept && Enabled(s)) RunAction(s);  // greyed: it can't run now (Setting::available)
       return;
     }
     if (!Enabled(s)) return;  // greyed: its enabled_by setting is off
@@ -936,7 +937,9 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
     if (a.back) listen_cvar_.clear();
   }
 
-  static bool Enabled(const Setting& s) { return s.enabled_by.empty() || CvarOn(s.enabled_by.c_str()); }
+  static bool Enabled(const Setting& s) {
+    return (s.enabled_by.empty() || CvarOn(s.enabled_by.c_str())) && (!s.available || s.available());
+  }
 
   // The setting of any page with that cvar (for "only with ... on"), or null.
   static const Setting* FindSetting(const std::string& cvar) {
@@ -1113,8 +1116,8 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
       if (s.action) {
         const char* go = Tr("Open", "\xC3\x96" "ffnen");
         const ImVec2 ts = TextSize(BoldFont(), S(21), go);
-        Label(dl, BoldFont(), S(21), {r1.x - S(24) - ts.x, r0.y + S(19)}, kGold, go);
-        if (!confirm_ && !ask_ && ImGui::IsMouseHoveringRect(r0, r1) && ImGui::IsMouseClicked(0)) {
+        Label(dl, BoldFont(), S(21), {r1.x - S(24) - ts.x, r0.y + S(19)}, enabled ? kGold : greyed, go);
+        if (enabled && !confirm_ && !ask_ && ImGui::IsMouseHoveringRect(r0, r1) && ImGui::IsMouseClicked(0)) {
           RunAction(s);
           return;
         }
@@ -1187,7 +1190,7 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
         "Einstellungsdatei).";
     const bool keyboard_help = keyboard_view_ && IsOverview(*s);
     std::string help = keyboard_help ? Tr(kKeyboardHelpEn, kKeyboardHelpDe) : Tr(s->help_en, s->help_de);
-    if (const Setting* needs = Enabled(*s) ? nullptr : FindSetting(s->enabled_by)) {
+    if (const Setting* needs = Enabled(*s) || s->enabled_by.empty() ? nullptr : FindSetting(s->enabled_by)) {
       help = (g_german ? "Nur mit \xE2\x80\x9E" + needs->de + "\xE2\x80\x9C an. " : "Only with \"" + needs->en + "\" on. ") + help;
     }
     if (!help.empty()) {
@@ -1389,7 +1392,7 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
     }
     const Setting* s = Selected();
     if (s && s->action) {
-      x += Hint(dl, {x, y}, "A", kAcceptGreen, Tr("Open", "\xC3\x96" "ffnen"), true, "Enter");
+      if (Enabled(*s)) x += Hint(dl, {x, y}, "A", kAcceptGreen, Tr("Open", "\xC3\x96" "ffnen"), true, "Enter");
     } else if (!s || !IsOverview(*s)) {
       x += Hint(dl, {x, y}, "< / >", kHintGrey, Tr("Change", "\xC3\x84ndern"), false);
     }
@@ -1496,6 +1499,7 @@ void RegisterSettingsMenu(rex::ui::ImGuiDrawer* drawer, rex::ui::WindowedAppCont
   g_drawer = drawer;
   g_app_context = app_context;
   RegisterProblemNote(drawer, app_context);
+  RegisterTextEntry(drawer, app_context);
   g_state.pages = std::move(pages);
   g_state.config_path = std::move(config_path);
   // The volume and the frame rate display as saved (the launcher writes them too).
@@ -1561,6 +1565,7 @@ void SetControllerPicture(ControllerPicture picture) { g_picture = std::move(pic
 void ShutdownSettingsMenu() {
   g_menu.reset();
   ShutdownProblemNote();
+  ShutdownTextEntry();
 }
 
 namespace {

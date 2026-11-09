@@ -19,29 +19,49 @@ namespace skylanders::online {
 // Hello): the checks a server runs on every Hello before it holds anything for the sender, in the
 // design's order, cheapest first. Pure: no sockets, no threads, the clock passed in, the random
 // bytes passed in (the caller draws them from the OS random source), so the unit test drives it
-// on fake time. The session wiring (a stateless cookie reply before any connection is made, the
-// Hello's secret, nonce and cookie fields, the let-in messages) is not here yet.
+// on fake time. The session (session.cpp, ServerSettings::gate) runs it on every Hello from an
+// unknown address and answers its verdicts statelessly (HelloCookie, JoinWait, Refuse) until it
+// admits one; only then does a connection exist for the sender.
 //
-//   1. size: a Hello datagram under kMinHelloBytes (the joiner pads to it) or over the protocol's
-//      maximum is dropped, so a cookie reply is never larger than what came in;
+//   1. size: a Hello datagram under kMinHelloBytes or over the protocol's maximum is dropped, so a
+//      cookie reply is never larger than what came in. Nothing pads a Hello: the floor holds
+//      because its fixed fields (with stage 8's nonce, secret and cookie) make even the smallest
+//      one, with an empty name, longer than that on the wire (106 bytes; the unit test checks it);
 //   2. a known session goes to its peer (the caller's, before this gate);
 //   3. limits: a global token bucket (16 Hellos per second) and a per-source bucket (2 per second,
 //      burst 4) in a table of at most 256 sources, least recently seen evicted first; over either,
-//      or from a source blocked for wrong secrets, dropped without a reply;
+//      or from a source blocked for wrong secrets, dropped without a reply. A loopback source (the
+//      owner's own game; the network cannot spoof 127/8) has only its source bucket;
 //   4. the cookie: without a valid one, a stateless reply carrying one (nothing stored);
+//   4a. the caller's own stateless checks (HelloFacts::compatible: protocol version, build digest,
+//      a wrong owner token, a synthetic peer it does not take): refused with the caller's reason;
 //   5. the secret: a cookie-valid Hello with the wrong secret is refused "wrong code"; after 4 a
 //      source gets no replies for 60 s; 4096 wrong secrets spend the secret's budget and no new
-//      joiner is admitted until the owner makes a new code (a new secret);
-//   6. let in: a joiner waits as a pending entry (at most 4, each expiring 60 s after it was shown,
-//      never a player slot) unless "let anyone with the code in" is on; the owner (a valid owner
-//      token, checked by the caller) skips the secret and let in;
-//   7. players: at most the session's maximum; one more is refused "full".
+//      joiner is admitted until the owner makes a new code (a new secret). A join already under
+//      way keeps the secret it was verified with (Sol 8B F1): a tuple with a pending entry or a
+//      kept decision whose Hello carries that secret skips this step, so a new code or a spent
+//      budget does not strand a joiner already waiting; any other Hello with an old code is a
+//      wrong code;
+//   6. let in: a joiner waits as a pending entry (at most 4, at most 2 of them from one address,
+//      each expiring 60 s after it was shown, never a player slot) unless "let anyone with the code
+//      in" is on; the owner (a valid owner token, checked by the caller) skips the secret and let in;
+//   7. players: at most the session's maximum; one more is refused "full". The owner's Hello that
+//      replaces the owner's own connection (HelloFacts::replaces_owner) takes no new place.
+//
+// The owner's answer to a pending entry (let in, refuse) and its expiry are kept as a decision for
+// that entry's (address, port, nonce) for kDecidedLifetime (at most kMaxDecided of them): the
+// joiner's next cookie-valid Hello with the secret its entry was verified with (or the current one)
+// gets it (admitted, "not let in", "not let in: timed out", "full"), since the joiner holds no
+// connection and learns it only from its next Hello.
 
 using CookieKey = std::array<uint8_t, 16>;
 
 // SipHash-2-4 with a 64-bit output (Aumasson and Bernstein's reference definition).
 uint64_t SipHash24(const CookieKey& key, std::span<const uint8_t> data);
 
+// The smallest Hello datagram the gate looks at. No joiner pads to it: a Hello of this build is
+// longer by its fixed fields alone (tests/online_hello_guard_test.cpp encodes the smallest one), and
+// a shorter one (an older build without the stage 8 fields) is dropped without a reply.
 constexpr size_t kMinHelloBytes = 96;
 constexpr size_t kMaxHelloBytes = 1200;  // netplay kMaxDatagramSize
 constexpr auto kCookieBucket = std::chrono::seconds(5);
@@ -54,7 +74,12 @@ constexpr int kWrongSecretsPerSource = 4;
 constexpr auto kWrongSecretBlock = std::chrono::seconds(60);
 constexpr uint32_t kWrongSecretBudget = 4096;
 constexpr size_t kMaxPendingJoins = 4;
+// Of them, at most this many from one source address (council 8, Opus B5): one holder of the code
+// cannot take every pending place with several nonces, and two players behind one NAT still wait.
+constexpr size_t kMaxPendingPerAddress = 2;
 constexpr auto kPendingJoinExpiry = std::chrono::seconds(60);
+constexpr size_t kMaxDecided = 16;
+constexpr auto kDecidedLifetime = std::chrono::seconds(30);
 
 // The cookie: SipHash-2-4 under a 128-bit per-session key over (time bucket, source address,
 // source port, the Hello's 64-bit client nonce). The bucket is S's own monotonic clock in 5 s steps
@@ -100,8 +125,11 @@ class TokenBucket {
 };
 
 // Per-source state in a fixed-size table (kMaxSources), keyed by the source address (a port is
-// free for a sender to change). A new source evicts the least recently seen one, preferring one
-// that is not blocked, so many addresses cannot grow memory.
+// free for a sender to change). A new source evicts the least recently seen one, so many addresses
+// cannot grow memory, preferring one that is neither blocked nor holding wrong-secret strikes, then
+// one that is not blocked (council 8, Opus B4: a sender cannot clear its own strikes by pushing its
+// row out with spoofed Hellos from new addresses; a strike needs a valid cookie, so a spoofed row
+// never has one).
 class SourceTable {
  public:
   struct Source {
@@ -131,6 +159,7 @@ struct PendingJoin {
   std::string name;
   uint16_t figure_id = 0;
   uint16_t figure_variant = 0;
+  uint32_t secret = 0;  // the secret its Hello was verified with (kept across a new code, Sol 8B F1)
   netplay::TimePoint shown{};
 };
 
@@ -138,7 +167,8 @@ class LetInTable {
  public:
   enum class Add { kAdded, kRetransmit, kBusy };
   // A new pending entry for (from, nonce), or the existing one for the same tuple (a retransmit:
-  // no second entry), or kBusy when kMaxPendingJoins are waiting. `id` gets the entry's id.
+  // no second entry), or kBusy when kMaxPendingJoins are waiting, or kMaxPendingPerAddress from
+  // that tuple's address. `id` gets the entry's id.
   Add Offer(const PendingJoin& join, netplay::TimePoint now, uint32_t* id);
   // The owner's decision takes the entry out (nullopt: no such entry, or it expired).
   std::optional<PendingJoin> Take(uint32_t id);
@@ -159,6 +189,13 @@ struct HelloFacts {
   uint64_t cookie = 0;  // 0: none
   uint32_t secret = 0;
   bool owner = false;  // the Hello carries the session's owner token (the caller compared it)
+  // With `owner`: the session already has a welcomed owner whose connection this Hello replaces
+  // (the session drops the old one when it welcomes the new one), so it needs no new place (Sol 8B
+  // F2). Read only for an owner Hello.
+  bool replaces_owner = false;
+  // The caller's own stateless checks passed (version, digest, no wrong owner token, a synthetic
+  // flag it takes); false: kIncompatible once the cookie is valid, refused with the caller's reason.
+  bool compatible = true;
   std::string name;
   uint16_t figure_id = 0;
   uint16_t figure_variant = 0;
@@ -171,8 +208,10 @@ enum class HelloVerdict {
   kCodeSpent,     // the secret's wrong-secret budget is spent: no new joiner until a new code
   kWait,          // a pending entry (new or retransmitted): wait for the owner's let in
   kBusy,          // "the host is busy, try again": every pending place is taken
-  kAdmit,         // welcome it now (the owner, or "let anyone with the code in")
+  kAdmit,         // welcome it now (the owner, "let anyone with the code in", or let in)
   kFull,          // "full"
+  kIncompatible,  // cookie-valid, but the caller's own checks failed (HelloFacts::compatible)
+  kNotLetIn,      // the owner refused it ("not let in"), or it timed out (`timed_out`)
 };
 const char* HelloVerdictName(HelloVerdict verdict);
 
@@ -180,6 +219,8 @@ struct HelloDecision {
   HelloVerdict verdict = HelloVerdict::kDrop;
   uint64_t cookie = 0;       // kCookieReply
   uint32_t pending_id = 0;   // kWait
+  bool new_pending = false;  // kWait: this Hello made the entry (not a retransmit): show it
+  bool timed_out = false;    // kNotLetIn: the entry expired unanswered
 };
 
 struct HelloGateSettings {
@@ -195,11 +236,12 @@ class HelloGate {
   // A Hello from a sender that is not a known session; `players` is how many are in now.
   HelloDecision Check(const HelloFacts& hello, int players, netplay::TimePoint now);
   // The owner let pending entry `id` in: kAdmit (with the entry in `out`), kFull, or kDrop (no
-  // such entry: it expired or was answered).
-  HelloVerdict LetIn(uint32_t id, int players, PendingJoin* out);
-  // The owner refused it: true if it was waiting.
-  bool Refuse(uint32_t id) { return pending_.Take(id).has_value(); }
-  std::vector<PendingJoin> ExpirePending(netplay::TimePoint now) { return pending_.Expire(now); }
+  // such entry: it expired or was answered). kAdmit and kFull are kept as the entry's decision.
+  HelloVerdict LetIn(uint32_t id, int players, netplay::TimePoint now, PendingJoin* out);
+  // The owner refused it: true if it was waiting (kept as its decision: "not let in").
+  bool Refuse(uint32_t id, netplay::TimePoint now);
+  // Entries shown kPendingJoinExpiry ago, taken out and kept as "timed out".
+  std::vector<PendingJoin> ExpirePending(netplay::TimePoint now);
   // A new code (a new secret): the wrong-secret budget starts again.
   void NewSecret(uint32_t secret);
   // Key rotation, with fresh random bytes from the caller.
@@ -210,13 +252,28 @@ class HelloGate {
   uint32_t WrongSecrets() const { return wrong_secrets_; }
   const LetInTable& Pending() const { return pending_; }
   const SourceTable& Sources() const { return sources_; }
+  size_t DecidedCount() const { return decided_.size(); }
 
  private:
+  enum class Decided : uint8_t { kAdmitted, kRefused, kTimedOut, kFull };
+  struct DecidedJoin {
+    netplay::Endpoint from;
+    uint64_t client_nonce = 0;
+    Decided decided = Decided::kRefused;
+    uint32_t secret = 0;  // the pending entry's verified secret
+    netplay::TimePoint until{};
+  };
+  void Decide(const PendingJoin& join, Decided decided, netplay::TimePoint now);
+  // A join already under way: (from, nonce) has a pending entry or a kept decision verified with
+  // `secret` (Sol 8B F1).
+  bool VerifiedBefore(const netplay::Endpoint& from, uint64_t client_nonce, uint32_t secret) const;
+
   HelloGateSettings settings_;
   CookieJar cookies_;
   TokenBucket global_;
   SourceTable sources_;
   LetInTable pending_;
+  std::vector<DecidedJoin> decided_;  // at most kMaxDecided, oldest first
   uint32_t wrong_secrets_ = 0;
 };
 

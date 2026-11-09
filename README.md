@@ -71,3 +71,8 @@ picture never goes into a repository.
 ## License
 
 MIT (see `LICENSE`). Skylanders is a trademark of its owners; this project is unofficial.
+
+[miniupnpc](https://github.com/miniupnp/miniupnp) (`thirdparty/miniupnp`, BSD 3-Clause) is built
+into `skylanders_online` while the CMake option `SKYLANDERS_PORTAL_MINIUPNPC` is on (the default),
+for the router mapping of online hosting. A game that calls `MakeSystemIgdClient()` links it and
+ships its licence, `licenses/miniupnpc-LICENSE.txt`, with the game (in the installer).

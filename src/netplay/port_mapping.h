@@ -16,22 +16,35 @@
 // - An add that fails (718 ConflictInMappingEntry, 729 ConflictWithOtherMechanisms, anything else) is
 //   never followed by a delete, an overwrite or a second add on that external port.
 // - After a successful add the entry is read again and owned only if it carries this session's tuple
-//   and nonce; anything else is a conflict: not owned, never renewed or deleted.
+//   and nonce; anything else is a conflict: not owned, never renewed or deleted. One exception stops
+//   the candidates (council 8, Opus B6): a re-read that shows this session's internal client and
+//   internal port with no description, or a cut-off one (routers that do not return the description
+//   in full), is this session's add as far as anyone can tell, but not proved. It is not owned
+//   (never renewed or deleted, it ends with its lease), no further candidate is added, and Host says
+//   so (kUnconfirmed). So such a router keeps at most one entry of a session, not one per candidate.
 // - Only the owned entry is renewed and deleted, each after a re-read that still shows the owned tuple
 //   and nonce. A crash leaves it to its lease.
 // - NAT-PMP cannot prove a mapping is this session's, so no NAT-PMP mapping request (opcodes 1, 2) is
 //   ever sent: only the 2-byte external-address request (opcode 0) and its 12-byte answer.
+// - A stop (the server's exit, from another thread; SetStop) is read before every IGD call Map and
+//   Renew make: once it is asked, no further read, add or candidate is tried. What a successful add
+//   may have left still goes the way Remove takes an owned entry (re-read, delete only if it still
+//   carries this session's tuple and nonce), whether Map or Renew was under way (Sol 8B F3).
 //
-// The IGD calls go through IgdClient. TODO(stage 8 item 4, OQ-C5): the miniupnpc-backed IgdClient
-// (miniupnpc as a nested submodule of the portal, the council's choice) and Host's three modes; until
-// then nothing in the game creates a PortMapper.
+// The IGD calls go through IgdClient. The system client is MakeSystemIgdClient (igd_system.h:
+// miniupnpc as a nested submodule of the portal, the council's choice, OQ-C5). The game creates a
+// PortMapper only through MappingLease, on S's mapping thread in Host's "Internet" mode (the game's
+// src/online/server/port_mapping_host.cpp).
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
+
+#include "netplay/transport.h"
 
 namespace skylanders::netplay {
 
@@ -99,6 +112,10 @@ class IgdClient {
   virtual int AddAnyPortMapping(const PortMappingEntry& entry, uint16_t* reserved_port) = 0;
   virtual int DeletePortMapping(uint16_t external_port, const std::string& protocol) = 0;
   virtual int GetExternalIPAddress(uint32_t* address) = 0;
+  // The host's address on the interface that reached the router during discovery (dotted IPv4), the
+  // internal client PortMapper asks for; empty when unknown. The system client's threads and bounds:
+  // igd_system_detail.h.
+  virtual std::string LanAddress() const { return {}; }
 };
 
 constexpr uint32_t kMappingLeaseS = 3600;
@@ -111,6 +128,11 @@ enum class MappingOutcome {
   kTakenByAnotherDevice, // "the port is taken on the router by another device"
   kNatPmpOnly,           // "your router offers only NAT-PMP, which this version does not use ..."
   kNoUpnp,               // "no router answered UPnP"
+  kStopped,              // the stop came first: nothing owned, nothing this session added left
+  // The add succeeded, but the re-read shows this session's internal client and port without its
+  // description (or with a cut-off one): not owned, left to its lease, no further candidate
+  // (council 8, Opus B6). "port mapping unconfirmed (external <addr>:<port>) ..."
+  kUnconfirmed,
 };
 
 struct MappingResult {
@@ -129,12 +151,22 @@ class PortMapper {
   PortMapper(IgdClient* igd, std::string internal_client, uint16_t port, std::string nonce,
              bool natpmp_answered = false);
 
+  // The stop flag another thread sets when the server ends (null: never stopped). Read before each
+  // IGD call of Map and Renew; it must outlive this mapper. Set it before Map.
+  void SetStop(const std::atomic<bool>* stop) { stop_ = stop; }
+
+  // kStopped when the stop came before the mapping was done: no further candidate is tried, and an
+  // entry already added has gone through Remove's re-read and delete (owned() is false then).
+  // kUnconfirmed when the re-read after an add showed this session's internal client and port but
+  // not its description: owned() stays false, and no further candidate is tried.
   MappingResult Map();
   // Renewal at half the lease: re-reads the owned entry and renews it only if it still carries the
   // owned tuple and nonce. False (and not owned any more) otherwise: "the router dropped the port
-  // mapping: new players may not reach you".
+  // mapping: new players may not reach you". A stop ends it before its next call with the entry
+  // still owned (true), so Remove's re-read and delete take it.
   bool Renew();
-  // At End session and normal exit: deletes the entry only if a re-read still shows it is ours.
+  // At End session and normal exit: deletes the entry only if a re-read still shows it is ours. Runs
+  // whether or not the stop is asked (it is the stop's cleanup).
   bool Remove();
 
   bool owned() const { return owned_; }
@@ -146,14 +178,26 @@ class PortMapper {
   bool IsOurs(const PortMappingEntry& e, uint16_t external_port) const;
 
  private:
+  // What the re-read after a successful add shows: this session's tuple and nonce, this session's
+  // internal client and port without the description in full (unconfirmed), or anything else.
+  enum class AfterAdd { kOurs, kUnconfirmed, kOther };
+  AfterAdd ReadAfterAdd(uint16_t external_port);
   bool OwnedAfterAdd(uint16_t external_port);
   MappingResult Mapped(uint16_t external_port);
+  // The add on `external_port` stands but is not proved this session's: not owned, never renewed
+  // or deleted, no further candidate.
+  MappingResult Unconfirmed(uint16_t external_port);
+  bool Stopping() const { return stop_ != nullptr && stop_->load(); }
+  // The stop after a successful add on `external_port`: the entry goes through Remove (re-read,
+  // delete only if ours), then kStopped.
+  MappingResult StoppedAfterAdd(uint16_t external_port);
 
   IgdClient* igd_;
   std::string internal_client_;
   uint16_t port_;
   std::string description_;
   bool natpmp_answered_;
+  const std::atomic<bool>* stop_ = nullptr;
   bool owned_ = false;
   uint16_t owned_port_ = 0;
 };
@@ -161,5 +205,33 @@ class PortMapper {
 std::string MappingMessage(const MappingResult& r);
 constexpr const char* kMappingDroppedMessage =
     "the router dropped the port mapping: new players may not reach you";
+
+// The owned mapping's life in one "Internet" session (stage 8 item 4, design 3.4): Start maps once
+// (PortMapper::Map), Tick renews at half the lease while the mapping is owned (a failed renewal
+// says kMappingDroppedMessage once and the mapping is never touched again), Stop deletes it at End
+// session and at the server's normal exit. A crash leaves it to its lease. Pure: the clock is
+// passed in, the IGD calls go through `igd` (which the caller owns and keeps alive), so the unit
+// test drives it on fake time with a fake IgdClient. Not thread-safe: one thread (the server's
+// mapping thread) calls all of it; only the stop flag (SetStop) is set from another thread.
+class MappingLease {
+ public:
+  MappingLease(IgdClient* igd, std::string internal_client, uint16_t port, std::string nonce,
+               bool natpmp_answered = false);
+  // PortMapper::SetStop: Start and Tick stop between IGD calls once it is set; Stop still runs.
+  void SetStop(const std::atomic<bool>* stop) { mapper_.SetStop(stop); }
+  MappingResult Start(TimePoint now);
+  // Renews when due; returns the line to show when the renewal failed (once), else empty.
+  std::string Tick(TimePoint now);
+  // Deletes the owned mapping (after the re-read); true if it was deleted. Idempotent.
+  bool Stop();
+  bool owned() const { return mapper_.owned(); }
+  // When the next renewal is due (only meaningful while owned()).
+  TimePoint NextRenewal() const { return next_renewal_; }
+  const PortMapper& mapper() const { return mapper_; }
+
+ private:
+  PortMapper mapper_;
+  TimePoint next_renewal_{};
+};
 
 }  // namespace skylanders::netplay

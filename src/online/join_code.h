@@ -66,4 +66,13 @@ std::string EncodeJoinCodeV2(const JoinTarget& target);
 // Reads either form, with the same leniency as DecodeJoinCode (case, dashes, spaces, I/L/O).
 JoinCodeResult DecodeJoinCodeV2(std::string_view code);
 
+// A code as a player typed or pasted it (F4 > Online > Join, the input script's online_join), as
+// the bare symbols the decoders read: ASCII spaces, tabs and line ends, dashes, and the look-alikes a
+// web page or a messenger may paste (no-break space U+00A0, the hyphens and dashes U+2010-U+2015,
+// minus U+2212, zero-width space and joiners U+200B-U+200D, the byte order mark U+FEFF, all as
+// UTF-8) are dropped; a-z become A-Z. Everything else stays as it is, so a stray character still
+// makes the decoder answer "not a join code"; I, L and O stay too (the decoders read them as 1, 1
+// and 0).
+std::string NormalizeJoinCodeText(std::string_view text);
+
 }  // namespace skylanders::online
