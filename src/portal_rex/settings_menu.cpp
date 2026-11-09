@@ -897,7 +897,13 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
     if (a.down) row_ = (row_ + 1) % rows;
     const Setting& s = page->settings[std::min(row_, rows - 1)];
     if (s.action) {
-      if (a.accept && Enabled(s)) RunAction(s);  // greyed: it can't run now (Setting::available)
+      if (!Enabled(s)) return;  // greyed: it can't run now (Setting::available)
+      // A run-time choice (Setting::step): left / right step it, with the pad's hold repeat.
+      if (s.step && (a.left || a.right)) {
+        s.step(a.left ? -1 : +1);
+        return;
+      }
+      if (a.accept) RunAction(s);
       return;
     }
     if (!Enabled(s)) return;  // greyed: its enabled_by setting is off
@@ -1114,7 +1120,8 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
         dl->AddCircleFilled({lx, r0.y + row_h / 2}, S(6), kGold);
       }
       if (s.action) {
-        const std::string value = s.shown ? s.shown() : std::string();  // a read-only value (Setting::shown)
+        std::string value = s.shown ? s.shown() : std::string();  // a read-only value (Setting::shown)
+        if (s.step && !value.empty()) value = "<  " + value + "  >";  // a run-time choice (Setting::step)
         const char* go = value.empty() ? Tr("Open", "\xC3\x96" "ffnen") : value.c_str();
         const ImVec2 ts = TextSize(BoldFont(), S(21), go);
         Label(dl, BoldFont(), S(21), {r1.x - S(24) - ts.x, r0.y + S(19)}, enabled ? kGold : greyed, go);
@@ -1393,6 +1400,7 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
     }
     const Setting* s = Selected();
     if (s && s->action) {
+      if (Enabled(*s) && s->step) x += Hint(dl, {x, y}, "< / >", kHintGrey, Tr("Change", "\xC3\x84ndern"), false);
       if (Enabled(*s)) x += Hint(dl, {x, y}, "A", kAcceptGreen, Tr("Open", "\xC3\x96" "ffnen"), true, "Enter");
     } else if (!s || !IsOverview(*s)) {
       x += Hint(dl, {x, y}, "< / >", kHintGrey, Tr("Change", "\xC3\x84ndern"), false);

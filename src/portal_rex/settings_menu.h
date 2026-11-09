@@ -75,6 +75,11 @@ struct Setting {
   // is shown (UI thread; keep it cheap). A read-only value whose action works on it (F4 > Online >
   // Join code shows the code and copies it again). Empty (or no function): "Open".
   std::function<std::string()> shown;
+  // With an action: a choice the app fills at run time. Left / right (held: repeating, as on a value
+  // row) call it with -1 / +1, and the row shows `shown` between arrows (F4 > Debug > Level steps
+  // through the game's own levels, a list no settings file holds). A still runs the action. Nothing
+  // is stored or saved; while the row is greyed (`available` false) it does not step either.
+  std::function<void(int delta)> step;
 };
 
 struct SettingsPage {
