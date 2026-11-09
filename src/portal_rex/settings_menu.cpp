@@ -1114,7 +1114,8 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
         dl->AddCircleFilled({lx, r0.y + row_h / 2}, S(6), kGold);
       }
       if (s.action) {
-        const char* go = Tr("Open", "\xC3\x96" "ffnen");
+        const std::string value = s.shown ? s.shown() : std::string();  // a read-only value (Setting::shown)
+        const char* go = value.empty() ? Tr("Open", "\xC3\x96" "ffnen") : value.c_str();
         const ImVec2 ts = TextSize(BoldFont(), S(21), go);
         Label(dl, BoldFont(), S(21), {r1.x - S(24) - ts.x, r0.y + S(19)}, enabled ? kGold : greyed, go);
         if (enabled && !confirm_ && !ask_ && ImGui::IsMouseHoveringRect(r0, r1) && ImGui::IsMouseClicked(0)) {

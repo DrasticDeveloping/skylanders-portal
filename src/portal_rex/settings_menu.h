@@ -71,6 +71,10 @@ struct Setting {
   // cheap). false: the row is greyed and A does nothing (F4 > Online > Join while a session runs).
   // Empty: always.
   std::function<bool()> available;
+  // With an action: the text the row shows at its right instead of "Open", asked each frame the row
+  // is shown (UI thread; keep it cheap). A read-only value whose action works on it (F4 > Online >
+  // Join code shows the code and copies it again). Empty (or no function): "Open".
+  std::function<std::string()> shown;
 };
 
 struct SettingsPage {
