@@ -126,6 +126,15 @@ class Classify(unittest.TestCase):
         self.assertEqual(lp.classify(self.obj("Level_Exit", lp.GROUP_CHECKPOINTS))[0], lp.EXIT_A)
         self.assertEqual(lp.classify(self.obj("EndEncounter_Manager", lp.GROUP_ENEMIES))[0], lp.EXIT_A)
 
+    def test_debug_and_trigger_point(self):
+        self.assertEqual(lp.classify(self.obj("Debug_ResetSwitch", lp.GROUP_INTERACT))[0], lp.VISIT)
+        inside = lp.Obj("T", "CScriptTriggerEntity", (0.0, 0.0, 0.0), lp.GROUP_TRIGGERS,
+                        box=((-10.0, -10.0, -10.0), (10.0, 10.0, 10.0)))
+        self.assertEqual(inside.point(), (0.0, 0.0, 0.0))
+        outside = lp.Obj("T", "CScriptTriggerEntity", (100.0, 0.0, 0.0), lp.GROUP_TRIGGERS,
+                         box=((-10.0, -10.0, 0.0), (10.0, 10.0, 20.0)))
+        self.assertEqual(outside.point(), (0.0, 0.0, 10.0))
+
     def test_stem(self):
         self.assertEqual(lp.stem("TA_Ship_Destructible_04"), "TA_Ship_Destructible")
         self.assertEqual(lp.stem("Lever_A"), "Lever_A")
@@ -279,6 +288,22 @@ class Report(unittest.TestCase):
         phases = lp.phase_times(self.LOG)
         self.assertEqual(phases, [("boot and level load", 90.0), ("sweep", 90.0), ("exit", 30.0)])
         self.assertEqual(len(lp.summaries(self.LOG)), 1)
+
+    def test_provoked(self):
+        log = "\n".join([
+            "x Online: audit diverge breakable Au:5 Box_Destructible_01#44: this client alone, S's row stays 00",
+            "x Online: audit diff p1 provoke breakable Au:5 slot 0 rev 2 differs at 1,2,3 local Box_Destructible_01#44"
+            " row 00 live 02 why value",
+            "x Online: audit diff p1 v2 breakable Au:6 slot 0 rev 2 differs at 1,2,4 local Box_Destructible_02#45 row 00"
+            " live 01 why value"])
+        fs = lp.findings_from_log("H", log, {})
+        self.assertEqual(lp.mark_provoked(fs, lp.provoked(log)), 1)
+        self.assertEqual(sorted(f.severity for f in fs), ["difference at rest", "provoked difference (expected)"])
+        self.assertEqual(lp.fold(fs)[0][0].severity, "provoked difference (expected)")
+        p = lp.make_plan(content(), late_join=False, provoke="breakable")
+        h = lp.script_h(p, None)
+        self.assertLess(h.index("online_audit v1\n"), h.index("dev_audit_diverge breakable"))
+        self.assertLess(h.index("dev_audit_diverge breakable"), h.index("online_audit provoke"))
 
     def test_step_labels(self):
         p = lp.make_plan(content(), late_join=False)

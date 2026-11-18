@@ -7861,7 +7861,7 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         content = lp.load_content(folder, a.level)
     except ValueError as e:
         raise SystemExit(f"levelpass: {e}") from None
-    plan = lp.make_plan(content, full=a.full, late_join=not a.no_late_join)
+    plan = lp.make_plan(content, full=a.full, late_join=not a.no_late_join, provoke=a.provoke or "")
     stamp = time.strftime("%Y%m%d-%H%M%S")
     cases = folder / "cases" / stamp
     cases.mkdir(parents=True, exist_ok=False)
@@ -7912,6 +7912,11 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                 notes.append(f"runner: {why}")
         except (OSError, ValueError):
             pass
+    if plan.provoke:
+        diverged = lp.provoked(texts["H"])
+        caught = lp.mark_provoked(findings, diverged)
+        notes.append(f"provoked: {plan.provoke} on H alone ({', '.join(e for _k, e in diverged) or 'no row qualified'});"
+                     f" the audit reported it {caught} time(s)" + ("" if caught or not diverged else ": NOT CAUGHT"))
     if crash:
         findings.insert(0, lp.Finding(severity="crash", kind="process", family=crash.split(":")[0], what=crash,
                                       obj="", step=""))
@@ -7994,6 +7999,9 @@ def main(argv: list[str] | None = None) -> int:
     lp_.add_argument("--no-late-join", action="store_true", help="no second client D near the end")
     lp_.add_argument("--folder", default=None, help="the levelpass folder (default: tests/skytest.toml's"
                      " [levelpass] folder)")
+    lp_.add_argument("--provoke", default=None, metavar="KIND", help="the audit's proof: after the first visit H"
+                     " makes one object of KIND (breakable) differ on its own (dev_audit_diverge); the report must"
+                     " show it as a provoked difference")
     lp_.add_argument("--plan-only", action="store_true", help="write the generated case and print the plan; start"
                      " no game")
     lp_.set_defaults(fn=cmd_levelpass)
