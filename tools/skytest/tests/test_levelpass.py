@@ -259,6 +259,26 @@ class Plans(unittest.TestCase):
         # The nearest stay.
         self.assertEqual(p.stops[0].cluster.center, (5000.0, 0.0, 0.0))
 
+    def test_budget_caps_each_kind(self):
+        """One per family still over the budget: at most a few actions of each kind, the first along the
+        path, and the plan says so; --full keeps them all."""
+        objs = []
+        for i in range(1, 21):
+            o = lp.Obj(f"Lever{chr(64 + i)}", "C", (i * 5000.0, 0.0, 0.0), lp.GROUP_INTERACT, ident=f"madeup#{i}")
+            o.ref = f"auth:madeup:{i}"
+            objs.append(o)
+        c = lp.Content("madeup", "made", (0.0, 0.0, 0.0), objs)
+        budget = lp.BOOT_S + lp.LEVEL_LOAD_S + lp.EXIT_S + 8 * (lp.VISIT_S + lp.ACTION_EXPECT[lp.INTERACT_A] +
+                                                                 lp.ACTION_MOVE_S + lp.AUDIT_S)
+        p = lp.make_plan(c, late_join=False, budget_s=budget)
+        acts = [a for s in p.stops for a in s.actions]
+        self.assertLessEqual(p.estimate_s, budget)
+        self.assertTrue(0 < len(acts) < 20)
+        self.assertTrue(any("each kind of action at most" in x for x in p.left_out))
+        self.assertEqual(acts[0].obj.name, "LeverA")  # the first along the path stay
+        full = lp.make_plan(c, full=True, late_join=False, budget_s=budget)
+        self.assertEqual(sum(len(s.actions) for s in full.stops), 20)
+
     def test_expected_effects_from_logic(self):
         c = content()
         c.edges = [lp.Edge("Lever_A", "StringMessage", "Lift_Platform", "moves")]

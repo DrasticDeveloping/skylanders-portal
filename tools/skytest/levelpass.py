@@ -685,12 +685,24 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
         n -= 1
         plan = _make_plan(content, full, late_join, budget_s, n, provoke)
         plan.left_out.append(f"each action family sampled {n} time(s), not {sample}, to fit the budget")
+    # Still over at one per family (a level with many archetypes): at most `cap` actions of each kind
+    # (fight, attack, interact, pickup, enter, talk), the first ones along the path, the cap going down
+    # until the plan fits; --full acts on the rest.
+    cap = KIND_CAP_START
+    while not full and plan.estimate_s > budget_s and cap >= 1:
+        plan = _make_plan(content, full, late_join, budget_s, n, provoke, kind_cap=cap)
+        plan.left_out.append(f"each action family sampled {n} time(s), not {sample}, to fit the budget")
+        plan.left_out.append(f"each kind of action at most {cap} times, to fit the budget (--full acts on all)")
+        cap -= 1
     plan.sample = n
     return plan
 
 
+KIND_CAP_START = 8   # the first per-kind cap tried when one action per family is still over the budget
+
+
 def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, sample: int,
-               provoke: str) -> Plan:
+               provoke: str, kind_cap: int = 0) -> Plan:
     visited = [o for o in content.objects if o.group in GROUPS_VISITED]
     # A sub-zone (a swap zone, a staging map) is its own map that a player reaches only through its own
     # entry: its objects are never visited, even when the probe walked its package at the level's load
@@ -768,6 +780,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
                                                 + (f" ({e.effect})" if e.effect else ""))
     taken: dict[tuple[str, str], int] = {}
     left: dict[tuple[str, str], int] = {}
+    per_kind: dict[str, int] = {}
     no_action: dict[str, int] = {}
     stops: list[Stop] = []
     exit_stop = None
@@ -795,6 +808,11 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
                 left[family] = left.get(family, 0) + 1
                 visit_only.append((o, f"sampled out ({act}: {sample} of its family taken)"))
                 continue
+            if kind_cap and act != EXIT_A and per_kind.get(act, 0) >= kind_cap:
+                left[family] = left.get(family, 0) + 1
+                visit_only.append((o, f"over the budget ({act}: at most {kind_cap} of each kind)"))
+                continue
+            per_kind[act] = per_kind.get(act, 0) + 1
             taken[family] = taken.get(family, 0) + 1
             actions.append(Action(action=act, obj=o, why=why, expect=effects.get(o.name, [])))
         stop = Stop(label=f"v{n + 1}", cluster=c, actions=actions, visit_only=visit_only)
