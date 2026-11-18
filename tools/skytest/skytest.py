@@ -812,9 +812,21 @@ class PeerSpec:
     # files = { "<name>" = """<text>""" }: files written into the peer's run folder before its game starts
     # (a plain file name each, not one the builder writes), e.g. a file the script follows (`follow`).
     files: dict[str, str] = field(default_factory=dict)
+    # start_after = '<regex>' (the level pass's late joiner): this local client starts only once the
+    # first line of `start_peer`'s log (default H) matches the pattern: a condition, never a fixed delay.
+    # Not started by the run's end: the peer fails `never started`.
+    start_after: str = ""
+    start_peer: str = "H"
 
 
 SETTINGS_FILE_VALUES = ("template", "none")
+# shader_cache = "snapshot" (the level pass): every peer's cache folder starts from the build snapshot's
+# shader cache (<snapshot>/shader-cache/, the merge of earlier runs' caches of the same build; Host's
+# server through --dev_server_cache_from), and the run's caches are merged back into it afterwards.
+# "fresh" (the default): every peer starts with an empty cache, as before.
+SHADER_CACHE_VALUES = ("fresh", "snapshot")
+SHADER_CACHE_DIR = "shader-cache"
+SERVER_CACHE_SEED = "server-cache-seed"
 
 
 @dataclass
@@ -888,6 +900,7 @@ class Spec:
     # beside the specs it leaves out by themselves.
     bulk: bool = True
     bulk_reason: str = ""
+    shader_cache: str = "fresh"
 
 
 PEER_KINDS = ("local", "remote")
@@ -1198,7 +1211,21 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             kind=kind,
             settings_file=peer_settings_file(path.name, n, own, common, d.get("server", "standin"), kind),
             files=peer_files(path.name, n, own.get("files", common.get("files", {}))),
+            start_after=str(own.get("start_after", "")),
+            start_peer=str(own.get("start_peer", "H")),
         )
+        if peers[n].start_after:
+            if n in ("H", "S") or kind != "local":
+                raise SpecError(f"{path.name}: peer {n}: start_after is for a local client that joins (D, E, F)")
+            if peers[n].start_peer not in names or peers[n].start_peer == n:
+                raise SpecError(f"{path.name}: peer {n}: start_peer {peers[n].start_peer!r} is not another peer of"
+                                f" {names}")
+            if JOIN_CODE_PLACEHOLDER in script:
+                raise SpecError(f"{path.name}: peer {n}: start_after with {{joincode}}: join by {{join}} instead")
+            try:
+                re.compile(peers[n].start_after)
+            except re.error as e:
+                raise SpecError(f"{path.name}: peer {n}: bad start_after {peers[n].start_after!r}: {e}") from e
         for arg in peers[n].args:
             for ph in ARG_PLACEHOLDER.findall(arg):
                 if ph not in ARG_PLACEHOLDERS:
@@ -1359,6 +1386,9 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         if remote:
             raise SpecError(f"{path.name}: [build_copy]: peer {', '.join(remote)} is remote and runs the second PC's"
                             " verified install, not a copy of this build")
+    shader_cache = d.get("shader_cache", "fresh")
+    if shader_cache not in SHADER_CACHE_VALUES:
+        raise SpecError(f"{path.name}: shader_cache = {shader_cache!r} ({' or '.join(SHADER_CACHE_VALUES)})")
     return Spec(
         name=d["name"], path=path, layout=d["layout"], stage=str(d["stage"]),
         description=d.get("description", ""), timeout=float(d.get("timeout", default_timeout)),
@@ -1367,6 +1397,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         exclusive=exclusive, tolerate=list(tolerate), not_ready=not_ready, scenes=scenes,
         scenes_reason=scenes_reason.strip(), breaker=breaker, sha256=hashlib.sha256(data).hexdigest(),
         synthetic=synthetic, build_copy=build_copy, bulk=bulk, bulk_reason=bulk_reason.strip(),
+        shader_cache=shader_cache,
     )
 
 
@@ -1389,7 +1420,8 @@ UNIT_SUMMARY = re.compile(r"^(\d+) (\w+) tests, (\d+) failed, (\d+) ms")
 # The keys that say how games run or are graded (a unit case starts none). `breaker` among them: a unit
 # case never counts toward the circuit breaker nor is stopped by it (C7 guards the build's games).
 GAME_ONLY_KEYS = ("peer", "grade", "measure", "compare", "server", "standin_seconds", "fail_fast",
-                  "show_server_window", "tolerate", "scenes", "scenes_reason", "breaker", "build_copy")
+                  "show_server_window", "tolerate", "scenes", "scenes_reason", "breaker", "build_copy",
+                  "shader_cache")
 
 
 # What a peer's `files` may not name: the files the launch builder and the game write in the run folder.
@@ -3651,7 +3683,32 @@ def launch_context(cfg: Config, folder: Path, tables: tuple[la.AllowList, la.Com
                          read_roots=[(cfg.repo / "tests" / "routes").resolve()], no_settings=no_settings)
 
 
-def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -> tuple[Path, list[str]]:
+def copy_cache(src: Path, dst: Path) -> int:
+    """Copies the shader cache files under `src` into `dst` (folders made); a file `dst` already has at
+    the same or a larger size stays. The number of files copied. Never fails the run: a file that cannot
+    be copied is skipped."""
+    n = 0
+    if not src.is_dir():
+        return 0
+    for f in src.rglob("*"):
+        if not f.is_file() or ".tmp-" in f.name:
+            continue
+        to = dst / f.relative_to(src)
+        try:
+            if to.is_file() and to.stat().st_size >= f.stat().st_size:
+                continue
+            to.parent.mkdir(parents=True, exist_ok=True)
+            tmp = to.with_name(to.name + f".tmp-{os.getpid()}")
+            shutil.copyfile(f, tmp)
+            os.replace(tmp, to)
+            n += 1
+        except OSError:
+            continue
+    return n
+
+
+def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0,
+                 cache_seed: Path | None = None) -> tuple[Path, list[str]]:
     """A local peer's own run folder and command line, made by the launch builder (launch_args.build_game,
     design D21): the copies of the fixture saves and figures, the settings template's copy, the input
     script (checked command by command, every path inside the folder), and the settings, checked as a
@@ -3665,11 +3722,18 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -
     tables = launch_tables(cfg)
     try:
         d = la.make_run_folder(run.resolve(), peer)
+        seed_args: list[str] = []
+        if cache_seed is not None:  # shader_cache = "snapshot": this peer's cache starts warm
+            copy_cache(cache_seed, d / "cache")
+            if spec.server == "host" and peer == "H":  # and the server Host starts, through its setting
+                copy_cache(cache_seed, d / SERVER_CACHE_SEED)
+                (d / SERVER_CACHE_SEED).mkdir(exist_ok=True)
+                seed_args = [f"--dev_server_cache_from={d / SERVER_CACHE_SEED}"]
         ctx = launch_context(cfg, d, tables, no_settings=spec.peers[peer].settings_file == "none")
         script = peer_script(spec, peer, ctx.figures, f"127.0.0.1:{port}" if port else "", JOIN_CODE_STANDIN)
         runner = [*cfg.default_args, *scene_args(cfg, spec), *show_server_args(cfg, spec, peer),
                   *([f"--online_port={port}"] if port and peer == "H" else []),
-                  *synthetic_server_args(cfg, spec, peer)]
+                  *synthetic_server_args(cfg, spec, peer), *seed_args]
         args = la.build_game(ctx, peer_args(cfg, spec.peers[peer].args), script, fixtures=(saves, figures),
                              runner_args=runner)
     except la.LaunchError as e:
@@ -4691,7 +4755,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         # Every peer's folder first (copies take a moment), then all games start close together, and
         # a spec error in a later peer starts no game at all.
         port = free_loopback_port() if hosted else 0
-        prepared = {n: prepare_peer(cfg, spec, n, run, port) for n in starts if n not in remote}
+        seed = (snap / SHADER_CACHE_DIR) if spec.shader_cache == "snapshot" else None
+        prepared = {n: prepare_peer(cfg, spec, n, run, port, seed) for n in starts if n not in remote}
         if live is not None:
             live.on_run(run, port)
         # server+N+hK: each synthetic peer's folder and command, before any game starts.
@@ -4753,8 +4818,12 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             # Stage 8 item 4: a client whose script names {joincode} starts once the hosted server
             # logged its join code (start_joiners below), never before.
             joiners = [n for n in starts if n not in remote and uses_join_code(spec, n)]
+            # start_after: a client that starts once its start peer's log shows the pattern.
+            late = {n: (LogTail(peer_log_path(run, spec.peers[n].start_peer, hosted)),
+                        re.compile(spec.peers[n].start_after))
+                    for n in starts if n not in remote and spec.peers[n].start_after}
             for n in starts:
-                if n in joiners:
+                if n in joiners or n in late:
                     continue
                 # Games booting in the same instant crashed and froze each other in a test
                 # (stage 0, five at once); real sessions never start them together either. The gap
@@ -4773,6 +4842,13 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             join_tail = LogTail(peer_log_path(run, "S", hosted)) if joiners else None
             join_waits = list(joiners)
             not_started: dict[str, str] = {}  # a joiner that will not start, and why
+
+            def start_late() -> None:
+                for ln, (tail, rx) in list(late.items()):
+                    if any(rx.search(line) for line in tail.new_lines()):
+                        del late[ln]
+                        pacer.wait_turn(note_ends)
+                        start_local(ln)
 
             def start_joiners() -> None:
                 code, problem = join_code_from(join_tail.new_lines())
@@ -4827,6 +4903,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                     droot.check()  # a phase line: that phase's end snapshot
                 if join_waits and not (watch is not None and watch.hit):  # no new game after a fatal line
                     start_joiners()
+                if late and not (watch is not None and watch.hit):
+                    start_late()
                 if watch is not None and time.monotonic() >= next_check:
                     next_check = time.monotonic() + FAIL_FAST_POLL
                     # Checked through the grace too: a hit whose log was replaced meanwhile is dropped.
@@ -4839,6 +4917,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             # {joincode}: a joiner still waiting when the run ended never got the code (fails closed).
             not_started.update({n: "never started: S never logged its join code (/"
                                    f"{SERVER_JOIN_CODE.pattern}/), so {{joincode}} had no value" for n in join_waits})
+            not_started.update({n: f"never started: {spec.peers[n].start_peer} never logged"
+                                   f" /{spec.peers[n].start_after}/" for n in late})
             stopped = ""
             if early and watch is not None and watch.hit and any(p.poll() is None for p in procs.values()):
                 stopped = f"stopped early: {watch.hit[0]} {watch.hit[1]} (fail fast)"
@@ -4885,6 +4965,12 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             rp.client.close()
         res.status, res.reasons = "error", [str(e)]
         return res
+    if spec.shader_cache == "snapshot":
+        # The run's caches into the snapshot's, for the next run of this build (S's in H's session folder).
+        for n in starts:
+            copy_cache(run / n / "cache", snap / SHADER_CACHE_DIR)
+        if hosted:
+            copy_cache(run / "H" / "data" / "Online" / "session" / "cache", snap / SHADER_CACHE_DIR)
     saves_after = {n: save_state(run / n / "data", save_title) for n in saves_before}
     if droot is not None:
         droot.finish()
@@ -7780,6 +7866,11 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
                 problems.append(f"{p.name}: grades time or load ({', '.join(timed_grades(s))}) but is not"
                                 " `exclusive = true`: beside another case (test --jobs) it would measure that load too")
             problems += scene_problems(cfg, s)
+            if s.name.startswith("levelpass-"):  # a level pass names objects, never positions
+                import levelpass as lp
+                for n, ps in s.peers.items():
+                    for line in lp.position_literals(ps.script)[:3]:
+                        problems.append(f"{p.name}: peer {n}: a level-pass script carries a position: {line!r}")
             if s.synthetic and not ((cfg.synthetic_exe or cfg.synthetic_launcher) and cfg.synthetic_setting):
                 problems.append(f"{p.name}: synthetic peers, but tests/skytest.toml [synthetic] lacks exe or"
                                 " server_setting")
@@ -8743,6 +8834,143 @@ def add_live_parser(sub) -> None:
     lv.set_defaults(fn=cmd_live)
 
 
+# --- the level pass (levelpass.py) -----------------------------------------------------------------
+
+# Where the level pass reads its content and writes its reports and generated cases: tests/skytest.toml's
+# [levelpass] folder (outside the repository: everything there is derived from the disc), or --folder.
+LEVELPASS_DEFAULT = "~/Documents/T3Code/SwapForceOnline-work/levelpass"
+
+
+def levelpass_folder(cfg: Config, given: str | None) -> Path:
+    if given:
+        folder = expand(given)
+    else:
+        c = tomllib.loads((cfg.repo / "tests" / "skytest.toml").read_text(encoding="utf-8"))
+        folder = expand(str(c.get("levelpass", {}).get("folder", LEVELPASS_DEFAULT)))
+    folder = folder.resolve()
+    if inside(folder, cfg.repo.resolve()):
+        raise SystemExit(f"levelpass: {folder} is inside the repository; its content is derived from the disc and"
+                         " stays outside git")
+    return folder
+
+
+def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
+    """One automatic level pass: the plan from the level's content, one generated case through `test`
+    (its guards, the machine's slots, fail fast), then the report from the run's logs."""
+    import levelpass as lp
+    folder = levelpass_folder(cfg, getattr(a, "folder", None))
+    try:
+        content = lp.load_content(folder, a.level, probe_ids=not a.no_probe)
+    except ValueError as e:
+        raise SystemExit(f"levelpass: {e}") from None
+    plan = lp.make_plan(content, full=a.full, late_join=not a.no_late_join, provoke=a.provoke or "")
+    plan.probe = not a.no_probe
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    cases = folder / "cases" / stamp
+    cases.mkdir(parents=True, exist_ok=False)
+    spec_path = cases / f"{lp.case_name(a.level)}.toml"
+    bugs: list = []
+    if a.predictions:
+        import levelpass_predictions as lpp
+        recipes_file = folder / "predictions.toml"
+        if not recipes_file.is_file():
+            raise SystemExit(f"levelpass --predictions: no {recipes_file}")
+        try:
+            recipes = lpp.load_recipes(recipes_file.read_text(encoding="utf-8"))
+        except (ValueError, tomllib.TOMLDecodeError) as e:
+            raise SystemExit(f"levelpass --predictions: {recipes_file}: {e}") from None
+        bugs = [b for b in recipes.bugs if b.level == a.level]
+        d_mode = recipes.d_mode.get(a.level, "early")  # D joins at the start and stays (the observed player)
+        h_script, d_script = lpp.scripts(a.level, bugs, d_mode)
+        text = lp.spec_from_scripts(a.level, h_script, d_script,
+                                    ["--trace_where_seconds=1"] if d_mode == "early" else [])
+        literals = lp.position_literals(h_script) + lp.position_literals(d_script or "")
+        plan.stops, plan.exit_stop, plan.late_join = [], None, d_mode != "none"
+        plan.left_out = [f"predictions mode: {len(bugs)} prediction(s) of {a.level}, D {d_mode}"]
+    else:
+        text = lp.spec_toml(plan)
+        literals = lp.position_literals(lp.script_h(plan, lp.LATE_JOIN_MARK)) + lp.position_literals(lp.script_d(plan))
+    if literals:  # the owner's rule: a level pass names objects; the game reads where they are
+        raise SystemExit(f"levelpass: the generated scripts carry positions: {literals[:3]}")
+    spec_path.write_text(text, encoding="utf-8")
+    print(f"levelpass {a.level}: content {plan.source}; {len(plan.stops)} stops, "
+          f"{sum(len(st.actions) for st in plan.stops)} actions, estimate {plan.estimate_s:.0f} s; case {spec_path}",
+          flush=True)
+    if a.plan_only:
+        return 0
+    t0 = time.monotonic()
+    started = time.strftime("%Y%m%d-%H%M%S")
+    ns = argparse.Namespace(cases=[lp.case_name(a.level)], stage=None, max_games=0, gate=False, per_build=False,
+                            allow_restricted=False, jobs=1, run_not_ready=False, no_breaker=False, queue=None,
+                            remote=None, remote_manifest=None, remote_token_file=None)
+    code = cmd_test(replace(cfg, cases_dir=cases), ns)
+    wall = time.monotonic() - t0
+    runs = sorted(p for p in (cfg.store / "runs").glob(f"*-{lp.case_name(a.level)}")
+                  if p.is_dir() and p.name[:15] >= started)
+    if not runs:
+        print(f"levelpass {a.level}: no run folder (the case did not start; exit {code})", flush=True)
+        return code or 1
+    run = runs[-1]
+    script = (run / "H" / "script.txt").read_text(encoding="utf-8", errors="replace") \
+        if (run / "H" / "script.txt").is_file() else lp.script_h(plan, None)
+    labels = lp.step_labels(script)
+    texts = {"H": read_peer_log(run, "H", False), "S": read_peer_log(run, "S", True)}
+    if (run / "D").is_dir():
+        texts["D"] = read_peer_log(run, "D", False)
+    findings: list = []
+    crash = ""
+    for peer, text in texts.items():
+        findings += lp.findings_from_log(peer, text, labels)
+        for line in text.splitlines():
+            if not crash and re.search(r"\] Crash: |\[FATAL\]|Unhandled guest access violation", line):
+                crash = f"{peer}: {line.strip()[:300]}"
+    notes = []
+    result = run / "result.json"
+    if result.is_file():
+        try:
+            rj = json.loads(result.read_text(encoding="utf-8"))
+            for r in rj.get("peers", []):
+                if r.get("exit_code") not in (0, None) and crash_exit_code(r.get("exit_code")):
+                    crash = crash or f"{r.get('peer')}: exit code {r.get('exit_code')}"
+            if rj.get("stopped_early"):
+                notes.append(rj["stopped_early"])
+            for why in rj.get("reasons", []):
+                notes.append(f"runner: {why}")
+        except (OSError, ValueError):
+            pass
+    findings, artefact_notes = lp.audit_artefacts(findings, texts)
+    findings = lp.exit_not_reached(findings, texts["H"])
+    notes += artefact_notes
+    findings += lp.level_changes(texts["H"], plan.timed)
+    lp.name_ids(findings, lp.names_by_hash(content.objects))
+    if plan.provoke:
+        diverged = lp.provoked(texts["H"])
+        caught = lp.mark_provoked(findings, diverged)
+        notes.append(f"provoked: {plan.provoke} on H alone ({', '.join(e for _k, e in diverged) or 'no row qualified'});"
+                     f" the audit reported it {caught} time(s)" + ("" if caught or not diverged else ": NOT CAUGHT"))
+    skipped = len(re.findall(r"skipped: the sweep's time is up", texts["H"]))
+    if skipped:
+        notes.append(f"{skipped} step(s) skipped at the sweep's deadline (not reached in the budget)")
+    if crash:
+        findings.insert(0, lp.Finding(severity="crash", kind="process", family=crash.split(":")[0], what=crash,
+                                      obj="", step=""))
+    notes.append(f"shader cache: {'warm (from the build snapshot)' if any((run / n / 'cache').rglob('*.xpso') for n in ('H',)) else 'cold'}")
+    settings = "settings: the release defaults a player gets (no online_route_file: every trigger unclassified) plus " \
+        "the test tools " + " ".join(lp.probe_args(lp.H_ARGS, plan.probe)) + " on H"
+    notes.insert(0, settings)
+    report = lp.report_text(a.level, plan, wall, lp.phase_times(texts["H"]), lp.fold(findings), crash,
+                            {p: lp.summaries(t) for p, t in texts.items()}, str(run), notes,
+                            boot=lp.boot_phases(texts["H"]))
+    if bugs:
+        import levelpass_predictions as lpp
+        report += "\n" + lpp.verdict_text(lpp.verdicts(bugs, texts))
+    out = folder / f"{a.level}-{'predictions' if a.predictions else 'pass'}-{stamp}.txt"
+    out.write_text(report, encoding="utf-8")
+    print(report, flush=True)
+    print(f"levelpass {a.level}: report {out}", flush=True)
+    return 0 if not crash else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="The Skylanders online forks' test runner.")
     p.add_argument("--repo", default=".", help="the game checkout (default: the current folder)")
@@ -8812,6 +9040,24 @@ def main(argv: list[str] | None = None) -> int:
                    " last of three or more, else all)")
     c.set_defaults(fn=cmd_compare)
     add_live_parser(sub)
+    lp_ = sub.add_parser("levelpass", help="the automatic level pass: one session, a sweep generated from the"
+                         " level's data, the audit's verdict, a report in the levelpass folder")
+    lp_.add_argument("level", help="the level's short name (tutorial_a, tutorial_b, ww1)")
+    lp_.add_argument("--full", action="store_true", help="act on every object (default: each action family at"
+                     " most 3 times, every cluster still visited)")
+    lp_.add_argument("--no-late-join", action="store_true", help="no second client D near the end")
+    lp_.add_argument("--folder", default=None, help="the levelpass folder (default: tests/skytest.toml's"
+                     " [levelpass] folder)")
+    lp_.add_argument("--provoke", default=None, metavar="KIND", help="the audit's proof: after the first visit H"
+                     " makes one object of KIND (breakable) differ on its own (dev_audit_diverge); the report must"
+                     " show it as a provoked difference")
+    lp_.add_argument("--predictions", action="store_true", help="the predictions run: each predicted co-op bug of"
+                     " the level (<levelpass>/predictions.toml) as steps, snapshots and a check, a verdict per bug")
+    lp_.add_argument("--no-probe", action="store_true", help="the authored probe off in every game: objects only by"
+                     " the names the probe saw live (no auth: ids); to tell a crash of the probe from the game's")
+    lp_.add_argument("--plan-only", action="store_true", help="write the generated case and print the plan; start"
+                     " no game")
+    lp_.set_defaults(fn=cmd_levelpass)
     a = p.parse_args(argv)
     cfg = load_config(repo_root(Path(a.repo)))
     return a.fn(cfg, a)
