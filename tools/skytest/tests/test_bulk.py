@@ -94,7 +94,6 @@ class ExclusionTest(unittest.TestCase):
             (spec(peers={"S": peer("S", ""), "H": peer("H", args=["--guest_vblank_rate=120"])}),
              "peer H sets --guest_vblank_rate itself"),
             (spec(peers={"S": peer("S", ""), "H": peer("H", settings_file="none")}), "release defaults"),
-            (spec(peers={"S": peer("S", ""), "H": peer("H", "tap a\n  key F4\nquit\n")}), "settings menu (key F4)"),
             (spec(peers={"S": peer("S", ""), "H": peer("H", expect=[r"Online: panel drawn \d+"])}),
              "Online: panel drawn"),
             (spec(peers={"S": peer("S", ""), "H": peer("H", forbid=[r"\(no picture\)"])}), "grades a picture"),
@@ -106,8 +105,8 @@ class ExclusionTest(unittest.TestCase):
             else:
                 self.assertIn(want, got, s)
 
-    def test_shot_and_a_key_other_than_f4_stay_in_bulk(self) -> None:
-        s = spec(peers={"S": peer("S", ""), "H": peer("H", "shot hub\nkey F5\nlog key F4 later\nquit\n")})
+    def test_shot_and_the_settings_menu_stay_in_bulk(self) -> None:
+        s = spec(peers={"S": peer("S", ""), "H": peer("H", "shot hub\nkey F4\ntap rb\nquit\n")})
         self.assertEqual(skytest.bulk_exclusion(s), "")
 
 
@@ -266,7 +265,8 @@ class BulkRunTest(unittest.TestCase):
         self.spec("plain", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.H]\n'
                   'args = ["--audio_mute=true"]\nscript = """\nwaitfor title_ready 35\nwait 2\n'
                   'place 0 {figures}/Roller Brawl.dump\nfps 8\nquit\n"""\n')
-        self.spec("menu", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "key F4\\nquit\\n"\n')
+        self.spec("menu", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n'
+                  'expect = ["Online: panel drawn"]\n')
         self.spec("alone", 'layout = "solo"\nstage = "0"\nexclusive = true\n[peer.H]\nscript = "quit\\n"\n')
         r = self.run_bulk("plain", "menu", "alone")
         self.assertEqual(r["exit"], 0, r["out"])
@@ -278,7 +278,7 @@ class BulkRunTest(unittest.TestCase):
         self.assertEqual(by["plain"]["status"], "pass", by["plain"])
         self.assertEqual(by["plain"]["mode"], "bulk")
         self.assertEqual(by["menu"]["status"], skytest.NOT_IN_BULK)
-        self.assertIn("key F4", by["menu"]["reasons"][0])
+        self.assertIn("panel drawn", by["menu"]["reasons"][0])
         self.assertEqual(by["alone"]["status"], skytest.NOT_IN_BULK)
         for p in by["plain"]["peers"]:
             self.assertIn("--window_hidden=true", p["command"], p["peer"])

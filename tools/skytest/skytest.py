@@ -416,13 +416,12 @@ BULK_PACINGS = {
 # not run in bulk (bulk mode sets them, or its subject is what bulk mode changes).
 BULK_OWN_SETTINGS = ("window_hidden", "render_hidden_draw", "dev_server_draw", "guest_vblank_rate", "present_interval",
                      "online_server_hz", "frame_rate_limit")
-# Script commands and expected lines that need a drawn window. The settings menu (key F4) and the
-# party panel's `Online: panel drawn` line run in the UI's draw callback (ImGui); whether a hidden
-# window draws its UI decides whether such specs can run in bulk (docs/testing-guide.md, bulk mode:
-# the hidden F4 and remove runs). (rx, reason) each.
-BULK_SCRIPT_EXCLUDED = [
-    (re.compile(r"(?m)^[ \t]*key[ \t]+F4\b"), "drives the settings menu (key F4), which runs in the UI's draw callback"),
-]
+# Script commands and expected lines bulk mode leaves out, (rx, reason) each. A hidden window still runs
+# the UI's draw callback (ImGui): on 2026-11-18 a hidden H's settings menu (key F4) took its presses as a
+# visible one's did (bulk-hidden-f4, host-button), and an auto-opened portal menu closed after a figure
+# went back on (bulk-hidden-remove), so neither is excluded. The party panel's `Online: panel drawn`
+# line is not shown hidden yet (its only spec runs alone), and a hidden window has no picture.
+BULK_SCRIPT_EXCLUDED: list[tuple[re.Pattern, str]] = []
 BULK_EXPECT_EXCLUDED = [
     (re.compile(r"panel drawn"), "expects `Online: panel drawn`, logged from the party panel's draw callback"),
     (re.compile(r"no picture"), "grades a picture (`shot`), which a hidden window under the draw skip does not have"),
