@@ -147,6 +147,48 @@ class Classify(unittest.TestCase):
         self.assertEqual(lp.classify(self.obj("Level_Exit", lp.GROUP_CHECKPOINTS))[0], lp.EXIT_A)
         self.assertEqual(lp.classify(self.obj("EndEncounter_Manager", lp.GROUP_ENEMIES))[0], lp.EXIT_A)
 
+    def static(self, name, state, components, cls="CGameEntity", box=None):
+        o = lp.Obj(name=name, cls=cls, pos=(1.0, 1.0, 1.0), group=lp.STATIC_GROUPS.get(state, ""), ident="u1",
+                   box=box)
+        o.state = state
+        o.components = list(components)
+        return o
+
+    def test_actions_from_components(self):
+        """The static reader's components choose the action, not the name or the reader group."""
+        # Nothing a player presses: a chest spawner, a battle gate, a caged NPC (the 20261118 passes).
+        for name, state, comps in (
+                ("MagicItem_HiddenTreasure_ChestSpawner", "chest", ["Scripts.MagicItem_HiddenTreasure_ChestComponentData"]),
+                ("TutorialBattleGate_01", "lock", ["CMessengerComponentData", "Scripts.LockedObjectComponentData"]),
+                ("TrappingPit_FoxenMale", "npc", ["CBehaviorComponentData", "CConversationComponentData"]),
+                ("RidingBird", "npc", ["CBehaviorComponentData", "Scripts.SpawnerComponentData"])):
+            act, why = lp.classify(self.static(name, state, comps, "CActor" if state == "npc" else "CGameEntity"))
+            self.assertEqual(act, lp.VISIT, name)
+            self.assertIn("nothing a player acts on directly", why)
+        # An interaction: pressed; on an NPC, talked to.
+        self.assertEqual(lp.classify(self.static("TreasureChest_3", "chest", ["CInteractionComponentData"]))[0],
+                         lp.INTERACT_A)
+        self.assertEqual(lp.classify(self.static("Tessa", "npc", ["CInteractionComponentData", "CConversationComponentData"],
+                                                 "CActor"))[0], lp.TALK)
+        # The interaction wins over a destructible (a cage with a press); a destructible alone is attacked,
+        # whatever its reader group (a sheep cage that spawns its sheep).
+        self.assertEqual(lp.classify(self.static("BigBait_Cage", "switch", ["CInteractionComponentData",
+                                                                            "Scripts.DestructibleComponentData"]))[0],
+                         lp.INTERACT_A)
+        self.assertEqual(lp.classify(self.static("SavedSheep_Cage002", "spawner", ["Scripts.DestructibleComponentData",
+                                                                                   "Scripts.SpawnerComponentData"]))[0],
+                         lp.ATTACK)
+        # A trigger volume component: entered, with no box of its own (its live origin).
+        self.assertEqual(lp.classify(self.static("GillmanConvo", "npc", ["CTriggerVolumeSphereComponentData",
+                                                                         "Scripts.InteractionSequenceComponentData"],
+                                                 "CActor"))[0], lp.ENTER)
+        # A collectible: picked up; enemies and spawners: fought as before.
+        self.assertEqual(lp.classify(self.static("StoryScroll", "collectible", ["Scripts.CollectibleComponentData"]))[0],
+                         lp.PICKUP)
+        self.assertEqual(lp.classify(self.static("AttackJunk_Spawner", "spawner", ["Scripts.SpawnerComponentData"]))[0],
+                         lp.FIGHT)
+        self.assertEqual(lp.classify(self.static("Chompy", "enemy", ["CSwarmerAIComponentData"], "CActor"))[0], lp.FIGHT)
+
     def test_debug_and_trigger_point(self):
         self.assertEqual(lp.classify(self.obj("Debug_ResetSwitch", lp.GROUP_INTERACT))[0], lp.VISIT)
         inside = lp.Obj("T", "CScriptTriggerEntity", (0.0, 0.0, 0.0), lp.GROUP_TRIGGERS,
@@ -390,6 +432,46 @@ class Report(unittest.TestCase):
         labels = lp.step_labels(lp.script_h(p, None))
         self.assertIn("v1", labels)
         self.assertTrue(all(isinstance(v, str) for v in labels.values()))
+
+    def test_tool_kinds(self):
+        """A step the tool could not carry out is its own kind; what may be the game's is not."""
+        k = lp.tool_kind
+        self.assertEqual(k("Dev: goto_entity auth:ww1:5 failed (teleport failed: landed 1,2,3, 287 under the target's "
+                           "floor at 584.90 (more than 150: fell)) after 3.0 s"), "teleport: no good landing beside it")
+        self.assertEqual(k("Dev: goto_entity auth:ww1:5 failed (teleport failed: held too long after the teleport) after "
+                           "3 s"), "teleport: the game held the hero")
+        self.assertIn("own event", k("Dev: goto_entity auth:ww1:5 failed (no entity: still asleep 4 s after the teleport to its "
+                                     "stored position: asleep; its area streamed in (12 stream-ins, none for 1.5 s): it "
+                                     "wakes only at its own event) after 5 s"))
+        self.assertEqual(k("Dev: interact auth:ww1:7 failed (no entity: asleep (not in the entity table) at its stored "
+                           "position 1,2,3) after 0.1 s"), "asleep: did not wake for the visit")
+        self.assertEqual(k("Dev: goto_entity TA_Ship_Junk_1 failed (no entity: no such entity) after 0.1 s"),
+                         "not in the live game by that name or id")
+        self.assertEqual(k("Dev: interact Gate#3 failed (no CInteractionComponent on Gate#3 or within 200 of it, and no "
+                           "CInteraction seen near it) after 2 s"), "no interaction on or near the object")
+        self.assertEqual(k("Dev: fight_area 1,2,-3 failed (the hero is 37913 from the area, more than its radius 2500 + "
+                           "1500: the route did not get here, nothing walked) after 0.0 s"), "could not get within reach")
+        self.assertIn("no floor", k("Dev: route teleport goto_entity failed (landed 1,2,3, 300 off the point 4,5,6 (more "
+                                    "than 200); no floor under it or beside it (0 no floor, 1 no floor)) (target X#1)"))
+        # The game's (or not known to be the tool's): stays a finding.
+        self.assertEqual(k("Dev: attack_until ShipJunk_2#7 failed (time: hp 50 -> 50, 9 bursts) after 30 s"), "")
+        self.assertEqual(k("Dev: interact Snagglescale#4 failed (the interaction went away after rt) after 3 s"), "")
+        self.assertEqual(k("Input script: waitfor online_level_end timed out after 60 s"), "")
+
+    def test_report_separates_tool(self):
+        """The findings section is only about the game; the tool's failures have their own section."""
+        p = lp.make_plan(content(), late_join=False)
+        log = self.LOG + ("[2026-11-18 05:20:00.000] [info] [core] [t1] Dev: goto_entity auth:madeup:3 failed (teleport "
+                          "failed: landed 1,2,3, 300 under the target's floor at 400 (more than 150: fell)) after 4 s\n")
+        fs = lp.findings_from_log("H", log, {})
+        self.assertTrue(any(f.severity == lp.TOOL and f.family == "goto_entity" for f in fs))
+        text = lp.report_text("madeup", p, 420.0, lp.phase_times(log), lp.fold(fs), "", {"H": lp.summaries(log)},
+                              "runfolder", [])
+        head, tool = text.split("tool: could not act: ", 1)
+        self.assertNotIn("[tool: could not act]", head)
+        self.assertIn("[tool: could not act] tool goto_entity: teleport: no good landing beside it (x1)", tool)
+        self.assertIn("[action failed]", head)
+        self.assertTrue(tool.startswith("1 in 1 entries"))
 
     def test_report_text(self):
         p = lp.make_plan(content(), late_join=False)

@@ -418,6 +418,48 @@ STATIC_ACTION = {
 }
 
 
+# What a player acts on, read from the static reader's component data classes (manifest.json's
+# "components"; class names as the reader writes them). The pass chose an action by the object's name or
+# its reader group before: a chest spawner, a battle gate and a caged NPC were pressed and had nothing
+# to press (the 20261118 passes); the components say what the object has.
+COMP_INTERACT = "CInteractionComponentData"
+COMP_CONVERSATION = "CConversationComponentData"
+COMP_DESTRUCTIBLE = "Scripts.DestructibleComponentData"
+COMP_COLLECTIBLE = "Scripts.CollectibleComponentData"
+COMP_TRIGGER = re.compile(r"^CTriggerVolume\w*ComponentData$")
+CLASS_FIGHT = ("CEncounterSpawnPoint",)
+CLASS_PICKUP = ("CCollectible",)
+CLASS_TRIGGER = ("CScriptTriggerEntity",)
+# Reader groups whose objects are fought at the cluster whatever their components (an enemy's AI).
+FIGHT_STATES = ("enemy", "encounter", "spawner")
+
+
+def action_from_components(o: Obj) -> tuple[str, str] | None:
+    """The action the static reader's components (and the class, for the component-less kinds) give,
+    or None when they say nothing (the group's table then decides). An interaction first (what a
+    player presses), then a destructible (attacked), a collectible (picked up), a spawner or encounter
+    (fought), a trigger volume (entered); an object of an acted-on group with none of those has nothing
+    a player acts on directly (a chest spawner's chest comes at run time, a battle gate opens on its
+    fight, a caged NPC is freed by breaking its cage): visited only, and said so."""
+    comps = set(o.components)
+    if COMP_INTERACT in comps:
+        if o.state == "npc" or (o.cls == "CActor" and COMP_CONVERSATION in comps):
+            return TALK, "an NPC with an interaction: talked to"
+        return INTERACT_A, "has an interaction (CInteractionComponentData)"
+    if COMP_DESTRUCTIBLE in comps:
+        return ATTACK, "a destructible (Scripts.DestructibleComponentData)"
+    if o.state in FIGHT_STATES or o.cls in CLASS_FIGHT:
+        return None  # the group's fight (an enemy, a spawner, an encounter)
+    if COMP_COLLECTIBLE in comps or o.cls in CLASS_PICKUP:
+        return PICKUP, "a collectible"
+    if any(COMP_TRIGGER.match(c) for c in comps) or o.cls in CLASS_TRIGGER:
+        return ENTER, "has a trigger volume: entered"
+    if o.state in ("switch", "lock", "chest", "npc"):
+        return VISIT, ("no interaction, destructible, spawner or trigger component: nothing a player acts on "
+                       f"directly (reader group {o.state})")
+    return None
+
+
 def classify(o: Obj) -> tuple[str, str]:
     """The generic action for an object and why (the report's "no action yet" names the why)."""
     name = o.name
@@ -431,9 +473,13 @@ def classify(o: Obj) -> tuple[str, str]:
             return VISIT, "a kill or death zone: never entered"
         if o.loads_map:
             return VISIT, "loads another map: entered only as the level's exit"
+        by_comp = action_from_components(o)
+        if by_comp is not None:
+            act, why = by_comp
         if act in ("attack", "interact", "pickup", "talk") and (not name or "_componentDataOverrides_" in name):
             return VISIT, "no run-time name to give a command"
-        if act == "enter" and o.box is None and o.cls != "CScriptTriggerEntity":
+        if act == "enter" and o.box is None and o.cls not in CLASS_TRIGGER and not any(
+                COMP_TRIGGER.match(c) for c in o.components):
             return VISIT, "no trigger box to enter"
         return act, why
     if name and EXIT.search(name) and o.group in (GROUP_CHECKPOINTS, GROUP_TRIGGERS, GROUP_ENEMIES, GROUP_NPCS):
@@ -1016,12 +1062,39 @@ def position_literals(script: str) -> list[str]:
 # --- the report ------------------------------------------------------------------------------------------
 
 SEVERITY = ("crash", "level changed before the exit", "provoked difference (expected)", "difference after an action", "difference at rest", "object without a row",
-            "row without an object", "action failed", "step failed", "not shared (documented)")
+            "row without an object", "action failed", "step failed", "not shared (documented)", "tool: could not act")
 
 AUDIT_DIFF = re.compile(r"Online: audit diff (\S+) (\S+) (\S+) (\S+) slot (\d+) rev (\d+) (\S+) at (\S+) local (\S+) "
                         r"row (\S+) live (\S+)(?: why (.*))?$")
 AUDIT_NOROW = re.compile(r"Online: audit norow (\S+) (\S+) (\S+) (\S+) at (\S+)$")
 AUDIT_SUMMARY = re.compile(r"Online: audit summary (\S+) (\S+) rows (\d+) differences (\d+) .*$")
+# A step the TOOL could not carry out (not a finding about the game): the report lists them in their own
+# section, "tool: could not act", by kind, so the findings are only about the game. First match wins;
+# a failure none of these names stays a finding ("action failed" or "step failed").
+TOOL = "tool: could not act"
+TOOL_KINDS = (
+    (re.compile(r"skipped: the sweep's time is up"), "not reached in the budget"),
+    (re.compile(r"bad arguments|unknown command"), "the step's own words were refused (a generator bug)"),
+    (re.compile(r"no floor under it or beside it"), "no floor under the object or beside it (off the map, or its area's collision not in)"),
+    (re.compile(r"still asleep .*wakes only at its own event"), "asleep: wakes only at its own event, not for a visit"),
+    (re.compile(r"still asleep|asleep \(not in the entity table\)|asleep, and the teleport"), "asleep: did not wake for the visit"),
+    (re.compile(r"no such entity|is gone\b|no authored object"), "not in the live game by that name or id"),
+    (re.compile(r"held too long|the game held the hero"), "teleport: the game held the hero"),
+    (re.compile(r"under the target's floor|off the point|teleport failed|bad landing"), "teleport: no good landing beside it"),
+    (re.compile(r"the route did not get here|out of reach|approach: teleport failed|no closer than"), "could not get within reach"),
+    (re.compile(r"no CInteractionComponent on"), "no interaction on or near the object"),
+    (re.compile(r"no player frame|no hero"), "no player frame or hero to act with"),
+)
+
+
+def tool_kind(words: str) -> str:
+    """The tool's failure kind of a failed step's words (TOOL_KINDS), "" when it may be the game's."""
+    for rx, kind in TOOL_KINDS:
+        if rx.search(words):
+            return kind
+    return ""
+
+
 STEP_FAIL = re.compile(r"(Input script: waitfor (\S+) timed out.*|Dev: (?:\S+ )*(?:failed|stopped|gives up)\b.*|"
                        r"Dev: wait_free stopped.*|Online: audit \S+: not done in 20 s|Online: audit \S+ refused.*)")
 MARK = re.compile(r"Input script: LEVELPASS (.*)$")
@@ -1111,9 +1184,17 @@ def findings_from_log(peer: str, text: str, labels: dict[str, str]) -> list[Find
         m = STEP_FAIL.search(line)
         if m:
             words = m.group(1)
+            family = words.split(" ")[1] if " " in words else words
+            if family == "route" and " teleport " in words:
+                family = words.split(" ")[3] if len(words.split(" ")) > 3 else family  # the helper's own name
+            tk = tool_kind(words)
+            if tk:
+                out.append(Finding(severity=TOOL, kind="tool", family=family, what=tk, obj="", step="",
+                                   lines=[line.strip()], peer=peer))
+                continue
             sev = "action failed" if re.search(r"attack_until|interact|pickup|fight_area|encounter", words) else "step failed"
             what = re.sub(r"\d+(\.\d+)?", "N", words)[:140]
-            out.append(Finding(severity=sev, kind="step", family=words.split(" ")[1] if " " in words else words,
+            out.append(Finding(severity=sev, kind="step", family=family,
                                what=what, obj="", step="", lines=[line.strip()], peer=peer))
     return out
 
@@ -1248,6 +1329,22 @@ def summaries(text: str) -> list[str]:
     return [m.group(0) for m in (AUDIT_SUMMARY.search(l) for l in text.splitlines()) if m]
 
 
+def _entries(lines: list[str], folded) -> None:
+    """One folded entry each: its head line and up to three examples (peer, step, object, values, line)."""
+    for f, n, fs in folded:
+        seen = f" in {f.sightings} audit line(s)" if f.sightings > n else ""
+        lines.append(f"- [{f.severity}] {f.kind} {f.family}: {f.what} (x{n}{seen})")
+        for g in fs[:3]:
+            where = f"    {g.peer} {g.step}: {g.obj}".rstrip()
+            lines.append(where)
+            if g.server or g.client:
+                lines.append(f"      S {g.server} / client {g.client}")
+            for l in g.lines[:1]:
+                lines.append(f"      {l[:300]}")
+        if n > 3:
+            lines.append(f"    ... and {n - 3} more")
+
+
 def report_text(level: str, plan: Plan, wall_s: float, phases: list[tuple[str, float]], folded,
                 crash: str, sums: dict[str, list[str]], run_folder: str, notes: list[str],
                 boot: list[tuple[str, float]] | None = None) -> str:
@@ -1264,21 +1361,16 @@ def report_text(level: str, plan: Plan, wall_s: float, phases: list[tuple[str, f
     if boot:
         lines.append("boot steps (H, seconds each condition waited):")
         lines.append("  " + ", ".join(f"{n} {s:.1f}" for n, s in boot))
-    total = sum(n for _f, n, _fs in folded)
+    game = [e for e in folded if e[0].severity != TOOL]
+    tool = [e for e in folded if e[0].severity == TOOL]
+    total = sum(n for _f, n, _fs in game)
     lines.append("")
-    lines.append(f"findings: {total} in {len(folded)} entries" + (f"; CRASH: {crash}" if crash else ""))
-    for f, n, fs in folded:
-        seen = f" in {f.sightings} audit line(s)" if f.sightings > n else ""
-        lines.append(f"- [{f.severity}] {f.kind} {f.family}: {f.what} (x{n}{seen})")
-        for g in fs[:3]:
-            where = f"    {g.peer} {g.step}: {g.obj}".rstrip()
-            lines.append(where)
-            if g.server or g.client:
-                lines.append(f"      S {g.server} / client {g.client}")
-            for l in g.lines[:1]:
-                lines.append(f"      {l[:300]}")
-        if n > 3:
-            lines.append(f"    ... and {n - 3} more")
+    lines.append(f"findings: {total} in {len(game)} entries" + (f"; CRASH: {crash}" if crash else ""))
+    _entries(lines, game)
+    lines.append("")
+    lines.append(f"tool: could not act: {sum(n for _f, n, _fs in tool)} in {len(tool)} entries "
+                 "(steps the pass could not carry out; not findings about the game)")
+    _entries(lines, tool)
     lines.append("")
     lines.append("audit summaries (last per peer):")
     for peer, ss in sums.items():
