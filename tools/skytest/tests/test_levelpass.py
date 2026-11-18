@@ -600,6 +600,27 @@ class Report(unittest.TestCase):
         self.assertIn("[difference after an action] breakable Box_Destructible", text)
         self.assertLess(text.index("[difference after an action]"), text.index("[action failed]"))
 
+    def test_asleep_heading(self):
+        # An object asleep on the audited side is not "object without a row": its own heading, counted.
+        p = lp.make_plan(content(), late_join=False)
+        log = "\n".join([
+            "x Online: audit norow p1 v2_a breakable Crate_A#11 at 1,2,3",
+            "x Online: audit asleep p1 v2_a breakable (null)#4625 at 4,5,6",
+            "x Online: audit asleep p1 v3 breakable (null)#4625 at 4,5,6",
+            "x Online: audit asleep p1 v3 gate GateDestructible001#900 at 7,8,9",
+            "x Online: audit summary p1 v3 rows 9 differences 1 in_flight 0 pending 0 unsupported 0 not_audited 3"
+            " no_row 1 asleep 2 kinds breakable=1/1/0/0"])
+        fs = lp.findings_from_log("H", log, {})
+        self.assertEqual(sorted(f.severity for f in fs), sorted(["object without a row"] + [lp.ASLEEP] * 3))
+        text = lp.report_text("madeup", p, 420.0, lp.phase_times(log), lp.fold(fs), "", {"H": lp.summaries(log)},
+                              "runfolder", [])
+        head, rest = text.split("asleep on the audited side: ", 1)
+        self.assertIn("findings: 1 in 1 entries", head)
+        self.assertNotIn("[asleep on the audited side]", head)
+        self.assertTrue(rest.startswith("2 in 2 entries"))
+        self.assertIn("[asleep on the audited side] gate GateDestructible", rest)
+        self.assertEqual(len(lp.summaries(log)), 1)
+
 
 class Case(unittest.TestCase):
     """The generated case through skytest's own spec reader, and the runner keys it uses."""

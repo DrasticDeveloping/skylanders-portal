@@ -1110,12 +1110,17 @@ def position_literals(script: str) -> list[str]:
 
 SEVERITY = ("crash", "level changed before the exit", "provoked difference (expected)", "difference after an action", "difference at rest", "object without a row",
             "row without an object", "S keeps rows of removed entities", "action failed", "step failed",
-            "not shared (documented)", "tool: could not act")
+            "not shared (documented)", "tool: could not act", "asleep on the audited side")
 
 AUDIT_DIFF = re.compile(r"Online: audit diff (\S+) (\S+) (\S+) (\S+) slot (\d+) rev (\d+) (\S+) at (\S+) local (\S+) "
                         r"row (\S+) live (\S+)(?: why (.*))?$")
 AUDIT_NOROW = re.compile(r"Online: audit norow (\S+) (\S+) (\S+) (\S+) at (\S+)$")
 AUDIT_SUMMARY = re.compile(r"Online: audit summary (\S+) (\S+) rows (\d+) differences (\d+) .*$")
+# A tracked object with no row that is asleep on the audited side (its area streamed out; the game's
+# `audit asleep` line): the census lets a binding go while its copy sleeps, so no row resolves to it by
+# design. Not a finding: the report lists them under their own heading, counted (ASLEEP).
+AUDIT_ASLEEP = re.compile(r"Online: audit asleep (\S+) (\S+) (\S+) (\S+) at (\S+)$")
+ASLEEP = "asleep on the audited side"
 # A step the TOOL could not carry out (not a finding about the game): the report lists them in their own
 # section, "tool: could not act", by kind, so the findings are only about the game. First match wins;
 # a failure none of these names stays a finding ("action failed" or "step failed").
@@ -1227,6 +1232,14 @@ def findings_from_log(peer: str, text: str, labels: dict[str, str]) -> list[Find
             who, label, kind, local, where = m.groups()
             out.append(Finding(severity="object without a row", kind=kind, family=stem(local.split("#")[0]),
                                what="tracked here, no row resolves to it", obj=f"{local} at {where}",
+                               step=f"{label} {labels.get(label, '')}".strip(), lines=[line.strip()],
+                               peer=f"{peer}/{who}"))
+            continue
+        m = AUDIT_ASLEEP.search(line)
+        if m:
+            who, label, kind, local, where = m.groups()
+            out.append(Finding(severity=ASLEEP, kind=kind, family=stem(local.split("#")[0]),
+                               what="tracked here, asleep: no row binds while it sleeps", obj=f"{local} at {where}",
                                step=f"{label} {labels.get(label, '')}".strip(), lines=[line.strip()],
                                peer=f"{peer}/{who}"))
             continue
@@ -1523,8 +1536,9 @@ def report_text(level: str, plan: Plan, wall_s: float, phases: list[tuple[str, f
     if boot:
         lines.append("boot steps (H, seconds each condition waited):")
         lines.append("  " + ", ".join(f"{n} {s:.1f}" for n, s in boot))
-    game = [e for e in folded if e[0].severity != TOOL]
+    game = [e for e in folded if e[0].severity not in (TOOL, ASLEEP)]
     tool = [e for e in folded if e[0].severity == TOOL]
+    asleep = [e for e in folded if e[0].severity == ASLEEP]
     total = sum(n for _f, n, _fs in game)
     lines.append("")
     lines.append(f"findings: {total} in {len(game)} entries" + (f"; CRASH: {crash}" if crash else ""))
@@ -1533,6 +1547,10 @@ def report_text(level: str, plan: Plan, wall_s: float, phases: list[tuple[str, f
     lines.append(f"tool: could not act: {sum(n for _f, n, _fs in tool)} in {len(tool)} entries "
                  "(steps the pass could not carry out; not findings about the game)")
     _entries(lines, tool)
+    lines.append("")
+    lines.append(f"asleep on the audited side: {sum(n for _f, n, _fs in asleep)} in {len(asleep)} entries "
+                 "(tracked objects with no row while their copy sleeps; not findings)")
+    _entries(lines, asleep)
     lines.append("")
     lines.append("audit summaries (last per peer):")
     for peer, ss in sums.items():
