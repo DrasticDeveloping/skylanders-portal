@@ -744,6 +744,21 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
             exit_names |= {m for m in content.level_end[:content.level_end.index(n) + 1]
                            if any(o.name == m and exit_kind(o) == exit_kind(named[0]) for o in content.objects)}
             break
+    if not exit_names and content.level_end:
+        # No chain member a player acts on: one step back, a sender to the chain's first member that a
+        # player does act on, a trigger first (ww1: LevelOutro_Trigger -> CouncilEsmeralda, whose own
+        # conversation has no interaction; without it the pass waited 240 s for an end that never came).
+        first = content.level_end[0]
+        senders = sorted({e.sender for e in content.edges if e.target.split(".")[-1] == first})
+        for want in (ENTER, TALK, INTERACT_A):
+            pick = [n for n in senders if any(o.name == n and placed(o) and classify(o)[0] == want
+                                              for o in content.objects)]
+            if pick:
+                exit_names = {pick[0]}
+                for o in content.objects:
+                    if o.name == pick[0] and not o.ref:
+                        o.ref = name_ref(o.name)  # the probe never saw it: its name, resolved live at the exit
+                break
     exits = []
     for o in content.objects:
         if not (o.name and o.name in exit_names and placed(o)):

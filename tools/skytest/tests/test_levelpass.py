@@ -98,6 +98,20 @@ class Readers(unittest.TestCase):
         self.assertEqual(lp.exit_senders(chains), ["CS_Intro", "EventMgr", "TP_Start", "Sp_01", "Sp_02", "End_Mgr",
                                                    "Outro"])
 
+    def test_exit_one_step_back(self):
+        """No chain member a player acts on, but a sender to its first member is (ww1's LevelOutro_Trigger ->
+        CouncilEsmeralda): that sender is the exit, by its name when the probe never saw it, not a timed wait."""
+        c = content()
+        c.objects = [o for o in c.objects if o.name != "Level_Exit"]
+        c.level_end = ["Event_StartFight"]
+        lever = [o for o in c.objects if o.name == "Lever_A"][0]
+        lever.ref = ""
+        c.edges = [lp.Edge(sender="Lever_A", message="CFireBehaviorEventMessage", target="unit.Event_StartFight")]
+        p = lp.make_plan(c, late_join=False)
+        self.assertFalse(p.timed)
+        self.assertEqual([(a.action, a.obj.name) for a in p.exit_stop.actions], [(lp.EXIT_A, "Lever_A")])
+        self.assertEqual(lever.ref, "Lever_A")
+
     def test_timed_level(self):
         c = content()
         c.objects = [o for o in c.objects if o.name != "Level_Exit"]
