@@ -1420,7 +1420,9 @@ def fold(findings: list[Finding]) -> list[tuple[Finding, int, list[Finding]]]:
     seen: set[tuple] = set()
     sightings: dict[tuple[str, str, str, str], int] = {}
     for f in findings:
-        key = (f.severity, f.kind, f.family, f.what)
+        # Values out of the key: one object's facing that differs by other amounts at each audit is one
+        # entry (ww1's EZ2_Skully gave ten); the entry's first finding keeps its own values.
+        key = (f.severity, f.kind, f.family, re.sub(r"-?\d+(?:\.\d+)?", "N", f.what))
         sightings[key] = sightings.get(key, 0) + 1
         obj = (key, f.peer, f.obj) if f.obj else (key, f.peer, f.lines[0] if f.lines else "")
         if obj in seen:

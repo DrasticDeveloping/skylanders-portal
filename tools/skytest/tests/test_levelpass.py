@@ -491,6 +491,16 @@ class Report(unittest.TestCase):
         self.assertIn("v1", labels)
         self.assertTrue(all(isinstance(v, str) for v in labels.values()))
 
+    def test_fold_ignores_values(self):
+        """One object differing by other amounts at each audit is one entry."""
+        f1 = lp.Finding(severity="difference at rest", kind="mover", family="EZ2_Skully", what="differs facing 0.1 0.0 1.4 vs -0.1 0 1.3",
+                        obj="EZ2_Skully#1 a1 at 1,2,3", step="v1", peer="H/p1")
+        f2 = lp.Finding(severity="difference at rest", kind="mover", family="EZ2_Skully", what="differs facing 0.1 0.0 1.4 vs 0.0 0.1 1.3",
+                        obj="EZ2_Skully#1 a1 at 1,2,3", step="v2", peer="H/p1")
+        folded = lp.fold([f1, f2])
+        self.assertEqual(len(folded), 1)
+        self.assertEqual(folded[0][1], 1)
+
     def test_tool_kinds(self):
         """A step the tool could not carry out is its own kind; what may be the game's is not."""
         k = lp.tool_kind
