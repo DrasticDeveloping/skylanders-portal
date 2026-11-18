@@ -1597,7 +1597,15 @@ def check_game_arg(arg: str) -> str:
     name, eq, value = arg.partition("=")
     if not name.startswith("--") or len(name) < 3 or not eq or not value.strip() or "'" in arg:
         raise ValueError(f"--game-arg {arg!r}: give --name=value with a non-empty value")
+    # A later value wins over the case's own: these would move the pass off the test copy of the owner's
+    # data or onto the real portal (docs/RULES.md), so they are never taken from --game-arg.
+    if name[2:].strip().lower() in GAME_ARG_REFUSED:
+        raise ValueError(f"--game-arg {arg!r}: {name} is the runner's own (the test copy and the software "
+                         "portal): not settable here")
     return arg
+
+
+GAME_ARG_REFUSED = ("user_data_root", "portal_mode")
 
 
 def _toml_list(items: list[str]) -> str:

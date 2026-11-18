@@ -600,6 +600,13 @@ class Report(unittest.TestCase):
         self.assertIn("[difference after an action] breakable Box_Destructible", text)
         self.assertLess(text.index("[difference after an action]"), text.index("[action failed]"))
 
+    def test_game_arg(self):
+        self.assertEqual(lp.check_game_arg("--online_authored_ids=2"), "--online_authored_ids=2")
+        for bad in ("--online_authored_ids=", "online_authored_ids=2", "--x", "--user_data_root=C:/x",
+                    "--portal_mode=usb", "--Portal_Mode=software"):
+            with self.assertRaises(ValueError, msg=bad):
+                lp.check_game_arg(bad)
+
     def test_asleep_heading(self):
         # An object asleep on the audited side is not "object without a row": its own heading, counted.
         p = lp.make_plan(content(), late_join=False)
