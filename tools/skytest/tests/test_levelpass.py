@@ -182,6 +182,9 @@ class Classify(unittest.TestCase):
         self.assertEqual(lp.classify(self.static("GillmanConvo", "npc", ["CTriggerVolumeSphereComponentData",
                                                                          "Scripts.InteractionSequenceComponentData"],
                                                  "CActor"))[0], lp.ENTER)
+        # A group the pass only visits is not made an action by its components (a teleporter's trigger volume).
+        self.assertEqual(lp.classify(self.static("Cave03_TeleToInt", "teleporter", ["Scripts.TeleporterComponentData",
+                                                                                "CTriggerVolumeBoxComponentData"]))[0], lp.VISIT)
         # A mini-game with an interaction (binoculars, a winch): never pressed.
         self.assertEqual(lp.classify(self.static("UndeadZone_Binoculars", "minigame", ["CInteractionComponentData",
                                                                                   "Scripts.BinocularMinigameComponentData"]))[0], lp.VISIT)

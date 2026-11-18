@@ -478,7 +478,11 @@ def classify(o: Obj) -> tuple[str, str]:
             return VISIT, "a kill or death zone: never entered"
         if o.loads_map:
             return VISIT, "loads another map: entered only as the level's exit"
-        by_comp = action_from_components(o)
+        # The components choose among the actions of an acted-on group (and take one away); a group the
+        # pass only visits (a teleporter, a mover, a mini-game, a bounce pad) is never made an action by
+        # them: ww1's Cave03_TeleToInt (a teleporter with a trigger volume) was entered and dropped the
+        # hero into an interior's endless fall (run 20261118-110326).
+        by_comp = action_from_components(o) if act != VISIT else None
         if by_comp is not None:
             act, why = by_comp
         if act in ("attack", "interact", "pickup", "talk") and (not name or "_componentDataOverrides_" in name):
