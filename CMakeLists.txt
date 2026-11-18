@@ -170,7 +170,7 @@ if(SKYLANDERS_PORTAL_TESTS)
     foreach(t portal_framing_test portal_mode_test software_portal_test figure_file_test
               figure_catalog_test figure_stats_test audio_test xam_bridge_test
               trap_villain_test g726_test figure_info_test real_portal_bridge_test
-              data_folder_test)
+              data_folder_test live_lines_test)
         add_executable(skylanders_${t} tests/${t}.cpp)
         target_include_directories(skylanders_${t} PRIVATE tests)
         target_link_libraries(skylanders_${t} PRIVATE skylanders_portal_core)

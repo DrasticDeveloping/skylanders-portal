@@ -60,6 +60,17 @@
 //                            holds, at most that long; what follows starts when it returns (met
 //                            or timed out), not by the clock
 //   quit                     ends the game
+//   follow <file>            live mode: plays every complete line appended to that file (relative
+//                            to the working directory), in order, each on a timeline of its own that
+//                            starts when it is taken, with the same commands and blocking rules;
+//                            what follows `follow` in the script waits until a `follow_end` line.
+//                            Only lines that end in a newline are taken; lines are numbered from 1
+//                            in the file (blank and comment lines count) and logged as
+//                            `Input script: live <n>: <line>` when they start, `Input script: live
+//                            <n> done` when their last command, press and wait are over, or
+//                            `Input script: live <n> refused: <why>` (the session goes on). The
+//                            test runner's `skytest.py live` sessions write the file (dev/live_lines.h)
+//   follow_end               (a live line only) leaves live mode: `Input script: live mode ended`
 //   <name> [<args>]          a command the game registered (RegisterScriptCommand), e.g. a
 //                            developer build's level loading; the timeline waits while it runs,
 //                            presses included
