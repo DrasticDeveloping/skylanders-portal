@@ -88,7 +88,7 @@ def h_lines(bug: Bug) -> list[str]:
         return [f"log LEVELPASS pred {bug.n} skipped"]
     out = [f"log LEVELPASS pred {bug.n} begin"]
     out += [line for line in bug.steps]
-    out.append("wait_free 30")
+    out.append("wait_free 15")
     out.append(f"log LEVELPASS pred {bug.n} snap")
     for name in bug.snap:
         out += [f"dump_entities {name}", f"online_server_dump_entities {name}", "waitfor online_server_dump_heard 30"]

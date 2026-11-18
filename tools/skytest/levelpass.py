@@ -82,6 +82,7 @@ class Obj:
     loads_map: bool = False      # it sends CLoadMapComponentMessage: entered only as the level's exit
     ref: str = ""                # the live reference a script step names it by (attach_refs); "" for none
     zone: str = ""               # the static reader's zone (the level or one of its sub-zones)
+    components: list[str] = field(default_factory=list)  # the static reader's component data classes
 
     def point(self) -> tuple[float, float, float]:
         """Where a teleport goes to enter it: its placed position when that is inside its trigger box
@@ -194,6 +195,7 @@ def parse_static_manifest(data: dict, level: str) -> Content:
                 along=float(e["along"]) if isinstance(e.get("along"), (int, float)) else None, loads_map=loads)
         o.state = str(e.get("group", ""))  # the static group itself
         o.zone = str(e.get("zone", ""))
+        o.components = [str(c) for c in e.get("components", []) or []]
         objects.append(o)
         if start is None and e.get("group") == "level_start" and (name == start_name or not start_name):
             start = pos
@@ -365,6 +367,7 @@ INTERACT = re.compile(r"chest|switch|lever|winch|crank|button|valve|keylock|lock
                       r"pull|wheel|turret|cannon", re.I)
 EXIT = re.compile(r"level_?end|end_?level|exit|outro|finale|endencounter|end_encounter|levelcomplete", re.I)
 SCENE = re.compile(r"^(vo_|cs_|hint|cutscene|cinematic|conversation|convo)", re.I)
+LOCK_GAME = re.compile(r"lockpick|minigamegate|minigame_gate", re.I)
 DEBUG = re.compile(r"^debug|_debug|debug_|^test_|_test\b", re.I)
 KILL = re.compile(r"kill_?z|killzone|death_?zone|kill_?volume|deathplane|kill_?plane", re.I)
 CHECKPOINT = re.compile(r"check_?point", re.I)
@@ -422,6 +425,8 @@ def classify(o: Obj) -> tuple[str, str]:
         return VISIT, "a level designer's debug object: never pressed"
     if o.state in STATIC_ACTION and o.ident:  # the static reader's group (parse_static_manifest)
         act, why = STATIC_ACTION[o.state]
+        if o.state == "lock" and (LOCK_GAME.search(name or "") or "Scripts.ForwardMessageComponentData" in o.components):
+            return VISIT, "a Spark Lock mini-game gate: no script plays the mini-game yet (it locks the controls)"
         if name and KILL.search(name):
             return VISIT, "a kill or death zone: never entered"
         if o.loads_map:
@@ -684,11 +689,11 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
         near = [o for o in exits if dist(o.pos, receiver.pos) <= EXIT_NEAR]
         exits = near or exits
         if all(exit_kind(o) == FIGHT for o in exits):
-            # The end fight: at the receiver (the arena's manager), once, then once more for a late wave.
-            exits = [Obj(name=receiver.name, cls=receiver.cls, pos=receiver.pos, group=GROUP_ENEMIES,
-                         ident=receiver.ident, state="encounter", kind=receiver.kind, along=receiver.along,
-                         ref=receiver.ref)]
-            exit_names = exit_names | {receiver.name}
+            # The end fight, once, then once more for a late wave: anchored on the chain's sender nearest the
+            # receiver (a spawner on the arena's floor; the manager itself may be placed in the air above it).
+            anchor = min((o for o in exits if o.ref), key=lambda o: dist(o.pos, receiver.pos), default=None)
+            if anchor is not None:
+                exits = [anchor]
     visited = [o for o in visited if not (o.name and o.name in exit_names)]
     # A stable order: along the level path when the content has it, else by distance from the start;
     # then name (the clusters' seeds come first in it).
@@ -881,7 +886,6 @@ def action_lines(a: Action, label: str) -> list[str]:
         out.append(f"interact {ref} {ACTION_TIMEOUT[TALK]}")
     elif a.action in (ENTER, EXIT_A):
         out.append(f"enter_trigger {ref}")
-    out.append("wait_free 30")
     return out
 
 
@@ -897,8 +901,8 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
     n_stops = len(plan.stops)
     marked = False
     for i, s in enumerate(plan.stops):
-        lead = n_stops if plan.timed else LATE_JOIN_LEAD
-        if late_join_after is not None and plan.late_join and i == max(0, n_stops - lead):
+        # D boots beside the sweep (about two minutes) and joins in its last part: the mark at the start.
+        if late_join_after is not None and plan.late_join and i == 0:
             lines.append("log LEVELPASS late-join start")
             marked = True
         if s is plan.exit_stop:
@@ -973,7 +977,7 @@ def stop_lines(s: Stop) -> list[str]:
     ref = visit_ref(s)
     out = [f"log LEVELPASS visit {s.label} objects {len(c.objects)} ({names}) ref {ref or '-'}"]
     if ref:
-        out += [f"goto_entity {ref}", "wait_free 20"]
+        out.append(f"goto_entity {ref}")
     out.append(f"online_audit {s.label}")
     for k, a in enumerate(s.actions):
         out += action_lines(a, f"{s.label}_{k + 1}")
@@ -994,8 +998,7 @@ def script_d(plan: Plan) -> str:
         step = len(acted) / D_VISITS
         acted = [acted[int(i * step)] for i in range(D_VISITS - 1)] + [acted[-1]]
     for s in acted:
-        lines += [f"log LEVELPASS D visit {s.label}", f"goto_entity {visit_ref(s)}", "wait_free 20",
-                  f"online_audit d-{s.label}"]
+        lines += [f"log LEVELPASS D visit {s.label}", f"goto_entity {visit_ref(s)}", f"online_audit d-{s.label}"]
     lines += ["log LEVELPASS D done", "online_end", "quit"]
     return "\n".join(lines) + "\n"
 
