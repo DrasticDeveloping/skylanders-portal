@@ -114,6 +114,12 @@ class Verdicts(unittest.TestCase):
         text = lpp.verdict_text(lpp.verdicts(r.bugs, {"H": H, "S": S, "D": D}))
         self.assertIn("#3 CONFIRMED", text)
 
+    def test_d_jump_window_ends_at_the_next_bug(self):
+        """A jump of D after the next bug began is that bug's, not this one's."""
+        dpos = [(100.0, (0.0, 0.0, 0.0)), (101.0, (0.0, 0.0, 0.0)), (104.0, (5000.0, 0.0, 0.0))]
+        self.assertEqual(lpp.check_one("d_jump 1000", {}, 100.0, {}, dpos)[0], lpp.CONFIRMED)
+        self.assertEqual(lpp.check_one("d_jump 1000", {}, 100.0, {}, dpos, until=103.0)[0], lpp.NOT_SEEN)
+
     def test_not_seen_and_could_not(self):
         b = lpp.Bug(n=1, level="x", title="t", steps=["s"], snap=["Block_A"], checks=["position_differs Block_A 500"])
         rows = lpp.verdicts([b], {"H": H.replace("pred 3", "pred 1"), "S": S})

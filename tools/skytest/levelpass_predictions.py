@@ -216,7 +216,9 @@ CONFIRMED, NOT_SEEN, COULD_NOT = "CONFIRMED", "NOT SEEN", "COULD NOT TEST"
 
 
 def check_one(check: str, snaps: dict[str, Snap], begin: float | None, texts: dict[str, str],
-              dpos: list[tuple[float, tuple[float, float, float]]]) -> tuple[str, str]:
+              dpos: list[tuple[float, tuple[float, float, float]]], until: float | None = None) -> tuple[str, str]:
+    """One check's verdict; `until` (the next bug's begin) closes this bug's time window, so a jump of D
+    is never counted for two bugs (run 20261118-115932 confirmed #9 and #10 by one jump)."""
     w = check.split()
     kind = w[0]
     taken = {p: s for p, s in snaps.items() if s.taken}
@@ -251,11 +253,12 @@ def check_one(check: str, snaps: dict[str, Snap], begin: float | None, texts: di
         if begin is None:
             return COULD_NOT, "the step never began"
         before = [p for t, p in dpos if t <= begin]
-        after = [p for t, p in dpos if begin < t <= begin + D_JUMP_WINDOW_S]
+        end = begin + D_JUMP_WINDOW_S if until is None else min(begin + D_JUMP_WINDOW_S, until)
+        after = [p for t, p in dpos if begin < t <= end]
         if not before or not after:
             return COULD_NOT, "no position of D around the step (D not in the session then)"
         jump = max(math.dist(before[-1], p) for p in after)
-        return (CONFIRMED if jump > dist else NOT_SEEN), f"D moved up to {jump:.0f} within {D_JUMP_WINDOW_S:.0f} s (limit {dist:.0f})"
+        return (CONFIRMED if jump > dist else NOT_SEEN), f"D moved up to {jump:.0f} within {end - begin:.0f} s (limit {dist:.0f})"
     if kind == "log":
         peer, rx = w[1], re.compile(" ".join(w[2:]))
         text = texts.get(peer)
@@ -275,6 +278,7 @@ def verdicts(recipes: list[Bug], texts: dict[str, str]) -> list[tuple[Bug, str, 
     s_snaps = s_snapshots(texts.get("S", ""), windows)
     d_snap = d_snapshot(texts["D"]) if "D" in texts else Snap()
     dpos = d_positions(texts["D"]) if "D" in texts else []
+    begins = sorted(w["begin"] for w in windows.values() if w["begin"] is not None)
     out = []
     for bug in recipes:
         if bug.could_not_test:
@@ -287,7 +291,8 @@ def verdicts(recipes: list[Bug], texts: dict[str, str]) -> list[tuple[Bug, str, 
         snaps = {"H": w["h"], "S": s_snaps.get(bug.n, Snap())}
         if d_snap.taken:
             snaps["D"] = d_snap
-        results = [check_one(c, snaps, w["begin"], texts, dpos) for c in bug.checks]
+        until = next((b for b in begins if b > w["begin"]), None)
+        results = [check_one(c, snaps, w["begin"], texts, dpos, until) for c in bug.checks]
         reasons = [f"{c}: {v}: {why}" for c, (v, why) in zip(bug.checks, results)]
         if any(v == CONFIRMED for v, _ in results):
             verdict = CONFIRMED
