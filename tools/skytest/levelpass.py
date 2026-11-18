@@ -443,6 +443,10 @@ def action_from_components(o: Obj) -> tuple[str, str] | None:
     a player acts on directly (a chest spawner's chest comes at run time, a battle gate opens on its
     fight, a caged NPC is freed by breaking its cage): visited only, and said so."""
     comps = set(o.components)
+    if o.state == "minigame" or any(c.endswith("MinigameComponentData") for c in comps):
+        # A mini-game (a winch, binoculars, a launch pad): pressing it enters a mode that locks the controls
+        # and stopped every later audit in ww1's run 20261118-104911 (binoculars); no script plays one yet.
+        return VISIT, "a mini-game (its component): no script plays it yet, pressing it locks the controls"
     if COMP_INTERACT in comps:
         if o.state == "npc" or (o.cls == "CActor" and COMP_CONVERSATION in comps):
             return TALK, "an NPC with an interaction: talked to"

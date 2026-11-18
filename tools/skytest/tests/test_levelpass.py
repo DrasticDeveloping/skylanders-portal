@@ -182,6 +182,11 @@ class Classify(unittest.TestCase):
         self.assertEqual(lp.classify(self.static("GillmanConvo", "npc", ["CTriggerVolumeSphereComponentData",
                                                                          "Scripts.InteractionSequenceComponentData"],
                                                  "CActor"))[0], lp.ENTER)
+        # A mini-game with an interaction (binoculars, a winch): never pressed.
+        self.assertEqual(lp.classify(self.static("UndeadZone_Binoculars", "minigame", ["CInteractionComponentData",
+                                                                                  "Scripts.BinocularMinigameComponentData"]))[0], lp.VISIT)
+        self.assertEqual(lp.classify(self.static("TreasureChest_3", "chest", ["CInteractionComponentData", "Scripts.MicrogameComponentData"]))[0],
+                         lp.INTERACT_A)  # a chest's own microgame: pressed
         # A collectible: picked up; enemies and spawners: fought as before.
         self.assertEqual(lp.classify(self.static("StoryScroll", "collectible", ["Scripts.CollectibleComponentData"]))[0],
                          lp.PICKUP)
