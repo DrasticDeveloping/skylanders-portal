@@ -659,6 +659,7 @@ class Plan:
     sample: int = SAMPLE            # the acted-on objects per family this plan took
     timed: bool = False             # the level ends on its own (no chain member a player acts on)
     probe: bool = True              # the authored probe on (--no-probe: names only, no auth: ids)
+    game_args: list[str] = field(default_factory=list)  # --game-arg: extra settings for H and D (Host forwards S's)
 
 
 # Seconds the boot and the level load take, measured (the report prints the real ones); used for the
@@ -1566,9 +1567,19 @@ D_ARGS = ["--dev_authored_probe=true", "--dev_backend_commands=true", "--dev_dam
 CASE_TIMEOUT_S = 1200   # the hard stop: twice the budget
 
 
-def probe_args(args: list[str], probe: bool) -> list[str]:
-    """A peer's arguments, without the authored probe for a --no-probe pass."""
-    return list(args) if probe else [a for a in args if not a.startswith("--dev_authored_probe")]
+def probe_args(args: list[str], probe: bool, extra: list[str] | None = None) -> list[str]:
+    """A peer's arguments, without the authored probe for a --no-probe pass, plus the pass's --game-arg
+    settings (after the defaults, so a later value wins)."""
+    return (list(args) if probe else [a for a in args if not a.startswith("--dev_authored_probe")]) + list(extra or [])
+
+
+def check_game_arg(arg: str) -> str:
+    """A --game-arg value: `--name=value` with a value (an empty value makes the game drop its whole command
+    line, its user data root included)."""
+    name, eq, value = arg.partition("=")
+    if not name.startswith("--") or len(name) < 3 or not eq or not value.strip() or "'" in arg:
+        raise ValueError(f"--game-arg {arg!r}: give --name=value with a non-empty value")
+    return arg
 
 
 def _toml_list(items: list[str]) -> str:
@@ -1611,10 +1622,10 @@ def spec_toml(plan: Plan) -> str:
            'shader_cache = "snapshot"',
            "",
            "[peer.H]",
-           f"args = {_toml_list(probe_args(H_ARGS, plan.probe))}",
+           f"args = {_toml_list(probe_args(H_ARGS, plan.probe, plan.game_args))}",
            "script = \'\'\'\n" + h + "\'\'\'",
            ]
     if late:
-        out += ["", "[peer.D]", f"args = {_toml_list(probe_args(D_ARGS, plan.probe))}", f"start_after = '{LATE_JOIN_MARK}'",
+        out += ["", "[peer.D]", f"args = {_toml_list(probe_args(D_ARGS, plan.probe, plan.game_args))}", f"start_after = '{LATE_JOIN_MARK}'",
                 "script = \'\'\'\n" + script_d(plan) + "\'\'\'"]
     return "\n".join(out) + "\n"
