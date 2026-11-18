@@ -111,7 +111,8 @@ TIME = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+)\]")
 ENTITY = re.compile(r"Online: entity (\d+) (\S+) class (\S+) at (\S+) team")
 MARK = re.compile(r"Input script: LEVELPASS pred (\d+) (begin|snap|end|skipped)")
 S_ASK = re.compile(r"Online: the owner asked for the entity list(?:: (\S+))?")
-WHERE = re.compile(r"Where: \S+ at (-?[\d.]+) (-?[\d.]+) (-?[\d.]+)")
+# The trace line is "Online: where <zone> at x,y,z" (trace_where_seconds); the older "Where: <zone> at x y z" too.
+WHERE = re.compile(r"(?:Online: where|Where:) \S+ at (-?[\d.]+)[ ,](-?[\d.]+)[ ,](-?[\d.]+)")
 FAILED = re.compile(r"Dev: \S+ .*\bfailed \(.*")
 
 
@@ -322,7 +323,9 @@ def scripts(level: str, bugs: list[Bug], d_mode: str) -> tuple[str, str | None]:
           "waitfor online_level_after_mark 300", "waitfor online_barrier 300", "wait_free 120",
           "log LEVELPASS phase predictions", "online_audit start", f"hold_cap {lp.HOLD_CAP_S}"]
     if d_mode == "early":
-        h += ["log LEVELPASS late-join start", "online_wait_peers 2 300", "wait_free 60"]
+        # D in play and its pose shown here (online_peer_shown), not only connected: run 20261118-114820
+        # began the bugs 17 s before D was in the level.
+        h += ["log LEVELPASS late-join start", "online_wait_peers 2 300", "waitfor online_peer_shown 300", "wait_free 60"]
     for bug in bugs:
         h += h_lines(bug)
         if not bug.could_not_test:

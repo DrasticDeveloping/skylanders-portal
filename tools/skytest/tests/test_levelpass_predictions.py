@@ -67,7 +67,7 @@ S = "\n".join([
 D = "\n".join([
     line("00:09", "Where: madeup at 0.0 0.0 0.0"),
     line("00:10", "Where: madeup at 0.0 0.0 0.0"),
-    line("00:12", "Where: madeup at 5000.0 0.0 0.0"),
+    line("00:12", "Online: where madeup at 5000.0,0.0,0.0"),  # the trace's own form
 ])
 
 
@@ -91,6 +91,7 @@ class Recipes(unittest.TestCase):
         self.assertIn("online_server_dump_entities Clip_A", h)
         self.assertIn("log LEVELPASS pred 13 skipped", h)
         self.assertLess(h.index("LEVELPASS late-join start"), h.index("pred 3 begin"))
+        self.assertLess(h.index("waitfor online_peer_shown"), h.index("pred 3 begin"))  # D in play first
         self.assertIn("waitfor online_left 1200", d)
         # Early D snapshots the bugs' names after the session, the world it watched H change.
         self.assertLess(d.index("waitfor online_left 1200"), d.index("dump_entities Block_A"))
