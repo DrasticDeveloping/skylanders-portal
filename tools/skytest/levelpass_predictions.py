@@ -320,7 +320,7 @@ def scripts(level: str, bugs: list[Bug], d_mode: str) -> tuple[str, str | None]:
     h = lp.boot_lines(True, lp.FIGURE_H)
     h += ["waitfor online_server_hub 300", "online_mark_level", f"level {level}",
           "waitfor online_level_after_mark 300", "waitfor online_barrier 300", "wait_free 120",
-          "log LEVELPASS phase predictions", "online_audit start"]
+          "log LEVELPASS phase predictions", "online_audit start", f"hold_cap {lp.HOLD_CAP_S}"]
     if d_mode == "early":
         h += ["log LEVELPASS late-join start", "online_wait_peers 2 300", "wait_free 60"]
     for bug in bugs:

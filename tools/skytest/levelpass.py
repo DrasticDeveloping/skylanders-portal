@@ -963,7 +963,8 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
     lines = boot_lines(True, FIGURE_H)
     lines += ["waitfor online_server_hub 300", "online_mark_level", f"level {plan.level}",
               "waitfor online_level_after_mark 300", "waitfor online_barrier 300", "wait_free 120",
-              "log LEVELPASS phase sweep", "online_audit start", f"sweep_deadline {sweep_share(plan):.0f}"]
+              "log LEVELPASS phase sweep", "online_audit start", f"hold_cap {HOLD_CAP_S}",
+              f"sweep_deadline {sweep_share(plan):.0f}"]
     n_stops = len(plan.stops)
     marked = False
     for i, s in enumerate(plan.stops):
@@ -1021,6 +1022,7 @@ def sweep_share(plan: Plan, budget_s: float = BUDGET_S) -> float:
 
 
 SWEEP_MARGIN_S = 30.0
+HOLD_CAP_S = 20         # hold_cap: one hold or fall ends a step after this (H and D, the whole pass)
 SWEEP_MIN_S = 60.0
 EXIT_WAIT_S = 60.0     # the level end's own waits after the exit's actions (online_level_end, the next level)
 PROVOKE_LABEL = "provoke"
@@ -1058,6 +1060,7 @@ def script_d(plan: Plan) -> str:
     that: online_alone)."""
     lines = boot_lines(False, FIGURE_D)
     lines += ["waitfor online_in_play 300", "online_join {join}", "waitfor online_barrier 300", "wait_free 120",
+              f"hold_cap {HOLD_CAP_S}",
               "log LEVELPASS D in", "online_audit d-in"]
     acted = [s for s in plan.stops if s.actions and s is not plan.exit_stop and visit_ref(s)]
     if len(acted) > D_VISITS:

@@ -329,6 +329,10 @@ class Scripts(unittest.TestCase):
         self.assertLess(h.index(f"sweep_deadline {share:.0f}"), h.index("LEVELPASS visit v1"))
         self.assertLess(h.index("sweep_deadline 0"), h.index("LEVELPASS phase late-join"))
         self.assertGreaterEqual(share, lp.SWEEP_MIN_S)
+        # One hold or fall ends a step after HOLD_CAP_S on H and D, from the sweep to the end (not only the sweep).
+        self.assertLess(h.index(f"hold_cap {lp.HOLD_CAP_S}"), h.index("LEVELPASS visit v1"))
+        self.assertNotIn("hold_cap 0", h)
+        self.assertIn(f"hold_cap {lp.HOLD_CAP_S}", lp.script_d(p))
         self.assertLessEqual(share + lp.BOOT_S + lp.LEVEL_LOAD_S + lp.LATE_JOIN_S + lp.exit_seconds(p), lp.BUDGET_S)
 
     def test_no_exit_no_exit_waits(self):
