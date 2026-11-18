@@ -1105,6 +1105,7 @@ TOOL_KINDS = (
     (re.compile(r"the route did not get here|out of reach|approach: teleport failed|no closer than"), "could not get within reach"),
     (re.compile(r"no CInteractionComponent on"), "no interaction on or near the object"),
     (re.compile(r"no player frame|no hero"), "no player frame or hero to act with"),
+    (re.compile(r"time: hp (-?\d+) -> \1\b|no damage for \d+ s"), "the hero's hits took no hit point (not attackable now: bolted, scripted)"),
 )
 
 

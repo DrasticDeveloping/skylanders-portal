@@ -486,7 +486,8 @@ class Report(unittest.TestCase):
         self.assertIn("no floor", k("Dev: route teleport goto_entity failed (landed 1,2,3, 300 off the point 4,5,6 (more "
                                     "than 200); no floor under it or beside it (0 no floor, 1 no floor)) (target X#1)"))
         # The game's (or not known to be the tool's): stays a finding.
-        self.assertEqual(k("Dev: attack_until ShipJunk_2#7 failed (time: hp 50 -> 50, 9 bursts) after 30 s"), "")
+        self.assertIn("no hit point", k("Dev: attack_until ShipJunk_2#7 failed (time: hp 50 -> 50, 9 bursts) after 30 s"))
+        self.assertEqual(k("Dev: attack_until Crate#7 failed (time: hp 50 -> 20, 9 bursts) after 30 s"), "")
         self.assertEqual(k("Dev: interact Snagglescale#4 failed (the interaction went away after rt) after 3 s"), "")
         self.assertEqual(k("Input script: waitfor online_level_end timed out after 60 s"), "")
 
