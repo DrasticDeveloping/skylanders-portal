@@ -81,6 +81,7 @@ class Obj:
     along: float | None = None  # distance along the level path (the static reader's sort key)
     loads_map: bool = False      # it sends CLoadMapComponentMessage: entered only as the level's exit
     ref: str = ""                # the live reference a script step names it by (attach_refs); "" for none
+    zone: str = ""               # the static reader's zone (the level or one of its sub-zones)
 
     def point(self) -> tuple[float, float, float]:
         """Where a teleport goes to enter it: its placed position when that is inside its trigger box
@@ -192,6 +193,7 @@ def parse_static_manifest(data: dict, level: str) -> Content:
                 ident=f"{e.get('unit', '')}", kind=str(e.get("kind", "")), box=box, fires=fires,
                 along=float(e["along"]) if isinstance(e.get("along"), (int, float)) else None, loads_map=loads)
         o.state = str(e.get("group", ""))  # the static group itself
+        o.zone = str(e.get("zone", ""))
         objects.append(o)
         if start is None and e.get("group") == "level_start" and (name == start_name or not start_name):
             start = pos
@@ -639,6 +641,10 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
 def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, sample: int,
                provoke: str) -> Plan:
     visited = [o for o in content.objects if o.group in GROUPS_VISITED]
+    # A sub-zone (a swap zone) is its own map, loaded by its own entry: its objects are visited only when
+    # the probe saw them in this level's load (an authored id).
+    other_zone = [o for o in visited if o.zone and o.zone != content.level and not o.ref.startswith("auth:")]
+    visited = [o for o in visited if o not in other_zone]
     unplaced = sum(1 for o in visited if not placed(o))
     visited = [o for o in visited if placed(o)]
     start = content.start
@@ -751,6 +757,9 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
         stops.remove(exit_stop)
         stops.append(exit_stop)
     left_out = [f"{family[0]} {family[1]}: {k} more not acted on (sampled)" for family, k in sorted(left.items())]
+    if other_zone:
+        zones = sorted({o.zone for o in other_zone})
+        left_out.append(f"{len(other_zone)} object(s) of sub-zones not loaded with the level ({', '.join(zones)})")
     # Over the budget: drop visits of stops with no action, farthest from the start first; then say so.
     est = estimate_seconds(stops, late_join)
     if est > budget_s:
