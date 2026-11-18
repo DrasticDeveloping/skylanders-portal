@@ -397,8 +397,10 @@ BULK_HIDDEN = ["--window_hidden=true", "--render_hidden_draw=false"]
 BULK_MARK = "bulk-mode.txt"  # in every bulk case folder: the waitfor history (`timeouts`) skips its logs
 NOT_IN_BULK = "not in bulk"  # a spec bulk mode leaves out (bulk_exclusion): reported, not failed
 # The pacing a bulk run gives its games (`test --bulk --bulk-pacing NAME`): never changed silently,
-# and part of the run's label and args hash. What each changes in the tested condition is in
-# docs/testing-guide.md (bulk mode); the measured ladder per arm too.
+# part of the run's label and args hash, and only ever on the hidden games of a bulk run (a plain
+# game and a watched playtest never get it). What each changes in the tested condition is in
+# docs/testing-guide.md (bulk mode); the measured ladder per arm too. None changes the session's
+# shared tick (online_server_hz): halving it would double every tick constant in real time.
 BULK_PACINGS = {
     # The game's own pacing: a frame that misses the 60 Hz vblank waits for the next (60, 30, 20, 15).
     "default": {"client": [], "host": [], "server": []},
@@ -406,11 +408,11 @@ BULK_PACINGS = {
     # frame goes at the next 4 ms vblank, frame_rate_limit 60 still caps the rate. A hosted S keeps the
     # default (server_role.cpp pins guest_vblank_rate, and Host does not forward it).
     "vblank240": {"client": ["--guest_vblank_rate=240"], "host": [], "server": ["--guest_vblank_rate=240"]},
-    # The game's native 30 Hz: present_interval 2 on every game (a swap every second vblank), and the
-    # session's tick at 30 (--online_server_hz=30 on H, which Host passes to its server, whose
-    # server_role.cpp then sets present_interval 2 on S).
-    "hz30": {"client": ["--present_interval=2"], "host": ["--online_server_hz=30"],
-             "server": ["--present_interval=2"]},
+    # The console's frame rate on the games the runner starts: frame_rate_limit 30 (the guest's tick
+    # paced at 30, ThrottleGuestTickRate; the vblank stays 60), the session's tick still 60. A hosted
+    # S keeps 60 (server_role.cpp sets frame_rate_limit 60 itself; Host does not forward it). Jumps
+    # come out about 5 % higher than at 60 (docs/high-framerate.md, jump height).
+    "fps30": {"client": ["--frame_rate_limit=30"], "host": [], "server": ["--frame_rate_limit=30"]},
 }
 # Settings whose subject is the window, the draw skip or the pacing: a spec that sets one itself is
 # not run in bulk (bulk mode sets them, or its subject is what bulk mode changes).
@@ -8161,8 +8163,8 @@ def main(argv: list[str] | None = None) -> int:
                    " timeouts scaled ([defaults] bulk_wait_factor), the budget [defaults] bulk_machine_games;"
                    " specs that cannot run hidden are reported `not in bulk` (docs/testing-guide.md, bulk mode)")
     t.add_argument("--bulk-pacing", default=None, choices=sorted(BULK_PACINGS), help="with --bulk: the games'"
-                   " pacing (default: the game's own; vblank240: --guest_vblank_rate=240; hz30: the game's native"
-                   " 30 Hz, present_interval 2 and a 30 Hz session); part of the run's label")
+                   " pacing (default: the game's own; vblank240: --guest_vblank_rate=240; fps30:"
+                   " --frame_rate_limit=30, the session tick stays 60); part of the run's label")
     t.add_argument("--run-not-ready", action="store_true", help="run the cases that are not ready (ready = false,"
                    " a PLACEHOLDER) anyway, e.g. for the legs that exist; their result is graded as usual")
     t.add_argument("--no-breaker", action="store_true", help="start cases even when the circuit breaker of this"

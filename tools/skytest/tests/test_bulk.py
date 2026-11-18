@@ -130,12 +130,14 @@ class PeerArgsTest(unittest.TestCase):
         v = skytest.BulkMode(pacing="vblank240")
         self.assertEqual(skytest.bulk_peer_args(v, hosted, "H"), [*skytest.BULK_HIDDEN, "--guest_vblank_rate=240"])
         self.assertEqual(skytest.bulk_peer_args(v, standin, "S"), [*skytest.BULK_HIDDEN, "--guest_vblank_rate=240"])
-        h = skytest.BulkMode(pacing="hz30")
-        self.assertEqual(skytest.bulk_peer_args(h, hosted, "H"),
-                         [*skytest.BULK_HIDDEN, "--present_interval=2", "--online_server_hz=30"])
-        self.assertEqual(skytest.bulk_peer_args(h, hosted, "D"), [*skytest.BULK_HIDDEN, "--present_interval=2"])
-        self.assertEqual(skytest.bulk_peer_args(h, standin, "H"), [*skytest.BULK_HIDDEN, "--present_interval=2"])
-        self.assertIn("pacing hz30", h.line())
+        h = skytest.BulkMode(pacing="fps30")
+        self.assertEqual(skytest.bulk_peer_args(h, hosted, "H"), [*skytest.BULK_HIDDEN, "--frame_rate_limit=30"])
+        self.assertEqual(skytest.bulk_peer_args(h, hosted, "D"), [*skytest.BULK_HIDDEN, "--frame_rate_limit=30"])
+        self.assertEqual(skytest.bulk_peer_args(h, standin, "S"), [*skytest.BULK_HIDDEN, "--frame_rate_limit=30"])
+        self.assertIn("pacing fps30", h.line())
+        # No arm touches the session's shared tick.
+        self.assertFalse(any("online_server_hz" in x for arm in skytest.BULK_PACINGS.values() for v in arm.values()
+                             for x in v))
 
 
 class RunLoadTest(unittest.TestCase):
@@ -306,18 +308,18 @@ class BulkRunTest(unittest.TestCase):
     def test_a_pacing_arm_reaches_the_command_line(self) -> None:
         self.bulk_config()
         self.spec("hosted", 'layout = "server+1"\nstage = "0"\nserver = "host"\n[peer.H]\nscript = "quit\\n"\n')
-        r = self.run_bulk("hosted", bulk_pacing="hz30")
-        self.assertEqual(r["bulk"]["pacing"], "hz30")
+        r = self.run_bulk("hosted", bulk_pacing="fps30")
+        self.assertEqual(r["bulk"]["pacing"], "fps30")
         h = next(p for p in r["cases"][0]["peers"] if p["peer"] == "H")
-        self.assertIn("--present_interval=2", h["command"])
-        self.assertIn("--online_server_hz=30", h["command"])
+        self.assertIn("--frame_rate_limit=30", h["command"])
+        self.assertNotIn("--online_server_hz=30", h["command"])
 
     def test_refused_combinations(self) -> None:
         self.spec("x", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
         with self.assertRaisesRegex(SystemExit, "--bulk and --gate"):
             skytest.cmd_test(self.cfg, argparse.Namespace(cases=["x"], stage=None, max_games=0, bulk=True, gate=True))
         with self.assertRaisesRegex(SystemExit, "--bulk-pacing goes with --bulk"):
-            skytest.cmd_test(self.cfg, argparse.Namespace(cases=["x"], stage=None, max_games=0, bulk_pacing="hz30"))
+            skytest.cmd_test(self.cfg, argparse.Namespace(cases=["x"], stage=None, max_games=0, bulk_pacing="fps30"))
 
 
 if __name__ == "__main__":
