@@ -92,6 +92,8 @@ class Recipes(unittest.TestCase):
         self.assertIn("log LEVELPASS pred 13 skipped", h)
         self.assertLess(h.index("LEVELPASS late-join start"), h.index("pred 3 begin"))
         self.assertIn("waitfor online_left 1200", d)
+        # Early D snapshots the bugs' names after the session, the world it watched H change.
+        self.assertLess(d.index("waitfor online_left 1200"), d.index("dump_entities Block_A"))
         h2, d2 = lpp.scripts("madeup", r.bugs, "late")
         self.assertLess(h2.index("pred 8 end"), h2.index("LEVELPASS late-join start"))
         self.assertIn("dump_entities Block_A", d2)

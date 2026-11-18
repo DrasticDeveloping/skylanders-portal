@@ -7882,7 +7882,7 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         except (ValueError, tomllib.TOMLDecodeError) as e:
             raise SystemExit(f"levelpass --predictions: {recipes_file}: {e}") from None
         bugs = [b for b in recipes.bugs if b.level == a.level]
-        d_mode = recipes.d_mode.get(a.level, "none")
+        d_mode = recipes.d_mode.get(a.level, "early")  # D joins at the start and stays (the observed player)
         h_script, d_script = lpp.scripts(a.level, bugs, d_mode)
         text = lp.spec_from_scripts(a.level, h_script, d_script,
                                     ["--trace_where_seconds=1"] if d_mode == "early" else [])

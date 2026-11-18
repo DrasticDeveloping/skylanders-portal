@@ -14,9 +14,12 @@ The recipes are data, in the levelpass folder (they name level objects, so they 
     checks = ["position_differs GA3_PushBlock_02 50"]
     # could_not_test = "why"               # the recipe cannot run yet: the verdict says why
 
-and per level, [level.<name>] d = "early" | "late" | "none": D joins at the start and stays idle (its
-position logged every second: other players' scenes and teleports show on it), or joins at the end
-and snapshots (a late joiner's world), or is not started.
+and per level, [level.<name>] d = "early" | "late" | "none" ("early" when not given): D joins at the
+start and stays to the end (its position logged every second: another player's scene, teleport or
+interior pull shows on it; when H ends the session D snapshots the bugs' names, its world as it
+watched H act, for the exists/position/count checks), or joins at the end and snapshots (a late
+joiner's world: the late-join bugs), or is not started. One player (H) acts in every step and D is the
+observed one; a step by D at a moment H chooses needs a cross-client signal the pass does not have yet.
 
 Checks (any one confirmed confirms the bug; a check whose inputs are missing makes it COULD NOT TEST):
     exists_differs <name>           the entity is live on one side of S / H (/ D) and not on another
@@ -336,5 +339,7 @@ def scripts(level: str, bugs: list[Bug], d_mode: str) -> tuple[str, str | None]:
         if d_mode == "late":
             d += d_snap_lines(bugs) + ["online_end", "quit"]
         else:
-            d += ["waitfor online_left 1200", "quit"]  # idle: its position every second (trace_where_seconds)
+            # Idle to the end, its position every second (trace_where_seconds); then its own snapshot of the
+            # bugs' names: the world it saw H change.
+            d += ["waitfor online_left 1200"] + d_snap_lines(bugs) + ["quit"]
     return "\n".join(h) + "\n", ("\n".join(d) + "\n" if d else None)
