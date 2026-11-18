@@ -493,6 +493,38 @@ class Report(unittest.TestCase):
         self.assertIn("[action failed]", head)
         self.assertTrue(tool.startswith("1 in 1 entries"))
 
+    def test_audit_artefacts(self):
+        """Lease kinds without a start, stale rows S also lost, and breakables S caught up with later are not
+        per-object findings."""
+        t = "[2026-11-18 03:35:{:02d}.000] [info] [core] [t1] "
+        h = "\n".join([
+            t.format(1) + "Online: audit norow p1 v1 container Hanging_Base#2606 at 1,2,3",
+            t.format(2) + "Online: audit norow p1 v1 turret Turret#2063 at 1,2,3",
+            t.format(3) + "Online: start ran start.personal Turret#2063 (lease 1)",
+            t.format(4) + "Online: audit diff p1 v1 prop a0000082e.1.2@2 slot 0 rev 2 no_object at - local - row 010100 live - why gone",
+            t.format(5) + "Online: audit diff p1 v1 prop a0000082f.1.2@2 slot 0 rev 2 no_object at - local - row 010100 live - why gone",
+            t.format(6) + "Online: audit diff p1 v1 breakable a00000900.1.2@2 slot 0 rev 1 no_object at - local - row 00 live - why gone",
+            t.format(7) + "Online: audit diff p1 v1 breakable a00000901.1.2@2 slot 0 rev 1 no_object at - local - row 00 live - why gone",
+            t.format(8) + "Online: audit summary p1 v1 rows 9 differences 4 in_flight 0 pending 0 unsupported 0 not_audited 0 no_row 2 kinds prop=2/2/0/0",
+            t.format(9) + "Online: audit diff p1 v2 breakable a00000901.1.2@2 slot 0 rev 1 no_object at - local - row 00 live - why gone",
+        ]) + "\n"
+        srv = t.format(8) + ("Online: audit summary S v1 rows 9 differences 0 in_flight 0 pending 2 unsupported 0 not_audited 0 "
+                             "no_row 0 kinds prop=2/0/0/2 breakable=2/0/0/0") + "\n"
+        texts = {"H": h, "S": srv}
+        fs = lp.findings_from_log("H", h, {})
+        out, notes = lp.audit_artefacts(fs, texts)
+        sev = [f.severity for f in out]
+        # (a) the container without a start goes; the turret a player started stays.
+        self.assertEqual([f.obj.split("#")[0] for f in out if f.severity == "object without a row"], ["Turret"])
+        # (b) the two props S lost too: one entry.
+        self.assertEqual(sev.count("S keeps rows of removed entities"), 1)
+        self.assertIn("(2 rows of prop)", [f for f in out if f.severity == "S keeps rows of removed entities"][0].what)
+        # (c) breakable 900 settled at the later audit; 901 was reported again after it and stays.
+        rows = {f.obj.split(" ")[1] for f in out if f.severity == "row without an object"}
+        self.assertEqual(rows, {"a00000901.1.2@2"})
+        self.assertTrue(any("1 breakable row(s)" in n for n in notes))
+        self.assertTrue(any("lease-carried" in n for n in notes))
+
     def test_report_text(self):
         p = lp.make_plan(content(), late_join=False)
         fs = lp.findings_from_log("H", self.LOG, {})

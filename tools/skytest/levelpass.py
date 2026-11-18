@@ -1080,7 +1080,8 @@ def position_literals(script: str) -> list[str]:
 # --- the report ------------------------------------------------------------------------------------------
 
 SEVERITY = ("crash", "level changed before the exit", "provoked difference (expected)", "difference after an action", "difference at rest", "object without a row",
-            "row without an object", "action failed", "step failed", "not shared (documented)", "tool: could not act")
+            "row without an object", "S keeps rows of removed entities", "action failed", "step failed",
+            "not shared (documented)", "tool: could not act")
 
 AUDIT_DIFF = re.compile(r"Online: audit diff (\S+) (\S+) (\S+) (\S+) slot (\d+) rev (\d+) (\S+) at (\S+) local (\S+) "
                         r"row (\S+) live (\S+)(?: why (.*))?$")
@@ -1215,6 +1216,92 @@ def findings_from_log(peer: str, text: str, labels: dict[str, str]) -> list[Find
             out.append(Finding(severity=sev, kind="step", family=family,
                                what=what, obj="", step="", lines=[line.strip()], peer=peer))
     return out
+
+
+# --- the audit's artefacts (findings-verified.txt, 20261118: F1, F2, F3, F5, F7) -------------------------
+#
+# Three kinds of audit line that are not a difference between the games, taken out of the findings:
+# (a) a lease-carried kind (a container's mini-game, a turret, a conversation) has a row only once a player
+#     started it: "object without a row" for one whose start no log shows is the audit's, not the game's;
+# (b) a row whose entity went on S and on the client alike (the level's own script removed it everywhere;
+#     S's own audit counts it pending) is a stale row: one entry per level, "S does not retire rows of
+#     removed entities (N rows)", not one per object and audit;
+# (c) a breakable whose client copy went while S's row was still intact is in flight when a later audit of
+#     the same peer no longer reports it (S caught up): dropped, counted in a note.
+LEASE_KINDS = ("container", "turret", "conversation")
+LEASE_START = re.compile(r"Online: start ran start\.\S+ ([^\s#]+)#\d+ \(lease")
+STALE_KINDS = ("prop", "mover")
+SUMMARY_KINDS = re.compile(r"Online: audit summary (\S+) (\S+) rows .* kinds (.*)$")
+STALE_WHAT = "S does not retire rows of removed entities"
+
+
+def server_pending(text: str) -> dict[str, int]:
+    """Per kind, the pending rows of S's last audit summary (S's census no longer has their entity)."""
+    out: dict[str, int] = {}
+    for line in text.splitlines():
+        m = SUMMARY_KINDS.search(line)
+        if not m or m.group(1) != "S":
+            continue
+        out = {}
+        for part in m.group(3).split():
+            k, _, v = part.partition("=")
+            nums = v.split("/")
+            if len(nums) == 4 and nums[3].isdigit():
+                out[k] = int(nums[3])
+    return out
+
+
+def audit_artefacts(findings: list[Finding], texts: dict[str, str]) -> tuple[list[Finding], list[str]]:
+    """The findings without the audit's artefacts (a, b, c above), and the notes that count them."""
+    leased = {m.group(1) for t in texts.values() for m in LEASE_START.finditer(t)}
+    pending = server_pending(texts.get("S", ""))
+    out: list[Finding] = []
+    stale: list[Finding] = []
+    lease_left = 0
+    settled: set[str] = set()
+    for f in findings:
+        if f.severity == "object without a row" and f.kind in LEASE_KINDS and f.obj.split("#")[0] not in leased:
+            lease_left += 1
+            continue
+        if (f.severity == "row without an object" and f.kind in STALE_KINDS and f.what.startswith("no_object gone")
+                and pending.get(f.kind, 0) > 0):
+            stale.append(f)
+            continue
+        if f.severity == "row without an object" and f.kind == "breakable" and _settled_later(f, texts):
+            settled.add(f.obj.split(" ")[1] if " " in f.obj else f.obj)
+            continue
+        out.append(f)
+    notes: list[str] = []
+    if stale:
+        rows = sorted({f.obj.split(" ")[1] if " " in f.obj else f.obj for f in stale})
+        first = stale[0]
+        out.append(Finding(severity="S keeps rows of removed entities", kind="audit", family="S",
+                           what=f"{STALE_WHAT} ({len(rows)} rows of {', '.join(sorted({f.kind for f in stale}))})",
+                           obj=", ".join(rows[:6]) + (" ..." if len(rows) > 6 else ""), step=first.step,
+                           lines=first.lines[:1], peer=first.peer))
+    if lease_left:
+        notes.append(f"{lease_left} audit line(s) of lease-carried kinds ({', '.join(LEASE_KINDS)}) without a row and "
+                     "no start in any log left out (they have a row only once a player starts them)")
+    if settled:
+        notes.append(f"{len(settled)} breakable row(s) gone on a client before S caught up, settled at a later audit "
+                     "(in flight, not findings)")
+    return out, notes
+
+
+def _settled_later(f: Finding, texts: dict[str, str]) -> bool:
+    """The row's last audit line in the same peer's log is followed by a later audit summary of the same
+    side (which no longer reports it): it settled (S caught up)."""
+    peer, _, who = f.peer.partition("/")
+    text = texts.get(peer, "")
+    row = f.obj.split(" ")[1] if " " in f.obj else ""
+    if not who or not row:
+        return False
+    last = None
+    for last in re.finditer(rf"Online: audit diff {re.escape(who)} \S+ \S+ {re.escape(row)} ", text):
+        pass
+    if last is None:
+        return False
+    return re.search(rf"Online: audit summary {re.escape(who)} ", text[last.end():]) is not None
 
 
 LEVEL_LOAD = re.compile(r"Online: level (\d+) (\S+): load")

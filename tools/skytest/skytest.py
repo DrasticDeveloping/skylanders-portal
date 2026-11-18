@@ -7940,6 +7940,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                 notes.append(f"runner: {why}")
         except (OSError, ValueError):
             pass
+    findings, artefact_notes = lp.audit_artefacts(findings, texts)
+    notes += artefact_notes
     findings += lp.level_changes(texts["H"], plan.timed)
     lp.name_ids(findings, lp.names_by_hash(content.objects))
     if plan.provoke:
