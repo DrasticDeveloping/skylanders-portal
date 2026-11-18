@@ -237,12 +237,17 @@ class AllowList:
 #               it (portal_rex.cpp:400, 665-671): inside the run's figures copy
 #   refused     `renderdoc`: its captures go wherever RenderDoc is set to write, which the game
 #               neither sets nor checks (:481-509); refused in every validated run
+#   follow_path `follow <file>`: live mode (input_script.h), the game reads the lines a runner appends to
+#               that file (relative to the working directory, the run folder): inside the run folder,
+#               it may not exist yet (skytest.py `live` makes it). Never in a live line itself;
+#               `follow_end` only in one (check_script's `live`)
 BUILTIN_COMMANDS = {
     "wait": "none", "tap": "none", "hold": "none", "stick": "none", "log": "none", "fps": "none",
     "scan": "none", "poke": "none", "dump": "none", "watch": "none", "watchread": "none",
     "pollwatch": "none", "unwatch": "none", "stacks": "none", "player": "none", "key": "none",
     "remove": "none", "putback": "none", "trap": "none", "waitfor": "none", "quit": "none",
     "save": "write_path", "shot": "write_path", "place": "figure_path", "renderdoc": "refused",
+    "follow": "follow_path", "follow_end": "none",
 }
 # The game's registered commands (RegisterScriptCommand), by what they do with a path. The game hands
 # such a command the rest of its line; a relative path is resolved against the game's working
@@ -424,12 +429,13 @@ def _rest_after(line: str, n_words: int) -> str:
     return line[i:]
 
 
-def parse_script(text: str, commands: CommandTable) -> list[ScriptCommand]:
+def parse_script(text: str, commands: CommandTable, live: bool = False) -> list[ScriptCommand]:
     """The script split and read exactly as the game's ParseScript does: the file is read in text mode
     (CRLF becomes LF), every ';' becomes a line break (comments included, so `# x; save ...` holds a
     `save`), '#' starts a comment, words split at whitespace. A line the game would refuse is refused
     here too, and so is anything the game could read differently (a control character, which text
-    mode or the parser would treat specially)."""
+    mode or the parser would treat specially). `live`: one line of a followed file (skytest.py `live
+    send`): `follow` is refused there and `follow_end` allowed, as the game parses a live line."""
     for ch in text:
         if ord(ch) < 32 and ch not in "\t\r\n":
             raise LaunchError(f"input script: control character {ord(ch):#04x} (the game's text-mode read "
@@ -450,6 +456,10 @@ def parse_script(text: str, commands: CommandTable) -> list[ScriptCommand]:
                 raise LaunchError(f"input script line {no}: {name!r} is no command in the table (an "
                                   "unclassified or unknown command is refused)")
         ok = _syntax_ok(name, args, commands)
+        if name == "follow" and live:
+            raise LaunchError(f"input script line {no}: follow inside live mode (a live line cannot follow another file)")
+        if name == "follow_end" and not live:
+            raise LaunchError(f"input script line {no}: follow_end outside live mode (only a followed file's line)")
         if not ok:
             raise LaunchError(f"input script line {no}: the game cannot parse {raw.strip()!r}")
         out.append(ScriptCommand(no, name, args, _rest_after(line, 1), cls))
@@ -485,8 +495,10 @@ def _syntax_ok(name: str, a: list[str], commands: CommandTable) -> bool:
     if name == "pollwatch":
         n = _int(a[1]) if len(a) > 1 else 16
         return len(a) in (1, 2) and bool(ADDRESS.fullmatch(a[0])) and n is not None and 0 < n <= 256
-    if name in ("unwatch", "putback", "quit"):
+    if name in ("unwatch", "putback", "quit", "follow_end"):
         return True
+    if name == "follow":
+        return len(a) >= 1
     if name == "stacks":
         n = _int(a[0]) if a else 3
         return len(a) <= 1 and n is not None and 0 < n <= 50
@@ -520,12 +532,13 @@ def decode_script(data: bytes) -> str:
         raise LaunchError(f"input script: not UTF-8 ({e})") from None
 
 
-def check_script(text: str, ctx: RunContext, script_dir: Path | None = None) -> list[ScriptCommand]:
+def check_script(text: str, ctx: RunContext, script_dir: Path | None = None, live: bool = False) -> list[ScriptCommand]:
     """Every command classified and every path argument contained. `script_dir` is the folder the
     script is written to (the run folder): `shot` joins its name to it, `save` and `place` resolve a
-    relative path against the game's working directory, which the builder sets to the run folder."""
+    relative path against the game's working directory, which the builder sets to the run folder.
+    `live`: a line for a followed file (parse_script), checked with the same rules before it is sent."""
     sd = script_dir or ctx.run_folder
-    cmds = parse_script(text, ctx.commands)
+    cmds = parse_script(text, ctx.commands, live)
     for c in cmds:
         where = f"input script line {c.line} ({c.name})"
         if c.cls == "refused":
@@ -544,6 +557,8 @@ def check_script(text: str, ctx: RunContext, script_dir: Path | None = None) -> 
         elif c.name == "place":
             dest = _rest_after(c.rest, 1)
             contained(ctx, dest, where, ctx.figures, ctx.run_folder, must_exist=True)
+        elif c.name == "follow":
+            contained(ctx, c.rest.rstrip(" \t"), where, ctx.run_folder, ctx.run_folder)
         elif c.cls == "read_path":
             path = _path_before_last_word(c.rest)
             if path is None:

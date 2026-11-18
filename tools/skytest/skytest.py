@@ -121,6 +121,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import winjob  # noqa: E402
 import backend_grades  # noqa: E402  (stage 3's backend grades: compare, faults, memory)
 import launch_args as la  # noqa: E402
+import live_session  # noqa: E402  (the live sessions' pure parts: `skytest.py live`)
 import remote_agent  # noqa: E402
 import remote_swap_grade  # noqa: E402  (stage 4's remote_swap grade over swap_pairs.py, the ordered form)
 import exclusive_grade  # noqa: E402  (stage 4's exclusive grade: a race exactly one client wins)
@@ -627,6 +628,9 @@ class PeerSpec:
     # "none" (Swap Force Online stage 8 P5 defaults-release: no settings file, --config_file names where it
     # would be, and the game starts on its compiled-in defaults; launch_args.RunContext.no_settings).
     settings_file: str = "template"
+    # files = { "<name>" = """<text>""" }: files written into the peer's run folder before its game starts
+    # (a plain file name each, not one the builder writes), e.g. a file the script follows (`follow`).
+    files: dict[str, str] = field(default_factory=dict)
 
 
 SETTINGS_FILE_VALUES = ("template", "none")
@@ -1008,6 +1012,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             save_slots=parse_save_slots(path.name, n, own.get("save_slots", common.get("save_slots", {}))),
             kind=kind,
             settings_file=peer_settings_file(path.name, n, own, common, d.get("server", "standin"), kind),
+            files=peer_files(path.name, n, own.get("files", common.get("files", {}))),
         )
         for arg in peers[n].args:
             for ph in ARG_PLACEHOLDER.findall(arg):
@@ -1191,6 +1196,22 @@ UNIT_SUMMARY = re.compile(r"^(\d+) (\w+) tests, (\d+) failed, (\d+) ms")
 # case never counts toward the circuit breaker nor is stopped by it (C7 guards the build's games).
 GAME_ONLY_KEYS = ("peer", "grade", "measure", "compare", "server", "standin_seconds", "fail_fast",
                   "show_server_window", "tolerate", "scenes", "scenes_reason", "breaker", "build_copy")
+
+
+# What a peer's `files` may not name: the files the launch builder and the game write in the run folder.
+PEER_FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,60}")
+PEER_FILE_TAKEN = {"game.log", "stderr.txt", "settings.toml", "swapforcerecomp.toml"}
+
+
+def peer_files(spec_name: str, peer: str, value: object) -> dict[str, str]:
+    """A peer's `files` table: plain names (no folder), each with its text."""
+    if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+        raise SpecError(f"{spec_name}: peer {peer}: files is a table of name = text")
+    for name in value:
+        if not PEER_FILE_NAME.fullmatch(name) or name.lower() in PEER_FILE_TAKEN or name == la.SCRIPT_FILE \
+                or ".." in name:
+            raise SpecError(f"{spec_name}: peer {peer}: files: {name!r} is not a plain file name of its own")
+    return dict(value)
 
 
 def build_relative(name: str, what: str, value: object) -> str:
@@ -3350,6 +3371,14 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -
     except la.LaunchError as e:
         raise SpecError(f"peer {peer}: {e}") from None
     (d / "data" / ".skytest-copy").write_text("a skytest run copy\n", encoding="ascii")  # the game's dev hooks need it
+    for name, text in spec.peers[peer].files.items():  # a spec's `files`, as written (no newline added)
+        try:
+            target = la.contained(ctx, name, f"peer {peer} file {name}", d, d)
+        except la.LaunchError as e:
+            raise SpecError(f"peer {peer}: {e}") from None
+        if target.exists():
+            raise SpecError(f"peer {peer}: files: {name} exists in the run folder already (the builder's)")
+        target.write_bytes(text.encode("utf-8"))
     if spec.peers[peer].save_slots:
         for line in fill_save_slots(d / "data", cfg.title_id, cfg.save_slot_name, spec.peers[peer].save_slots):
             print(f"  {spec.name} {peer}: save_slots: {line}")
@@ -4311,10 +4340,12 @@ def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
 def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
              thresholds: dict | None = None, baseline: dict | None = None,
              accepted_grades: tuple[str, ...] = (), folder: Path | None = None,
-             pacer: StartPacer | None = None) -> CaseResult:
+             pacer: StartPacer | None = None, live: "LiveHooks | None" = None) -> CaseResult:
     """One run of a case. `folder`: where the run goes (a compared case's run, inside the case's
     folder); by default a new `<stamp>-<case>` folder in the store's runs. `pacer`: the start gap
-    shared with the cases running beside it (`test --jobs N`); by default this case's own."""
+    shared with the cases running beside it (`test --jobs N`); by default this case's own. `live`: a
+    live session's hooks (LiveHooks: told the run folder, asked each turn of the watch loop whether to
+    stop); None for every case."""
     pacer = pacer if pacer is not None else StartPacer(cfg.start_gap, machine_budget(cfg))
     names = list(spec.peers)
     hosted = spec.server == "host"
@@ -4355,6 +4386,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         # a spec error in a later peer starts no game at all.
         port = free_loopback_port() if hosted else 0
         prepared = {n: prepare_peer(cfg, spec, n, run, port) for n in starts if n not in remote}
+        if live is not None:
+            live.on_run(run, port)
         # server+N+hK: each synthetic peer's folder and command, before any game starts.
         syn_prepared = {n: prepare_synthetic(cfg, spec, n, run, snap, port) for n in spec.synthetic}
         # save_copy: each named peer's save copy as it is before any game starts.
@@ -4494,6 +4527,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                     stop_at = min(deadline, watch.hit_at + cfg.fail_fast_grace) \
                         if watch.check({**procs, **syn_procs}) else deadline
                     early = stop_at < deadline  # else the timeout comes first: a timeout as before
+                if live is not None and live.tick(procs):
+                    break  # the session's stop: its grace is over, what still runs is ended below
                 time.sleep(min(0.5, max(0.0, stop_at - time.monotonic())))
             # {joincode}: a joiner still waiting when the run ended never got the code (fails closed).
             not_started.update({n: "never started: S never logged its join code (/"
@@ -7747,6 +7782,572 @@ def tolerated_lines(spec: Spec, folder: Path, most: int = 3) -> list[tuple[str, 
     return found
 
 
+# --- live sessions (`skytest.py live`) --------------------------------------------------------------
+#
+# A live session starts the games of a server layout exactly as a case does (run_case: the launch builder
+# with its guards, copies of the fixtures, the defaults, the machine's slots and boot token, the job
+# object), with a prologue per client that ends in `follow live.txt` (the input script's live mode). It
+# runs in a session process of its own, detached from the shell that started it; `live send` checks a line
+# like a spec's script line, appends it to a peer's file and waits for the game's `live <n> done` line.
+# The pure parts (prologues, numbering, matching, the idle rule, the spec skeleton) are in live_session.py.
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether a process runs (never os.kill: on Windows any signal but Ctrl+C/Break terminates it)."""
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = ctypes.c_ulong(0)
+        return bool(k32.GetExitCodeProcess(ctypes.c_void_p(h), ctypes.byref(code))) and code.value == 259
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+class LiveHooks:
+    """run_case's hooks for a live session: the run folder once it exists (the peers' logs, followed
+    files and the join address go to state.json), then each turn of run_case's watch loop: which peers
+    follow their file, the fatal lines (the peer's fail-fast patterns: ALWAYS_FORBIDDEN, DEFAULT_FATAL)
+    and exits as problems, a stop request or the idle stop (`quit` to every followed file, then the
+    games are ended after STOP_GRACE_S)."""
+
+    def __init__(self, folder: Path, info: "live_session.SessionInfo", spec: Spec,
+                 state: "live_session.SessionState") -> None:
+        self.folder, self.info, self.spec, self.state = folder, info, spec, state
+        self.hosted = spec.server == "host"
+        self.patterns = {n: [re.compile(rx, re.M) for rx in fail_fast_patterns(spec, n)] for n in spec.peers}
+        self.tails: dict[str, LogTail] = {}
+        self.exits: set[str] = set()
+        self.stop_at: float | None = None
+        self.live_since: float | None = None
+        self.last_save = 0.0
+        self.run: Path | None = None
+
+    def save(self) -> None:
+        live_session.save_state(self.folder, self.state)
+        self.last_save = time.monotonic()
+
+    def on_run(self, run: Path, port: int) -> None:
+        self.run = run
+        st = self.state
+        st.run = str(run)
+        st.join = f"127.0.0.1:{port}" if port else ""
+        st.state = "booting"
+        peers = list(self.info.clients) + (["S"] if self.info.server_live else [])
+        for n in list(self.spec.peers):
+            st.logs[n] = str(peer_log_path(run, n, self.hosted))
+            self.tails[n] = LogTail(peer_log_path(run, n, self.hosted))
+        for n in peers:
+            f = run / "H" / live_session.SERVER_LIVE_FILE if n == "S" else run / n / live_session.LIVE_FILE
+            f.touch()  # the game reads a missing file as empty; made now so `live send` finds it
+            st.live_files[n] = str(f)
+        self.save()
+
+    def last_activity(self) -> float:
+        sends = self.folder / "sends.jsonl"
+        t = max(self.info.created, self.live_since or 0.0)
+        with contextlib.suppress(OSError):
+            t = max(t, sends.stat().st_mtime)
+        return t
+
+    def request_stop(self, why: str) -> None:
+        if self.stop_at is not None:
+            return
+        self.stop_at = time.monotonic() + live_session.STOP_GRACE_S
+        self.state.state, self.state.note = "stopping", why
+        for n, f in self.state.live_files.items():
+            with contextlib.suppress(OSError), live_send_lock(self.folder, n):
+                live_session.append_lines(Path(f), ["quit"])
+        self.save()
+
+    def tick(self, procs: dict) -> bool:
+        st, changed = self.state, False
+        for n, tail in self.tails.items():
+            for line in tail.new_lines():
+                if live_session.FOLLOWING.search(line) and n not in st.following:
+                    st.following.append(n)
+                    changed = True
+                elif live_session.LIVE_ENDED in line and n in st.following:
+                    st.following.remove(n)
+                    changed = True
+                if any(rx.search(line) for rx in self.patterns.get(n, [])):
+                    st.problems.append(f"{n}: {line.strip()[:300]}")
+                    changed = True
+        for n, p in procs.items():
+            code = p.poll()
+            if code is not None and n not in self.exits:
+                self.exits.add(n)
+                st.problems.append(f"{n}: the game exited (code 0x{code & 0xFFFFFFFF:08X})")
+                changed = True
+        want = set(st.live_files)
+        if st.state == "booting" and want and want <= set(st.following):
+            st.state, st.note = "live", "every peer follows its file"
+            self.live_since = time.time()
+            changed = True
+        if self.stop_at is None:
+            stop = self.folder / "stop"
+            if stop.is_file():
+                self.request_stop(stop.read_text(encoding="utf-8", errors="replace").strip() or "stopped")
+            elif live_session.idle_due(self.last_activity(), time.time(), self.info.idle_minutes):
+                self.request_stop(f"idle stop: no send for {self.info.idle_minutes:g} min")
+        if changed or time.monotonic() - self.last_save > 5:
+            self.save()
+        return self.stop_at is not None and time.monotonic() >= self.stop_at
+
+
+@contextlib.contextmanager
+def live_send_lock(folder: Path, peer: str, wait: float = 30.0):
+    """One writer per followed file at a time (two sends to one peer would interleave their numbers)."""
+    fd = _open_lock_file(folder / f"send-{peer}.lock")
+    try:
+        t0 = time.monotonic()
+        while not _try_lock(fd):
+            if time.monotonic() - t0 > wait:
+                raise live_session.LiveError(f"another send to {peer} holds {folder / f'send-{peer}.lock'}")
+            time.sleep(0.05)
+        yield
+    finally:
+        _unlock_close(fd)
+
+
+def live_session_folder(cfg: Config, name: str) -> Path:
+    folder = live_session.session_dir(cfg.store, name)
+    if not (folder / "session.json").is_file():
+        matches = sorted(p.name for p in (cfg.store / "live").glob(f"*{name}*") if (p / "session.json").is_file()) \
+            if (cfg.store / "live").is_dir() else []
+        if len(matches) == 1:
+            return live_session.session_dir(cfg.store, matches[0])
+        raise SystemExit(f"no live session {name!r} in {cfg.store / 'live'}" +
+                         (f" (it matches {', '.join(matches)})" if matches else "; `skytest.py live list` names them"))
+    return folder
+
+
+def live_serve(cfg: Config, a: argparse.Namespace) -> int:
+    """The session process (`live _serve <session>`, started detached by `live start`)."""
+    folder = live_session_folder(cfg, a.session)
+    info = live_session.load_info(folder)
+    st = live_session.load_state(folder)
+    st.pid = os.getpid()
+    lease: Lease | None = None
+    hooks: LiveHooks | None = None
+
+    def say(state: str, note: str = "") -> None:
+        st.state, st.note = state, note
+        live_session.save_state(folder, st)
+        print(f"{time.strftime('%H:%M:%S')} {state}{': ' + note if note else ''}", flush=True)
+
+    try:
+        say("starting")
+        spec = load_spec(folder / "spec.toml", cfg.timeout)
+        token_preflight(bool(a.allow_restricted))
+        check_disc(cfg)
+        snap = snapshot_build(cfg)
+        budget = machine_budget(cfg)
+        if budget is not None:
+            budget.owner = f"skytest live pid {os.getpid()}, {info.name}"
+            say("waiting for slots", f"{len(spec.peers)} game(s)")
+            lease = budget.acquire(machine_need(spec, budget.games), spec.name, memory_games=len(spec.peers),
+                                   say=lambda why: say("waiting for slots", why))
+            if lease.capacity:
+                say("failed", lease.capacity)
+                return 1
+        hooks = LiveHooks(folder, info, spec, st)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        res = run_case(cfg, spec, snap, len(spec.peers), stamp, {}, {}, (),
+                       folder=cfg.store / "runs" / f"{stamp}-{spec.name}",
+                       pacer=StartPacer(cfg.start_gap, budget), live=hooks)
+    except BaseException as e:  # noqa: BLE001 - said in state.json, then raised
+        say("failed", f"{type(e).__name__}: {e}")
+        raise
+    finally:
+        if lease is not None:
+            lease.release()
+    if res.folder and Path(res.folder).is_dir():
+        write_text_replacing(Path(res.folder) / "result.json",
+                             json.dumps({"live_session": info.name, "runner": runner_version(), **asdict(res)}, indent=2))
+    st.ended = time.time()
+    why = st.note if st.state == "stopping" else ("the games ended" if res.status != "error" else "; ".join(res.reasons))
+    say("ended", f"{why}; slots freed; run {res.folder}")
+    return 0
+
+
+def spawn_detached(cmd: list[str], log: Path, cwd: Path) -> int:
+    """Starts the session process outside the caller's console, process group and (when its job allows
+    it) job object, so it goes on after the caller ends."""
+    flags = 0
+    if os.name == "nt":
+        flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP
+    with open(log, "ab") as out:
+        for extra in ((0x01000000,) if os.name == "nt" else ()) + (0,):  # CREATE_BREAKAWAY_FROM_JOB, then without
+            try:
+                p = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                     creationflags=flags | extra, close_fds=True,
+                                     start_new_session=os.name != "nt")
+                return p.pid
+            except OSError:
+                if not extra:
+                    raise
+    raise OSError("could not start the session process")
+
+
+def live_peer_paths(info: "live_session.SessionInfo", st: "live_session.SessionState", peer: str) -> tuple[Path, Path, Path]:
+    """A peer's followed file, log and launch-check folder (S's: its owner's folder, its working directory)."""
+    if peer not in st.live_files:
+        raise live_session.LiveError(f"{peer} has no live file in this session (it has {', '.join(st.live_files) or 'none yet'})")
+    run = Path(st.run)
+    return Path(st.live_files[peer]), Path(st.logs.get(peer, "")), run / ("H" if peer == "S" else peer)
+
+
+def live_problem_text(st: "live_session.SessionState", since: int = 0) -> list[str]:
+    return [f"PROBLEM {p}" for p in st.problems[since:]]
+
+
+def read_from(path: Path, offset: int) -> tuple[str, int]:
+    """The text a log got after `offset` (from its start when it was replaced and is shorter now)."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return "", offset
+    if size < offset:
+        offset = 0
+    if size == offset:
+        return "", offset
+    with open(path, "rb") as f:
+        f.seek(offset)
+        data = f.read(size - offset)
+    cut = data.rfind(b"\n") + 1  # whole lines only; the rest comes with the next read
+    return data[:cut].decode("utf-8", errors="replace"), offset + cut
+
+
+def cmd_live(cfg: Config, a: argparse.Namespace) -> int:
+    try:
+        return LIVE_VERBS[a.verb](cfg, a)
+    except live_session.LiveError as e:
+        print(f"live {a.verb}: {e}", file=sys.stderr)
+        return 2
+
+
+def live_start(cfg: Config, a: argparse.Namespace) -> int:
+    layout = a.layout
+    if not LAYOUT.match(layout) or not layout.startswith("server+") or synthetic_of(layout):
+        raise live_session.LiveError(f"--layout {layout}: a server layout (server+1, server+2, ...)")
+    peers = peers_of(layout)
+    clients = [p for p in peers if p != "S"]
+    late = set(a.late or [])
+    if late - set(clients) or "H" in late:
+        raise live_session.LiveError(f"--late names a joining client of {layout} ({', '.join(c for c in clients if c != 'H')})")
+    if a.level and not re.fullmatch(r"[A-Za-z0-9_]+", a.level):
+        raise live_session.LiveError(f"--level {a.level!r}")
+    tag = a.name or f"{layout.replace('+', '')}-{a.level or 'hub'}"
+    if not live_session.TAG.fullmatch(tag):
+        raise live_session.LiveError(f"--name {tag!r}: letters, digits, - and _")
+    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{tag}"
+    folder = live_session.session_dir(cfg.store, name)
+    tables = launch_tables(cfg)
+    server_live = not a.no_server_live and live_session.SERVER_FOLLOW_SETTING in tables[0].rules
+    extra: dict[str, list[str]] = {c: [] for c in clients}
+    for item in a.arg or []:
+        peer, _, setting = item.partition(":")
+        if peer not in extra or not setting.startswith("--"):
+            raise live_session.LiveError(f"--arg {item!r}: PEER:--setting=value with PEER one of {', '.join(clients)}")
+        extra[peer].append(setting)
+    args = {c: ([*live_session.HOST_ARGS,
+                 *([f"--{live_session.SERVER_FOLLOW_SETTING}={live_session.SERVER_LIVE_FILE}"] if server_live else [])]
+                if c == "H" else []) + extra[c] for c in clients}
+    prologue = live_session.prologues(clients, a.level, late)
+    show = not a.hide_server
+    folder.mkdir(parents=True)
+    spec_text = live_session.session_spec_text(f"live-{tag}", layout, clients, prologue, args, show,
+                                               f"live session {name}")
+    (folder / "spec.toml").write_text(spec_text, encoding="utf-8")
+    load_spec(folder / "spec.toml", cfg.timeout)  # a spec error before anything starts
+    info = live_session.SessionInfo(name=name, layout=layout, level=a.level or "", clients=clients, late=sorted(late),
+                                    hide_server=not show, server_live=server_live, idle_minutes=a.idle_minutes,
+                                    prologue=prologue, args=args, worktree=str(cfg.repo))
+    live_session.write_json(folder / "session.json", asdict(info))
+    live_session.save_state(folder, live_session.SessionState())
+    cmd = [sys.executable, "-I", str(Path(__file__).resolve()), "--repo", str(cfg.repo), "live", "_serve", name]
+    if a.allow_restricted:
+        cmd.append("--allow-restricted")
+    pid = spawn_detached(cmd, folder / "session.log", cfg.repo)
+    print(f"live session {name} (session process {pid})", flush=True)
+    print(f"  session folder: {folder}", flush=True)
+    t0, last = time.monotonic(), ""
+    while True:
+        st = live_session.load_state(folder)
+        now = f"{st.state}{': ' + st.note if st.note else ''}"
+        if now != last:
+            print(f"  {time.monotonic() - t0:5.0f} s  {now}" +
+                  (f" (following: {', '.join(st.following)})" if st.following else ""), flush=True)
+            last = now
+        if st.state == "live":
+            break
+        if st.state in ("failed", "ended") or (st.pid and not pid_alive(st.pid)) or (not st.pid and not pid_alive(pid)):
+            for line in live_problem_text(st):
+                print(f"  {line}")
+            print(f"  the session did not reach live mode; its log: {folder / 'session.log'}")
+            return 1
+        if time.monotonic() - t0 > a.start_timeout:
+            print(f"  not live after {a.start_timeout:.0f} s (it goes on; `skytest.py live list` shows it)")
+            return 2
+        time.sleep(1.0)
+    print(f"  live after {time.monotonic() - t0:.0f} s; run folder: {st.run}")
+    for n in [*clients, "S"]:
+        if n in st.logs:
+            print(f"  {n} log: {st.logs[n]}" + (f"\n  {n} live file: {st.live_files[n]}" if n in st.live_files else ""))
+    if st.join:
+        print(f"  {{join}} = {st.join}")
+    for line in live_problem_text(st):
+        print(f"  {line}")
+    print(f'  send: skytest.py live send {name} H "goto <x> <y> <z>; waitfor goto_done 30"')
+    return 0
+
+
+def live_send(cfg: Config, a: argparse.Namespace) -> int:
+    folder = live_session_folder(cfg, a.session)
+    info, st = live_session.load_info(folder), live_session.load_state(folder)
+    if st.state in ("ended", "failed", "stopping"):
+        raise live_session.LiveError(f"the session is {st.state}: {st.note}" +
+                                     "".join(f"\n  {x}" for x in live_problem_text(st)))
+    if st.pid and not pid_alive(st.pid):
+        raise live_session.LiveError("the session process is gone (`skytest.py live list`)")
+    peer = a.peer
+    live_file, log, check_dir = live_peer_paths(info, st, peer)
+    raw = live_session.split_send(a.lines)
+    if not raw:
+        raise live_session.LiveError("nothing to send")
+    figures = str(Path(st.run) / ("H" if peer == "S" else peer) / "figures")
+    filled = [live_session.fill_placeholders(x, figures, st.join) for x in raw]
+    ctx = launch_context(cfg, check_dir.resolve(), launch_tables(cfg))
+    for x in filled:
+        try:
+            la.check_script(x, ctx, live=True)
+        except la.LaunchError as e:
+            raise live_session.LiveError(f"refused before sending (nothing sent): {x!r}: {e}") from None
+    if peer not in st.following:
+        print(f"note: {peer} does not follow its file yet ({st.state}); the line waits in the file", flush=True)
+    offsets = {n: (Path(p).stat().st_size if Path(p).is_file() else 0) for n, p in st.logs.items()}
+    problems_before = len(st.problems)
+    with live_send_lock(folder, peer):
+        numbers = live_session.append_lines(live_file, filled)
+        seq = len(live_session.read_sends(folder / "sends.jsonl"))
+        with open(folder / "sends.jsonl", "a", encoding="utf-8") as f:
+            for i, (n, line, sent) in enumerate(zip(numbers, raw, filled)):
+                f.write(json.dumps({"peer": peer, "number": n, "line": line, "sent": sent, "t": time.time(),
+                                    "seq": seq + i}) + "\n")
+    t0 = time.monotonic()
+    print(f"sent to {peer}: " + "; ".join(f"live {n}: {x}" for n, x in zip(numbers, filled)), flush=True)
+    if a.no_wait:
+        return 0
+    outcomes = {n: live_session.LineOutcome(n) for n, x in zip(numbers, filled) if not live_session.is_silent(x)}
+    wait_offset, problem, timed_out = offsets.get(peer, 0), "", False
+    next_state = 0.0
+    while not live_session.all_over(outcomes):
+        text, wait_offset = read_from(log, wait_offset)
+        if text:
+            live_session.match_outcomes(text.splitlines(), outcomes)
+            continue
+        if time.monotonic() - t0 > a.timeout:
+            timed_out = True
+            break
+        if time.monotonic() >= next_state:
+            next_state = time.monotonic() + 1.0
+            now = live_session.load_state(folder)
+            if len(now.problems) > problems_before or now.state in ("ended", "failed"):
+                st, problem = now, now.state
+                break
+        time.sleep(0.1)
+    round_trip = time.monotonic() - t0
+    time.sleep(0.3)  # the other peers' reaction to the last line, a moment later
+    for n in [*info.clients, "S"]:
+        if n not in st.logs:
+            continue
+        text, _ = read_from(Path(st.logs[n]), offsets.get(n, 0))
+        for line in text.splitlines():
+            if not a.grep or re.search(a.grep, line):
+                print(f"{n}| {line}")
+    st = live_session.load_state(folder)
+    for line in live_problem_text(st, problems_before):
+        print(line)
+    bad = False
+    for n, o in outcomes.items():
+        if o.refused:
+            print(f"live {n} REFUSED by the game: {o.refused}")
+            bad = True
+        elif not o.done:
+            print(f"live {n} NOT DONE after {round_trip:.1f} s" + (" (timeout; it still runs in the game)" if timed_out else
+                                                                  f" (the session is {problem})" if problem else ""))
+            bad = True
+    if not bad:
+        print(f"done: {', '.join(f'live {n}' for n in outcomes) or 'nothing to wait for'} in {round_trip:.2f} s (send to done)")
+    return 1 if bad or len(st.problems) > problems_before else 0
+
+
+def live_log(cfg: Config, a: argparse.Namespace) -> int:
+    folder = live_session_folder(cfg, a.session)
+    info, st = live_session.load_info(folder), live_session.load_state(folder)
+    peers = [a.peer] if a.peer else [n for n in [*info.clients, "S"] if n in st.logs]
+    for n in peers:
+        if n not in st.logs:
+            raise live_session.LiveError(f"no log for {n} in this session")
+        p = Path(st.logs[n])
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines() if p.is_file() else []
+        if a.since:
+            hits = [i for i, line in enumerate(lines) if a.since in line]
+            lines = lines[hits[-1]:] if hits else []
+        elif not a.all:
+            lines = lines[-a.tail:]
+        for line in lines:
+            if not a.grep or re.search(a.grep, line):
+                print(f"{n}| {line}")
+    return 0
+
+
+def live_list(cfg: Config, a: argparse.Namespace) -> int:
+    root = cfg.store / "live"
+    folders = sorted(p for p in root.iterdir() if (p / "session.json").is_file()) if root.is_dir() else []
+    shown = 0
+    for f in folders:
+        info, st = live_session.load_info(f), live_session.load_state(f)
+        alive = pid_alive(st.pid) if st.pid else False
+        if st.state in ("ended", "failed") and not a.all:
+            continue
+        state = st.state if alive or st.state in ("ended", "failed") else f"{st.state} (session process gone)"
+        idle = live_session.idle_seconds(max(info.created, (f / "sends.jsonl").stat().st_mtime
+                                             if (f / "sends.jsonl").is_file() else 0.0), time.time())
+        print(f"{info.name}: {state}; {info.layout}{' ' + info.level if info.level else ''}; "
+              f"following {', '.join(st.following) or 'none'}; idle {idle / 60:.1f} of {info.idle_minutes:g} min")
+        if st.note:
+            print(f"  {st.note}")
+        if st.run:
+            print(f"  run: {st.run}")
+        for line in live_problem_text(st):
+            print(f"  {line}")
+        shown += 1
+    if not shown:
+        print("no live session" + ("" if a.all else " running (--all lists the ended ones too)"))
+    return 0
+
+
+def live_stop(cfg: Config, a: argparse.Namespace) -> int:
+    folder = live_session_folder(cfg, a.session)
+    st = live_session.load_state(folder)
+    if st.state not in ("ended", "failed"):
+        (folder / "stop").write_text("stopped by `skytest.py live stop`", encoding="utf-8")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < live_session.STOP_GRACE_S + 90:
+            st = live_session.load_state(folder)
+            if st.state in ("ended", "failed") or (st.pid and not pid_alive(st.pid)):
+                break
+            time.sleep(0.5)
+    st = live_session.load_state(folder)
+    print(f"{folder.name}: {st.state}{': ' + st.note if st.note else ''}")
+    if st.pid and pid_alive(st.pid):
+        print("  the session process still runs (it ends its games itself; `skytest.py live list`)")
+    if st.run:
+        print(f"  run folder: {st.run}")
+    budget = machine_budget(cfg)
+    if budget is not None:
+        with budget.mutex():
+            taken, held = budget._probe()
+            for _, fd in taken:
+                _unlock_close(fd)
+        mine = [i for i, note in held.items() if folder.name in str(note.get("owner", ""))]
+        print(f"  machine slots: {len(held)} of {MACHINE_SLOT_FILES} held ({budget.holders(held)}); this session"
+              f" holds {len(mine)}")
+    return 0 if st.state in ("ended", "failed") else 1
+
+
+def live_spec(cfg: Config, a: argparse.Namespace) -> int:
+    folder = live_session_folder(cfg, a.session)
+    info = live_session.load_info(folder)
+    if not live_session.CASE_NAME.fullmatch(a.name):
+        raise live_session.LiveError(f"--name {a.name!r}: lower-case letters, digits, - and _")
+    out = cfg.cases_dir / f"{a.name}.toml"
+    if out.exists() and not a.force:
+        raise live_session.LiveError(f"{out} exists (--force replaces it)")
+    sends = live_session.read_sends(folder / "sends.jsonl")
+    text = live_session.skeleton_spec(a.name, info, sends, a.from_line, a.to_line, source=folder.name)
+    out.write_text(text, encoding="utf-8", newline="\n")
+    try:
+        load_spec(out, cfg.timeout)
+    except SpecError as e:
+        print(f"{out}: written, but it does not load: {e}")
+        return 1
+    print(f"{out}: {sum(1 for s in sends if (a.from_line or 0) <= s.number <= (a.to_line or s.number))} sent line(s)"
+          f" after the prologues; run it with `skytest.py test {a.name}`")
+    return 0
+
+
+LIVE_VERBS = {"start": live_start, "send": live_send, "log": live_log, "list": live_list, "stop": live_stop,
+              "spec": live_spec, "_serve": live_serve}
+
+
+def add_live_parser(sub) -> None:
+    lv = sub.add_parser("live", help="live sessions: start the games once, then send them script lines and read"
+                        " what every peer logs (docs/testing-guide.md, Live sessions)")
+    vs = lv.add_subparsers(dest="verb", required=True)
+    s = vs.add_parser("start", help="start a session's games (as a case does) and return when every peer follows"
+                      " its live file")
+    s.add_argument("--layout", required=True, help="server+1, server+2, ...")
+    s.add_argument("--level", default=None, help="H loads this level after the hub (the clients follow)")
+    s.add_argument("--hide-server", action="store_true", help="S hidden with its draw skip (the release"
+                   " configuration); else shown as in playtests")
+    s.add_argument("--name", default=None, help="a tag for the session's name (default: layout and level)")
+    s.add_argument("--late", action="append", metavar="PEER", help="this client stops at its title with its"
+                   " figure placed; send `online_join {join}` to join later (repeatable)")
+    s.add_argument("--arg", action="append", metavar="PEER:--SETTING=VALUE", help="an extra setting for a client"
+                   " (checked like a spec's args; repeatable)")
+    s.add_argument("--idle-minutes", type=float, default=live_session.DEFAULT_IDLE_MINUTES,
+                   help="the session stops itself after this long without a send (0: never)")
+    s.add_argument("--start-timeout", type=float, default=live_session.DEFAULT_START_TIMEOUT,
+                   help="seconds to wait for live mode before returning (the session goes on)")
+    s.add_argument("--no-server-live", action="store_true", help="S gets no live file (an older build without"
+                   " dev_server_follow gets none anyway)")
+    s.add_argument("--allow-restricted", action="store_true", help="as `test --allow-restricted`")
+    s = vs.add_parser("send", help="check lines, append them to a peer's live file, wait for the game's done line,"
+                      " print every peer's log lines since the send")
+    s.add_argument("session")
+    s.add_argument("peer", help="H, D, E, F, or S (its live file, when the build has one)")
+    s.add_argument("lines", nargs="+", help="script lines; several arguments or ';' send several")
+    s.add_argument("--timeout", type=float, default=live_session.DEFAULT_SEND_TIMEOUT)
+    s.add_argument("--no-wait", action="store_true", help="return once the lines are in the file")
+    s.add_argument("--grep", default=None, help="print only the log lines that match this regex")
+    s = vs.add_parser("log", help="a session's logs (the last lines, or from the last line holding --since)")
+    s.add_argument("session")
+    s.add_argument("peer", nargs="?", default=None)
+    s.add_argument("--since", default=None, metavar="TEXT", help="from the last line holding this text (e.g."
+                   " 'live 12:')")
+    s.add_argument("--grep", default=None, metavar="REGEX")
+    s.add_argument("--tail", type=int, default=60, help="without --since: the last N lines of each log")
+    s.add_argument("--all", action="store_true", help="the whole log")
+    s = vs.add_parser("list", help="the running sessions (--all: the ended ones too)")
+    s.add_argument("--all", action="store_true")
+    s = vs.add_parser("stop", help="quit every game of the session, end what is left, free the slots")
+    s.add_argument("session")
+    s = vs.add_parser("spec", help="write tests/runtime/<name>.toml from the prologues and the lines sent")
+    s.add_argument("session")
+    s.add_argument("--name", required=True, help="the case's name (the file's too)")
+    s.add_argument("--from", dest="from_line", type=int, default=None, help="each peer's first live line to take")
+    s.add_argument("--to", dest="to_line", type=int, default=None, help="each peer's last live line to take")
+    s.add_argument("--force", action="store_true", help="replace an existing spec file")
+    s = vs.add_parser("_serve")
+    s.add_argument("session")
+    s.add_argument("--allow-restricted", action="store_true")
+    lv.set_defaults(fn=cmd_live)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="The Skylanders online forks' test runner.")
     p.add_argument("--repo", default=".", help="the game checkout (default: the current folder)")
@@ -7808,6 +8409,7 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--noise", type=int, default=0, help="how many of the runs make the A/A (default: all but the"
                    " last of three or more, else all)")
     c.set_defaults(fn=cmd_compare)
+    add_live_parser(sub)
     a = p.parse_args(argv)
     cfg = load_config(repo_root(Path(a.repo)))
     return a.fn(cfg, a)
