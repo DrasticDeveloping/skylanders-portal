@@ -483,8 +483,8 @@ class Report(unittest.TestCase):
                            "CInteraction seen near it) after 2 s"), "no interaction on or near the object")
         self.assertEqual(k("Dev: fight_area 1,2,-3 failed (the hero is 37913 from the area, more than its radius 2500 + "
                            "1500: the route did not get here, nothing walked) after 0.0 s"), "could not get within reach")
-        self.assertIn("no floor", k("Dev: route teleport goto_entity failed (landed 1,2,3, 300 off the point 4,5,6 (more "
-                                    "than 200); no floor under it or beside it (0 no floor, 1 no floor)) (target X#1)"))
+        self.assertIn("no static floor", k("Dev: route teleport goto_entity failed (landed 1,2,3, 300 off the point 4,5,6 (more "
+                                    "than 200); no static floor under it or beside it (0 no floor, 1 no floor)) (target X#1)"))
         # The game's (or not known to be the tool's): stays a finding.
         self.assertIn("no hit point", k("Dev: attack_until ShipJunk_2#7 failed (time: hp 50 -> 50, 9 bursts) after 30 s"))
         self.assertEqual(k("Dev: attack_until Crate#7 failed (time: hp 50 -> 20, 9 bursts) after 30 s"), "")

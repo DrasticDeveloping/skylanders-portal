@@ -1096,7 +1096,7 @@ TOOL = "tool: could not act"
 TOOL_KINDS = (
     (re.compile(r"skipped: the sweep's time is up"), "not reached in the budget"),
     (re.compile(r"bad arguments|unknown command"), "the step's own words were refused (a generator bug)"),
-    (re.compile(r"no floor under it or beside it"), "no floor under the object or beside it (off the map, or its area's collision not in)"),
+    (re.compile(r"no (?:static )?floor under it or beside it"), "no static floor under the object or beside it (on a moving ship or platform, off the map, or its area's collision not in)"),
     (re.compile(r"still asleep .*wakes only at its own event"), "asleep: wakes only at its own event, not for a visit"),
     (re.compile(r"still asleep|asleep \(not in the entity table\)|asleep, and the teleport"), "asleep: did not wake for the visit"),
     (re.compile(r"no such entity|is gone\b|no authored object"), "not in the live game by that name or id"),
