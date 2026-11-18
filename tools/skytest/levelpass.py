@@ -50,7 +50,9 @@ GROUP_INTERACT = "switches, gates, locks, pads, movers, breakables, turrets, min
 GROUP_TRIGGERS = "trigger volumes and level events"
 GROUP_NPCS = "NPCs, conversations, scenes, voice-overs and hints"
 GROUP_CHECKPOINTS = "checkpoints, level start and exit"
-GROUPS_VISITED = (GROUP_ENEMIES, GROUP_PICKUPS, GROUP_INTERACT, GROUP_TRIGGERS, GROUP_NPCS, GROUP_CHECKPOINTS)
+GROUP_OTHER = "other"
+GROUPS_VISITED = (GROUP_ENEMIES, GROUP_PICKUPS, GROUP_INTERACT, GROUP_TRIGGERS, GROUP_NPCS, GROUP_CHECKPOINTS,
+                  GROUP_OTHER)  # other: visited and audited only
 # The static reader's groups (tools/level_logic.py manifest.json schema 1) as the probe's groups; scenery
 # and other are not visited.
 STATIC_GROUPS = {
@@ -61,6 +63,7 @@ STATIC_GROUPS = {
     "breakable": GROUP_INTERACT, "turret": GROUP_INTERACT, "minigame": GROUP_INTERACT,
     "trigger": GROUP_TRIGGERS, "conversation": GROUP_NPCS, "cutscene": GROUP_NPCS, "npc": GROUP_NPCS,
     "checkpoint": GROUP_CHECKPOINTS, "level_start": GROUP_CHECKPOINTS, "level_end": GROUP_CHECKPOINTS,
+    "other": GROUP_OTHER,
 }
 
 
@@ -379,6 +382,7 @@ STATIC_ACTION = {
     "cutscene": ("enter", "a cutscene trigger: entered"),
     "level_start": ("visit", "a player start: visited only"),
     "level_end": ("visit", "the level's end (its chain's senders are acted on at the exit)"),
+    "other": ("visit", "a generic entity: visited and audited only"),
 }
 
 
@@ -1006,12 +1010,39 @@ def phase_times(text: str) -> list[tuple[str, float]]:
     return out
 
 
+WAIT_MET = re.compile(r"Input script: waitfor (\S+) (met|timed out) after ([\d.]+) s")
+WAIT_FREE = re.compile(r"Dev: wait_free free after ([\d.]+) s")
+
+
+def boot_phases(text: str) -> list[tuple[str, float]]:
+    """The boot's steps from H's log, up to the sweep's start: each waitfor's wait (seconds) in order,
+    and the game's start to its first line as `process start`."""
+    from datetime import datetime
+    out: list[tuple[str, float]] = []
+    first = None
+    for line in text.splitlines():
+        t = TIME.match(line)
+        if t and first is None:
+            first = datetime.strptime(t.group(1)[:23], "%Y-%m-%d %H:%M:%S.%f").timestamp()
+        if "LEVELPASS phase sweep" in line:
+            break
+        m = WAIT_MET.search(line)
+        if m:
+            out.append((m.group(1) + ("" if m.group(2) == "met" else " (timed out)"), float(m.group(3))))
+            continue
+        m = WAIT_FREE.search(line)
+        if m:
+            out.append(("wait_free", float(m.group(1))))
+    return out
+
+
 def summaries(text: str) -> list[str]:
     return [m.group(0) for m in (AUDIT_SUMMARY.search(l) for l in text.splitlines()) if m]
 
 
 def report_text(level: str, plan: Plan, wall_s: float, phases: list[tuple[str, float]], folded,
-                crash: str, sums: dict[str, list[str]], run_folder: str, notes: list[str]) -> str:
+                crash: str, sums: dict[str, list[str]], run_folder: str, notes: list[str],
+                boot: list[tuple[str, float]] | None = None) -> str:
     lines = [f"Level pass: {level}", f"run folder: {run_folder}", f"content: {plan.source}",
              f"wall clock: {wall_s:.0f} s ({'under' if wall_s <= BUDGET_S else 'OVER'} the {BUDGET_S:.0f} s budget); "
              f"estimate was {plan.estimate_s:.0f} s",
@@ -1022,6 +1053,9 @@ def report_text(level: str, plan: Plan, wall_s: float, phases: list[tuple[str, f
     lines.append("time per phase:")
     for name, s in phases:
         lines.append(f"  {name}: {s:.1f} s")
+    if boot:
+        lines.append("boot steps (H, seconds each condition waited):")
+        lines.append("  " + ", ".join(f"{n} {s:.1f}" for n, s in boot))
     total = sum(n for _f, n, _fs in folded)
     lines.append("")
     lines.append(f"findings: {total} in {len(folded)} entries" + (f"; CRASH: {crash}" if crash else ""))

@@ -7922,7 +7922,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                                       obj="", step=""))
     notes.append(f"shader cache: {'warm (from the build snapshot)' if any((run / n / 'cache').rglob('*.xpso') for n in ('H',)) else 'cold'}")
     report = lp.report_text(a.level, plan, wall, lp.phase_times(texts["H"]), lp.fold(findings), crash,
-                            {p: lp.summaries(t) for p, t in texts.items()}, str(run), notes)
+                            {p: lp.summaries(t) for p, t in texts.items()}, str(run), notes,
+                            boot=lp.boot_phases(texts["H"]))
     out = folder / f"{a.level}-pass-{stamp}.txt"
     out.write_text(report, encoding="utf-8")
     print(report, flush=True)

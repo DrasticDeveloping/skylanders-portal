@@ -305,6 +305,16 @@ class Report(unittest.TestCase):
         self.assertLess(h.index("online_audit v1\n"), h.index("dev_audit_diverge breakable"))
         self.assertLess(h.index("dev_audit_diverge breakable"), h.index("online_audit provoke"))
 
+    def test_boot_phases(self):
+        log = "\n".join([
+            "[2026-11-18 10:00:00.000] [info] Input script: playing 'x'",
+            "[2026-11-18 10:00:12.000] [info] Input script: waitfor title_ready met after 11.5 s",
+            "[2026-11-18 10:01:12.000] [info] Input script: waitfor online_server_hub met after 40.2 s",
+            "[2026-11-18 10:01:20.000] [info] Dev: wait_free free after 0.3 s (held: no)",
+            "[2026-11-18 10:01:21.000] [info] Input script: LEVELPASS phase sweep",
+            "[2026-11-18 10:01:30.000] [info] Input script: waitfor goto_done met after 1.0 s"])
+        self.assertEqual(lp.boot_phases(log), [("title_ready", 11.5), ("online_server_hub", 40.2), ("wait_free", 0.3)])
+
     def test_step_labels(self):
         p = lp.make_plan(content(), late_join=False)
         labels = lp.step_labels(lp.script_h(p, None))
