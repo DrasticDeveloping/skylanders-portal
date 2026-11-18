@@ -21,29 +21,29 @@ Level start: Start_01 at 0.0 0.0 0.0
 
 == checkpoints, level start and exit: 2
    classes: CPlayerStartEntity 1, CScriptTriggerEntity 1
-       0        0.0       0.0      0.0  CPlayerStartEntity         Start_01                             [z#1] registered
-    9000     9000.0       0.0      0.0  CScriptTriggerEntity       Level_Exit                           [z#2] registered
+       0        0.0       0.0      0.0  CPlayerStartEntity         Start_01                             [madeup#1] registered
+    9000     9000.0       0.0      0.0  CScriptTriggerEntity       Level_Exit                           [madeup#2] registered
 
 == enemies, spawners and encounters: 3
-     500      500.0       0.0      0.0  CEncounterSpawnPoint       (no name)                            [z#3] registered
-     600      600.0       0.0      0.0  CActionEntity              Fight_Manager                        [z#4] registered
-    5000     5000.0       0.0      0.0  CGameEntity                Grub_Spawner_01                      [z#5] registered
+     500      500.0       0.0      0.0  CEncounterSpawnPoint       (no name)                            [madeup#3] registered
+     600      600.0       0.0      0.0  CActionEntity              Fight_Manager                        [madeup#4] registered
+    5000     5000.0       0.0      0.0  CGameEntity                Grub_Spawner_01                      [madeup#5] registered
 
 == switches, gates, locks, pads, movers, breakables, turrets, mini-games: 6
-     300      300.0     100.0      0.0  CPhysicalEntity            Box_Destructible_01                  [z#6] asleep
-     310      310.0     100.0      0.0  CPhysicalEntity            Box_Destructible_02                  [z#7] asleep
-     320      320.0     100.0      0.0  CPhysicalEntity            Box_Destructible_03                  [z#8] asleep
-     330      330.0     100.0      0.0  CPhysicalEntity            Box_Destructible_04                  [z#9] asleep
-    3000     3000.0       0.0      0.0  CGameEntity                Lever_A                              [z#10] registered
-    3100     3100.0       0.0      0.0  CDynamicClipEntity          Lift_Platform                        [z#11] registered
+     300      300.0     100.0      0.0  CPhysicalEntity            Box_Destructible_01                  [madeup#6] asleep
+     310      310.0     100.0      0.0  CPhysicalEntity            Box_Destructible_02                  [madeup#7] asleep
+     320      320.0     100.0      0.0  CPhysicalEntity            Box_Destructible_03                  [madeup#8] asleep
+     330      330.0     100.0      0.0  CPhysicalEntity            Box_Destructible_04                  [madeup#9] asleep
+    3000     3000.0       0.0      0.0  CGameEntity                Lever_A                              [madeup#10] registered
+    3100     3100.0       0.0      0.0  CDynamicClipEntity          Lift_Platform                        [madeup#11] registered
 
 == trigger volumes and level events: 3
-    2000     2000.0       0.0      0.0  CScriptTriggerEntity       (no name)                            [z#12] registered
-    2100     2100.0       0.0      0.0  CGameEntity                Event_StartFight                     [z#13] registered
-  900000   900000.0       0.0      0.0  CPhysicalEntity            CrossBeam_Far                        [z#14] registered
+    2000     2000.0       0.0      0.0  CScriptTriggerEntity       (no name)                            [madeup#12] registered
+    2100     2100.0       0.0      0.0  CGameEntity                Event_StartFight                     [madeup#13] registered
+  900000   900000.0       0.0      0.0  CPhysicalEntity            CrossBeam_Far                        [madeup#14] registered
 
 == effects, sound and scenery: 1
-     100      100.0       0.0      0.0  CGameEntity                vfx_Smoke                            [z#15] registered
+     100      100.0       0.0      0.0  CGameEntity                vfx_Smoke                            [madeup#15] registered
 
 == completeness
    total: 15 placed entities
@@ -61,7 +61,7 @@ class Readers(unittest.TestCase):
         c = content()
         self.assertEqual(c.start, (0.0, 0.0, 0.0))
         self.assertEqual(len(c.objects), 15)
-        unnamed = [o for o in c.objects if o.ident == "z#3"][0]
+        unnamed = [o for o in c.objects if o.ident == "madeup#3"][0]
         self.assertEqual(unnamed.name, "")
         self.assertEqual(unnamed.group, lp.GROUP_ENEMIES)
         box = [o for o in c.objects if o.name == "Box_Destructible_01"][0]
@@ -248,16 +248,26 @@ class Scripts(unittest.TestCase):
         self.assertIn("online_wait_peers 2 300", h)
         self.assertIn("waitfor online_past_level_end 240", h)
         self.assertLess(h.index("LEVELPASS phase late-join"), h.index("LEVELPASS phase exit"))
-        self.assertIn("attack_until auth:z:6 12", h)
-        self.assertIn("interact auth:z:10 10", h)
-        self.assertIn("goto_entity auth:z:", h)
+        self.assertIn("attack_until auth:madeup:6 12", h)
+        self.assertIn("interact auth:madeup:10 10", h)
+        self.assertIn("goto_entity auth:madeup:", h)
         self.assertIn("waitfor online_alone 300", h)
         d = lp.script_d(p)
         self.check_script(d)
         self.assertIn("online_join {join}", d)
         self.assertNotIn("online_host", d)
-        self.assertIn("goto_entity auth:z:", d)
+        self.assertIn("goto_entity auth:madeup:", d)
         self.assertLess(d.index("online_end"), d.index("quit"))
+
+    def test_sweep_deadline(self):
+        p = lp.make_plan(content())
+        h = lp.script_h(p, lp.LATE_JOIN_MARK)
+        share = lp.sweep_share(p)
+        self.assertIn(f"sweep_deadline {share:.0f}", h)
+        self.assertLess(h.index(f"sweep_deadline {share:.0f}"), h.index("LEVELPASS visit v1"))
+        self.assertLess(h.index("sweep_deadline 0"), h.index("LEVELPASS phase late-join"))
+        self.assertGreaterEqual(share, lp.SWEEP_MIN_S)
+        self.assertLessEqual(share + lp.BOOT_S + lp.LEVEL_LOAD_S + lp.LATE_JOIN_S + lp.exit_seconds(p), lp.BUDGET_S)
 
     def test_no_exit_no_exit_waits(self):
         c = content()
@@ -287,10 +297,13 @@ class Refs(unittest.TestCase):
                 lp.Obj("X_componentDataOverrides_archetype_Y", "C", (1.0, 1.0, 1.0), lp.GROUP_ENEMIES),
                 lp.Obj("", "CGameEntity", (2.0, 2.0, 2.0), lp.GROUP_OTHER)]
         self.assertEqual(lp.attach_refs(objs, probe), 2)
-        self.assertEqual([o.ref for o in objs], ["auth:zone_x:12", "auth:zone_x:40", "Chest_9", "Lever_A", "", ""])
+        # Chest_9 is not a name the probe saw live: no reference; Lever_A is (its other copy).
+        self.assertEqual([o.ref for o in objs], ["auth:zone_x:12", "auth:zone_x:40", "", "Lever_A", "", ""])
+        lp.attach_refs(objs, None)  # no probe: names as they are
+        self.assertEqual(objs[2].ref, "Chest_9")
 
     def test_position_literals(self):
-        self.assertEqual(lp.position_literals("\n".join(["goto_entity auth:z:1", "fight_near Lever_A 1500 25",
+        self.assertEqual(lp.position_literals("\n".join(["goto_entity auth:madeup:1", "fight_near Lever_A 1500 25",
                                                          "wait_free 30"])), [])
         for bad in ("goto 1.0 2.0 3.0", "fight_area 1 2 3 1500 25", "attack_until at:1,2,3 10",
                     "log LEVELPASS visit at 12.5 -3.0 7", "online_wait_peer_near 1 2 3 400 300"):

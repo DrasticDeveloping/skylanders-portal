@@ -7947,6 +7947,9 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         caught = lp.mark_provoked(findings, diverged)
         notes.append(f"provoked: {plan.provoke} on H alone ({', '.join(e for _k, e in diverged) or 'no row qualified'});"
                      f" the audit reported it {caught} time(s)" + ("" if caught or not diverged else ": NOT CAUGHT"))
+    skipped = len(re.findall(r"skipped: the sweep's time is up", texts["H"]))
+    if skipped:
+        notes.append(f"{skipped} step(s) skipped at the sweep's deadline (not reached in the budget)")
     if crash:
         findings.insert(0, lp.Finding(severity="crash", kind="process", family=crash.split(":")[0], what=crash,
                                       obj="", step=""))

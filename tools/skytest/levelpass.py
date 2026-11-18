@@ -376,8 +376,8 @@ OUTLIER_FLOOR = 8000.0
 # Actions: what the generator does at an object.
 FIGHT, ATTACK, INTERACT_A, PICKUP, ENTER, TALK, EXIT_A, VISIT = (
     "fight", "attack", "interact", "pickup", "enter", "talk", "exit", "visit")
-EXIT_FIGHT_S = 150
-EXIT_LATE_WAVE_S = 45
+EXIT_FIGHT_S = 90
+EXIT_LATE_WAVE_S = 30
 EXIT_RADIUS = 3000.0
 EXIT_NEAR = 5000.0     # the level-end senders taken: those this close to the chain's receiver
 EXIT_FIGHT_RADIUS = 2500   # the level-end senders this close share one exit fight (an arena)
@@ -641,9 +641,11 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
 def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, sample: int,
                provoke: str) -> Plan:
     visited = [o for o in content.objects if o.group in GROUPS_VISITED]
-    # A sub-zone (a swap zone) is its own map, loaded by its own entry: its objects are visited only when
-    # the probe saw them in this level's load (an authored id).
-    other_zone = [o for o in visited if o.zone and o.zone != content.level and not o.ref.startswith("auth:")]
+    # A sub-zone (a swap zone, a staging map) is its own map that a player reaches only through its own
+    # entry: its objects are never visited, even when the probe walked its package at the level's load
+    # (a teleport there put H where no player can be: run 3, a crash in the zone's scripts).
+    other_zone = [o for o in visited if (o.zone and o.zone.lower() != content.level.lower()) or
+                  (o.ref.startswith("auth:") and o.ref.split(":")[1].lower() != content.level.lower())]
     visited = [o for o in visited if o not in other_zone]
     unplaced = sum(1 for o in visited if not placed(o))
     visited = [o for o in visited if placed(o)]
@@ -823,6 +825,7 @@ def attach_refs(objects: list[Obj], probe: list[Obj] | None) -> int:
     can take it. How many got an authored id."""
     by_name: dict[str, list[Obj]] = {}
     unnamed: list[Obj] = []
+    live_names = {p.name.lower() for p in probe or [] if p.name}
     for p in probe or []:
         if "#" not in p.ident:
             continue
@@ -835,8 +838,11 @@ def attach_refs(objects: list[Obj], probe: list[Obj] | None) -> int:
             zone, index = best.ident.rsplit("#", 1)
             o.ref = f"auth:{zone}:{index}"
             joined += 1
-        else:
+        elif probe is None or o.name.lower() in live_names:
+            # A name the probe saw live (its refname may be another name at run time otherwise).
             o.ref = name_ref(o.name)
+        else:
+            o.ref = ""
     return joined
 
 
@@ -887,7 +893,7 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
     lines = boot_lines(True, FIGURE_H)
     lines += ["waitfor online_server_hub 300", "online_mark_level", f"level {plan.level}",
               "waitfor online_level_after_mark 300", "waitfor online_barrier 300", "wait_free 120",
-              "log LEVELPASS phase sweep", "online_audit start"]
+              "log LEVELPASS phase sweep", "online_audit start", f"sweep_deadline {sweep_share(plan):.0f}"]
     n_stops = len(plan.stops)
     marked = False
     for i, s in enumerate(plan.stops):
@@ -904,6 +910,7 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
                       f"online_audit {PROVOKE_LABEL}"]
     if late_join_after is not None and plan.late_join and not marked:
         lines.append("log LEVELPASS late-join start")
+    lines.append("sweep_deadline 0")
     lines.append("log LEVELPASS phase audit")
     lines.append("online_audit end")
     if plan.late_join and late_join_after is not None:
@@ -926,6 +933,26 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def exit_seconds(plan: Plan) -> float:
+    """The exit phase's share: its actions' own timeouts and the level end's waits."""
+    if plan.exit_stop is None:
+        return EXIT_WAIT_S if plan.timed else 0.0
+    t = EXIT_WAIT_S
+    for a in plan.exit_stop.actions:
+        t += (EXIT_FIGHT_S + EXIT_LATE_WAVE_S) if exit_kind(a.obj) == FIGHT else ACTION_TIMEOUT[TALK]
+    return t
+
+
+def sweep_share(plan: Plan, budget_s: float = BUDGET_S) -> float:
+    """The sweep's time (sweep_deadline): the budget less the boot, the late join, the exit and a margin;
+    at least SWEEP_MIN_S."""
+    rest = BOOT_S + LEVEL_LOAD_S + (LATE_JOIN_S if plan.late_join else 0.0) + exit_seconds(plan) + SWEEP_MARGIN_S
+    return max(SWEEP_MIN_S, budget_s - rest)
+
+
+SWEEP_MARGIN_S = 30.0
+SWEEP_MIN_S = 60.0
+EXIT_WAIT_S = 60.0     # the level end's own waits after the exit's actions (online_level_end, the next level)
 PROVOKE_LABEL = "provoke"
 TIMED_END_S = 240      # a timed level's own end comes within this after the sweep
 LATE_JOIN_LEAD = 6     # D starts this many stops before the sweep ends (its boot runs beside them)
