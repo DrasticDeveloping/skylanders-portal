@@ -376,6 +376,169 @@ class SpecError(Exception):
     pass
 
 
+# --- bulk mode (`test --bulk`) ----------------------------------------------------------------------
+#
+# Bulk mode runs many more games at once than the watched default (every window visible, 4 games) by
+# hiding them: every game it starts gets a hidden window and the SDK's draw skip (rexglue-sdk
+# render_hidden_draw=false: a hidden window's draws, resolves and presents are skipped, memexport
+# draws still run; include/rex/graphics/draw_skip.h). A client (H, D, E, F) gets --window_hidden=true
+# --render_hidden_draw=false, a standalone S the same, and a hosted S is hidden because H no longer
+# gets --dev_show_server_window (Host then passes --window_hidden=true and --render_hidden_draw=false
+# itself, host.cpp). Measured 2026-11-17: a hidden game takes about 0.95 GB private memory and almost
+# no video memory, against 2.0 GB and 1.2 GB visible, and the visible games were GPU-bound at 4.
+# Bulk results are labelled (CaseResult.mode, results.json `mode` and `bulk`, the args hash) and never
+# mix with the default mode's history (run times, statuses, per-build gate results, waitfor history).
+# Specs that cannot run hidden or must not are not run in bulk (bulk_exclusion): they are reported
+# `not in bulk` with the reason, and the report names the command that runs them visible.
+BULK_MACHINE_GAMES = 8  # [defaults] bulk_machine_games when the key is missing
+BULK_WAIT_FACTOR = 2.0  # [defaults] bulk_wait_factor: every `waitfor <condition> <seconds>` times this
+BULK_GB_PER_GAME = 1.5  # [defaults] bulk_gb_per_game: free memory a game needs at its case's start
+BULK_HIDDEN = ["--window_hidden=true", "--render_hidden_draw=false"]
+BULK_MARK = "bulk-mode.txt"  # in every bulk case folder: the waitfor history (`timeouts`) skips its logs
+NOT_IN_BULK = "not in bulk"  # a spec bulk mode leaves out (bulk_exclusion): reported, not failed
+# The pacing a bulk run gives its games (`test --bulk --bulk-pacing NAME`): never changed silently,
+# part of the run's label and args hash, and only ever on the hidden games of a bulk run (a plain
+# game and a watched playtest never get it). What each changes in the tested condition is in
+# docs/testing-guide.md (bulk mode); the measured ladder per arm too. None changes the session's
+# shared tick (online_server_hz): halving it would double every tick constant in real time.
+BULK_PACINGS = {
+    # The game's own pacing: a frame that misses the 60 Hz vblank waits for the next (60, 30, 20, 15).
+    "default": {"client": [], "host": [], "server": []},
+    # A 240 Hz guest vblank on every game the runner starts (rexglue-sdk guest_vblank_rate): a late
+    # frame goes at the next 4 ms vblank, frame_rate_limit 60 still caps the rate. A hosted S keeps the
+    # default (server_role.cpp pins guest_vblank_rate, and Host does not forward it).
+    "vblank240": {"client": ["--guest_vblank_rate=240"], "host": [], "server": ["--guest_vblank_rate=240"]},
+    # The console's frame rate on the games the runner starts: frame_rate_limit 30 (the guest's tick
+    # paced at 30, ThrottleGuestTickRate; the vblank stays 60), the session's tick still 60. A hosted
+    # S keeps 60 (server_role.cpp sets frame_rate_limit 60 itself; Host does not forward it). Jumps
+    # come out about 5 % higher than at 60 (docs/high-framerate.md, jump height).
+    "fps30": {"client": ["--frame_rate_limit=30"], "host": [], "server": ["--frame_rate_limit=30"]},
+}
+# Settings whose subject is the window, the draw skip or the pacing: a spec that sets one itself is
+# not run in bulk (bulk mode sets them, or its subject is what bulk mode changes).
+BULK_OWN_SETTINGS = ("window_hidden", "render_hidden_draw", "dev_server_draw", "guest_vblank_rate", "present_interval",
+                     "online_server_hz", "frame_rate_limit")
+# Script commands and expected lines bulk mode leaves out, (rx, reason) each. A hidden window still runs
+# the UI's draw callback (ImGui): on 2026-11-18 a hidden H's settings menu (key F4) took its presses as a
+# visible one's did (bulk-hidden-f4, host-button), and an auto-opened portal menu closed after a figure
+# went back on (bulk-hidden-remove), so neither is excluded. The party panel's `Online: panel drawn`
+# line is not shown hidden yet (its only spec runs alone), and a hidden window has no picture.
+BULK_SCRIPT_EXCLUDED: list[tuple[re.Pattern, str]] = []
+BULK_EXPECT_EXCLUDED = [
+    (re.compile(r"panel drawn"), "expects `Online: panel drawn`, logged from the party panel's draw callback"),
+    (re.compile(r"no picture"), "grades a picture (`shot`), which a hidden window under the draw skip does not have"),
+]
+
+
+@dataclass
+class BulkSettings:
+    """[defaults] bulk_machine_games, bulk_wait_factor and bulk_gb_per_game (load_config)."""
+    games: int = BULK_MACHINE_GAMES
+    wait_factor: float = BULK_WAIT_FACTOR
+    gb_per_game: float = BULK_GB_PER_GAME
+
+
+@dataclass
+class BulkMode:
+    """A bulk run's choices (cmd_test): the game budget it shares with every runner, the waitfor factor,
+    the free memory per game at a case's start, and the pacing (BULK_PACINGS)."""
+    games: int = BULK_MACHINE_GAMES
+    wait_factor: float = BULK_WAIT_FACTOR
+    gb_per_game: float = BULK_GB_PER_GAME
+    pacing: str = "default"
+
+    def label(self) -> dict:
+        """What results.json and each case's result record about the mode (`bulk`)."""
+        return {"games": self.games, "wait_factor": self.wait_factor, "gb_per_game": self.gb_per_game,
+                "pacing": self.pacing, "hidden": list(BULK_HIDDEN)}
+
+    def line(self) -> str:
+        return (f"Mode: BULK: every game hidden with the draw skip ({' '.join(BULK_HIDDEN)}), pacing {self.pacing}"
+                + (f" ({' '.join(sorted(set(a for v in BULK_PACINGS[self.pacing].values() for a in v)))})"
+                   if self.pacing != "default" else "")
+                + f", waitfor timeouts x{self.wait_factor:g} (and the case timeouts), at most {self.games} games"
+                f" at once machine-wide, {self.gb_per_game:g} GB free per game at a case's start. Bulk results"
+                " never count for the default mode's history, gate or checkpoint.")
+
+
+def setting_set(args: list[str], name: str) -> bool:
+    """Whether args set `--name` at all (`--name=value`)."""
+    return any(a.split("=", 1)[0] == f"--{name}" for a in args)
+
+
+def bulk_exclusion(spec: "Spec") -> str:
+    """Why bulk mode does not run a spec ('' when it does): the spec's own `bulk = false`, a case that runs
+    alone (exclusive, a timed grade, a [compare], a remote peer: its measurement or condition is the
+    visible default), a server whose window the spec shows, a setting bulk mode owns (BULK_OWN_SETTINGS),
+    a settings file of none (the release defaults), or a script command or expected line that needs a
+    drawn window (BULK_SCRIPT_EXCLUDED, BULK_EXPECT_EXCLUDED). A unit case starts no game: never excluded."""
+    if spec.layout == UNIT:
+        return ""
+    if not spec.bulk:
+        return "bulk = false: " + (spec.bulk_reason or "(no bulk_reason)")
+    if runs_alone(spec):
+        what = ", ".join(timed_grades(spec)) or ("a remote peer" if any(p.kind == "remote" for p in spec.peers.values())
+                                                 else "exclusive = true")
+        return f"runs alone ({what}): its measurement or condition is the visible default"
+    if spec.show_server_window is True:
+        return "show_server_window = true: its subject needs the server's window shown"
+    for n, p in spec.peers.items():
+        if own := [s for s in BULK_OWN_SETTINGS if setting_set(p.args, s)]:
+            return f"peer {n} sets --{own[0]} itself: its subject is the window, the draw skip or the pacing"
+        if p.settings_file == "none":
+            return f"peer {n} starts on the release defaults (settings_file = \"none\")"
+    for n, p in spec.peers.items():
+        for rx, why in BULK_SCRIPT_EXCLUDED:
+            if rx.search(p.script):
+                return f"peer {n} {why}"
+        for rx, why in BULK_EXPECT_EXCLUDED:
+            if any(rx.search(x) for x in p.expect + list(p.expect_count) + p.expect_order + p.forbid):
+                return f"peer {n} {why}"
+    return ""
+
+
+WAITFOR_LINE = re.compile(r"(?m)^([ \t]*waitfor[ \t]+\S+[ \t]+)(\d+(?:\.\d+)?)([ \t]*)$")
+
+
+def scale_waitfors(script: str, factor: float) -> str:
+    """A script with every `waitfor <condition> <seconds>` timeout times `factor` (bulk mode; the spec file
+    is never changed). A met waitfor returns at once whatever its timeout, and the input script counts
+    what follows from its return (input_script.cpp g_timeline_shift), so only a wait that would time out
+    changes. Whole seconds stay whole; the rest keep one decimal."""
+    if factor == 1:
+        return script
+
+    def longer(m: re.Match) -> str:
+        v = float(m.group(2)) * factor
+        text = str(int(v)) if v == int(v) else f"{v:.1f}"
+        return f"{m.group(1)}{text}{m.group(3)}"
+    return WAITFOR_LINE.sub(longer, script)
+
+
+def bulk_spec(spec: "Spec", bulk: BulkMode) -> "Spec":
+    """The spec as a bulk run runs it: each peer's waitfor timeouts, the case's timeout and a stand-in
+    server's seconds times the wait factor (under load every wait takes longer; the spec file stays)."""
+    f = bulk.wait_factor
+    peers = {n: replace(p, script=scale_waitfors(p.script, f)) for n, p in spec.peers.items()}
+    return replace(spec, peers=peers, timeout=spec.timeout * f, standin_seconds=spec.standin_seconds * f)
+
+
+def bulk_peer_args(bulk: BulkMode, spec: "Spec", peer: str) -> list[str]:
+    """What bulk mode gives one local peer: hidden with the draw skip, and the pacing's settings. An H whose
+    spec keeps its hosted server drawing (--dev_server_draw=true) gets no --render_hidden_draw=false: Host
+    would forward it after its own --render_hidden_draw=true and the server would skip after all
+    (host_modes.h HostChoosesForServer); such a spec is not run in bulk (BULK_OWN_SETTINGS), this only
+    keeps a direct call from breaking it."""
+    pacing = BULK_PACINGS[bulk.pacing]
+    if peer == "S":
+        return [*BULK_HIDDEN, *pacing["server"]]
+    keeps_drawing = peer == "H" and spec.server == "host" and "true" in setting_values(
+        spec.peers[peer].args, "dev_server_draw")
+    hidden = ["--window_hidden=true"] if keeps_drawing else list(BULK_HIDDEN)
+    host = pacing["host"] if peer == "H" and spec.server == "host" else []
+    return [*hidden, *pacing["client"], *host]
+
+
 # --- configuration --------------------------------------------------------------------------------
 
 
@@ -435,6 +598,11 @@ class Config:
     synthetic_args: list[str] = field(default_factory=list)
     synthetic_setting: str = ""
     synthetic_launcher: list[str] = field(default_factory=list)
+    # Bulk mode's [defaults] keys (BulkSettings: the game budget, the waitfor factor, the free memory a
+    # game needs at its case's start), and `test --bulk`'s choice for this run (None: the default mode,
+    # every window as before).
+    bulk_settings: "BulkSettings" = field(default_factory=lambda: BulkSettings())
+    bulk: "BulkMode | None" = None
 
 
 def main_store(repo: Path) -> Path:
@@ -485,6 +653,18 @@ def load_config(repo: Path) -> Config:
     if not isinstance(machine, int) or isinstance(machine, bool) or not 1 <= machine <= MACHINE_SLOT_FILES:
         raise SystemExit(f"{f}: [defaults] machine_games is a whole number from 1 to {MACHINE_SLOT_FILES} (the games"
                          " all runners on the machine share)")
+    bulk_games = d.get("bulk_machine_games", BULK_MACHINE_GAMES)
+    if not isinstance(bulk_games, int) or isinstance(bulk_games, bool) or not 1 <= bulk_games <= MACHINE_SLOT_FILES:
+        raise SystemExit(f"{f}: [defaults] bulk_machine_games is a whole number from 1 to {MACHINE_SLOT_FILES} (the"
+                         " games all runners share while a `test --bulk` run holds them)")
+    factor = d.get("bulk_wait_factor", BULK_WAIT_FACTOR)
+    if not isinstance(factor, (int, float)) or isinstance(factor, bool) or not 1 <= factor <= 10:
+        raise SystemExit(f"{f}: [defaults] bulk_wait_factor is a number from 1 to 10 (what bulk mode multiplies"
+                         " every waitfor timeout and case timeout by)")
+    gb = d.get("bulk_gb_per_game", BULK_GB_PER_GAME)
+    if not isinstance(gb, (int, float)) or isinstance(gb, bool) or not 0 < gb <= 16:
+        raise SystemExit(f"{f}: [defaults] bulk_gb_per_game is a number of GB above 0 (free memory a hidden game"
+                         " needs at its case's start)")
     syn = c.get("synthetic", {})
     syn_args = syn.get("args", [])
     if not isinstance(syn_args, list) or not all(isinstance(x, str) and x.strip() for x in syn_args):
@@ -526,6 +706,7 @@ def load_config(repo: Path) -> Config:
         synthetic_args=list(syn_args),
         synthetic_setting=str(syn.get("server_setting", "")),
         synthetic_launcher=[os.path.expandvars(x) for x in syn.get("launcher", [])],
+        bulk_settings=BulkSettings(games=bulk_games, wait_factor=float(factor), gb_per_game=float(gb)),
     )
 
 
@@ -699,6 +880,10 @@ class Spec:
     # the build snapshot with these files removed or cut short (case_build_copy, launch_args.copy_build);
     # None: from the shared snapshot, as every other case.
     build_copy: la.BuildEdits | None = None
+    # `bulk = false` with a `bulk_reason`: bulk mode (`test --bulk`) does not run the case (bulk_exclusion),
+    # beside the specs it leaves out by themselves.
+    bulk: bool = True
+    bulk_reason: str = ""
 
 
 PEER_KINDS = ("local", "remote")
@@ -1150,6 +1335,15 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
                 raise SpecError(f"{path.name}: peer {n} sets --{SCENE_SETTING} in its args beside the spec's"
                                 f" scenes key: the key says it (the runner passes --{SCENE_SETTING} itself)")
     check_remote_peers(path.name, peers, grades, names)
+    bulk, bulk_reason = d.get("bulk", True), d.get("bulk_reason", "")
+    if not isinstance(bulk, bool):
+        raise SpecError(f"{path.name}: bulk is true or false")
+    if not isinstance(bulk_reason, str):
+        raise SpecError(f"{path.name}: bulk_reason is a string (why bulk mode must not run the case)")
+    if bulk is False and not bulk_reason.strip():
+        raise SpecError(f"{path.name}: bulk = false needs a `bulk_reason` (why the case must not run hidden)")
+    if bulk_reason.strip() and bulk is not False:
+        raise SpecError(f"{path.name}: bulk_reason without bulk = false")
     build_copy = None
     if "build_copy" in d:
         try:
@@ -1167,7 +1361,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         server=server, grades=grades, compare=compare, fail_fast=fail_fast, show_server_window=show,
         exclusive=exclusive, tolerate=list(tolerate), not_ready=not_ready, scenes=scenes,
         scenes_reason=scenes_reason.strip(), breaker=breaker, sha256=hashlib.sha256(data).hexdigest(),
-        synthetic=synthetic, build_copy=build_copy,
+        synthetic=synthetic, build_copy=build_copy, bulk=bulk, bulk_reason=bulk_reason.strip(),
     )
 
 
@@ -2473,6 +2667,9 @@ class PeerResult:
     # (BootHold.outcome: its first frame line, its exit, or BOOT_TIMEOUT_S).
     boot_wait_s: float = 0.0
     boot: str = ""
+    # The fps of each `Online: frames` window (every 10 s on a server and on a client in a session), for
+    # bulk mode's run load line (the lowest client fps seen).
+    frames_fps: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -2507,6 +2704,9 @@ class CaseResult:
     machine: dict = field(default_factory=dict)
     # C7: a failed case's fatal signature (case_signature: signature, peer, line, kind); {} otherwise.
     signature: dict = field(default_factory=dict)
+    # "bulk" for a case of a `test --bulk` run (hidden games: BulkMode), '' for the default mode. The
+    # history walks (run times, statuses, per-build results) keep the two apart (payload_mode).
+    mode: str = ""
 
 
 def crash_exit_code(code: int | None) -> bool:
@@ -3157,6 +3357,104 @@ class LoadSampler:
         return out
 
 
+RUN_LOAD_SAMPLE_S = 5.0
+
+
+def busy_threads(s0: tuple[int, int], s1: tuple[int, int], threads: int) -> float | None:
+    """The CPU threads in use between two _system_times samples (idle, total): the busy share of all
+    cores times the machine's threads."""
+    total = s1[1] - s0[1]
+    if total <= 0:
+        return None
+    return round(max(0.0, 1.0 - (s1[0] - s0[0]) / total) * threads, 2)
+
+
+def lowest_client_fps(results: list["CaseResult"]) -> dict:
+    """The lowest fps any client (not S) showed in a run's cases: its `fps` windows (`guest FPS`) and its
+    `Online: frames` windows, each with the case and peer, and how many windows there were."""
+    out: dict = {}
+    for kind, attr in (("fps", "fps"), ("frames", "frames_fps")):
+        seen = [(v, r.case, p.peer) for r in results for p in r.peers
+                if p.peer.split(":")[-1] != "S" for v in getattr(p, attr)]
+        if seen:
+            v, case, peer = min(seen)
+            values = sorted(x for x, _, _ in seen)
+            out[kind] = {"min": v, "case": case, "peer": peer, "windows": len(seen),
+                         "p10": values[max(0, (len(values) - 1) // 10)]}
+    return out
+
+
+class RunLoad:
+    """Bulk mode's load for the whole run (one thread from start() to summary()): every `every` seconds
+    the games alive on the machine (any runner's) and the CPU threads in use (busy_threads), so a bulk
+    batch that was too heavy shows in its report (run_load_line). Nothing in it ever stops a case."""
+
+    def __init__(self, exe: str, every: float | None = None) -> None:
+        self.exe = Path(exe).name
+        self.every = RUN_LOAD_SAMPLE_S if every is None else every
+        self.games: list[int] = []
+        self.threads: list[float] = []
+        self.error = ""
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="skytest-run-load", daemon=True)
+
+    def start(self) -> "RunLoad":
+        if WINDOWS:
+            self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        try:
+            last = _system_times()
+            while not self._stop.wait(self.every):
+                table = process_table()
+                if table is not None:
+                    self.games.append(count_games(table, self.exe, os.getpid())[0])
+                now = _system_times()
+                if last and now and (t := busy_threads(last, now, os.cpu_count() or 1)) is not None:
+                    self.threads.append(t)
+                last = now
+        except Exception as e:  # noqa: BLE001 - a load sample never stops a case
+            self.error = f"{type(e).__name__}: {e}"
+
+    def summary(self, results: list["CaseResult"]) -> dict:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=15)
+        out: dict = {"samples": len(self.games), "every_s": self.every, "threads_of": os.cpu_count() or 0}
+        busy = [g for g in self.games if g > 0]
+        if busy:
+            out["games_max"] = max(busy)
+            out["games_mean"] = round(sum(busy) / len(busy), 1)
+        if self.threads:
+            out["threads_max"] = max(self.threads)
+            out["threads_mean"] = round(sum(self.threads) / len(self.threads), 1)
+        out["client_fps"] = lowest_client_fps(results)
+        if self.error:
+            out["error"] = self.error
+        return out
+
+
+def run_load_line(load: dict) -> str:
+    """report.md's per-run load line of a bulk run (RunLoad.summary): games at once, CPU threads used, the
+    lowest client fps seen."""
+    parts = []
+    if "games_max" in load:
+        parts.append(f"games at once {load['games_max']} max, {load['games_mean']:.1f} mean while any ran")
+    if "threads_max" in load:
+        parts.append(f"CPU threads used {load['threads_mean']:.1f} mean, {load['threads_max']:.1f} max of"
+                     f" {load.get('threads_of', '?')}")
+    fps = load.get("client_fps") or {}
+    for kind, what in (("fps", "fps windows"), ("frames", "Online: frames windows")):
+        if kind in fps:
+            f = fps[kind]
+            parts.append(f"lowest client {what} {f['min']:.1f} ({f['case']} {f['peer']}; p10 {f['p10']:.1f} of"
+                         f" {f['windows']})")
+    if not fps:
+        parts.append("no client fps window")
+    return "Run load (bulk): " + ("; ".join(parts) if parts else "not sampled") + "."
+
+
 def load_line(load: dict) -> str:
     """report.md's load line for a case (LoadSampler.summary)."""
     if not load:
@@ -3212,6 +3510,8 @@ def args_sha256(cfg: Config, spec: Spec) -> str:
         parts.append([n, show_server_args(cfg, spec, n), p.args])
     for r in spec.compare.get("run", []) if spec.compare else []:
         parts.append([r.get("name"), {n: t.get("args", []) for n, t in sorted(r.get("peer", {}).items())}])
+    if cfg.bulk is not None:  # a bulk run's hash never equals a visible run's (its own label part)
+        parts.append(["mode", "bulk", cfg.bulk.label()])
     return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
@@ -3236,6 +3536,10 @@ def show_server_args(cfg: Config, spec: Spec, peer: str) -> list[str]:
     standalone S gets --window_hidden=true. Shown (the spec's show_server_window, else [defaults]):
     a standalone S gets --dev_show_server_window=true instead, and in a hosted layout H gets it (Host
     starts its server with it)."""
+    if cfg.bulk is not None:
+        # Bulk mode: every game hidden with the draw skip (bulk_peer_args); a hosted S is hidden since H
+        # gets no --dev_show_server_window, and Host gives it the skip itself.
+        return bulk_peer_args(cfg.bulk, spec, peer)
     show = spec.show_server_window if spec.show_server_window is not None else cfg.show_server_window
     if peer == "S":
         return [f"--{SHOW_SERVER_SETTING}=true"] if show else ["--window_hidden=true"]
@@ -3717,7 +4021,7 @@ def grade_synthetic(spec: Spec, r: PeerResult, text: str, started: bool) -> None
 
 def parse_log(text: str) -> dict:
     out = {"levels": [], "fps": [], "longest": [], "private": 0, "working": 0, "errors": 0, "build": "",
-           "lines": [], "frame_p95": [], "video": 0}
+           "lines": [], "frame_p95": [], "video": 0, "frames_fps": []}
     for line in text.splitlines():
         m = TS.match(line)
         t = time.mktime(time.strptime(m.group(1)[:19], "%Y-%m-%d %H:%M:%S")) + float("0" + m.group(1)[19:]) \
@@ -3738,6 +4042,8 @@ def parse_log(text: str) -> dict:
             out["working"] = max(out["working"], int(mem.group(2)))
         if fr := FRAMES.search(line):
             out["frame_p95"].append(float(fr.group(4)))
+            if int(fr.group(1)) > 0:
+                out["frames_fps"].append(float(fr.group(2)))
             out["private"] = max(out["private"], int(fr.group(6)))
             out["working"] = max(out["working"], int(fr.group(7)))
             out["video"] = max(out["video"], int(fr.group(8)))
@@ -4559,6 +4865,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         parsed = parse_log(text)
         r = results[n]
         r.build, r.levels, r.fps, r.longest_frame_ms = parsed["build"], parsed["levels"], parsed["fps"], parsed["longest"]
+        r.frames_fps = parsed["frames_fps"]
         r.peak_private_mb, r.peak_working_set_mb, r.errors = parsed["private"], parsed["working"], parsed["errors"]
         r.frame_p95_ms, r.peak_video_mb = parsed["frame_p95"], parsed["video"]
         r.startup_stall_s = parsed["startup_stall"]
@@ -5320,17 +5627,28 @@ def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: l
 def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: dict, thresholds: dict,
                  max_games: int, guard: list[dict], unwritten: list[str], checkpoint: dict | None = None,
                  gate: dict | None = None, token: dict | None = None, jobs: int = 1, progress: str = "",
-                 queue_unmatched: list[str] | None = None, breaker: dict | None = None) -> None:
+                 queue_unmatched: list[str] | None = None, breaker: dict | None = None,
+                 run_load: dict | None = None) -> None:
     """report.md. `progress` (PS14): the run is still going; the report so far (its finished cases)
     says so and leaves out what only the run's end knows (the manifest's cases not run, the guarded
-    folders, the checkpoint and the gate)."""
+    folders, the checkpoint and the gate). A bulk run (cfg.bulk) says so first, with its run load."""
     head = f"At most {max_games} game(s) at once."
     if jobs > 1:
         head = (f"At most {max_games} game(s) and {jobs} case(s) at once (--jobs {jobs}); an exclusive case ran"
                 " alone. With: the cases that ran beside it.")
-    lines = [f"# skytest run {out.name}", "", head, ""]
+    lines = [f"# skytest run {out.name}{' (BULK)' if cfg.bulk is not None else ''}", ""]
+    if cfg.bulk is not None:
+        lines += [f"**{cfg.bulk.line()}**", ""]
+        if run_load:
+            lines += [run_load_line(run_load), ""]
+        left = [r for r in results if r.status == NOT_IN_BULK]
+        if left:
+            lines += [f"{len(left)} case(s) not in bulk (listed below with why); they run visible with"
+                      f" `skytest.py test {' '.join(r.case for r in left)}`.", ""]
+    lines += [head, ""]
     if cfg.slots is not None:
-        lines += [f"The machine's budget, shared with every other runner: {cfg.machine_games} game(s); an exclusive"
+        budget = cfg.bulk.games if cfg.bulk is not None else cfg.machine_games
+        lines += [f"The machine's budget, shared with every other runner: {budget} game(s); an exclusive"
                   " or timed case takes all of it (Machine: under each case).", ""]
     if breaker:
         lines += [f"**{breaker_line(breaker)}**", ""]
@@ -5440,8 +5758,19 @@ def write_text_replacing(path: Path, text: str, retry_s: float | None = None) ->
     return False
 
 
+def payload_mode(payload: object) -> str:
+    """A recorded run's mode: "bulk" (`test --bulk`, results.json `mode`), else '' (the default mode)."""
+    return "bulk" if isinstance(payload, dict) and payload.get("mode") == "bulk" else ""
+
+
+def cfg_mode(cfg: Config) -> str:
+    """This run's mode, as payload_mode names it."""
+    return "bulk" if cfg.bulk is not None else ""
+
+
 def previous_statuses(cfg: Config, current: Path) -> dict[str, str]:
-    """The last recorded status of each case before this run, from earlier results.json files."""
+    """The last recorded status of each case before this run, from earlier results.json files of the same
+    mode (a bulk run's statuses are its own; a case not run in bulk says nothing)."""
     seen: dict[str, str] = {}
     runs = cfg.store / "runs"
     if not runs.is_dir():
@@ -5450,7 +5779,12 @@ def previous_statuses(cfg: Config, current: Path) -> dict[str, str]:
         if f.parent == current:
             continue
         try:
-            for c in json.loads(f.read_text(encoding="utf-8")).get("cases", []):
+            payload = json.loads(f.read_text(encoding="utf-8"))
+            if payload_mode(payload) != cfg_mode(cfg):
+                continue
+            for c in payload.get("cases", []):
+                if c.get("status") == NOT_IN_BULK:
+                    continue
                 seen[c["case"]] = c["status"]
         except (OSError, ValueError, KeyError):
             continue
@@ -5501,6 +5835,8 @@ def last_run_seconds(cfg: Config, current: Path | None = None) -> dict[str, dict
             continue
         try:
             payload = json.loads(f.read_text(encoding="utf-8"))
+            if payload_mode(payload) != cfg_mode(cfg):  # a bulk run's times are its own (hidden, loaded)
+                continue
             cases = payload.get("cases", [])
         except (OSError, ValueError, AttributeError):
             continue
@@ -5627,6 +5963,8 @@ def build_results(cfg: Config, build: str, current: Path | None = None) -> dict[
             continue
         try:
             payload = json.loads(f.read_text(encoding="utf-8"))
+            if payload_mode(payload):  # a bulk run never decides a per-build gate case
+                continue
             snap = payload.get("snapshot")
             if not isinstance(snap, str) or re.split(r"[\\/]", snap.rstrip("\\/"))[-1] != build:
                 continue
@@ -6213,9 +6551,15 @@ def check_slots_folder(cfg: Config, folder: Path) -> None:
 
 
 def machine_budget(cfg: Config) -> "MachineBudget | None":
+    """The machine's game budget for this run: [defaults] machine_games, or a bulk run's own budget and
+    free memory per game (BulkMode). Every runner counts the same slot files, so a bulk run's games hold
+    a default runner's cases off while they run, and the other way round."""
     if cfg.slots is None:
         return None
     check_slots_folder(cfg, cfg.slots)
+    bulk = getattr(cfg, "bulk", None)
+    if bulk is not None:
+        return MachineBudget(cfg.slots, bulk.games, gb_per_game=bulk.gb_per_game)
     return MachineBudget(cfg.slots, cfg.machine_games)
 
 
@@ -6311,8 +6655,10 @@ def memory_recheck(want: float, mem: float, seconds: float | None = None, every:
 class MachineBudget:
     """The game budget every runner on the machine shares (PS15): `games` slots in `folder`."""
 
-    def __init__(self, folder: Path, games: int, owner: str = "") -> None:
+    def __init__(self, folder: Path, games: int, owner: str = "", gb_per_game: float | None = None) -> None:
         self.folder, self.games = Path(folder), max(1, min(int(games), MACHINE_SLOT_FILES))
+        # None: GB_PER_GAME as it is when a case is admitted (read then, not when the budget is made).
+        self.gb_per_game = gb_per_game
         self.owner = owner or f"skytest pid {os.getpid()}"
         self.folder.mkdir(parents=True, exist_ok=True)
 
@@ -6416,7 +6762,7 @@ class MachineBudget:
                             for _, fd in taken[need:]:
                                 _unlock_close(fd)
                             mem = available_memory_gb()
-                            want = memory_games * GB_PER_GAME
+                            want = memory_games * (GB_PER_GAME if self.gb_per_game is None else self.gb_per_game)
                             if mem is not None and mem < want and not held and rechecked is not None:
                                 mem = max(mem, rechecked)
                             if mem is not None and mem < want:
@@ -6883,6 +7229,13 @@ class StoreJanitor:
                     pass
 
 
+def not_in_bulk_result(spec: Spec, why: str) -> CaseResult:
+    """A case bulk mode leaves out (bulk_exclusion), reported at 0 s without a game; not failed."""
+    return CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage, status=NOT_IN_BULK,
+                      reasons=[f"not in bulk: {why}"], exclusive=runs_alone(spec), mode="bulk",
+                      started=time.strftime("%Y%m%d-%H%M%S"))
+
+
 def not_ready_result(spec: Spec) -> CaseResult:
     """PS2: a case that is not ready, reported at 0 s without a game (or a run folder)."""
     return CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage, status="not ready",
@@ -6937,6 +7290,18 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     if per_build_run and not gate_run:
         raise SystemExit("--per-build goes with --gate (`test --gate --per-build`: the per-build gate cases)")
     run_not_ready = bool(getattr(a, "run_not_ready", False))
+    bulk_on = bool(getattr(a, "bulk", False))
+    pacing = getattr(a, "bulk_pacing", None)
+    if pacing and not bulk_on:
+        raise SystemExit("--bulk-pacing goes with --bulk")
+    if bulk_on:
+        if gate_run:
+            raise SystemExit("--bulk and --gate do not go together: a gate's verdict is the watched default mode's"
+                             " (bulk results never count for it)")
+        bs = cfg.bulk_settings
+        cfg.bulk = BulkMode(games=bs.games, wait_factor=bs.wait_factor, gb_per_game=bs.gb_per_game,
+                            pacing=pacing or "default")
+        print(cfg.bulk.line(), flush=True)
     queue_file = getattr(a, "queue", None)
     queue = CaseQueue(Path(queue_file)) if queue_file else None
     if queue is not None:
@@ -7029,9 +7394,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         check_disc(cfg)
     if getattr(a, "remote", None):
         cfg.remote = remote_target(a.remote, getattr(a, "remote_token_file", None), getattr(a, "remote_manifest", None))
-    max_games = a.max_games or default_max_games()
+    max_games = a.max_games or (cfg.bulk.games if cfg.bulk is not None else default_max_games())
     jobs = getattr(a, "jobs", None)
-    jobs = 1 if jobs is None else int(jobs)
+    # Bulk mode: as many cases at once as the budget has room for server+1 cases (two games each).
+    jobs = (max(1, max_games // 2) if cfg.bulk is not None else 1) if jobs is None else int(jobs)
     if jobs < 1:
         raise SystemExit("--jobs is 1 or more")
     # PS2: a case that is not ready starts no game; it is reported at 0 s with its reason.
@@ -7045,6 +7411,12 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         ready = []
         for sp in new:
             order.append(sp)
+            if (run_not_ready or not sp.not_ready) and cfg.bulk is not None and (why := bulk_exclusion(sp)):
+                print(f"{sp.name}: NOT IN BULK: {why} (no game started)", flush=True)
+                r = not_in_bulk_result(sp, why)
+                r.provenance = case_provenance(cfg, sp, fixtures)
+                by_case[id(sp)] = r
+                continue
             if run_not_ready or not sp.not_ready:
                 ready.append(sp)
                 continue
@@ -7154,7 +7526,9 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                     # PS12: the load beside the case, sampled while it runs, and what ran.
                     sampler = LoadSampler(cfg.exe).start()
                     try:
-                        r = run(cfg, spec, game, max_games, time.strftime("%Y%m%d-%H%M%S"), thresholds, baseline,
+                        # Bulk mode: its waitfor and case timeouts scaled (bulk_spec); the spec file stays.
+                        r = run(cfg, bulk_spec(spec, cfg.bulk) if cfg.bulk is not None else spec, game, max_games,
+                                time.strftime("%Y%m%d-%H%M%S"), thresholds, baseline,
                                 tuple(entry.get("accepted_grades", [])), pacer=pacer)
                     finally:
                         load = sampler.summary()
@@ -7172,6 +7546,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 print(f"{spec.name}: NOT ALONE: {note}", flush=True)
             r.provenance = case_provenance(cfg, spec, fixtures)
             r.scenes = scene_policy(cfg, spec)
+            if cfg.bulk is not None:
+                r.mode = "bulk"
+                if r.folder and Path(r.folder).is_dir():
+                    (Path(r.folder) / BULK_MARK).write_text(json.dumps(cfg.bulk.label()) + "\n", encoding="utf-8")
             if breaker is not None and spec.breaker and r.status in ("fail", "error") and r.signature:
                 breaker.record(spec.name, r.folder, r.signature)
                 if (t := breaker.tripped()) is not None:
@@ -7187,7 +7565,7 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             note = f"{len(done_now)} of {len(order)} case(s) ended" + (", more may come from the queue"
                                                                        if queue is not None else "")
             payload = {"in_progress": note, "snapshot": str(snap) if snap else "", "max_games": max_games, "jobs": jobs,
-                       "machine": machine_info, "stages": stages, "restricted_token": token["restricted"],
+                       **mode_info, "machine": machine_info, "stages": stages, "restricted_token": token["restricted"],
                        "restricted_token_cause": token["cause"], "runner": runner_version(),
                        "cases": [asdict(r) for r in done_now]}
             write_text_replacing(out / "results.json", json.dumps(payload, indent=2))
@@ -7208,7 +7586,11 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             print(f"  report: {out / 'report.md'}" if jobs == 1 else f"{spec.name}: report: {out / 'report.md'}",
                   flush=True)
 
-        machine_info = {"games": cfg.machine_games, "slots": str(cfg.slots) if cfg.slots else ""}
+        machine_info = {"games": cfg.bulk.games if cfg.bulk is not None else cfg.machine_games,
+                        "slots": str(cfg.slots) if cfg.slots else ""}
+        # Bulk mode: results.json says so (payload_mode keeps its history apart), and the run's own load.
+        mode_info = {"mode": "bulk", "bulk": cfg.bulk.label()} if cfg.bulk is not None else {}
+        run_load = RunLoad(cfg.exe).start() if cfg.bulk is not None else None
         write_progress()
         print(f"report (rewritten after every case): {out / 'report.md'}", flush=True)
         if not runnable and queue is not None:  # only not-ready cases so far: the queue may still add some
@@ -7219,6 +7601,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             for sp, r in zip(runnable, got):  # `runnable` grew with the queue's cases
                 by_case.setdefault(id(sp), r)
         results = [by_case[id(sp)] for sp in order]
+        run_load_summary = run_load.summary(results) if run_load is not None else None
+        if run_load_summary is not None:
+            mode_info["run_load"] = run_load_summary
+            print(run_load_line(run_load_summary), flush=True)
         after_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
         tripped_now = breaker.tripped() if breaker is not None else None
         store_line = janitor.line()  # never started after the cases (PS1): their end waits for nothing new
@@ -7237,8 +7623,11 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     touched = [g["folder"] for g in guard if not g["unchanged"]]
     # A gate run is a subset: never a checkpoint; nor is a queue's run (its cases are the lane's).
     full_run = a.cases in ([], ["all"]) and gate is None and queue is None
-    checkpoint = checkpoint_verdict(manifest, a.stage, stages, results, touched, before) if a.stage and full_run else None
-    payload = {"snapshot": str(snap) if snap else "", "max_games": max_games, "jobs": jobs, "machine": machine_info,
+    # A bulk run never decides a checkpoint (its verdict is the watched default mode's).
+    checkpoint = checkpoint_verdict(manifest, a.stage, stages, results, touched, before) \
+        if a.stage and full_run and cfg.bulk is None else None
+    payload = {"snapshot": str(snap) if snap else "", "max_games": max_games, "jobs": jobs, **mode_info,
+               "machine": machine_info,
                "breaker": tripped_now, "stages": stages, "thresholds": thresholds,
                "guarded_folders": guard, "required_without_spec": unwritten, "checkpoint": checkpoint,
                "restricted_token": token["restricted"], "restricted_token_cause": token["cause"],
@@ -7257,9 +7646,13 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         payload["gate"] = gate
     write_text_replacing(out / "results.json", json.dumps(payload, indent=2))
     write_report(cfg, out, results, manifest, thresholds, max_games, guard, unwritten, checkpoint, gate, token,
-                 jobs=jobs, queue_unmatched=queue_unmatched, breaker=tripped_now)
+                 jobs=jobs, queue_unmatched=queue_unmatched, breaker=tripped_now, run_load=run_load_summary)
     write_findings(out, results, before)
-    failed = [r for r in results if r.status not in ("pass", "capacity")]
+    failed = [r for r in results if r.status not in ("pass", "capacity", NOT_IN_BULK)]
+    left_out = [r for r in results if r.status == NOT_IN_BULK]
+    if left_out:
+        print(f"{len(left_out)} case(s) not in bulk (reported, not failed; they run visible with `skytest.py test"
+              f" {' '.join(r.case for r in left_out)}`)")
     capacity = [r for r in results if r.status == "capacity"]
     not_ready = [r for r in results if r.status == "not ready"]
     stopped = [r for r in results if r.status == "breaker"]
@@ -7592,6 +7985,8 @@ def store_game_logs(store: Path, since: str | None = None) -> list[tuple[str, Pa
     for name, path in run_dirs:
         if since and name < since:
             continue
+        if (Path(path) / BULK_MARK).is_file():  # a bulk case: its waits were scaled and loaded
+            continue
         out += [(name, log) for log in run_game_logs(Path(path))]
     return out
 
@@ -7763,8 +8158,15 @@ def main(argv: list[str] | None = None) -> int:
                    " out and counts each met when its newest result on the same build snapshot is a pass")
     t.add_argument("--allow-restricted", action="store_true", help="start the games even when this runner has a"
                    " restricted token (an agent sandbox): their shader caches are unusable, timings not comparable")
-    t.add_argument("--jobs", type=int, default=1, help="most cases at once (default 1: one after another); their"
-                   " games count against --max-games, and a spec with exclusive = true runs alone")
+    t.add_argument("--jobs", type=int, default=None, help="most cases at once (default 1: one after another; with"
+                   " --bulk half the bulk budget); their games count against --max-games, and a spec with exclusive"
+                   " = true runs alone")
+    t.add_argument("--bulk", action="store_true", help="bulk mode: every game hidden with the draw skip, waitfor"
+                   " timeouts scaled ([defaults] bulk_wait_factor), the budget [defaults] bulk_machine_games;"
+                   " specs that cannot run hidden are reported `not in bulk` (docs/testing-guide.md, bulk mode)")
+    t.add_argument("--bulk-pacing", default=None, choices=sorted(BULK_PACINGS), help="with --bulk: the games'"
+                   " pacing (default: the game's own; vblank240: --guest_vblank_rate=240; fps30:"
+                   " --frame_rate_limit=30, the session tick stays 60); part of the run's label")
     t.add_argument("--run-not-ready", action="store_true", help="run the cases that are not ready (ready = false,"
                    " a PLACEHOLDER) anyway, e.g. for the legs that exist; their result is graded as usual")
     t.add_argument("--no-breaker", action="store_true", help="start cases even when the circuit breaker of this"
