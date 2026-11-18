@@ -857,6 +857,9 @@ def action_lines(a: Action, label: str) -> list[str]:
     o = a.obj
     ref = o.ref
     out = [f"log LEVELPASS act {label} {a.action} {_safe(o.name) or '-'} {o.cls} ref {ref}"]
+    if ref.startswith("auth:") and a.action in (ATTACK, INTERACT_A, TALK, PICKUP):
+        # The helpers find a live object; goto_entity first wakes an asleep one (its area streamed in).
+        out.append(f"goto_entity {ref}")
     if a.action == FIGHT:
         out.append(f"fight_near {ref} {FIGHT_RADIUS} {ACTION_TIMEOUT[FIGHT]}")
     elif a.action == ATTACK:
@@ -1017,6 +1020,37 @@ def label_kind(label: str) -> str:
     if re.fullmatch(r"v\d+_(\d+|a)", label):
         return "action"
     return "visit"
+
+
+def name_hash(name: str) -> int:
+    """The game's NameHash (FNV-1a, 32 bits, over the name's bytes): an entity id's middle word."""
+    h = 2166136261
+    for b in name.encode("utf-8", errors="replace"):
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def names_by_hash(objects: list[Obj]) -> dict[str, str]:
+    """Hex name hash -> the content's name(s) with it, for the report's ids."""
+    out: dict[str, set[str]] = {}
+    for o in objects:
+        if o.name:
+            out.setdefault(f"{name_hash(o.name):08x}", set()).add(o.name)
+    return {h: "/".join(sorted(n)[:3]) for h, n in out.items()}
+
+
+ENTITY_ID = re.compile(r"\ba[0-9a-f]{8}\.([0-9a-f]{8})\.[0-9a-f]{8}@\d+")
+
+
+def name_ids(findings: list[Finding], names: dict[str, str]) -> None:
+    """Each finding's entity ids get the content's name for their name hash, where it has one."""
+    for f in findings:
+        for m in ENTITY_ID.finditer(f.obj + " " + f.family):
+            n = names.get(m.group(1))
+            if n and n not in f.obj:
+                f.obj = f"{f.obj} ({n})"
+                if f.family == m.group(0) or f.family.startswith("a"):
+                    f.family = stem(n)
 
 
 def findings_from_log(peer: str, text: str, labels: dict[str, str]) -> list[Finding]:
@@ -1255,6 +1289,20 @@ def _toml_list(items: list[str]) -> str:
 
 def case_name(level: str) -> str:
     return f"levelpass-{level}"
+
+
+def spec_from_scripts(level: str, h: str, d: str | None, d_args: list[str] | None = None,
+                      name: str | None = None) -> str:
+    """A case from ready scripts (the predictions mode): H hosts, S hidden, D (when given) starts at H's
+    LEVELPASS late-join start mark."""
+    out = [f'name = "{name or case_name(level)}"', f'layout = "{"server+2" if d else "server+1"}"', 'stage = "8"',
+           'server = "host"', f'description = "The level pass of {level} (skytest levelpass; generated, not committed)"',
+           f"timeout = {CASE_TIMEOUT_S}", 'scenes = "skip"', "show_server_window = false", 'shader_cache = "snapshot"',
+           "", "[peer.H]", f"args = {_toml_list(H_ARGS)}", "script = '''\n" + h + "'''"]
+    if d:
+        out += ["", "[peer.D]", f"args = {_toml_list(D_ARGS + (d_args or []))}", f"start_after = '{LATE_JOIN_MARK}'",
+                "script = '''\n" + d + "'''"]
+    return "\n".join(out) + "\n"
 
 
 def spec_toml(plan: Plan) -> str:

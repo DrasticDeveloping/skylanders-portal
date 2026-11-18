@@ -7871,8 +7871,27 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     cases = folder / "cases" / stamp
     cases.mkdir(parents=True, exist_ok=False)
     spec_path = cases / f"{lp.case_name(a.level)}.toml"
-    text = lp.spec_toml(plan)
-    literals = lp.position_literals(lp.script_h(plan, lp.LATE_JOIN_MARK)) + lp.position_literals(lp.script_d(plan))
+    bugs: list = []
+    if a.predictions:
+        import levelpass_predictions as lpp
+        recipes_file = folder / "predictions.toml"
+        if not recipes_file.is_file():
+            raise SystemExit(f"levelpass --predictions: no {recipes_file}")
+        try:
+            recipes = lpp.load_recipes(recipes_file.read_text(encoding="utf-8"))
+        except (ValueError, tomllib.TOMLDecodeError) as e:
+            raise SystemExit(f"levelpass --predictions: {recipes_file}: {e}") from None
+        bugs = [b for b in recipes.bugs if b.level == a.level]
+        d_mode = recipes.d_mode.get(a.level, "none")
+        h_script, d_script = lpp.scripts(a.level, bugs, d_mode)
+        text = lp.spec_from_scripts(a.level, h_script, d_script,
+                                    ["--trace_where_seconds=1"] if d_mode == "early" else [])
+        literals = lp.position_literals(h_script) + lp.position_literals(d_script or "")
+        plan.stops, plan.exit_stop, plan.late_join = [], None, d_mode != "none"
+        plan.left_out = [f"predictions mode: {len(bugs)} prediction(s) of {a.level}, D {d_mode}"]
+    else:
+        text = lp.spec_toml(plan)
+        literals = lp.position_literals(lp.script_h(plan, lp.LATE_JOIN_MARK)) + lp.position_literals(lp.script_d(plan))
     if literals:  # the owner's rule: a level pass names objects; the game reads where they are
         raise SystemExit(f"levelpass: the generated scripts carry positions: {literals[:3]}")
     spec_path.write_text(text, encoding="utf-8")
@@ -7922,6 +7941,7 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         except (OSError, ValueError):
             pass
     findings += lp.level_changes(texts["H"], plan.timed)
+    lp.name_ids(findings, lp.names_by_hash(content.objects))
     if plan.provoke:
         diverged = lp.provoked(texts["H"])
         caught = lp.mark_provoked(findings, diverged)
@@ -7931,10 +7951,16 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         findings.insert(0, lp.Finding(severity="crash", kind="process", family=crash.split(":")[0], what=crash,
                                       obj="", step=""))
     notes.append(f"shader cache: {'warm (from the build snapshot)' if any((run / n / 'cache').rglob('*.xpso') for n in ('H',)) else 'cold'}")
+    settings = "settings: the release defaults a player gets (no online_route_file: every trigger unclassified) plus " \
+        "the test tools " + " ".join(lp.H_ARGS) + (" on H" if lp.H_ARGS else "")
+    notes.insert(0, settings)
     report = lp.report_text(a.level, plan, wall, lp.phase_times(texts["H"]), lp.fold(findings), crash,
                             {p: lp.summaries(t) for p, t in texts.items()}, str(run), notes,
                             boot=lp.boot_phases(texts["H"]))
-    out = folder / f"{a.level}-pass-{stamp}.txt"
+    if bugs:
+        import levelpass_predictions as lpp
+        report += "\n" + lpp.verdict_text(lpp.verdicts(bugs, texts))
+    out = folder / f"{a.level}-{'predictions' if a.predictions else 'pass'}-{stamp}.txt"
     out.write_text(report, encoding="utf-8")
     print(report, flush=True)
     print(f"levelpass {a.level}: report {out}", flush=True)
@@ -8013,6 +8039,8 @@ def main(argv: list[str] | None = None) -> int:
     lp_.add_argument("--provoke", default=None, metavar="KIND", help="the audit's proof: after the first visit H"
                      " makes one object of KIND (breakable) differ on its own (dev_audit_diverge); the report must"
                      " show it as a provoked difference")
+    lp_.add_argument("--predictions", action="store_true", help="the predictions run: each predicted co-op bug of"
+                     " the level (<levelpass>/predictions.toml) as steps, snapshots and a check, a verdict per bug")
     lp_.add_argument("--plan-only", action="store_true", help="write the generated case and print the plan; start"
                      " no game")
     lp_.set_defaults(fn=cmd_levelpass)

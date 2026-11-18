@@ -361,6 +361,17 @@ class Report(unittest.TestCase):
             "[2026-11-18 10:01:30.000] [info] Input script: waitfor goto_done met after 1.0 s"])
         self.assertEqual(lp.boot_phases(log), [("title_ready", 11.5), ("online_server_hub", 40.2), ("wait_free", 0.3)])
 
+    def test_name_ids(self):
+        self.assertEqual(lp.name_hash(""), 2166136261)
+        self.assertEqual(f"{lp.name_hash('a'):08x}", "e40c292c")  # FNV-1a 32 of "a"
+        objs = [lp.Obj("Lever_A", "C", (0.0, 0.0, 0.0), lp.GROUP_INTERACT)]
+        h = f"{lp.name_hash('Lever_A'):08x}"
+        f = lp.Finding(severity="row without an object", kind="gate", family=f"a00000010.{h}.12345678@2", what="x",
+                       obj=f"- a00000010.{h}.12345678@2 at -", step="v1")
+        lp.name_ids([f], lp.names_by_hash(objs))
+        self.assertTrue(f.obj.endswith("(Lever_A)"))
+        self.assertEqual(f.family, "Lever_A")
+
     def test_step_labels(self):
         p = lp.make_plan(content(), late_join=False)
         labels = lp.step_labels(lp.script_h(p, None))
