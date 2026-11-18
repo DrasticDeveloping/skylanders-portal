@@ -1294,6 +1294,30 @@ def audit_artefacts(findings: list[Finding], texts: dict[str, str]) -> tuple[lis
     return out, notes
 
 
+EXIT_NOT_ACTED = "the exit's action could not be carried out, so the level was not ended by a player"
+
+
+def exit_not_reached(findings: list[Finding], h_text: str) -> list[Finding]:
+    """The level end's wait timing out after the exit's own action failed for the tool (no floor in the
+    end arena, out of reach) is the tool's too: that timeout moves to "tool: could not act"."""
+    at = h_text.find("Input script: LEVELPASS phase exit")
+    if at < 0:
+        return findings
+    after = h_text[at:]
+    tool_failed = any(tool_kind(m.group(1)) for m in STEP_FAIL.finditer(after)
+                      if not m.group(1).startswith("Input script: waitfor"))
+    if not tool_failed:
+        return findings
+    out = []
+    for f in findings:
+        if f.severity == "step failed" and f.lines and "waitfor online_level_end timed out" in f.lines[0] \
+                and f.lines[0] in after:
+            f = Finding(severity=TOOL, kind="tool", family="exit", what=EXIT_NOT_ACTED, obj="", step="",
+                        lines=f.lines, peer=f.peer)
+        out.append(f)
+    return out
+
+
 def _settled_later(f: Finding, texts: dict[str, str]) -> bool:
     """The row's last audit line in the same peer's log is followed by a later audit summary of the same
     side (which no longer reports it): it settled (S caught up)."""

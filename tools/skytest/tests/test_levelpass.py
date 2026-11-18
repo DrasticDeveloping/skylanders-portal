@@ -542,6 +542,23 @@ class Report(unittest.TestCase):
         self.assertTrue(any("1 breakable row(s)" in n for n in notes))
         self.assertTrue(any("lease-carried" in n for n in notes))
 
+    def test_exit_not_reached(self):
+        """A level end that did not come after the exit's action failed for the tool is the tool's."""
+        t = "[2026-11-18 10:27:{:02d}.000] [info] [core] [t1] "
+        h = "\n".join([
+            t.format(1) + "Input script: LEVELPASS phase exit",
+            t.format(2) + "Dev: fight_area 1,2,3 failed (the hero is 18372 from the area, more than its radius 2500 + 1500: "
+                          "the route did not get here, nothing walked) after 0.0 s",
+            t.format(9) + "Input script: waitfor online_level_end timed out after 60.0 s",
+        ]) + "\n"
+        fs = lp.exit_not_reached(lp.findings_from_log("H", h, {}), h)
+        self.assertFalse(any(f.severity == "step failed" for f in fs))
+        self.assertTrue(any(f.severity == lp.TOOL and f.what == lp.EXIT_NOT_ACTED for f in fs))
+        # An exit whose action ran: the timeout stays a finding.
+        h2 = t.format(1) + "Input script: LEVELPASS phase exit\n" + t.format(9) + \
+            "Input script: waitfor online_level_end timed out after 60.0 s\n"
+        self.assertTrue(any(f.severity == "step failed" for f in lp.exit_not_reached(lp.findings_from_log("H", h2, {}), h2)))
+
     def test_report_text(self):
         p = lp.make_plan(content(), late_join=False)
         fs = lp.findings_from_log("H", self.LOG, {})

@@ -7942,6 +7942,7 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         except (OSError, ValueError):
             pass
     findings, artefact_notes = lp.audit_artefacts(findings, texts)
+    findings = lp.exit_not_reached(findings, texts["H"])
     notes += artefact_notes
     findings += lp.level_changes(texts["H"], plan.timed)
     lp.name_ids(findings, lp.names_by_hash(content.objects))
