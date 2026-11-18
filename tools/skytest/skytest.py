@@ -7437,6 +7437,11 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
                 problems.append(f"{p.name}: grades time or load ({', '.join(timed_grades(s))}) but is not"
                                 " `exclusive = true`: beside another case (test --jobs) it would measure that load too")
             problems += scene_problems(cfg, s)
+            if s.name.startswith("levelpass-"):  # a level pass names objects, never positions
+                import levelpass as lp
+                for n, ps in s.peers.items():
+                    for line in lp.position_literals(ps.script)[:3]:
+                        problems.append(f"{p.name}: peer {n}: a level-pass script carries a position: {line!r}")
             if s.synthetic and not ((cfg.synthetic_exe or cfg.synthetic_launcher) and cfg.synthetic_setting):
                 problems.append(f"{p.name}: synthetic peers, but tests/skytest.toml [synthetic] lacks exe or"
                                 " server_setting")
@@ -7866,7 +7871,11 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     cases = folder / "cases" / stamp
     cases.mkdir(parents=True, exist_ok=False)
     spec_path = cases / f"{lp.case_name(a.level)}.toml"
-    spec_path.write_text(lp.spec_toml(plan), encoding="utf-8")
+    text = lp.spec_toml(plan)
+    literals = lp.position_literals(lp.script_h(plan, lp.LATE_JOIN_MARK)) + lp.position_literals(lp.script_d(plan))
+    if literals:  # the owner's rule: a level pass names objects; the game reads where they are
+        raise SystemExit(f"levelpass: the generated scripts carry positions: {literals[:3]}")
+    spec_path.write_text(text, encoding="utf-8")
     print(f"levelpass {a.level}: content {plan.source}; {len(plan.stops)} stops, "
           f"{sum(len(st.actions) for st in plan.stops)} actions, estimate {plan.estimate_s:.0f} s; case {spec_path}",
           flush=True)
@@ -7912,6 +7921,7 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                 notes.append(f"runner: {why}")
         except (OSError, ValueError):
             pass
+    findings += lp.level_changes(texts["H"], plan.timed)
     if plan.provoke:
         diverged = lp.provoked(texts["H"])
         caught = lp.mark_provoked(findings, diverged)

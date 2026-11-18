@@ -51,7 +51,9 @@ Level start: Start_01 at 0.0 0.0 0.0
 
 
 def content() -> lp.Content:
-    return lp.parse_probe_manifest(PROBE, "madeup")
+    c = lp.parse_probe_manifest(PROBE, "madeup")
+    lp.attach_refs(c.objects, c.objects)  # the probe's own manifest: every object its authored id
+    return c
 
 
 class Readers(unittest.TestCase):
@@ -87,6 +89,25 @@ class Readers(unittest.TestCase):
         self.assertEqual([(e.sender, e.target, e.effect) for e in edges],
                          [("T1", "Fight_Manager", "starts the encounter")])
         self.assertEqual(end, ["Fight_Manager", "Level_Exit"])
+
+    def test_chain_names(self):
+        chains = ["(inferred) CS_Intro -[Scripts.CutscenePlayerMessage {MessageType: Done}]-> CS_Intro  =>  "
+                  "CS_Intro -[Scripts.StringMessage {MessageString: Go}]-> EventMgr  =>  "
+                  "EventMgr -[X after 0.1s]-> TP_Start  =>  TP_Start -[CLoadMapComponentMessage {_mapPath: a/b}]-> roles 4",
+                  "{Sp_01, Sp_02, ?} -[Scripts.StringMessage {MessageString: ImDead}]-> End_Mgr  =>  End_Mgr [x11] -[Y]-> Outro"]
+        self.assertEqual(lp.exit_senders(chains), ["CS_Intro", "EventMgr", "TP_Start", "Sp_01", "Sp_02", "End_Mgr",
+                                                   "Outro"])
+
+    def test_timed_level(self):
+        c = content()
+        c.objects = [o for o in c.objects if o.name != "Level_Exit"]
+        c.level_end = ["Event_StartFight"]  # a script event: nothing a player acts on
+        p = lp.make_plan(c, late_join=True)
+        self.assertTrue(p.timed)
+        self.assertIsNone(p.exit_stop)
+        h = lp.script_h(p, lp.LATE_JOIN_MARK)
+        self.assertIn(f"waitfor online_level_end {lp.TIMED_END_S}", h)
+        self.assertLess(h.index("LEVELPASS late-join start"), h.index("LEVELPASS visit v1"))
 
     def test_load_content_prefers_static(self):
         with tempfile.TemporaryDirectory() as d:
@@ -213,6 +234,7 @@ class Scripts(unittest.TestCase):
                 self.assertRegex(line, r"^waitfor \S+ \d+$")
             if line.startswith(("wait_free", "online_wait_peers", "online_wait_peer_near")):
                 self.assertRegex(line, r"\d+$")
+        self.assertEqual(lp.position_literals(text), [], "a level-pass script names objects, never positions")
         labels = [l.split()[1] for l in text.splitlines() if l.startswith("online_audit ")]
         self.assertEqual(len(labels), len(set(labels)), "audit labels are unique")
 
@@ -226,14 +248,16 @@ class Scripts(unittest.TestCase):
         self.assertIn("online_wait_peers 2 300", h)
         self.assertIn("waitfor online_past_level_end 240", h)
         self.assertLess(h.index("LEVELPASS phase late-join"), h.index("LEVELPASS phase exit"))
-        self.assertIn("attack_until Box_Destructible_01 12", h)
-        self.assertIn("interact Lever_A 10", h)
+        self.assertIn("attack_until auth:z:6 12", h)
+        self.assertIn("interact auth:z:10 10", h)
+        self.assertIn("goto_entity auth:z:", h)
+        self.assertIn("waitfor online_alone 300", h)
         d = lp.script_d(p)
         self.check_script(d)
         self.assertIn("online_join {join}", d)
         self.assertNotIn("online_host", d)
-        end = lp.late_join_point(p)
-        self.assertIn(f"online_wait_peer_near {end[0]:.1f} {end[1]:.1f} {end[2]:.1f} 400 300", h)
+        self.assertIn("goto_entity auth:z:", d)
+        self.assertLess(d.index("online_end"), d.index("quit"))
 
     def test_no_exit_no_exit_waits(self):
         c = content()
@@ -247,8 +271,30 @@ class Scripts(unittest.TestCase):
 
     def test_names_are_safe(self):
         o = lp.Obj("Bad;Name#1", "C", (1.0, 2.0, 3.0), lp.GROUP_INTERACT)
+        o.ref = lp.name_ref(o.name)
         lines = lp.action_lines(lp.Action(lp.INTERACT_A, o, "x"), "v1_1")
         self.assertTrue(all(";" not in l and "#" not in l for l in lines))
+
+
+class Refs(unittest.TestCase):
+    def test_join_and_fallback(self):
+        probe = [lp.Obj("Lever_A", "CGameEntity", (10.0, 0.0, 0.0), lp.GROUP_INTERACT, ident="zone_x#12"),
+                 lp.Obj("", "CEncounterSpawnPoint", (500.0, 0.0, 0.0), lp.GROUP_ENEMIES, ident="zone_x#40")]
+        objs = [lp.Obj("Lever_A", "CGameEntity", (11.0, 1.0, 0.0), lp.GROUP_INTERACT),
+                lp.Obj("", "CEncounterSpawnPoint", (500.5, 0.0, 0.0), lp.GROUP_ENEMIES),
+                lp.Obj("Chest_9", "CPhysicalEntity", (900.0, 0.0, 0.0), lp.GROUP_PICKUPS),
+                lp.Obj("Lever_A", "CGameEntity", (5000.0, 0.0, 0.0), lp.GROUP_INTERACT),
+                lp.Obj("X_componentDataOverrides_archetype_Y", "C", (1.0, 1.0, 1.0), lp.GROUP_ENEMIES),
+                lp.Obj("", "CGameEntity", (2.0, 2.0, 2.0), lp.GROUP_OTHER)]
+        self.assertEqual(lp.attach_refs(objs, probe), 2)
+        self.assertEqual([o.ref for o in objs], ["auth:zone_x:12", "auth:zone_x:40", "Chest_9", "Lever_A", "", ""])
+
+    def test_position_literals(self):
+        self.assertEqual(lp.position_literals("\n".join(["goto_entity auth:z:1", "fight_near Lever_A 1500 25",
+                                                         "wait_free 30"])), [])
+        for bad in ("goto 1.0 2.0 3.0", "fight_area 1 2 3 1500 25", "attack_until at:1,2,3 10",
+                    "log LEVELPASS visit at 12.5 -3.0 7", "online_wait_peer_near 1 2 3 400 300"):
+            self.assertEqual(len(lp.position_literals(bad)), 1, bad)
 
 
 class Report(unittest.TestCase):

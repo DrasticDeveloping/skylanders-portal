@@ -80,6 +80,7 @@ class Obj:
     fires: list[str] = field(default_factory=list)  # "<message> -> <target>" the entity sends
     along: float | None = None  # distance along the level path (the static reader's sort key)
     loads_map: bool = False      # it sends CLoadMapComponentMessage: entered only as the level's exit
+    ref: str = ""                # the live reference a script step names it by (attach_refs); "" for none
 
     def point(self) -> tuple[float, float, float]:
         """Where a teleport goes to enter it: its placed position when that is inside its trigger box
@@ -110,6 +111,7 @@ class Content:
     edges: list[Edge] = field(default_factory=list)
     level_end: list[str] = field(default_factory=list)  # the names in the level-end chain
     level_end_receiver: str = ""  # the chain's first receiver (an encounter manager), when it names one
+    authored: int = 0             # objects whose live reference is the probe's exact id
 
 
 PROBE_ROW = re.compile(
@@ -210,14 +212,32 @@ def exit_receiver(level_end: object) -> str:
 
 
 def exit_senders(level_end: object) -> list[str]:
-    """The first senders of each level-end chain ("{A, B} -[message]-> C => ..."); `?` dropped."""
+    """Every name of each level-end chain in its order: the first senders ("{A, B} -[message]-> C" or
+    "(inferred) A -[message]-> A"), then each later sender and receiver ("=> C -[...]-> D"); `?`,
+    `-` and roles dropped. make_plan acts on the first of them a player can act on."""
     out: list[str] = []
+
+    def add(n: str) -> None:
+        n = n.strip()
+        if n and n not in ("?", "-") and not n.startswith("roles") and n not in out:
+            out.append(n)
+
     for chain in level_end if isinstance(level_end, list) else ([level_end] if level_end else []):
-        m = re.match(r"\s*\{([^}]*)\}", str(chain))
-        names = [n.strip() for n in m.group(1).split(",")] if m else []
-        for n in names:
-            if n and n != "?" and n not in out:
-                out.append(n)
+        for seg in str(chain).split("=>"):
+            seg = seg.strip()
+            if seg.startswith("(inferred)"):
+                seg = seg[len("(inferred)"):].strip()
+            m = re.match(r"\{([^}]*)\}", seg)
+            if m:
+                for n in m.group(1).split(","):
+                    add(n)
+            else:
+                m = re.match(r"(\S+)", seg)
+                if m:
+                    add(m.group(1))
+            r = re.search(r"\]->\s*(\S+)", seg)
+            if r:
+                add(r.group(1))
     return out
 
 
@@ -316,6 +336,13 @@ def load_content(folder, level: str) -> Content:
     else:
         raise ValueError(f"no manifest for {level}: neither {static} nor {probe} (tools/level_logic.py or "
                          f"tools/level_manifest.py writes one)")
+    # Live references: the probe's authored ids joined to the content (the probe's own content: its ids).
+    if probe.is_file():
+        probe_content = content if content.source == str(probe) else \
+            parse_probe_manifest(probe.read_text(encoding="utf-8", errors="replace"), level)
+        content.authored = attach_refs(content.objects, probe_content.objects)
+    else:
+        content.authored = attach_refs(content.objects, None)
     logic = folder / level / "logic.json"
     if content.objects and any(o.fires for o in content.objects):
         # The static manifest carries every sender's telegrams itself.
@@ -568,6 +595,7 @@ class Plan:
     exit_stop: Stop | None
     provoke: str = ""               # a kind the pass makes differ on H alone (dev_audit_diverge): the proof
     sample: int = SAMPLE            # the acted-on objects per family this plan took
+    timed: bool = False             # the level ends on its own (no chain member a player acts on)
 
 
 # Seconds the boot and the level load take, measured (the report prints the real ones); used for the
@@ -623,7 +651,18 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
         unplaced += len(visited) - len(keep)
         visited = keep
     # The level-end chain's first senders are the exit: acted on last, never during the sweep.
-    exit_names = set(content.level_end)
+    # The exit: the first name of the level-end chain a player can act on (an end fight's spawners, an NPC,
+    # a trigger); a chain with none (a scripted end, tutorial_a's ride) is a timed level: the pass waits
+    # for the level's own end.
+    exit_names: set[str] = set()
+    for n in content.level_end:
+        named = [o for o in content.objects if o.name == n and placed(o) and o.ref]
+        if any(exit_kind(o) == FIGHT or classify(o)[0] in (ENTER, TALK, INTERACT_A) for o in named):
+            exit_names = {n}
+            # The other first senders of the same segment (BomberSpawner_01 and _02) go with it.
+            exit_names |= {m for m in content.level_end[:content.level_end.index(n) + 1]
+                           if any(o.name == m and exit_kind(o) == exit_kind(named[0]) for o in content.objects)}
+            break
     exits = []
     for o in content.objects:
         if not (o.name and o.name in exit_names and placed(o)):
@@ -639,7 +678,8 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
         if all(exit_kind(o) == FIGHT for o in exits):
             # The end fight: at the receiver (the arena's manager), once, then once more for a late wave.
             exits = [Obj(name=receiver.name, cls=receiver.cls, pos=receiver.pos, group=GROUP_ENEMIES,
-                         ident=receiver.ident, state="encounter", kind=receiver.kind, along=receiver.along)]
+                         ident=receiver.ident, state="encounter", kind=receiver.kind, along=receiver.along,
+                         ref=receiver.ref)]
             exit_names = exit_names | {receiver.name}
     visited = [o for o in visited if not (o.name and o.name in exit_names)]
     # A stable order: along the level path when the content has it, else by distance from the start;
@@ -680,6 +720,8 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
             act, why = classify(o)
             if o.name and o.name in exit_names:
                 act, why = EXIT_A, "the level-end chain's sender: acted on last"
+            if act != VISIT and not o.ref:
+                act, why = VISIT, "no live reference (no probe id, no name a lookup takes)"
             if act == VISIT:
                 visit_only.append((o, why))
                 no_action_key = f"{stem(o.name) or o.cls}: {why}"
@@ -725,23 +767,27 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
             left_out.append(f"{dropped} visit(s) of clusters with no sampled action (over the budget)")
     return Plan(level=content.level, source=content.source, stops=stops, left_out=left_out, no_action=no_action,
                 unplaced=unplaced, estimate_s=round(est, 1), full=full, late_join=late_join, exit_stop=exit_stop,
-                provoke=provoke)
+                provoke=provoke, timed=bool(content.level_end) and exit_stop is None)
 
 
 # --- the scripts -------------------------------------------------------------------------------------------
-
-def _xyz(p: tuple[float, float, float], lift: float = 0.0) -> str:
-    return f"{p[0]:.1f} {p[1]:.1f} {p[2] + lift:.1f}"
-
+#
+# No coordinate is written into a script: every step names its object (Obj.ref) and the game reads where
+# it is when the step runs (route_actions.cpp: goto_entity, enter_trigger, fight_near, and the helpers
+# attack_until, interact, pickup, all through one live selector). A ref is the authored probe's exact
+# identity `auth:<zone>:<index>` (the probe's manifest, joined to the content by name and placed
+# position), else the object's name, resolved against the live entity table (the nearest of that name).
+# An object with neither is not addressed: it is visited only through another object of its cluster.
 
 def _safe(name: str) -> str:
     # The input script splits at every ';' and starts a comment at '#'.
     return name.replace(";", "").replace("#", "")
 
 
-GOTO_LIFT = 60.0   # a teleport lands this far above the placed point (no landing inside the floor)
 FIGURE_H = "Roller Brawl.dump"
 FIGURE_D = "Scorp.dump"
+GENERATED_NAME = re.compile(r"_componentDataOverrides_|_entityData$|^CEntityData|^CScriptTriggerEntityData|^CGameEntityData")
+JOIN_DISTANCE = 5.0     # a content object and a probe object this close (same name) are one object
 
 
 def boot_lines(host: bool, figure: str) -> list[str]:
@@ -753,6 +799,36 @@ def boot_lines(host: bool, figure: str) -> list[str]:
     lines += ["tap start", "waitfor menu_ready 60", "tap a", "waitfor menu_ready 60", "tap a",
               "waitfor front_end_left 120", f"place 0 {{figures}}/{figure}"]
     return lines
+
+
+def name_ref(name: str) -> str:
+    """A name a live lookup can take: not empty, not a data object's generated name."""
+    if not name or GENERATED_NAME.search(name):
+        return ""
+    return _safe(name)
+
+
+def attach_refs(objects: list[Obj], probe: list[Obj] | None) -> int:
+    """Each object's live reference (Obj.ref): the probe's authored id when a probe object of the same
+    name (or, unnamed, of the same class) lies within JOIN_DISTANCE of it, else its name when a lookup
+    can take it. How many got an authored id."""
+    by_name: dict[str, list[Obj]] = {}
+    unnamed: list[Obj] = []
+    for p in probe or []:
+        if "#" not in p.ident:
+            continue
+        (by_name.setdefault(p.name.lower(), []) if p.name else unnamed).append(p)
+    joined = 0
+    for o in objects:
+        cands = by_name.get(o.name.lower(), []) if o.name else [p for p in unnamed if p.cls == o.cls]
+        best = min(cands, key=lambda p: dist(p.pos, o.pos), default=None)
+        if best is not None and dist(best.pos, o.pos) <= JOIN_DISTANCE:
+            zone, index = best.ident.rsplit("#", 1)
+            o.ref = f"auth:{zone}:{index}"
+            joined += 1
+        else:
+            o.ref = name_ref(o.name)
+    return joined
 
 
 FIGHT_GROUPS = ("enemy", "spawner", "encounter")
@@ -770,40 +846,43 @@ def exit_kind(o: Obj) -> str:
 
 def action_lines(a: Action, label: str) -> list[str]:
     o = a.obj
-    n = _safe(o.name)
-    out = [f"log LEVELPASS act {label} {a.action} {n or '-'} {o.cls} at {_xyz(o.pos)}"]
+    ref = o.ref
+    out = [f"log LEVELPASS act {label} {a.action} {_safe(o.name) or '-'} {o.cls} ref {ref}"]
     if a.action == FIGHT:
-        out.append(f"fight_area {_xyz(o.pos)} 1500 {ACTION_TIMEOUT[FIGHT]}")
+        out.append(f"fight_near {ref} {FIGHT_RADIUS} {ACTION_TIMEOUT[FIGHT]}")
     elif a.action == ATTACK:
-        out.append(f"attack_until {n} {ACTION_TIMEOUT[ATTACK]}")
-    elif a.action == INTERACT_A:
-        out.append(f"interact {n} {ACTION_TIMEOUT[INTERACT_A]}")
+        out.append(f"attack_until {ref} {ACTION_TIMEOUT[ATTACK]}")
+    elif a.action in (INTERACT_A, TALK):
+        out.append(f"interact {ref} {ACTION_TIMEOUT[a.action]}")
     elif a.action == PICKUP:
-        out.append(f"pickup {n} {ACTION_TIMEOUT[PICKUP]}")
-    elif a.action == TALK:
-        out.append(f"interact {n} {ACTION_TIMEOUT[TALK]}")
+        out.append(f"pickup {ref} {ACTION_TIMEOUT[PICKUP]}")
     elif a.action == EXIT_A and exit_kind(o) == FIGHT:
-        out += [f"goto {_xyz(o.pos, GOTO_LIFT)}", "waitfor goto_done 10",
-                f"fight_area {_xyz(o.pos)} {EXIT_FIGHT_RADIUS} {EXIT_FIGHT_S}",
-                f"fight_area {_xyz(o.pos)} {EXIT_FIGHT_RADIUS} {EXIT_LATE_WAVE_S}"]
-    elif a.action == EXIT_A and exit_kind(o) == TALK and n:
-        out.append(f"interact {n} {ACTION_TIMEOUT[TALK]}")
+        out += [f"fight_near {ref} {EXIT_FIGHT_RADIUS} {EXIT_FIGHT_S}",
+                f"fight_near {ref} {EXIT_FIGHT_RADIUS} {EXIT_LATE_WAVE_S}"]
+    elif a.action == EXIT_A and exit_kind(o) == TALK:
+        out.append(f"interact {ref} {ACTION_TIMEOUT[TALK]}")
     elif a.action in (ENTER, EXIT_A):
-        out += [f"goto {_xyz(o.point(), GOTO_LIFT if o.point() == o.pos else 0.0)}", "waitfor goto_done 10"]
+        out.append(f"enter_trigger {ref}")
     out.append("wait_free 30")
     return out
 
 
+FIGHT_RADIUS = 1500
+
+
 def script_h(plan: Plan, late_join_after: str | None) -> str:
-    """H's script: boot, Host, the level, the sweep, the scenes left, the late join's wait, the exit."""
+    """H's script: boot, Host, the level, the sweep, the late join's wait, the exit."""
     lines = boot_lines(True, FIGURE_H)
     lines += ["waitfor online_server_hub 300", "online_mark_level", f"level {plan.level}",
               "waitfor online_level_after_mark 300", "waitfor online_barrier 300", "wait_free 120",
               "log LEVELPASS phase sweep", "online_audit start"]
     n_stops = len(plan.stops)
+    marked = False
     for i, s in enumerate(plan.stops):
-        if late_join_after is not None and plan.late_join and i == max(0, n_stops - LATE_JOIN_LEAD):
+        lead = n_stops if plan.timed else LATE_JOIN_LEAD
+        if late_join_after is not None and plan.late_join and i == max(0, n_stops - lead):
             lines.append("log LEVELPASS late-join start")
+            marked = True
         if s is plan.exit_stop:
             continue
         lines += stop_lines(s)
@@ -811,16 +890,24 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
             # The audit's own proof: one object of the kind made different on H alone, then audited.
             lines += [f"log LEVELPASS provoke {plan.provoke}", f"dev_audit_diverge {plan.provoke}",
                       f"online_audit {PROVOKE_LABEL}"]
+    if late_join_after is not None and plan.late_join and not marked:
+        lines.append("log LEVELPASS late-join start")
     lines.append("log LEVELPASS phase audit")
     lines.append("online_audit end")
     if plan.late_join and late_join_after is not None:
-        lines += ["log LEVELPASS phase late-join", "online_wait_peers 2 300",
-                  f"online_wait_peer_near {_xyz(late_join_point(plan))} 400 300", "online_audit late"]
+        # D ends its session once its audits are done: H waits for D in, then for D gone.
+        lines += ["log LEVELPASS phase late-join", "online_wait_peers 2 300", "waitfor online_alone 300",
+                  "online_audit late"]
     lines.append("log LEVELPASS phase exit")
     if plan.exit_stop is not None:
         lines += stop_lines(plan.exit_stop)
         lines += ["waitfor online_level_end 60", "waitfor online_past_level_end 240", "wait_free 120",
                   "log LEVELPASS phase next-level", "online_audit next"]
+    elif plan.timed:
+        # A timed level: its own end, then the next level (TIMED_END_S at most).
+        lines += ["log LEVELPASS exit timed (the level ends on its own)", f"waitfor online_level_end {TIMED_END_S}",
+                  "waitfor online_past_level_end 240", "wait_free 120", "log LEVELPASS phase next-level",
+                  "online_audit next"]
     else:
         lines.append("log LEVELPASS exit none (no level-end candidate in the content)")
     lines += ["log LEVELPASS done", "online_end", "quit"]
@@ -828,56 +915,65 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
 
 
 PROVOKE_LABEL = "provoke"
-LATE_JOIN_LEAD = 6
-D_VISITS = 6           # the late joiner's visits (each streams an area in; every audit covers all its rows)     # D starts this many stops before the sweep ends (its boot runs beside them)
+TIMED_END_S = 240      # a timed level's own end comes within this after the sweep
+LATE_JOIN_LEAD = 6     # D starts this many stops before the sweep ends (its boot runs beside them)
+D_VISITS = 6           # the late joiner's visits (each streams an area in; every audit covers all its rows)
 
 
-def late_join_point(plan: Plan) -> tuple[float, float, float]:
-    """Where D ends its visit (H waits for D's pose there): the last acted-on stop's point, else the
-    first stop's."""
-    acted = [s for s in plan.stops if s.actions and s is not plan.exit_stop]
-    s = acted[-1] if acted else plan.stops[0]
-    return s.cluster.center
+def visit_ref(s: Stop) -> str:
+    """The object a stop's teleport goes to: its first object with a live reference, "" for none."""
+    for o in s.cluster.objects:
+        if o.ref:
+            return o.ref
+    return ""
 
 
 def stop_lines(s: Stop) -> list[str]:
     c = s.cluster
     names = ", ".join(sorted({_safe(o.name) for o in c.objects if o.name})[:6]) or "-"
-    out = [f"log LEVELPASS visit {s.label} at {_xyz(c.center)} objects {len(c.objects)} ({names})",
-           f"goto {_xyz(c.center, GOTO_LIFT)}", "waitfor goto_done 10", "wait_free 20", f"online_audit {s.label}"]
+    ref = visit_ref(s)
+    out = [f"log LEVELPASS visit {s.label} objects {len(c.objects)} ({names}) ref {ref or '-'}"]
+    if ref:
+        out += [f"goto_entity {ref}", "wait_free 20"]
+    out.append(f"online_audit {s.label}")
     for k, a in enumerate(s.actions):
-        if a.action == ENTER and a.obj.pos == c.center and a.obj.box is None:
-            out.append(f"log LEVELPASS act {s.label}_{k + 1} {a.action} {_safe(a.obj.name) or '-'} {a.obj.cls} "
-                       f"at {_xyz(a.obj.pos)} (the visit's teleport entered it)")
-            continue
         out += action_lines(a, f"{s.label}_{k + 1}")
-    if any(not (a.action == ENTER and a.obj.pos == c.center and a.obj.box is None) for a in s.actions):
+    if s.actions:
         out.append(f"online_audit {s.label}_a")
     return out
 
 
 def script_d(plan: Plan) -> str:
-    """D's script (the late joiner): boot, its own hub, join the session ({join}), then the visit and
-    audit of the stops H acted on, ending at the late-join point H waits for."""
+    """D's script (the late joiner): boot, its own hub, join the session ({join}), the visit and audit
+    of up to D_VISITS stops H acted on (spread over the level), then it ends its session (H waits for
+    that: online_alone)."""
     lines = boot_lines(False, FIGURE_D)
     lines += ["waitfor online_in_play 300", "online_join {join}", "waitfor online_barrier 300", "wait_free 120",
               "log LEVELPASS D in", "online_audit d-in"]
-    acted = [s for s in plan.stops if s.actions and s is not plan.exit_stop]
-    if len(acted) > D_VISITS:  # spread over the level: the audit covers every row D holds anyway
+    acted = [s for s in plan.stops if s.actions and s is not plan.exit_stop and visit_ref(s)]
+    if len(acted) > D_VISITS:
         step = len(acted) / D_VISITS
         acted = [acted[int(i * step)] for i in range(D_VISITS - 1)] + [acted[-1]]
     for s in acted:
-        lines += [f"log LEVELPASS D visit {s.label}", f"goto {_xyz(s.cluster.center, GOTO_LIFT)}", "waitfor goto_done 10",
-                  "wait_free 20", f"online_audit d-{s.label}"]
-    end = late_join_point(plan)
-    lines += [f"goto {_xyz(end, GOTO_LIFT)}", "waitfor goto_done 10", "log LEVELPASS D done",
-              "waitfor online_left 900", "quit"]
+        lines += [f"log LEVELPASS D visit {s.label}", f"goto_entity {visit_ref(s)}", "wait_free 20",
+                  f"online_audit d-{s.label}"]
+    lines += ["log LEVELPASS D done", "online_end", "quit"]
     return "\n".join(lines) + "\n"
+
+
+POSITION_LITERAL = re.compile(r"(?<![\w:.\-])-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?|at:-?\d|\bgoto -?\d|fight_area\b|"
+                              r"online_wait_peer_near\b|online_server_goto\b|walkto\b|navto\b")
+
+
+def position_literals(script: str) -> list[str]:
+    """The lines of a level-pass script that carry a position (three numbers in a row, an at: point, a
+    goto, fight_area, walkto or navto with coordinates): a level pass names objects, never places."""
+    return [l for l in script.splitlines() if POSITION_LITERAL.search(l)]
 
 
 # --- the report ------------------------------------------------------------------------------------------
 
-SEVERITY = ("crash", "provoked difference (expected)", "difference after an action", "difference at rest", "object without a row",
+SEVERITY = ("crash", "level changed before the exit", "provoked difference (expected)", "difference after an action", "difference at rest", "object without a row",
             "row without an object", "action failed", "step failed", "not shared (documented)")
 
 AUDIT_DIFF = re.compile(r"Online: audit diff (\S+) (\S+) (\S+) (\S+) slot (\d+) rev (\d+) (\S+) at (\S+) local (\S+) "
@@ -904,6 +1000,7 @@ class Finding:
     client: str = ""   # the client's value
     lines: list[str] = field(default_factory=list)
     peer: str = ""
+    sightings: int = 0  # fold: how many audit lines the entry's objects had in all
 
 
 def label_kind(label: str) -> str:
@@ -948,6 +1045,33 @@ def findings_from_log(peer: str, text: str, labels: dict[str, str]) -> list[Find
     return out
 
 
+LEVEL_LOAD = re.compile(r"Online: level (\d+) (\S+): load")
+
+
+def level_changes(text: str, timed: bool) -> list[Finding]:
+    """A level load on H after the sweep began and before its exit phase: the level changed under the
+    pass (the steps after it ran in the next level). In a timed level (it ends on its own) the same,
+    named as its own end."""
+    out: list[Finding] = []
+    phase, step = "", ""
+    for line in text.splitlines():
+        m = MARK.search(line)
+        if m:
+            w = m.group(1)
+            if w.startswith("phase "):
+                phase = w[len("phase "):]
+            elif w.startswith(("visit ", "act ")):
+                step = w
+            continue
+        m = LEVEL_LOAD.search(line)
+        if m and phase in ("sweep", "audit", "late-join"):
+            what = ("the level ended on its own (a timed level)" if timed else
+                    "the level ended before the pass's exit") + f"; loading {m.group(2)}"
+            out.append(Finding(severity="level changed before the exit", kind="level", family=m.group(2), what=what,
+                               obj="", step=f"during {phase}, after `{step}`", lines=[line.strip()], peer="H"))
+    return out
+
+
 def provoked(text: str) -> list[tuple[str, str]]:
     """(kind, entity text) of each dev_audit_diverge in a peer's log."""
     return [(m.group(1), m.group(2)) for m in (DIVERGE.search(l) for l in text.splitlines()) if m]
@@ -977,11 +1101,22 @@ def step_labels(script: str) -> dict[str, str]:
 
 
 def fold(findings: list[Finding]) -> list[tuple[Finding, int, list[Finding]]]:
-    """Findings of one severity, kind, family and what are one entry with a count; most severe first,
-    then by count, then by name (stable)."""
+    """Findings of one severity, kind, family and what are one entry; its count is the number of
+    distinct objects (an object seen in several audits counts once; the entry keeps one finding per
+    object, the first); most severe first, then by count, then by name (stable)."""
     groups: dict[tuple[str, str, str, str], list[Finding]] = {}
+    seen: set[tuple] = set()
+    sightings: dict[tuple[str, str, str, str], int] = {}
     for f in findings:
-        groups.setdefault((f.severity, f.kind, f.family, f.what), []).append(f)
+        key = (f.severity, f.kind, f.family, f.what)
+        sightings[key] = sightings.get(key, 0) + 1
+        obj = (key, f.peer, f.obj) if f.obj else (key, f.peer, f.lines[0] if f.lines else "")
+        if obj in seen:
+            continue
+        seen.add(obj)
+        groups.setdefault(key, []).append(f)
+    for key, fs in groups.items():
+        fs[0].sightings = sightings[key]
     rank = {s: i for i, s in enumerate(SEVERITY)}
     entries = [(fs[0], len(fs), fs) for fs in groups.values()]
     entries.sort(key=lambda e: (rank.get(e[0].severity, len(rank)), -e[1], e[0].kind, e[0].family, e[0].what))
@@ -1060,7 +1195,8 @@ def report_text(level: str, plan: Plan, wall_s: float, phases: list[tuple[str, f
     lines.append("")
     lines.append(f"findings: {total} in {len(folded)} entries" + (f"; CRASH: {crash}" if crash else ""))
     for f, n, fs in folded:
-        lines.append(f"- [{f.severity}] {f.kind} {f.family}: {f.what} (x{n})")
+        seen = f" in {f.sightings} audit line(s)" if f.sightings > n else ""
+        lines.append(f"- [{f.severity}] {f.kind} {f.family}: {f.what} (x{n}{seen})")
         for g in fs[:3]:
             where = f"    {g.peer} {g.step}: {g.obj}".rstrip()
             lines.append(where)
@@ -1096,10 +1232,10 @@ LATE_JOIN_MARK = r"Input script: LEVELPASS late-join start"
 # god mode to keep fights short and the hero alive (dev_damage_multiplier is forwarded to S, which
 # scales the puppets' hits), the fight helpers' lowering setting (refused in a session in its own
 # words, never "is off"), the encounter lines, logs large enough for the whole pass.
-H_ARGS = ["--dev_backend_commands=true", "--dev_hello_ungated_loopback=true", "--dev_damage_multiplier=-1",
+H_ARGS = ["--dev_authored_probe=true", "--dev_backend_commands=true", "--dev_hello_ungated_loopback=true", "--dev_damage_multiplier=-1",
           "--dev_hero_invulnerable=true", "--dev_defeat_commands=true", "--dev_trigger_commands=true",
           "--log_max_file_size_mb=64", "--log_max_files=4"]
-D_ARGS = ["--dev_backend_commands=true", "--dev_damage_multiplier=-1", "--dev_hero_invulnerable=true",
+D_ARGS = ["--dev_authored_probe=true", "--dev_backend_commands=true", "--dev_damage_multiplier=-1", "--dev_hero_invulnerable=true",
           "--log_max_file_size_mb=64", "--log_max_files=4"]
 CASE_TIMEOUT_S = 1200   # the hard stop: twice the budget
 
