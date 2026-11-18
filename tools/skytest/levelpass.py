@@ -1265,18 +1265,19 @@ STALE_WHAT = "S does not retire rows of removed entities"
 
 
 def server_pending(text: str) -> dict[str, int]:
-    """Per kind, the pending rows of S's last audit summary (S's census no longer has their entity)."""
+    """Per kind, the most pending rows any of S's audit summaries counted (S's census no longer has their
+    entity): the most, not the last, as a timed level can change under the pass (tutorial_a's S counted 15
+    pending props before the next level reset its rows)."""
     out: dict[str, int] = {}
     for line in text.splitlines():
         m = SUMMARY_KINDS.search(line)
         if not m or m.group(1) != "S":
             continue
-        out = {}
         for part in m.group(3).split():
             k, _, v = part.partition("=")
             nums = v.split("/")
             if len(nums) == 4 and nums[3].isdigit():
-                out[k] = int(nums[3])
+                out[k] = max(out.get(k, 0), int(nums[3]))
     return out
 
 
