@@ -6557,8 +6557,9 @@ def machine_budget(cfg: Config) -> "MachineBudget | None":
     if cfg.slots is None:
         return None
     check_slots_folder(cfg, cfg.slots)
-    if cfg.bulk is not None:
-        return MachineBudget(cfg.slots, cfg.bulk.games, gb_per_game=cfg.bulk.gb_per_game)
+    bulk = getattr(cfg, "bulk", None)
+    if bulk is not None:
+        return MachineBudget(cfg.slots, bulk.games, gb_per_game=bulk.gb_per_game)
     return MachineBudget(cfg.slots, cfg.machine_games)
 
 
@@ -6654,9 +6655,10 @@ def memory_recheck(want: float, mem: float, seconds: float | None = None, every:
 class MachineBudget:
     """The game budget every runner on the machine shares (PS15): `games` slots in `folder`."""
 
-    def __init__(self, folder: Path, games: int, owner: str = "", gb_per_game: float = GB_PER_GAME) -> None:
+    def __init__(self, folder: Path, games: int, owner: str = "", gb_per_game: float | None = None) -> None:
         self.folder, self.games = Path(folder), max(1, min(int(games), MACHINE_SLOT_FILES))
-        self.gb_per_game = float(gb_per_game)
+        # None: GB_PER_GAME as it is when a case is admitted (read then, not when the budget is made).
+        self.gb_per_game = gb_per_game
         self.owner = owner or f"skytest pid {os.getpid()}"
         self.folder.mkdir(parents=True, exist_ok=True)
 
@@ -6760,7 +6762,7 @@ class MachineBudget:
                             for _, fd in taken[need:]:
                                 _unlock_close(fd)
                             mem = available_memory_gb()
-                            want = memory_games * self.gb_per_game
+                            want = memory_games * (GB_PER_GAME if self.gb_per_game is None else self.gb_per_game)
                             if mem is not None and mem < want and not held and rechecked is not None:
                                 mem = max(mem, rechecked)
                             if mem is not None and mem < want:
