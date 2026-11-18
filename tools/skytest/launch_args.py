@@ -642,8 +642,11 @@ def check_args(ctx: RunContext, args: list[str]) -> None:
                               "builder sets it once, for the run's own copy)")
     if values.get("portal_mode") != ["software"]:
         raise LaunchError("refusing to start a game without exactly one --portal_mode=software")
-    if "true" in values.get("window_hidden", []) and values.get("audio_mute") != ["true"]:
-        raise LaunchError("refusing a hidden run without --audio_mute=true")
+    # A hidden game is muted: every --audio_mute says true (the runner's default and a spec's own may both
+    # say it; a bool setting's occurrences sum, so one false among them would unmute it).
+    mute = values.get("audio_mute", [])
+    if "true" in values.get("window_hidden", []) and (not mute or any(v != "true" for v in mute)):
+        raise LaunchError("refusing a hidden run without --audio_mute=true (every --audio_mute true)")
     for key in ROOT_SETTINGS:
         contained(ctx, values[key][0], f"--{key}", ctx.run_folder)
     cfg = canonical(values["config_file"][0], ctx.run_folder, "--config_file", must_exist=not ctx.no_settings)

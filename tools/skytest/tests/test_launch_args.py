@@ -223,6 +223,12 @@ class BuilderTest(_Base):
         args = [a for a in self.args() if a != "--audio_mute=true"] + ["--window_hidden=true"]
         self.assertIn("audio_mute", self.refuses(la.check_args, self.ctx, args))
 
+    def test_hidden_run_muted_twice(self) -> None:
+        # skytest's bulk mode hides games whose spec says --audio_mute=true beside the runner's default.
+        args = self.args() + ["--window_hidden=true"]
+        la.check_args(self.ctx, args + ["--audio_mute=true"])
+        self.assertIn("audio_mute", self.refuses(la.check_args, self.ctx, args + ["--audio_mute=false"]))
+
     def test_value_kinds(self) -> None:
         self.refuses(self.build, ["--window_width=9"])
         self.refuses(self.build, ["--window_width=6x"])
