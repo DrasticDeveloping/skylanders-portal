@@ -7863,10 +7863,11 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     import levelpass as lp
     folder = levelpass_folder(cfg, getattr(a, "folder", None))
     try:
-        content = lp.load_content(folder, a.level)
+        content = lp.load_content(folder, a.level, probe_ids=not a.no_probe)
     except ValueError as e:
         raise SystemExit(f"levelpass: {e}") from None
     plan = lp.make_plan(content, full=a.full, late_join=not a.no_late_join, provoke=a.provoke or "")
+    plan.probe = not a.no_probe
     stamp = time.strftime("%Y%m%d-%H%M%S")
     cases = folder / "cases" / stamp
     cases.mkdir(parents=True, exist_ok=False)
@@ -7957,7 +7958,7 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                                       obj="", step=""))
     notes.append(f"shader cache: {'warm (from the build snapshot)' if any((run / n / 'cache').rglob('*.xpso') for n in ('H',)) else 'cold'}")
     settings = "settings: the release defaults a player gets (no online_route_file: every trigger unclassified) plus " \
-        "the test tools " + " ".join(lp.H_ARGS) + (" on H" if lp.H_ARGS else "")
+        "the test tools " + " ".join(lp.probe_args(lp.H_ARGS, plan.probe)) + " on H"
     notes.insert(0, settings)
     report = lp.report_text(a.level, plan, wall, lp.phase_times(texts["H"]), lp.fold(findings), crash,
                             {p: lp.summaries(t) for p, t in texts.items()}, str(run), notes,
@@ -8046,6 +8047,8 @@ def main(argv: list[str] | None = None) -> int:
                      " show it as a provoked difference")
     lp_.add_argument("--predictions", action="store_true", help="the predictions run: each predicted co-op bug of"
                      " the level (<levelpass>/predictions.toml) as steps, snapshots and a check, a verdict per bug")
+    lp_.add_argument("--no-probe", action="store_true", help="the authored probe off in every game: objects only by"
+                     " the names the probe saw live (no auth: ids); to tell a crash of the probe from the game's")
     lp_.add_argument("--plan-only", action="store_true", help="write the generated case and print the plan; start"
                      " no game")
     lp_.set_defaults(fn=cmd_levelpass)

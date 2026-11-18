@@ -321,7 +321,7 @@ def parse_logic(data: object) -> tuple[list[Edge], list[str]]:
     return edges, level_end
 
 
-def load_content(folder, level: str) -> Content:
+def load_content(folder, level: str, probe_ids: bool = True) -> Content:
     """The level's content from the levelpass folder (a pathlib.Path): the static manifest when it
     exists, else the probe's; logic.json's edges when it exists. ValueError when neither manifest is
     there."""
@@ -344,7 +344,8 @@ def load_content(folder, level: str) -> Content:
     if probe.is_file():
         probe_content = content if content.source == str(probe) else \
             parse_probe_manifest(probe.read_text(encoding="utf-8", errors="replace"), level)
-        content.authored = attach_refs(content.objects, probe_content.objects)
+        # --no-probe: the probe is off in the games, so only the names it saw live address objects.
+        content.authored = attach_refs(content.objects, probe_content.objects, names_only=not probe_ids)
     else:
         content.authored = attach_refs(content.objects, None)
     logic = folder / level / "logic.json"
@@ -649,6 +650,7 @@ class Plan:
     provoke: str = ""               # a kind the pass makes differ on H alone (dev_audit_diverge): the proof
     sample: int = SAMPLE            # the acted-on objects per family this plan took
     timed: bool = False             # the level ends on its own (no chain member a player acts on)
+    probe: bool = True              # the authored probe on (--no-probe: names only, no auth: ids)
 
 
 # Seconds the boot and the level load take, measured (the report prints the real ones); used for the
@@ -888,7 +890,7 @@ def name_ref(name: str) -> str:
     return _safe(name)
 
 
-def attach_refs(objects: list[Obj], probe: list[Obj] | None) -> int:
+def attach_refs(objects: list[Obj], probe: list[Obj] | None, names_only: bool = False) -> int:
     """Each object's live reference (Obj.ref): the probe's authored id when a probe object of the same
     name (or, unnamed, of the same class) lies within JOIN_DISTANCE of it, else its name when a lookup
     can take it. How many got an authored id."""
@@ -903,7 +905,7 @@ def attach_refs(objects: list[Obj], probe: list[Obj] | None) -> int:
     for o in objects:
         cands = by_name.get(o.name.lower(), []) if o.name else [p for p in unnamed if p.cls == o.cls]
         best = min(cands, key=lambda p: dist(p.pos, o.pos), default=None)
-        if best is not None and dist(best.pos, o.pos) <= JOIN_DISTANCE:
+        if not names_only and best is not None and dist(best.pos, o.pos) <= JOIN_DISTANCE:
             zone, index = best.ident.rsplit("#", 1)
             o.ref = f"auth:{zone}:{index}"
             joined += 1
@@ -1510,6 +1512,11 @@ D_ARGS = ["--dev_authored_probe=true", "--dev_backend_commands=true", "--dev_dam
 CASE_TIMEOUT_S = 1200   # the hard stop: twice the budget
 
 
+def probe_args(args: list[str], probe: bool) -> list[str]:
+    """A peer's arguments, without the authored probe for a --no-probe pass."""
+    return list(args) if probe else [a for a in args if not a.startswith("--dev_authored_probe")]
+
+
 def _toml_list(items: list[str]) -> str:
     return "[" + ", ".join("'" + i.replace("'", "") + "'" for i in items) + "]"
 
@@ -1550,10 +1557,10 @@ def spec_toml(plan: Plan) -> str:
            'shader_cache = "snapshot"',
            "",
            "[peer.H]",
-           f"args = {_toml_list(H_ARGS)}",
+           f"args = {_toml_list(probe_args(H_ARGS, plan.probe))}",
            "script = \'\'\'\n" + h + "\'\'\'",
            ]
     if late:
-        out += ["", "[peer.D]", f"args = {_toml_list(D_ARGS)}", f"start_after = '{LATE_JOIN_MARK}'",
+        out += ["", "[peer.D]", f"args = {_toml_list(probe_args(D_ARGS, plan.probe))}", f"start_after = '{LATE_JOIN_MARK}'",
                 "script = \'\'\'\n" + script_d(plan) + "\'\'\'"]
     return "\n".join(out) + "\n"

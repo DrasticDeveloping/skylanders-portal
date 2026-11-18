@@ -341,6 +341,18 @@ class Scripts(unittest.TestCase):
         self.assertIn("LEVELPASS exit none", h)
         self.assertNotIn("online_wait_peers", h)
 
+    def test_no_probe(self):
+        """--no-probe: no auth: ids in the steps and no probe setting on any game."""
+        c = lp.parse_probe_manifest(PROBE, "madeup")
+        lp.attach_refs(c.objects, c.objects, names_only=True)
+        self.assertFalse(any(o.ref.startswith("auth:") for o in c.objects))
+        p = lp.make_plan(c)
+        p.probe = False
+        text = lp.spec_toml(p)
+        self.assertNotIn("dev_authored_probe", text)
+        self.assertNotIn("auth:", text)
+        self.assertIn("dev_authored_probe", lp.spec_toml(lp.make_plan(content())))
+
     def test_names_are_safe(self):
         o = lp.Obj("Bad;Name#1", "C", (1.0, 2.0, 3.0), lp.GROUP_INTERACT)
         o.ref = lp.name_ref(o.name)
