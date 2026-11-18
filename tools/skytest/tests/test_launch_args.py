@@ -350,6 +350,29 @@ class ScriptTest(_Base):
         la.parse_script("waitfor title_ready 5", t)
         self.refuses(la.parse_script, "waitfor nope 5", t)
 
+    def test_follow_file_inside_the_run_folder(self) -> None:
+        # follow <file>: a file the runner writes and the game reads, inside the run folder; it may not
+        # exist yet. Anywhere else (an owner folder, past the run folder) is refused.
+        self.check("wait 1\nfollow live.txt\nquit")
+        self.check(f"follow {self.run / 'live.txt'}")
+        self.assertIn("outside", self.refuses(self.check, f"follow {self.root / 'elsewhere.txt'}"))
+        self.assertIn("outside", self.refuses(self.check, "follow ..\\..\\live.txt"))
+        self.refuses(self.check, f"follow {self.owner / 'Swap Force' / 'live.txt'}")
+        self.assertIn("cannot parse", self.refuses(self.check, "follow"))
+        junction(self.run / "j", self.owner)
+        self.refuses(self.check, "follow j\\live.txt")
+
+    def test_live_lines(self) -> None:
+        # A live line (skytest.py live send) is checked with the same rules, plus live mode's own:
+        # follow_end only there, never a follow inside it.
+        la.check_script("follow_end", self.ctx, live=True)
+        la.check_script("tap a; level x; follow_end", self.ctx, live=True)
+        self.assertIn("outside live mode", self.refuses(self.check, "follow_end"))
+        self.assertIn("inside live mode", self.refuses(la.check_script, "follow live2.txt", self.ctx, live=True))
+        self.assertIn("table", self.refuses(la.check_script, "dev_new_tool 1", self.ctx, live=True))
+        self.assertIn("outside", self.refuses(la.check_script, "save 1 2 C:\\x.bin", self.ctx, live=True))
+        self.refuses(la.check_script, "tap q", self.ctx, live=True)
+
 
 class SyntheticPeerTest(_Base):
     """Stage 4's synthetic peer (role synthetic-peer): `--name value` pairs, the session address, the
