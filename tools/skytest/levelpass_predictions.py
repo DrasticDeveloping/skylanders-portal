@@ -328,7 +328,7 @@ def scripts(level: str, bugs: list[Bug], d_mode: str) -> tuple[str, str | None]:
         if not bug.could_not_test:
             h.append(f"online_audit p{bug.n}")
     if d_mode == "late":
-        h += ["log LEVELPASS late-join start", "log LEVELPASS phase late-join", "online_wait_peers 2 300",
+        h += ["log LEVELPASS late-join start", "log LEVELPASS phase late-join", "waitfor online_peer_was_in 300",
               "waitfor online_alone 300", "online_audit late"]
     h += ["log LEVELPASS done", "online_end", "quit"]
     d = None

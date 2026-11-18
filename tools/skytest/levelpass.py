@@ -986,7 +986,7 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
     lines.append("online_audit end")
     if plan.late_join and late_join_after is not None:
         # D ends its session once its audits are done: H waits for D in, then for D gone.
-        lines += ["log LEVELPASS phase late-join", "online_wait_peers 2 300", "waitfor online_alone 300",
+        lines += ["log LEVELPASS phase late-join", "waitfor online_peer_was_in 300", "waitfor online_alone 300",
                   "online_audit late"]
     lines.append("log LEVELPASS phase exit")
     if plan.exit_stop is not None:

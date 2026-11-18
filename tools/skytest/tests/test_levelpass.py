@@ -307,7 +307,7 @@ class Scripts(unittest.TestCase):
         self.assertIn("online_host 0", h)
         self.assertIn("level madeup", h)
         self.assertIn("log LEVELPASS late-join start", h)
-        self.assertIn("online_wait_peers 2 300", h)
+        self.assertIn("waitfor online_peer_was_in 300", h)  # D may have come and gone already
         self.assertIn("waitfor online_past_level_end 240", h)
         self.assertLess(h.index("LEVELPASS phase late-join"), h.index("LEVELPASS phase exit"))
         self.assertIn("attack_until auth:madeup:6 12", h)
