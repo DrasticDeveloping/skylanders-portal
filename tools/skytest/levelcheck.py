@@ -1651,7 +1651,7 @@ def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[st
             trail.append(battle_gate_left(run, data, g))
         if missing:
             opened_on = [f"{w} at {when(where[w])}" for w in where if where[w] is not None]
-            shut.append(f"{g.name} ({g.kind}): performed ({req[0].cite()}); opened on "
+            shut.append(f"{g.name} ({g.kind}): attempted by the pass ({req[0].cite()}: its own line, no proof of anything the game did); opened on "
                         f"{', '.join(opened_on) or 'no game'}, not on {', '.join(missing)}"
                         + ("; " + "; ".join(trail) if trail else ""))
         else:
@@ -1659,6 +1659,35 @@ def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[st
                         + "; ".join(f"{w} at {when(line)} {line.cite()}" for w, line in where.items())
                         + ("; " + "; ".join(trail) if trail else ""))
     return shut, done
+
+
+# "Reached the next level" is the game's own evidence on that client: a level loaded after the level under test
+# (`Online: level <g> <path>: load` with a later generation) and that generation's start released there
+# (`Online: barrier <g> released`: the hero in play). Never the script's own marker (`LEVELPASS phase
+# next-level`, `LEVELPASS D next level`), which runs whatever its wait's outcome: batch 11 run 4 (tutorial_b
+# 20261119-063529) logged it right after `waitfor online_level_after_mark timed out after 150.0 s`, and the page
+# said "H yes". A timed-out wait for the level change is cited as the reason.
+CLIENT_BARRIER = re.compile(r"Online: barrier (\d+) released at tick")
+LEVEL_WAIT_TIMEOUT = re.compile(r"Input script: waitfor online_level_after_mark timed out after [\d.]+ s")
+
+
+def next_level_reached(log: Log, level: str) -> tuple[Line | None, str]:
+    """(the line that shows this client in play in the level after `level`, or None; why not, in words)."""
+    loads = [(line, int(m.group(1)), m.group(2)) for line, m in log.find(LEVEL_LOAD)]
+    # A late joiner comes into the level under test by its Welcome (`connected as peer <n> (..., level <g> <path>)`).
+    joined = [(line, int(m.group(2)), m.group(3)) for line, m in log.find(CONNECTED)]
+    under = [g for _l, g, path in loads + joined if level and path.split("/")[-1].lower() == level.lower()]
+    if not under:
+        return None, (f"no load of {level} on this game" if level else "the level under test is not known (no case name)")
+    after = [(line, g, path) for line, g, path in loads if g > min(under)]
+    timed_out = log.find(LEVEL_WAIT_TIMEOUT)
+    if not after:
+        return None, ("no level loaded after " + level + (f"; {timed_out[-1][0].cite()}" if timed_out else ""))
+    load, g, path = after[0]
+    played = [line for line, m in log.find(CLIENT_BARRIER) if int(m.group(1)) == g]
+    if not played:
+        return None, f"loaded {path.split('/')[-1]} ({load.cite()}) but its start was never released here (not in play)"
+    return played[0], ""
 
 
 def grade_completable(run: Run, data: LevelData | None = None) -> Verdict:
@@ -1670,14 +1699,19 @@ def grade_completable(run: Run, data: LevelData | None = None) -> Verdict:
     verdict = str(lp.get("verdict", ""))
     missed = [str(x) for x in lp.get("not_covered", []) or []]
     reached = {}
-    for who, rx in (("H", H_NEXT), ("D", D_NEXT)):
+    why_not: dict[str, str] = {}
+    level = run_level(run)
+    for who in ("H", "D"):
         log = run.clients.get(who)
-        hit = log.find(rx) if log else []
-        reached[who] = hit[0][0] if hit else None
-    counts = (f"level pass {verdict or '?'}; next level reached: " +
+        if log is None:
+            reached[who] = None
+            continue
+        reached[who], why_not[who] = next_level_reached(log, level)
+    counts = (f"level pass {verdict or '?'}; next level reached (the level change and play on that game): " +
               ", ".join(f"{w} {'yes' if line else 'no'}" for w, line in reached.items() if w in run.clients))
     example = next((line.cite() for line in reached.values() if line), "")
     notes = [f"not covered: {m}" for m in missed]
+    notes += [f"{w} did not reach the next level: {why}" for w, why in why_not.items() if reached.get(w) is None and why]
     # The pass teleports: it can reach the end without doing what a player must on the way.
     shut, done = required_steps(run, data)
     if data is None:
@@ -1704,10 +1738,9 @@ def grade_completable(run: Run, data: LevelData | None = None) -> Verdict:
                            f"gate opened on {', '.join(['S'] + sorted(run.clients, key=lambda w: (w != 'H', w)))}; "
                            f"{counts}", example, notes=notes)
         return Verdict("completable", PASS, counts, example, notes=notes)
-    missing = [w for w, line in reached.items() if line is None]
-    return Verdict("completable", FAIL, counts, example, [Finding(f"{', '.join(missing)} logged no next-level mark", [
-        absent(run.clients[w], f"`{(H_NEXT if w == 'H' else D_NEXT).pattern}`") for w in missing if w in run.clients])],
-        notes)
+    missing = [w for w, line in reached.items() if line is None and w in run.clients]
+    return Verdict("completable", FAIL, counts, example, [Finding(
+        f"{', '.join(missing)} did not reach the next level", [f"{w}: {why_not.get(w, '')}" for w in missing])], notes)
 
 
 # --- the page ------------------------------------------------------------------------------------------

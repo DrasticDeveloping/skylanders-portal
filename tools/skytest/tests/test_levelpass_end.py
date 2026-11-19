@@ -402,7 +402,7 @@ class Budget(unittest.TestCase):
 
     def test_the_verdict(self):
         p = self.plan()
-        done = "Input script: LEVELPASS phase next-level\n"
+        done = NEXT_SEEN + "Input script: LEVELPASS phase next-level\n"
         self.assertEqual(lp.pass_verdict("pass", [], done, p), (lp.PASS, []))
         v, missed = lp.pass_verdict("pass", [], "[t1] Dev: attack_until auth:lvl:9 12 skipped: the sweep's time is up\n" + done, p)
         self.assertEqual(v, lp.INCOMPLETE)
@@ -514,11 +514,27 @@ class CountedFightNotes(unittest.TestCase):
         self.assertEqual(lp.counted_fight_notes(lp.make_plan(lp.Content("x", "x", (0.0, 0.0, 0.0), []), late_join=False), s, h), [])
 
 
+# The game's own evidence of the next level on a client: the level under test loaded, a later one loaded and its
+# start released there (levelpass.next_level_seen). The script's marker alone is no longer enough.
+NEXT_SEEN = ("[t] Online: level 2 a/lvl/lvl: load\n[t] Online: level 3 town/town_state1/town_state1: load\n"
+             "[t] Online: barrier 3 released at tick 900\n")
+
+
 class BothClients(unittest.TestCase):
     """A PASS says every client in the session at the exit reached the next level (D stays by default)."""
-    H_DONE = "[t1] Input script: waitfor online_level_end met after 3.0 s\n[t1] Input script: LEVELPASS phase next-level\n"
+    H_DONE = (NEXT_SEEN + "[t1] Input script: waitfor online_level_end met after 3.0 s\n"
+              "[t1] Input script: LEVELPASS phase next-level\n")
     D_IN = "[t2] Input script: LEVELPASS D in\n"
-    D_DONE = D_IN + "[t2] Input script: waitfor online_level_end met after 9.0 s\n[t2] Input script: LEVELPASS D next level\n"
+    D_DONE = D_IN + NEXT_SEEN + ("[t2] Input script: waitfor online_level_end met after 9.0 s\n"
+                                  "[t2] Input script: LEVELPASS D next level\n")
+
+    def test_a_marker_after_a_timed_out_wait_is_not_reached(self):
+        # Batch 11 run 4 (tutorial_b 20261119-063529): the marker came right after the level wait timed out.
+        p = self.plan()
+        h = ("[t1] Input script: waitfor online_level_after_mark timed out after 150.0 s\n"
+             "[t1] Input script: LEVELPASS phase next-level\n")
+        v, missed = lp.pass_verdict("pass", [], h, p, self.D_DONE)
+        self.assertEqual((v, missed[0]), (lp.INCOMPLETE, "the level's end and the next level (not reached)"))
 
     def plan(self, **kw):
         chains, logic = trigger_level()
