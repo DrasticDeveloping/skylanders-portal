@@ -679,6 +679,8 @@ class Plan:
     end: object = None              # levelpass_end.End derived from logic.json (None: the older exit below)
     end_objs: dict = field(default_factory=dict)  # node key -> Obj of the end's objects (their refs)
     end_missing: str = ""           # why the derived end cannot be acted on (an object with no live reference)
+    d_stays: bool = True            # D stays through the level end and must reach the next level itself
+                                    # (--d-leaves-before-end: D ends its session before the exit, as before)
 
 
 # Seconds the boot and the level load take, measured (the report prints the real ones); used for the
@@ -706,22 +708,23 @@ def estimate_seconds(stops: list[Stop], late_join: bool, end: bool = True) -> fl
 
 
 def make_plan(content: Content, full: bool = False, late_join: bool = True, budget_s: float = BUDGET_S,
-              sample: int = SAMPLE, provoke: str = "", no_end: bool = False) -> Plan:
+              sample: int = SAMPLE, provoke: str = "", no_end: bool = False, d_stays: bool = True) -> Plan:
     """The plan; without --full, over the budget, the sample per family goes down to 2, then 1 (the
     plan says so), after the quiet visits were dropped. `no_end` (--no-end): the level's end is found
     (the plan names it) but not attempted, and its time is not in the estimate."""
-    plan = _make_plan(content, full, late_join, budget_s, sample, provoke, no_end=no_end)
+    plan = _make_plan(content, full, late_join, budget_s, sample, provoke, no_end=no_end, d_stays=d_stays)
     n = sample
     while not full and plan.estimate_s > budget_s and n > 1:
         n -= 1
-        plan = _make_plan(content, full, late_join, budget_s, n, provoke, no_end=no_end)
+        plan = _make_plan(content, full, late_join, budget_s, n, provoke, no_end=no_end, d_stays=d_stays)
         plan.left_out.append(f"each action family sampled {n} time(s), not {sample}, to fit the budget")
     # Still over at one per family (a level with many archetypes): at most `cap` actions of each kind
     # (fight, attack, interact, pickup, enter, talk), the first ones along the path, the cap going down
     # until the plan fits; --full acts on the rest.
     cap = KIND_CAP_START
     while not full and plan.estimate_s > budget_s and cap >= 1:
-        plan = _make_plan(content, full, late_join, budget_s, n, provoke, kind_cap=cap, no_end=no_end)
+        plan = _make_plan(content, full, late_join, budget_s, n, provoke, kind_cap=cap, no_end=no_end,
+                          d_stays=d_stays)
         plan.left_out.append(f"each action family sampled {n} time(s), not {sample}, to fit the budget")
         plan.left_out.append(f"each kind of action at most {cap} times, to fit the budget (--full acts on all)")
         cap -= 1
@@ -733,7 +736,7 @@ KIND_CAP_START = 8   # the first per-kind cap tried when one action per family i
 
 
 def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, sample: int,
-               provoke: str, kind_cap: int = 0, no_end: bool = False) -> Plan:
+               provoke: str, kind_cap: int = 0, no_end: bool = False, d_stays: bool = True) -> Plan:
     visited = [o for o in content.objects if o.group in GROUPS_VISITED]
     # A sub-zone (a swap zone, a staging map) is its own map that a player reaches only through its own
     # entry: its objects are never visited, even when the probe walked its package at the level's load
@@ -899,7 +902,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
     # skipped at the deadline).
     timed = (end.kind == le.TIMED) if end is not None else (bool(content.level_end) and exit_stop is None)
     est = estimate_seconds([s for s in stops if s is not exit_stop], late_join, end=False) + \
-        exit_reserve(no_end, end, exit_stop, timed) + SWEEP_MARGIN_S
+        exit_reserve(no_end, end, exit_stop, timed, d_end=late_join and d_stays) + SWEEP_MARGIN_S
     if est > budget_s:
         quiet = [s for s in stops if not s.actions]
         quiet.sort(key=lambda s: -(dist(start, s.cluster.center) if start else s.cluster.index))
@@ -914,7 +917,8 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
             left_out.append(f"{dropped} visit(s) of clusters with no sampled action (over the budget)")
     return Plan(level=content.level, source=content.source, stops=stops, left_out=left_out, no_action=no_action,
                 unplaced=unplaced, estimate_s=round(est, 1), full=full, late_join=late_join, exit_stop=exit_stop,
-                provoke=provoke, no_end=no_end, end=end, end_objs=end_objs, end_missing=end_missing, timed=timed)
+                provoke=provoke, no_end=no_end, end=end, end_objs=end_objs, end_missing=end_missing, timed=timed,
+                d_stays=d_stays)
 
 
 # --- the scripts -------------------------------------------------------------------------------------------
@@ -1088,8 +1092,13 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
     lines.append("sweep_deadline 0")
     lines.append("log LEVELPASS phase audit")
     lines.append("online_audit end")
-    if plan.late_join and late_join_after is not None:
-        # D ends its session once its audits are done: H waits for D in, then for D gone.
+    d_end = late_join_after is not None and d_through_end(plan)
+    if plan.late_join and late_join_after is not None and d_end:
+        # D stays (the default): H waits for D in the session now, so the level ends with two players in it.
+        lines += ["log LEVELPASS phase late-join", "waitfor online_peer_was_in 300", "online_wait_peers 2 120",
+                  "online_audit late"]
+    elif plan.late_join and late_join_after is not None:
+        # --d-leaves-before-end: D ends its session once its audits are done: H waits for D in, then gone.
         lines += ["log LEVELPASS phase late-join", "waitfor online_peer_was_in 300", "waitfor online_alone 300",
                   "online_audit late"]
     if plan.no_end:
@@ -1113,6 +1122,9 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
                   "online_audit next"]
     else:
         lines.append("log LEVELPASS exit none (no level-end candidate in the content)")
+    if d_end:
+        # D audits the next level itself and then leaves: H ends the session only after that.
+        lines += ["log LEVELPASS phase end-of-session", f"waitfor online_alone {D_ALONE_WAIT_S}"]
     lines += ["log LEVELPASS done", "online_end", "quit"]
     return "\n".join(lines) + "\n"
 
@@ -1187,7 +1199,7 @@ def unresolved_exit(h_text: str, script: str) -> str:
 TRIGGER_END_S = 150      # after the outro's trigger: its conversations (skipped), its cutscenes, the results
 FIGHT_APPROACH_S = 25    # goto_entity's own limit
 FIRST_ROUND_S = 60       # the first round of a counted fight
-ROUND_S = 30             # each later round (a wave's arrival; each ends after 10 s with no enemy near)
+ROUND_S = 25             # each later round (a wave's arrival; each ends after 10 s with no enemy near)
 FIGHT_RADIUS_MIN, FIGHT_RADIUS_MAX, FIGHT_MARGIN = 1500, 3000, 500
 END_IMPOSSIBLE = "LEVELPASS exit impossible"
 
@@ -1292,13 +1304,37 @@ def end_lines(plan: Plan) -> list[str]:
 
 def exit_seconds(plan: Plan) -> float:
     """The exit phase's share: its actions' own timeouts and the level end's waits."""
-    return exit_reserve(plan.no_end, plan.end, plan.exit_stop, plan.timed)
+    return exit_reserve(plan.no_end, plan.end, plan.exit_stop, plan.timed, d_end=plan.late_join and plan.d_stays)
 
 
-def exit_reserve(no_end: bool, end, exit_stop: Stop | None, timed: bool) -> float:
-    """exit_seconds before the Plan exists (the estimate keeps the same)."""
+D_END_S = 20.0   # H's wait for D's own next-level audit and D's leave after the level end (D stays)
+D_ALONE_WAIT_S = 60  # at most this for D to leave after its own next level (its time beyond D_END_S is the grace's)
+# D's level-end waits can be met only while H's game runs (the session ends with it): wait_needs, so a pass
+# whose H ended without the level end stops at once instead of D waiting out D_LEVEL_END_WAIT_S.
+D_WAIT_NEEDS = '{ online_level_end = ["H"], online_past_level_end = ["H"] }'
+
+
+def ends_level(no_end: bool, end, exit_stop: Stop | None, timed: bool) -> bool:
+    """The pass attempts the level's end (a derived trigger or fight, the older exit, or a timed level)."""
+    if no_end:
+        return False
+    if end is not None:
+        return end.kind in (le.TRIGGER, le.FIGHT, le.TIMED)
+    return exit_stop is not None or timed
+
+
+def d_through_end(plan: Plan) -> bool:
+    """D joins, stays through the level end and must reach the next level itself (the default)."""
+    return plan.late_join and plan.d_stays and ends_level(plan.no_end, plan.end, plan.exit_stop, plan.timed)
+
+
+def exit_reserve(no_end: bool, end, exit_stop: Stop | None, timed: bool, d_end: bool = False) -> float:
+    """exit_seconds before the Plan exists (the estimate keeps the same); `d_end`: D stays through the end
+    (H then waits for D's own next level before it ends the session)."""
     if no_end:
         return 0.0
+    if d_end and ends_level(no_end, end, exit_stop, timed):
+        return D_END_S + exit_reserve(no_end, end, exit_stop, timed)
     if end is not None:
         return end_seconds(end) if end.kind != le.TIMED else EXIT_WAIT_S
     if exit_stop is None:
@@ -1355,6 +1391,9 @@ def stop_lines(s: Stop) -> list[str]:
     return out
 
 
+D_LEVEL_END_WAIT_S = 600   # D's wait for the level end: the whole case (its stop is at CASE_TIMEOUT_S)
+
+
 def script_d(plan: Plan) -> str:
     """D's script (the late joiner): boot, its own hub, join the session ({join}), the visit and audit
     of up to D_VISITS stops H acted on (spread over the level), then it ends its session (H waits for
@@ -1370,6 +1409,12 @@ def script_d(plan: Plan) -> str:
     for s in acted:
         lines += [f"log LEVELPASS D visit {s.label}", f"goto_entity {visit_ref(s)}", *dismiss_after(visit_obj(s)),
                   f"online_audit d-{s.label}"]
+    if d_through_end(plan):
+        # D stays through the level end and must reach the next level itself: the same waits as H's, as
+        # long as the case may run (the level ends when H's exit or the level's own timer ends it).
+        lines += ["log LEVELPASS D visits done, stays for the level end",
+                  f"waitfor online_level_end {D_LEVEL_END_WAIT_S}", "waitfor online_past_level_end 240",
+                  "wait_free 120", "log LEVELPASS D next level", "online_audit d-next"]
     lines += ["log LEVELPASS D done", "online_end", "quit"]
     return "\n".join(lines) + "\n"
 
@@ -1929,10 +1974,39 @@ def counted_fight_notes(plan: Plan, s_text: str, h_text: str) -> list[str]:
     return out
 
 
-def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan) -> tuple[str, list[str]]:
+H_NEXT = "Input script: LEVELPASS phase next-level"
+D_IN = "Input script: LEVELPASS D in"
+D_NEXT = "Input script: LEVELPASS D next level"
+LEVEL_END_MET = "Input script: waitfor online_level_end met"
+
+
+def client_progress(text: str, peer: str) -> str:
+    """How far one client got, in words, from its log's marks."""
+    if not text:
+        return "no log"
+    if peer == "D" and D_IN not in text:
+        return "never joined"
+    if (H_NEXT if peer == "H" else D_NEXT) in text:
+        return "reached the next level"
+    if LEVEL_END_MET in text:
+        return "saw the level end, not the next level"
+    return "did not see the level end"
+
+
+def clients_line(plan: Plan, h_text: str, d_text: str) -> str:
+    """Each client's progress, for the report's head."""
+    out = [f"H {client_progress(h_text, 'H')}"]
+    if plan.late_join:
+        how = "stays through the end" if d_through_end(plan) else "leaves before the end (--d-leaves-before-end)"
+        out.append(f"D ({how}) {client_progress(d_text, 'D')}")
+    return "clients: " + "; ".join(out)
+
+
+def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan, d_text: str = "") -> tuple[str, list[str]]:
     """The pass's verdict and what it did not cover: FAIL for a failed run that was not only stopped for
     time; INCOMPLETE when the runner stopped it at the soft budget, steps were skipped at the sweep's
-    deadline, or the exit it planned was not reached; PASS otherwise."""
+    deadline, or the exit it planned was not reached by every client that was to be in the session at the
+    exit (H, and D unless --d-leaves-before-end); PASS otherwise: every such client reached the next level."""
     missed: list[str] = []
     skipped = [f"{m.group(1)} {m.group(2)}" for m in SKIPPED.finditer(h_text)]
     if skipped:
@@ -1943,8 +2017,10 @@ def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan) -> tu
         missed.append(f"stopped by the runner at the soft budget ({CASE_TIMEOUT_S} s)")
     planned_end = not plan.no_end and (plan.end is not None and plan.end.kind != le.TIMED or plan.exit_stop is not None
                                        or plan.timed)
-    if planned_end and "Input script: LEVELPASS phase next-level" not in h_text:
+    if planned_end and H_NEXT not in h_text:
         missed.append("the level's end and the next level (not reached)")
+    if d_through_end(plan) and D_NEXT not in d_text:
+        missed.append(f"D did not reach the next level ({client_progress(d_text, 'D')}): the pass shows one client only")
     paused = paused_after(h_text) if any(PAUSE_LINE.search(r) for r in reasons) else ""
     if paused:
         missed.insert(0, f"the game stayed paused with its frames stopped after `{paused}` (a screen the pass's press"
@@ -2027,5 +2103,6 @@ def spec_toml(plan: Plan) -> str:
            ]
     if late:
         out += ["", "[peer.D]", f"args = {_toml_list(probe_args(D_ARGS, plan.probe, plan.game_args))}", f"start_after = '{LATE_JOIN_MARK}'",
+                *([f"wait_needs = {D_WAIT_NEEDS}"] if d_through_end(plan) else []),
                 "script = \'\'\'\n" + script_d(plan) + "\'\'\'"]
     return "\n".join(out) + "\n"
