@@ -127,5 +127,35 @@ class Runner(unittest.TestCase):
         self.assertIsNone(watch.check({"H": Proc(None), "D": Proc(0)}))
 
 
+
+class WhenLines(unittest.TestCase):
+    """`when <condition> <line>` / `unless <condition> <line>`: a spec line kept by the checkout's command table."""
+    SCRIPT = "\n".join(["tap y", "when scene_skip_prompt_up waitfor scene_skip_prompt_up 10",
+                         "unless scene_skip_prompt_up wait 0.5", "  when other_cond log x", "tap y", "quit"])
+
+    def test_listed_and_not_listed(self):
+        self.assertEqual(skytest.expand_when_lines(self.SCRIPT, {"scene_skip_prompt_up"}),
+                         "tap y\nwaitfor scene_skip_prompt_up 10\ntap y\nquit")
+        self.assertEqual(skytest.expand_when_lines(self.SCRIPT, set()), "tap y\nwait 0.5\ntap y\nquit")
+        self.assertEqual(skytest.expand_when_lines(self.SCRIPT, None), "tap y\nwait 0.5\ntap y\nquit")
+        self.assertEqual(skytest.expand_when_lines("log when this\nwhen", {"x"}), "log when this\nwhen")
+
+    def test_load_spec_expands_with_the_table(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        f = Path(tmp.name) / "case.toml"
+        f.write_text("\n".join(['name = "x"', 'layout = "server+1"', 'stage = "8"', 'server = "host"',
+                                 'scenes = "skip"', "[peer.H]", "script = '''\nonline_host 0\n" + self.SCRIPT +
+                                 "\n'''", ""]), encoding="utf-8")
+        old = skytest.SCRIPT_CONDITIONS
+        self.addCleanup(setattr, skytest, "SCRIPT_CONDITIONS", old)
+        skytest.SCRIPT_CONDITIONS = {"scene_skip_prompt_up"}
+        self.assertIn("waitfor scene_skip_prompt_up 10\ntap y", skytest.load_spec(f, 300).peers["H"].script)
+        skytest.SCRIPT_CONDITIONS = set()
+        script = skytest.load_spec(f, 300).peers["H"].script
+        self.assertIn("tap y\nwait 0.5\ntap y", script)
+        self.assertNotIn("when", script)
+        self.assertNotIn("unless", script)
+
 if __name__ == "__main__":
     unittest.main()

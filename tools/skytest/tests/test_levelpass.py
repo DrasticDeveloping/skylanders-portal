@@ -1038,23 +1038,57 @@ class RequiredStepsPlan(unittest.TestCase):
         for r in p.required:
             press = f"interact nearest:TutorialLockedGate_keylock:{lp.KEY_LOCK_NEAR} {lp.KEY_PRESS_S}"
             i = h.index(f"log LEVELPASS required {r.label} key_gate TutorialLockedGate (fetch its key {r.gate.key_data})")
-            self.assertEqual(h[i + 1:i + 7], [f"goto_entity {r.gate_ref}", f"pickup TutorialLockedGate_key {lp.KEY_PICKUP_S}",
-                                              f"goto_entity {r.gate_ref}", press,
-                                              f"wait_moved {r.gate_ref} 50 {lp.GATE_OPEN_WAIT_S}", f"online_audit {r.label}"])
+            self.assertEqual(h[i + 1:i + 6], [f"goto_entity {r.gate_ref}", f"pickup TutorialLockedGate_key {lp.KEY_PICKUP_S}",
+                                              f"goto_entity {r.gate_ref}", press, f"online_audit {r.label}"])
         self.assertNotIn(f"interact TutorialLockedGate_keylock {lp.KEY_PRESS_S}", h)
         self.assertEqual([l for l in h if "nearest:" in l and "_keylock:" not in l], [])  # the key: exact name only
         self.assertEqual(lp.position_literals("\n".join(h)), [])
         d = lp.script_d(p)
         self.assertIn(f"online_wait_peer_near_entity {p.required[0].gate_ref} {lp.D_NEAR} {lp.D_COME_WAIT_S}", d)
 
+    def test_the_gates_phase_has_its_own_budget(self) -> None:
+        # W13 (batch 12 case 7, ww1 20261119-124636): the gates took the sweep's time (deadline 60 s, 175 s without).
+        for level in ("tutorial_b", "ww1"):
+            gated, free = self.plan(level), self.plan(level, no_gates=True)
+            self.assertGreater(gated.required_s, 0, level)
+            self.assertEqual(gated.required_s, sum(r.est_s for r in gated.required if not r.why_not))
+            self.assertEqual(lp.plan_budget(gated), lp.BUDGET_S + gated.required_s)
+            self.assertEqual(lp.sweep_share(gated, lp.plan_budget(gated)), lp.sweep_share(free, lp.plan_budget(free)),
+                             level)
+            self.assertEqual(len(gated.stops), len(free.stops), level)
+            self.assertIn(f"timeout = {int(lp.CASE_TIMEOUT_S + gated.required_s)}", lp.spec_toml(gated))
+            words = lp.budget_words(gated)
+            self.assertIn(f"gates phase {gated.required_s:.0f} s of its own", words)
+            self.assertIn(f"total {lp.BUDGET_S + gated.required_s:.0f} s", words)
+
+    def test_each_client_walks_through_each_gate(self) -> None:
+        # W23: H after its step (before the audit), D when H is at the gate with its follow off; the data's yaw.
+        p = self.plan("tutorial_b")
+        p.pass_gates, p.d_follow = True, True
+        h = lp.script_h(p, None).splitlines()
+        for r in p.required:
+            i = h.index(f"online_audit {r.label}")
+            self.assertEqual(h[i - 1], f"pass_gate {r.gate_ref} {lp.PASS_DISTANCE} {lp.PASS_H_S} yaw {r.yaw:.4f}")
+        self.assertEqual(p.required[0].yaw, 0.6109)
+        d = lp.script_d(p).splitlines()
+        j = d.index(f"log LEVELPASS D passes required r1 TutorialLockedGate")
+        self.assertEqual(d[j + 2], "online_auto_follow off")
+        self.assertTrue(d[j + 3].startswith(f"pass_gate {p.required[0].gate_ref} {lp.PASS_DISTANCE} "))
+        self.assertEqual(d[j + 4], "online_auto_follow on")
+        self.assertEqual(lp.position_literals("\n".join(h + d)), [])
+        off = self.plan("tutorial_b")  # a build without pass_gate: no walk
+        self.assertFalse([l for l in lp.script_h(off, None).splitlines() + lp.script_d(off).splitlines()
+                          if l.startswith("pass_gate")])
+
     def test_no_gates_keeps_the_full_sweep_and_says_so(self) -> None:
         gated, free = self.plan("tutorial_b"), self.plan("tutorial_b", no_gates=True)
         self.assertEqual(free.required, [])
-        self.assertGreater(len(free.stops), len(gated.stops))
+        self.assertEqual(len(free.stops), len(gated.stops))  # W13: the gates no longer shrink the sweep
         self.assertLessEqual(free.estimate_s, lp.BUDGET_S)
         self.assertIn(f"log {lp.GATES_SKIPPED}", lp.script_h(free, None).splitlines())
-        self.assertTrue(lp.budget_words(free).startswith("--no-gates: gates not attempted"))
-        self.assertTrue(lp.budget_words(gated).startswith("gates phase: 2 of 2 required gate(s) performed"))
+        self.assertIn("; gates not attempted (--no-gates); total 600 s", lp.budget_words(free))
+        self.assertIn(f"gates phase {2 * lp.REQ_KEY_S:.0f} s of its own (2 of 2 required gate(s) performed)",
+                      lp.budget_words(gated))
 
     def test_ww1_fights_its_battle_gates_and_waits_for_the_lock_commands(self) -> None:
         p = self.plan("ww1")
@@ -1063,9 +1097,19 @@ class RequiredStepsPlan(unittest.TestCase):
                                  ("Spark Lock", True), ("battle gate", False)])
         saw = next(r for r in p.required if r.gate.name == "PuzzleGateSawtooth001")
         self.assertTrue(saw.h[1].startswith("enter_trigger "))  # the caged Greebles' release first
-        self.assertTrue(saw.h[2].startswith("fight_near ") and saw.h[2].endswith(f" 1500 {lp.GATE_FIGHT_S}"))
+        self.assertTrue(saw.h[2].startswith("fight_near "))
+        # W16: EncounterManager001_002 starts within its activation radius (2000, nothing toggles it): the step goes
+        # to the manager first (batch 12 case 7 fought a placed enemy 2990 away; the encounter never started).
         ec = next(r for r in p.required if r.gate.name == "EC001_DemonGate")
-        self.assertTrue(ec.h[1].startswith("encounter_clear ") and ec.h[1].endswith(" exact"))
+        self.assertEqual(ec.h[1], "goto_entity auth:ww1:8291")
+        self.assertEqual(ec.h[2], "encounter_clear auth:ww1:8291 1500 70 exact")  # W18: 6 spawns: 30 + 5 * 6 + 10
+        # W18: the three-wave gate (3 placed, 6 and 5 spawns): 30 + 5 * 14 + 10.
+        fin = next(r for r in p.required if r.gate.name == "Finale_DemonGate008")
+        self.assertTrue(fin.h[-2].startswith("fight_near ") and fin.h[-2].endswith(" 1500 110"), fin.h)
+        self.assertEqual(fin.est_s, lp.REQ_BATTLE_S + 110)
+        # W17: no gate step waits for its gate to move (a LockedObjectComponent gate opens in place).
+        for r in p.required + self.plan("tutorial_b").required + self.plan("ww1", lock_commands=True).required:
+            self.assertFalse([l for l in r.h if l.startswith("wait_moved")], r.h)
         spark = self.plan("ww1", lock_commands=True).required[0]
         self.assertEqual(spark.h[2:5], [f"interact {spark.gate_ref} 20", "waitfor lock_ready 30", "lock_solve 120"])
         self.assertEqual(spark.d, [f"interact {spark.gate_ref} 20", "waitfor lock_ready 30", "lock_solve 120"])
@@ -1206,6 +1250,93 @@ class FoundScreenDismissal(unittest.TestCase):
         self.assertGreater(old, 90.0)
         self.assertEqual(FoundScreen(new).play(W3_DISMISS), "found")        # what the new run did
         self.assertEqual(FoundScreen(new).play(self.gem_step()), "closed")  # what W7 does from there
+
+
+MARK_RACE_RUN = Path("D:/SwapForceOnline-data/tests/int2/runs/20261119-120551-levelpass-tutorial_b")
+
+
+class MarkRace(unittest.TestCase):
+    """W11 (batch 12 run 2): D's mark of its first level landed 0.02 s after the level under test began loading, so
+    its wait for the next level was met only in the hub. D now marks before its first level's barrier."""
+
+    def test_d_marks_in_play_before_the_barrier_and_h_marks_before_its_level_command(self) -> None:
+        p = lp.make_plan(content(), d_lobby=True)
+        d = lp.script_d(p).splitlines()
+        k = d.index("waitfor online_in_play 300")
+        self.assertEqual(d[k + 1:k + 3], ["online_mark_level", "waitfor online_barrier 300"])
+        first_in = d.index("log LEVELPASS D in the first level")
+        self.assertNotIn("online_mark_level", d[k + 2:first_in])   # no second mark after the barrier (the race)
+        self.assertEqual(d[first_in + 1], f"waitfor {lp.NEXT_LEVEL} 600")
+        h = lp.script_h(p, None).splitlines()
+        self.assertEqual(h[h.index(f"level {p.level}") - 1], "online_mark_level")
+
+    def test_a_mark_inside_a_load_is_named(self) -> None:
+        log = "\n".join([
+            "[2026-11-19 12:07:45.115] [info] [core] [t1] Online: barrier 1 released at tick 6079",
+            "[2026-11-19 12:07:45.454] [info] [core] [t1] Online: level 2 tutorial/tutorial_b/tutorial_b: load",
+            "[2026-11-19 12:07:45.472] [info] [core] [t2] Online: online_mark_level: generation 2",
+            "[2026-11-19 12:07:58.244] [info] [core] [t1] Online: barrier 2 released at tick 6867",
+            "[2026-11-19 12:07:58.256] [info] [core] [t2] Online: online_mark_level: generation 2"])
+        late = lp.late_marks(log)
+        self.assertEqual([(m.generation, m.load_no, m.mark_no, m.mark_at) for m in late], [(2, 2, 3, "12:07:45.472")])
+        self.assertTrue(lp.client_progress(log + "\nInput script: LEVELPASS D in", "D", "tutorial_b").startswith(
+            "its mark landed inside a load: `online_mark_level: generation 2` at 12:07:45.472"))
+
+    def test_the_first_levels_mark_before_its_barrier_is_not_named(self) -> None:
+        # W20 (batch 13 case 7, 20261119-141657): D's own order marks the hub while it loads, no start released yet.
+        log = "\n".join([
+            "[2026-11-19 14:17:35.922] [info] [core] [t1] Online: level 1 town/town_state10/town_state10: load",
+            "[2026-11-19 14:18:50.743] [info] [core] [t2] Online: online_mark_level: generation 1",
+            "[2026-11-19 14:18:51.739] [info] [core] [t1] Online: barrier 1 released at tick 6091",
+            "[2026-11-19 14:18:51.833] [info] [core] [t1] Online: level 2 tutorial/tutorial_b/tutorial_b: load",
+            "[2026-11-19 14:19:05.077] [info] [core] [t1] Online: barrier 2 released at tick 6891",
+            "[2026-11-19 14:19:05.402] [info] [core] [t2] Online: online_mark_level: generation 2"])
+        self.assertEqual(lp.late_marks(log), [])
+
+    @unittest.skipUnless((MARK_RACE_RUN / "D" / "game.log").is_file() and (MARK_RACE_RUN / "H" / "game.log").is_file(),
+                         "batch 12's tutorial_b run is not on this machine")
+    def test_the_recorded_run(self) -> None:
+        read = lambda who: (MARK_RACE_RUN / who / "game.log").read_text(encoding="utf-8", errors="replace")
+        d, h = read("D"), read("H")
+        late = lp.late_marks(d)
+        self.assertEqual([(m.generation, m.load_at, m.mark_at) for m in late], [(2, "12:07:45.454", "12:07:45.472")])
+        self.assertEqual(lp.late_marks(h), [])  # H marks before its own `level`
+        # Where the new order marks: right after D's `waitfor online_in_play` was met, D's latest generation was 1.
+        lines = d.splitlines()
+        met = next(i for i, l in enumerate(lines) if "Input script: waitfor online_in_play met" in l)
+        loads = [int(m.group(1)) for m in map(lp.LEVEL_LOAD_LINE.search, lines[:met]) if m]
+        self.assertEqual(loads[-1], 1)
+
+
+class Figures(unittest.TestCase):
+    """W21: a named figure for one player from the copied figure folder, a swapper as its two halves."""
+
+    def folder(self) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        f = Path(tmp.name)
+        for name in ("Scorp.dump", "Spy Rise Top.dump", "Spy Rise Bottom.dump", "Trap Shadow Top.dump"):
+            (f / name).write_bytes(b"x")
+        return f
+
+    def test_a_figure_a_swapper_and_a_refusal(self) -> None:
+        f = self.folder()
+        self.assertEqual(lp.figure_files(f, "Scorp"), ["Scorp.dump"])
+        self.assertEqual(lp.figure_files(f, "Spy Rise"), ["Spy Rise Top.dump", "Spy Rise Bottom.dump"])
+        self.assertEqual(lp.figure_words(["Spy Rise Top.dump", "Spy Rise Bottom.dump"]),
+                         "Spy Rise (a swapper: Spy Rise Top + Spy Rise Bottom)")
+        with self.assertRaises(ValueError) as e:
+            lp.figure_files(f, "Trap Shadow")  # a top half alone is no swapper
+        self.assertIn("its swappers: Spy Rise", str(e.exception))
+
+    def test_d_gets_both_halves_on_the_portal(self) -> None:
+        p = lp.make_plan(content(), d_lobby=True)
+        p.figures_d = ["Spy Rise Top.dump", "Spy Rise Bottom.dump"]
+        d = lp.script_d(p).splitlines()
+        k = d.index("place 0 {figures}/Spy Rise Top.dump")
+        self.assertEqual(d[k + 1], "place 1 {figures}/Spy Rise Bottom.dump")
+        self.assertNotIn(f"place 0 {{figures}}/{lp.FIGURE_D}", d)
+        self.assertIn(f"place 0 {{figures}}/{lp.FIGURE_H}", lp.script_h(p, None).splitlines())
 
 class HeldFights(unittest.TestCase):
     """A fight is planned only when its held enemies' release is on the route before it (levelpass_holds)."""

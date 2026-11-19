@@ -722,6 +722,8 @@ def load_config(repo: Path) -> Config:
         bulk_settings=BulkSettings(games=bulk_games, wait_factor=float(factor), gb_per_game=float(gb)),
     )
     cfg.snapshots = snapshots_setting(cfg)
+    global SCRIPT_CONDITIONS
+    SCRIPT_CONDITIONS = table_conditions(cfg.script_commands)
     return cfg
 
 
@@ -1261,11 +1263,56 @@ def fill_save_slots(data: Path, title: str, name_pattern: str, slots: dict[int, 
     return done
 
 
+# A spec script line that depends on the build: `when <condition> <line>` keeps <line> when the checkout's command
+# table (Config.script_commands, tests/script_commands.toml: the conditions the game's source registers, checked
+# against it by tools/tests/test_launch_tables.py) lists <condition>, `unless <condition> <line>` when it does not.
+# Expanded when a spec is read (load_spec, the preflight), so the runner, the preflight's checks and the game see
+# plain lines; the game has no `when` command, so a line left unexpanded is refused there (fail closed). Without a
+# table (SCRIPT_CONDITIONS None: no config read) a condition counts as not listed. First use: scene-skip-press-tb
+# waits for the cutscene skip prompt (`scene_skip_prompt_up`, online/8-test-conditions) where the build has it.
+SCRIPT_CONDITIONS: set[str] | None = None
+WHEN_LINE = re.compile(r"^(\s*)(when|unless)\s+(\S+)\s+(\S.*)$")
+
+
+def table_conditions(path: Path) -> set[str] | None:
+    """The conditions a command table lists, or None when it cannot be read."""
+    try:
+        return set(tomllib.loads(path.read_text(encoding="utf-8")).get("conditions", []))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+
+
+def expand_when_lines(script: str, conditions: set[str] | None) -> str:
+    """A script with its `when` / `unless` lines decided (WHEN_LINE): the kept ones without their prefix."""
+    out = []
+    for line in script.split("\n"):
+        m = WHEN_LINE.match(line)
+        if not m:
+            out.append(line)
+            continue
+        listed = conditions is not None and m.group(3) in conditions
+        if listed == (m.group(2) == "when"):
+            out.append(m.group(1) + m.group(4))
+    return "\n".join(out)
+
+
+def expand_spec_dict(d: dict, conditions: set[str] | None = None) -> dict:
+    """A spec table with every peer's script (and the common one) expanded (expand_when_lines); the table's own
+    SCRIPT_CONDITIONS unless `conditions` is given."""
+    conds = SCRIPT_CONDITIONS if conditions is None else conditions
+    if isinstance(d.get("script"), str):
+        d["script"] = expand_when_lines(d["script"], conds)
+    for peer in (d.get("peer") or {}).values():
+        if isinstance(peer, dict) and isinstance(peer.get("script"), str):
+            peer["script"] = expand_when_lines(peer["script"], conds)
+    return d
+
+
 def load_spec(path: Path, default_timeout: float) -> Spec:
     try:
         data = path.read_bytes()
         text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")  # as read_text reads it
-        d = tomllib.loads(text)
+        d = expand_spec_dict(tomllib.loads(text))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
         raise SpecError(f"{path.name}: {e}") from e
     for key in ("name", "layout", "stage"):
@@ -8141,6 +8188,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 breaker.record(spec.name, r.folder, r.signature)
                 if (t := breaker.tripped()) is not None:
                     tell_breaker(t)
+            # A caller's own verdict of the case (the level pass: W15), decided before the case's status line is
+            # printed and its result.json, report.md and results.json are written, so all of them carry one verdict.
+            if (case_verdict := getattr(a, "case_verdict", None)) is not None:
+                case_verdict(spec, r)
             return r
 
         def finished() -> list[CaseResult]:
@@ -8396,7 +8447,7 @@ def preflight_check(cfg: Config, spec: Spec, cache: dict) -> list:
     if "ctx" not in cache:
         cache["ctx"], cache["runs"], *_ = preflight_context(cfg)
     try:
-        d = tomllib.loads(spec.path.read_text(encoding="utf-8"))
+        d = expand_spec_dict(tomllib.loads(spec.path.read_text(encoding="utf-8")))
     except (OSError, tomllib.TOMLDecodeError):
         return []  # load_spec read it: a file changed since is said by run_one
     return preflight_case(cache["ctx"], cache["runs"], spec.name, d, True)
@@ -8410,7 +8461,7 @@ def cmd_preflight(cfg: Config, a: argparse.Namespace) -> int:
     for path in paths:
         text = path.read_text(encoding="utf-8")
         try:
-            d = tomllib.loads(text)
+            d = expand_spec_dict(tomllib.loads(text))
         except tomllib.TOMLDecodeError as e:
             print(f"{path.stem}: error spec -: not TOML ({e})")
             continue
@@ -8426,7 +8477,8 @@ def cmd_preflight(cfg: Config, a: argparse.Namespace) -> int:
     for f in a.file or []:
         fp = expand(f)
         try:
-            chosen.append((fp.stem.split("@")[0], tomllib.loads(fp.read_text(encoding="utf-8")), False))
+            chosen.append((fp.stem.split("@")[0], expand_spec_dict(tomllib.loads(fp.read_text(encoding="utf-8"))),
+                           False))
         except (OSError, tomllib.TOMLDecodeError) as e:
             print(f"{fp.name}: error spec -: {e}")
     if not chosen:
@@ -9467,6 +9519,16 @@ def lock_commands_known(cfg: Config) -> bool:
         "lock_ready" in table.conditions
 
 
+def pass_gate_known(cfg: Config) -> bool:
+    """The game registers `pass_gate` (W23; the checkout's tests/script_commands.toml)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        return "pass_gate" in la.CommandTable.load(path).registered
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+
+
 def auto_follow_known(cfg: Config) -> bool:
     """The game registers `online_auto_follow` (the checkout's tests/script_commands.toml: the launch builder
     refuses a script with a command the table does not have)."""
@@ -9533,6 +9595,22 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                         scene_lengths=measured_scene_lengths(cfg, a.level) if getattr(a, "scenes", "skip") == "play"
                         else None, lock_commands=lock_commands_known(cfg), no_gates=getattr(a, "no_gates", False))
     plan.probe = not a.no_probe
+    plan.pass_gates = pass_gate_known(cfg)  # W23: H and D walk through each gate H opened
+    if plan.pass_gates:  # the walks' seconds in the gates phase's budget (H's; D's run beside H's next steps)
+        extra = sum(lp.PASS_H_S + lp.PASS_TELEPORT_S for r in plan.required if not r.why_not)
+        for r in plan.required:
+            if not r.why_not:
+                r.est_s += lp.PASS_H_S + lp.PASS_TELEPORT_S
+        plan.required_s += extra
+        plan.estimate_s += extra
+    # W21: a named figure (or a swapper's two halves) for H or D, from the copied figure folder.
+    for who, opt in (("h", "h_figure"), ("d", "d_figure")):
+        name = getattr(a, opt, None)
+        if name:
+            try:
+                setattr(plan, f"figures_{who}", lp.figure_files(fixture_dirs(cfg)[1], name))
+            except ValueError as e:
+                raise SystemExit(f"levelpass: --{who}-figure: {e}") from None
     plan.server_hidden = bool(getattr(a, "server_hidden", False))
     plan.long_pause_s = int(getattr(a, "long_pause", 0) or 0)
     plan.long_pause_at = getattr(a, "long_pause_at", "") or ""
@@ -9590,6 +9668,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     # The plan's first line: its estimate and which budget it is in (the gates phase, or --no-gates).
     print(f"levelpass {a.level}: estimate {plan.estimate_s:.0f} s ({lp.budget_words(plan)}); content {plan.source}; "
           f"{len(plan.stops)} stops, {sum(len(st.actions) for st in plan.stops)} actions; case {spec_path}", flush=True)
+    print(f"levelpass {a.level}: figures: H {lp.figure_words(plan.figures_h)}"
+          + (f"; D {lp.figure_words(plan.figures_d)}" if plan.late_join else ""), flush=True)
     for n in notices:
         print(f"levelpass {a.level}: {n}", flush=True)
     for h in plan.held:  # the fights the level's script holds (levelpass_holds), in words
@@ -9605,11 +9685,28 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         return 0
     t0 = time.monotonic()
     started = time.strftime("%Y%m%d-%H%M%S")
+    # The pass's verdict (R3), decided as the case ends (W15): batch 12 case 7 printed the runner's `PASS` while
+    # the level pass's verdict and result.json said INCOMPLETE (its sweep skipped steps for time). An incomplete
+    # pass is the case's status `incomplete` from the first line printed about it on.
+    decided: dict = {}
+
+    def case_verdict(_spec, r) -> None:
+        if not r.folder or not Path(r.folder).is_dir():
+            return
+        run_dir = Path(r.folder)
+        d_text = read_peer_log(run_dir, "D", False) if (run_dir / "D").is_dir() else ""
+        verdict, missed = lp.pass_verdict(r.status, list(r.reasons), read_peer_log(run_dir, "H", False), plan, d_text)
+        decided["verdict"] = (verdict, missed)
+        if verdict == lp.INCOMPLETE and r.status in ("pass", "fail"):
+            r.status = "incomplete"
+            r.reasons.append("levelpass: incomplete: " + "; ".join(missed))
+
     ns = argparse.Namespace(cases=[case], stage=None, max_games=0, gate=False, per_build=False,
                             allow_restricted=False, jobs=1, run_not_ready=False, no_breaker=False, queue=None,
                             remote=None, remote_manifest=None, remote_token_file=None,
                             rerun_known_failure=a.rerun_known_failure, ignore_build=a.ignore_build,
-                            build_wait_min=a.build_wait_min, ignore_preflight=a.ignore_preflight)
+                            build_wait_min=a.build_wait_min, ignore_preflight=a.ignore_preflight,
+                            case_verdict=case_verdict)
     code = cmd_test(replace(cfg, cases_dir=cases), ns)
     if code in (EXIT_KNOWN_FAILURE, EXIT_BUILD_RUNNING, EXIT_PREFLIGHT):
         why = {EXIT_KNOWN_FAILURE: "a known failure", EXIT_BUILD_RUNNING: "a build held its slot",
@@ -9689,8 +9786,9 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         rj_now = json.loads(result.read_text(encoding="utf-8")) if result.is_file() else {}
     except (OSError, ValueError):
         rj_now = {}
-    verdict, missed = lp.pass_verdict(str(rj_now.get("status", "fail")), list(rj_now.get("reasons", [])), texts["H"],
-                                      plan, texts.get("D", ""))
+    # The verdict decided as the case ended (case_verdict), else (a run folder of an older runner) from result.json.
+    verdict, missed = decided.get("verdict") or lp.pass_verdict(
+        str(rj_now.get("status", "fail")), list(rj_now.get("reasons", [])), texts["H"], plan, texts.get("D", ""))
     if crash:
         verdict = lp.FAIL
     head = f"verdict: {verdict}" + (f" (not covered: {'; '.join(missed)})" if missed else "") + \
@@ -9734,6 +9832,11 @@ def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
                      " dismisses a pause screen within seconds")
     lp_.add_argument("--long-pause-at", default="", metavar="NAME", help="the object whose pickup takes the long"
                      " pause (default: the plan's first pickup of a collectible)")
+    lp_.add_argument("--h-figure", default=None, metavar="NAME", help="H's figure from the copied figure folder"
+                     " (default Roller Brawl): `<NAME>.dump`, or a swapper's two halves (`<NAME> Top.dump` in slot 0,"
+                     " `<NAME> Bottom.dump` in slot 1)")
+    lp_.add_argument("--d-figure", default=None, metavar="NAME", help="D's figure, as --h-figure (default Scorp);"
+                     " e.g. --d-figure \"Spy Rise\" puts a swapper on D")
     lp_.add_argument("--d-stays", action="store_true", help="D stays where it entered the level (the old"
                      " behaviour); by default D's hero follows H's through the stops (the game's Auto follow,"
                      " online_auto_follow on) once the game registers that command")

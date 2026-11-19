@@ -40,6 +40,7 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import levelpass_end as le
 import levelpass_holds as lh
@@ -713,6 +714,10 @@ class Plan:
     scene_at: dict = field(default_factory=dict)
     scene_load_s: float = 0.0
     scene_extra_s: float = 0.0      # the scenes' own seconds: added to the budget and the case's timeout
+    required_s: float = 0.0         # the gates phase's own budget (its performed steps' seconds): added the same way
+    pass_gates: bool = False        # W23: the build has pass_gate (the checkout's command table)
+    figures_h: list[str] = field(default_factory=lambda: [FIGURE_H])  # H's figure files (W21: a swapper is two)
+    figures_d: list[str] = field(default_factory=lambda: [FIGURE_D])
     # The fights the level's script holds (levelpass_holds): what each fight did about them (a release entered
     # before it, or the fight left out: "needs a lock opened", nothing releases them), in words.
     held: list[str] = field(default_factory=list)
@@ -786,6 +791,17 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
     plan = _make_plan(content, full, late_join, budget_s, sample, provoke, no_end=no_end, d_stays=d_stays,
                       scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands,
                       no_gates=no_gates)
+    # The gates phase has its own budget (W13): its performed steps' seconds are added to the budget as the scenes'
+    # are, so the sweep keeps the size it has without gates. Batch 12 case 7 (ww1 20261119-124636) took them out of
+    # the ten minutes: `sweep_deadline 60 s` (175 s without gates), ten sweep steps skipped for time. The owner's
+    # rule (2026-11-19): a level check with gates may take more than ten minutes; the plan prints both budgets.
+    required_s = sum(r.est_s for r in plan.required if not r.why_not)
+    if required_s:
+        budget_s += required_s
+        fresh()
+        plan = _make_plan(content, full, late_join, budget_s, sample, provoke, no_end=no_end, d_stays=d_stays,
+                          scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands,
+                          no_gates=no_gates)
     n = sample
     while not full and plan.estimate_s > budget_s and n > 1:
         n -= 1
@@ -809,7 +825,14 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
     plan.sample = n
     plan.d_lobby, plan.new_slot = d_lobby, new_slot
     plan.scene_extra_s = extra
+    plan.required_s = required_s
     return plan
+
+
+def plan_budget(plan: Plan) -> float:
+    """The pass's whole budget: the owner's ten minutes (the sweep and the end), the scenes' seconds and the gates
+    phase's own (W13)."""
+    return BUDGET_S + plan.scene_extra_s + plan.required_s
 
 
 KIND_CAP_START = 8   # the first per-kind cap tried when one action per family is still over the budget
@@ -1206,11 +1229,63 @@ def gates_words(content: Content) -> list[str]:
 #   when the build's command table has lock_solve, lock_move and the condition lock_ready; otherwise not performed,
 #   said so.
 # D, not following H, comes to each gate (d_come_lines). The level check grades each gate's opening on S, H and D.
-REQ_KEY_S = 50.0          # pickup (a navto to its key), back to the gate, the press, the gate's move
-REQ_BATTLE_S = 80.0       # the release, the fight (GATE_FIGHT_S), the gate's move
-REQ_SPARK_S = 90.0        # the press, the board, its solve
-GATE_FIGHT_S = 60         # a gate's fight is bounded by this (encounter_clear exact, fight_near)
-GATE_OPEN_WAIT_S = 20     # wait_moved on the gate after its step
+REQ_KEY_S = 30.0          # pickup (a navto to its key), back to the gate, the press
+REQ_BATTLE_S = 20.0       # the releases and the approach; the fight's own seconds (gate_fight_seconds) are added
+REQ_SPARK_S = 70.0        # the press, the board, its solve
+GATE_FIGHT_S = 60         # a gate's fight is bounded by at least this (encounter_clear exact, fight_near)
+# A gate's fight gets its time from the level's data (W18: batch 12 case 7's r4, three waves of 14 enemies, ran out of
+# its fixed 60 s 5.7 s after the last kill, inside the 10 s quiet window fight_area's done rule needs): a base, a share
+# per enemy its openers bring (an encounter manager's _maxSpawnedLifetime, a placed enemy 1) and the quiet window.
+GATE_FIGHT_BASE_S = 30
+GATE_FIGHT_PER_ENEMY_S = 5
+GATE_FIGHT_QUIET_S = 10
+# A gate's opening is not waited for by wait_moved (W17): a Scripts.LockedObjectComponent gate opens in place (its lock
+# state, its open animation, DisableCollisionOnOpen), its origin never moves (batch 12 case 7: `wait_moved ... most 0`
+# 3 s after the demon gate opened; tutorial_b 20261119-065111's key gate the same). The level check reads the lock
+# state on each game (S's gate row written again, each client's `backend key gate <ref> ... (unlocked ...)`).
+ACTIVATION_RADIUS = re.compile(r"activationRadius (\d+)")
+# W23: after a gate's step each client WALKS through the gate (`pass_gate`, a route command: one teleport before the
+# gate, then the move input to the point as far beyond it): an opened gate drops its collision, its origin never
+# moves, so only a walk proves a player can pass it. H right after its step; D when H is at the gate, its follow off
+# meanwhile (a follow teleport would carry it through), for as long as the gate may take to open on D. Only when the
+# build's command table has pass_gate (Plan.pass_gates).
+PASS_DISTANCE = 300
+PASS_H_S = 30            # H's walk, after its own step opened the gate (the server's row may land later on H)
+PASS_D_MAX_S = 120       # D's: the gate opens on D when S's row lands; pass_gate's own cap
+PASS_TELEPORT_S = 5      # the one teleport before the gate
+
+
+def manifest_entity(manifest: dict | None, key: str) -> dict | None:
+    """The static manifest's entity `<unit>.<name>`, or None."""
+    unit, _, name = key.rpartition(".")
+    for e in (manifest or {}).get("entities", []) or []:
+        if isinstance(e, dict) and e.get("name") == name and (e.get("unit") or "") == unit:
+            return e
+    return None
+
+
+def encounter_radius(entity: dict | None) -> float | None:
+    """An encounter manager's activation radius from the data (`starts`: `activationRadius <r>`), or None."""
+    m = ACTIVATION_RADIUS.search(str(((entity or {}).get("details") or {}).get("starts", "")))
+    return float(m.group(1)) if m else None
+
+
+def opener_enemies(entity: dict | None) -> int:
+    """How many enemies an opener of a battle gate brings: an encounter manager its spawns over its life
+    (_maxSpawnedLifetime, else its payloads), anything else 1."""
+    details = (entity or {}).get("details") or {}
+    if (entity or {}).get("group") == "encounter":
+        life = str(details.get("_maxSpawnedLifetime", ""))
+        if life.isdigit():
+            return int(life)
+        return max(1, str(details.get("_spawnPayloads", "")).count("_actorDataToSpawnFrom"))
+    return 1
+
+
+def gate_fight_seconds(manifest: dict | None, openers: list[str]) -> int:
+    """A battle gate's fight budget from the level's data (W18), at least GATE_FIGHT_S."""
+    n = sum(opener_enemies(manifest_entity(manifest, k)) for k in openers)
+    return max(GATE_FIGHT_S, GATE_FIGHT_BASE_S + GATE_FIGHT_PER_ENEMY_S * n + GATE_FIGHT_QUIET_S)
 KEY_PICKUP_S = 40         # pickup: onto the key (tutorial_b's lies about 1400 from its gate) and its follow
 KEY_PRESS_S = 60          # interact: the walk back to the lock with the key and the press
 KEY_LOCK_NEAR = 1000      # the press takes a `<gate>_keylock` within this of the hero standing at the gate
@@ -1227,18 +1302,23 @@ class ReqStep:
     d: list[str]
     est_s: float
     why_not: str = ""         # "" when the pass performs it
+    yaw: float | None = None  # the gate's orientation in the level's data (pass_gate's passage axis)
 
 
 def budget_words(plan: Plan) -> str:
-    """Which of the two budgets the plan is in: the gates phase (its steps and seconds, the sweep shrunk for them)
-    or --no-gates (the full sweep, the ten-minute budget)."""
+    """The plan's budgets: the sweep and the end's (the ten minutes, the scenes' seconds added), the gates phase's
+    own (W13: never taken from the sweep) or why there is none, and the total."""
+    sweep = f"sweep and end {BUDGET_S:.0f} s" + (f" + scenes {plan.scene_extra_s:.0f} s" if plan.scene_extra_s else "")
     if plan.no_gates:
-        return f"--no-gates: gates not attempted, the full sweep in the {BUDGET_S / 60:.0f}-minute budget"
-    done = [r for r in plan.required if not r.why_not]
-    if not plan.required:
-        return "no required gate in this level: the full sweep"
-    return (f"gates phase: {len(done)} of {len(plan.required)} required gate(s) performed, "
-            f"{sum(r.est_s for r in done):.0f} s, the sweep shrunk for them (a level with gates takes what it takes)")
+        gates = "gates not attempted (--no-gates)"
+    elif not plan.required:
+        gates = "no required gate in this level"
+    else:
+        done = [r for r in plan.required if not r.why_not]
+        gates = (f"gates phase {plan.required_s:.0f} s of its own ({len(done)} of {len(plan.required)} required "
+                 f"gate(s) performed)")
+    return (f"budgets: {sweep}; {gates}; total {plan_budget(plan):.0f} s ({plan_budget(plan) / 60:.1f} min); the sweep's "
+            f"deadline {sweep_share(plan, plan_budget(plan)):.0f} s")
 
 
 def plan_required(content: Content, holds: dict, forbidden: set[str], lock_commands: bool) -> list[ReqStep]:
@@ -1256,14 +1336,16 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
         ref = o.ref if o is not None else ""
         head = f"log LEVELPASS required {label} {g.kind.replace(' ', '_')} {_safe(g.name)}"
         step = ReqStep(label, g, g.kind, ref, [], [], 0.0)
+        orient = (manifest_entity(content.manifest, f"{g.unit}.{g.name}") or {}).get("orient")
+        if isinstance(orient, list) and len(orient) == 3 and isinstance(orient[2], (int, float)):
+            step.yaw = float(orient[2])
         out.append(step)
         if not ref:
             step.why_not = "no live reference to the gate"
         elif g.kind == lh.KEY_GATE:
             step.h = [f"{head} (fetch its key {_safe(g.key_data)})", f"goto_entity {ref}",
                       f"pickup {g.name}_key {KEY_PICKUP_S}", f"goto_entity {ref}",
-                      f"interact nearest:{g.name}_keylock:{KEY_LOCK_NEAR} {KEY_PRESS_S}",
-                      f"wait_moved {ref} 50 {GATE_OPEN_WAIT_S}", f"online_audit {label}"]
+                      f"interact nearest:{g.name}_keylock:{KEY_LOCK_NEAR} {KEY_PRESS_S}", f"online_audit {label}"]
             step.est_s = REQ_KEY_S
         elif g.kind == lh.SPARK_LOCK:
             if not lock_commands:
@@ -1271,14 +1353,14 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                                 "is not in it)")
             else:
                 step.h = [f"{head} (solve its lock puzzle)", f"goto_entity {ref}", f"interact {ref} 20",
-                          "waitfor lock_ready 30", "lock_solve 120", f"wait_moved {ref} 50 {GATE_OPEN_WAIT_S}",
-                          f"online_audit {label}"]
+                          "waitfor lock_ready 30", "lock_solve 120", f"online_audit {label}"]
                 step.d = [f"interact {ref} 20", "waitfor lock_ready 30", "lock_solve 120"]
                 step.est_s = REQ_SPARK_S
         elif g.kind == lh.BATTLE_GATE:
             releases: list[str] = []
             blocked: list[str] = []
             fight = ""
+            fight_s = gate_fight_seconds(content.manifest, g.openers)
             for k in g.openers:
                 h = holds.get(k)
                 if h is not None and not h.ambient:
@@ -1302,8 +1384,18 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                                 break
                 ob = by_key.get(k)
                 if not fight and ob is not None and ob.ref:
-                    fight = (f"encounter_clear {ob.ref} 1500 {GATE_FIGHT_S} exact" if n is not None and
-                             n.group == "encounter" else f"fight_near {ob.ref} 1500 {GATE_FIGHT_S}")
+                    is_encounter = n is not None and n.group == "encounter"
+                    fight = (f"encounter_clear {ob.ref} 1500 {fight_s} exact" if is_encounter
+                             else f"fight_near {ob.ref} 1500 {fight_s}")
+                    # W16: an encounter nothing toggles starts when a player comes within its activation radius of
+                    # the manager (the data's `activationRadius`): the step goes to the manager first, so
+                    # encounter_clear waits there for it to run and fights its spawnees. Batch 12 case 7's r2
+                    # (EncounterManager001_002, radius 2000) fought a placed enemy 2990 away instead and the encounter
+                    # never started (`spawned 0/6` for 61 s).
+                    radius = encounter_radius(manifest_entity(content.manifest, k)) if is_encounter else None
+                    toggled = any(tg.receiver == k and tg.message == TOGGLE for tg in tels)
+                    if radius is not None and not toggled:
+                        releases.append(f"goto_entity {ob.ref}")
             if not fight:
                 step.why_not = "no live reference to any of its fight's enemies or encounters"
             elif blocked and len(blocked) == len([k for k in g.openers if k in holds]) and \
@@ -1311,15 +1403,32 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                 step.why_not = "its enemies are held: " + "; ".join(blocked[:2])
             else:
                 names = ", ".join(_safe(k.split(".")[-1]) for k in g.openers[:4])
-                step.h = [f"{head} (win its fight: {names})", *releases, fight, f"wait_moved {ref} 50 {GATE_OPEN_WAIT_S}",
-                          f"online_audit {label}"]
-                step.est_s = REQ_BATTLE_S
+                step.h = [f"{head} (win its fight: {names})", *releases, fight, f"online_audit {label}"]
+                step.est_s = REQ_BATTLE_S + fight_s
         else:
             step.why_not = f"no rule for a {g.kind} yet ({g.opener})"
     return out
 
 
 GATES_SKIPPED = "LEVELPASS gates not attempted (--no-gates)"
+
+
+def pass_line(r: ReqStep, seconds: float) -> str:
+    """`pass_gate` for a required gate (W23), with the data's yaw when it has one."""
+    return f"pass_gate {r.gate_ref} {PASS_DISTANCE} {int(seconds)}" + (f" yaw {r.yaw:.4f}" if r.yaw is not None else "")
+
+
+def d_pass_lines(plan: Plan, r: ReqStep) -> list[str]:
+    """D's walk through a required gate (W23): when H is there, its follow off meanwhile, as long as the gate may
+    take to open on D (H's step's own seconds and its walk, PASS_D_MAX_S at most)."""
+    follow = plan.d_follow
+    return [f"log LEVELPASS D passes required {r.label} {_safe(r.gate.name)}",
+            # H comes to the gates after the sweep: the wait covers the sweep's deadline too.
+            f"online_wait_peer_near_entity {r.gate_ref} {D_NEAR} "
+            f"{int(D_COME_WAIT_S + sweep_share(plan, plan_budget(plan)))}",
+            *(["online_auto_follow off"] if follow else []),
+            pass_line(r, min(PASS_D_MAX_S, r.est_s + PASS_H_S)),
+            *(["online_auto_follow on"] if follow else [])]
 
 
 def required_lines(plan: Plan) -> list[str]:
@@ -1335,7 +1444,8 @@ def required_lines(plan: Plan) -> list[str]:
             out.append(f"log LEVELPASS required {r.label} {r.kind.replace(' ', '_')} {_safe(r.gate.name)} not performed: "
                        f"{_safe(r.why_not)}")
         else:
-            out += r.h
+            # W23: H walks through the gate after its step, before the step's audit.
+            out += r.h[:-1] + ([pass_line(r, PASS_H_S)] if plan.pass_gates else []) + r.h[-1:]
     return out
 
 
@@ -1577,7 +1687,7 @@ def stop_seconds(plan: Plan, s: Stop) -> float:
 def sweep_rearm(plan: Plan) -> list[float]:
     """For each sweep stop (in the script's order, the exit's stop counted as 0), the deadline set before it:
     the sweep's share times the planned share of it and the stops after it (at least SWEEP_MIN_S / 4)."""
-    share = sweep_share(plan, BUDGET_S + plan.scene_extra_s)
+    share = sweep_share(plan, plan_budget(plan))
     secs = [0.0 if s is plan.exit_stop else stop_seconds(plan, s) for s in plan.stops]
     total = sum(secs) or 1.0
     out, left = [], total
@@ -1632,6 +1742,39 @@ def _safe(name: str) -> str:
 
 FIGURE_H = "Roller Brawl.dump"
 FIGURE_D = "Scorp.dump"
+
+
+# W21: a named figure for one player (--h-figure / --d-figure), from the copied figure folder: `<name>.dump`, or a
+# SWAPPER, two figures on the portal at once (`<name> Top.dump` in slot 0 and `<name> Bottom.dump` in slot 1, as
+# swap-zone-tb places Spy Rise), so a level check can run with a swapper's halves on one player (the code that sets a
+# swapper's halves has never run in a real-body pass: Roller Brawl and Scorp are no swappers).
+def figure_files(folder: Path, name: str) -> list[str]:
+    """The figure files a player gets for `name`: [`<name>.dump`], or a swapper's [`<name> Top.dump`, `<name>
+    Bottom.dump`]; ValueError naming the folder's swappers when neither is there."""
+    plain = name if name.lower().endswith(".dump") else f"{name}.dump"
+    if (folder / plain).is_file():
+        return [plain]
+    base = name[:-5] if name.lower().endswith(".dump") else name
+    halves = [f"{base} Top.dump", f"{base} Bottom.dump"]
+    if all((folder / h).is_file() for h in halves):
+        return halves
+    swappers = sorted({f.name[:-len(" Top.dump")] for f in folder.glob("* Top.dump")
+                       if (folder / f.name.replace(" Top.dump", " Bottom.dump")).is_file()})
+    raise ValueError(f"no figure {plain!r} and no swapper {base!r} (both halves) in {folder}; its swappers: "
+                     f"{', '.join(swappers) or 'none'}")
+
+
+def figure_words(files: list[str]) -> str:
+    """A player's figures in words: the name, or `<swapper> (a swapper: <top> + <bottom>)`."""
+    names = [f[:-5] if f.lower().endswith(".dump") else f for f in files]
+    if len(names) == 2 and names[0].endswith(" Top") and names[1].endswith(" Bottom"):
+        return f"{names[0][:-4]} (a swapper: {names[0]} + {names[1]})"
+    return " + ".join(names)
+
+
+def place_lines(files: list[str]) -> list[str]:
+    """`place <slot> {figures}/<file>` for each of a player's figures (a swapper's top in 0, its bottom in 1)."""
+    return [f"place {slot} {{figures}}/{f}" for slot, f in enumerate(files)]
 GENERATED_NAME = re.compile(r"_componentDataOverrides_|_entityData$|^CEntityData|^CScriptTriggerEntityData|^CGameEntityData")
 JOIN_DISTANCE = 5.0     # a content object and a probe object this close (same name) are one object
 
@@ -1646,7 +1789,7 @@ LOBBY_H_ARGS_DROP = ("--dev_hello_ungated_loopback=true",)
 LOBBY_H_ARGS_ADD = ("--dev_hello_gate_loopback=true",)
 
 
-def party_boot_h(lobby: bool, new_slot: bool) -> list[str]:
+def party_boot_h(lobby: bool, new_slot: bool, figures: list[str] | None = None) -> list[str]:
     lines = ["waitfor online_title 300", "waitfor title_ready 240", "online_host -1", "waitfor online_connected 150"]
     if lobby:
         lines += ["waitfor online_join_pending 300", "online_let_in", "online_wait_peers 2 120",
@@ -1654,25 +1797,43 @@ def party_boot_h(lobby: bool, new_slot: bool) -> list[str]:
     lines += ["waitfor menu_ready 60", "tap start", "waitfor menu_ready 60", "tap a", "waitfor menu_ready 60"]
     lines += (["tap down", "waitfor menu_ready 60", "tap a", "waitfor menu_ready 60", "tap a"] if new_slot
               else ["tap a"])
-    lines += ["waitfor front_end_left 120", f"place 0 {{figures}}/{FIGURE_H}", "waitfor online_in_play 300",
+    lines += ["waitfor front_end_left 120", *place_lines(figures or [FIGURE_H]), "waitfor online_in_play 300",
               "waitfor online_barrier 300", "wait_free 120"]
     return lines
 
 
-def party_boot_d() -> list[str]:
-    """D in the lobby: its figure, the join by code, then it follows the host's pick into play."""
-    return ["waitfor online_title 300", "waitfor title_ready 240", f"place 0 {{figures}}/{FIGURE_D}",
-            "online_join {joincode}", "waitfor online_in_play 300", "waitfor online_barrier 300", "wait_free 120"]
+def party_boot_d(figures: list[str] | None = None) -> list[str]:
+    """D in the lobby: its figure, the join by code, then it follows the host's pick into play. D marks its first
+    level as soon as it is in play there, before that level's start is released (D_MARK_BEFORE_BARRIER)."""
+    return ["waitfor online_title 300", "waitfor title_ready 240", *place_lines(figures or [FIGURE_D]),
+            "online_join {joincode}", "waitfor online_in_play 300", "online_mark_level", "waitfor online_barrier 300",
+            "wait_free 120"]
 
 
-def boot_lines(host: bool, figure: str) -> list[str]:
+# D's mark of its first level (the pick's) and H's `level` command raced: the barrier of the first level releases
+# both clients on the same tick, H then runs `wait_free`, `online_mark_level`, `level <x>` (0.28 s) and D `wait_free`,
+# `online_mark_level` (0.31 s). `online_mark_level` keeps the latest generation ANNOUNCED here, so D's mark 0.02 s
+# after the level under test began loading kept that level, and its wait for "the level after the mark" was met
+# only by the level after it (batch 12 run 2, tutorial_b 20261119-120551: D `level 2 ...: load` 12:07:45.454,
+# `online_mark_level: generation 2` 12:07:45.472, `waitfor online_level_after_mark met after 135.4 s` in the hub).
+# D now marks right after `waitfor online_in_play` in its first level, before that level's barrier: H sends `level`
+# only after the barrier, and the barrier waits for D's own load report. In the batch 12 run D was in play 1.0 s
+# before its load report (12:07:44.101 / 12:07:45.106); that order is the run's, not proven by the code (the load
+# report can also come from the service frame while the barrier hold freezes the world). A mark that still lands
+# inside a load is named by late_marks (the pass and the page). H marks before its own `level` command: no race.
+# online/8-test-conditions (41d0a165) makes the mark itself keep the level the game is in (the last released one
+# while a later one loads); the order above stays as a second guard, and late_marks then finds nothing to name.
+D_MARK_BEFORE_BARRIER = True
+
+
+def boot_lines(host: bool, figure: str | list[str]) -> list[str]:
     """The shortest boot the specs use: title, Host (H), the two menu presses, the figure, the hub; no
     fixed wait anywhere (each step a condition)."""
     lines = ["waitfor online_title 300", "waitfor title_ready 240"]
     if host:
         lines += ["online_host 0", "waitfor online_connected 60"]
     lines += ["tap start", "waitfor menu_ready 60", "tap a", "waitfor menu_ready 60", "tap a",
-              "waitfor front_end_left 120", f"place 0 {{figures}}/{figure}"]
+              "waitfor front_end_left 120", *place_lines([figure] if isinstance(figure, str) else figure)]
     return lines
 
 
@@ -1844,13 +2005,13 @@ MADE_COPY_LEFT = r"Online: runtime spawn (?:made copy|twin) .* still in the enti
 def script_h(plan: Plan, late_join_after: str | None) -> str:
     """H's script: boot, Host, the level, the sweep, the late join's wait, the exit."""
     # The one boot (party_boot_h): the lobby (with D) or the host alone (D joins late, or no D).
-    lines = party_boot_h(plan.late_join and plan.d_lobby and late_join_after is None, plan.new_slot)
+    lines = party_boot_h(plan.late_join and plan.d_lobby and late_join_after is None, plan.new_slot, plan.figures_h)
     lines += ["online_mark_level", f"level {plan.level}",
               "waitfor online_level_after_mark 300", "waitfor online_barrier 300", "wait_free 120",
               "online_mark_level",  # the level under test: its next level is `online_level_after_mark` (NEXT_LEVEL)
               "log LEVELPASS phase sweep", *([scenes_expected_line(plan)] if plan.scenes else []),
               "online_audit start", f"hold_cap {scene_hold_cap(plan)}",
-              f"sweep_deadline {sweep_share(plan, BUDGET_S + plan.scene_extra_s):.0f}"]
+              f"sweep_deadline {sweep_share(plan, plan_budget(plan)):.0f}"]
     rearm = sweep_rearm(plan) if plan.scenes else []
     lines += pieces_lines(plan)  # first in the sweep: the deadline never skips them
     n_stops = len(plan.stops)
@@ -2292,7 +2453,8 @@ def d_come_lines(plan: Plan) -> list[str]:
             continue
         out += [f"log LEVELPASS D comes to required {r.label} {_safe(r.gate.name)}",
                 f"online_wait_peer_near_entity {r.gate_ref} {D_NEAR} {D_COME_WAIT_S}",
-                f"goto_entity {r.gate_ref} {EXIT_FIGHT_STANDOFF}", *r.d]
+                f"goto_entity {r.gate_ref} {EXIT_FIGHT_STANDOFF}", *r.d,
+                *(d_pass_lines(plan, r)[2:] if plan.pass_gates else [])]
     end = plan.end
     if end is not None and end.kind == le.FIGHT and not plan.end_missing and not plan.no_end:
         anchor = _ref(plan.end_objs, end.anchor)
@@ -2315,7 +2477,7 @@ def script_d(plan: Plan) -> str:
         # level), then the level under test when H's `level` command loads it. No visits of its own: no
         # condition tells D that H's sweep is over, and the graders read D's lines for every key wherever it
         # stands; D is in the session from the lobby to the next level, as a second player is.
-        lines = party_boot_d() + ["online_mark_level", "log LEVELPASS D in the first level",
+        lines = party_boot_d(plan.figures_d) + ["log LEVELPASS D in the first level",
                                   f"waitfor {NEXT_LEVEL} 600", "waitfor online_barrier 300", "wait_free 120",
                                   "online_mark_level", f"hold_cap {scene_hold_cap(plan)}", "log LEVELPASS D in",
                                   "online_audit d-in"]
@@ -2325,12 +2487,16 @@ def script_d(plan: Plan) -> str:
             lines += ["online_auto_follow on", "log LEVELPASS D follows H"]
         if d_brought(plan):
             lines += d_come_lines(plan)
+        elif plan.pass_gates and d_through_end(plan):
+            for r in plan.required:  # W23: D, following H, walks through each gate H opened
+                if not r.why_not:
+                    lines += d_pass_lines(plan, r)
         if d_through_end(plan):
             lines += ["log LEVELPASS D stays for the level end", f"waitfor {NEXT_LEVEL} {D_LEVEL_END_WAIT_S}",
                       "wait_free 120", "log LEVELPASS D next level", "online_audit d-next"]
         lines += ["log LEVELPASS D done", "online_end", "quit"]
         return "\n".join(lines) + "\n"
-    lines = boot_lines(False, FIGURE_D)
+    lines = boot_lines(False, plan.figures_d or [FIGURE_D])
     lines += ["waitfor online_in_play 300", "online_join {join}", "waitfor online_barrier 300", "wait_free 120",
               "online_mark_level", f"hold_cap {HOLD_CAP_S}",
               "log LEVELPASS D in", "online_audit d-in"]
@@ -2803,9 +2969,10 @@ def report_text(level: str, plan: Plan, wall_s: float, phases: list[tuple[str, f
                 crash: str, sums: dict[str, list[str]], run_folder: str, notes: list[str],
                 boot: list[tuple[str, float]] | None = None) -> str:
     lines = [f"Level pass: {level}", f"run folder: {run_folder}", f"content: {plan.source}",
-             f"wall clock: {wall_s:.0f} s ({'under' if wall_s <= BUDGET_S + plan.scene_extra_s else 'OVER'} the "
-             f"{BUDGET_S + plan.scene_extra_s:.0f} s budget"
-             + (f", {plan.scene_extra_s:.0f} s of it the scenes'" if plan.scene_extra_s else "") + "); "
+             f"wall clock: {wall_s:.0f} s ({'under' if wall_s <= plan_budget(plan) else 'OVER'} the "
+             f"{plan_budget(plan):.0f} s budget"
+             + (f", {plan.scene_extra_s:.0f} s of it the scenes'" if plan.scene_extra_s else "")
+             + (f", {plan.required_s:.0f} s of it the gates phase's" if plan.required_s else "") + "); "
              f"estimate was {plan.estimate_s:.0f} s",
              f"pass: {'full' if plan.full else 'sampled (each action family at most ' + str(plan.sample) + ' times)'}, "
              f"{len(plan.stops)} stops, {sum(len(s.actions) for s in plan.stops)} actions, "
@@ -2962,6 +3129,55 @@ def next_level_seen(text: str, level: str) -> bool:
     return bool(later) and later[0] in released
 
 
+MARK_LINE = re.compile(r"Online: online_mark_level: generation (\d+)")
+LOG_STAMP = re.compile(r"^\[\d{4}-\d\d-\d\d (\d\d:\d\d:\d\d\.\d+)\]")
+
+
+@dataclass
+class LateMark:
+    generation: int
+    path: str
+    load_no: int      # 1-based line of `level <g> <path>: load`
+    load_at: str
+    mark_no: int      # 1-based line of `online_mark_level: generation <g>`
+    mark_at: str
+
+    def words(self, who: str = "") -> str:
+        return (f"{who + chr(39) + 's ' if who else ''}mark landed inside a load: `online_mark_level: generation "
+                f"{self.generation}` at {self.mark_at} (line {self.mark_no}), after `level {self.generation} "
+                f"{self.path}: load` at {self.load_at} (line {self.load_no}) and before its start was released: the "
+                "mark keeps the level being loaded, so the script's wait for the next level waited for the level after "
+                "it (the mark race: the test tool's fault, not the game's)")
+
+
+def late_marks(text: str) -> list[LateMark]:
+    """Each `online_mark_level` that kept a level announced after the one this game was in: its `level <g> <path>:
+    load` already logged, its `barrier <g> released` not yet, and an earlier level's start released here (the race:
+    batch 12 run 2 marked generation 2 after barrier 1). A mark of the session's first level while it loads (no
+    start released yet) is D's own order (D_MARK_BEFORE_BARRIER) and the level it is in: never named (W20, batch 13
+    case 7, tutorial_b 20261119-141657: D's `online_mark_level: generation 1` 1.0 s before barrier 1 was flagged)."""
+    loading: dict[int, tuple[str, int, str]] = {}
+    released = 0
+    out = []
+    for no, line in enumerate(text.splitlines(), 1):
+        stamp = LOG_STAMP.match(line)
+        at = stamp.group(1) if stamp else "?"
+        m = LEVEL_LOAD_LINE.search(line)
+        if m:
+            loading[int(m.group(1))] = (m.group(2), no, at)
+            continue
+        m = CLIENT_BARRIER.search(line)
+        if m:
+            loading.pop(int(m.group(1)), None)
+            released = max(released, int(m.group(1)))
+            continue
+        m = MARK_LINE.search(line)
+        if m and int(m.group(1)) in loading and 0 < released < int(m.group(1)):
+            path, load_no, load_at = loading[int(m.group(1))]
+            out.append(LateMark(int(m.group(1)), path, load_no, load_at, no, at))
+    return out
+
+
 def client_progress(text: str, peer: str, level: str = "") -> str:
     """How far one client got, in words, from its log: its marks, and for the next level the game's own
     evidence (next_level_seen) when the level is known."""
@@ -2972,6 +3188,9 @@ def client_progress(text: str, peer: str, level: str = "") -> str:
     marked = (H_NEXT if peer == "H" else D_NEXT) in text
     if marked and (not level or next_level_seen(text, level)):
         return "reached the next level"
+    late = late_marks(text)
+    if late:
+        return "its " + late[0].words()
     loads = [m.group(2) for m in LEVEL_LOAD_LINE.finditer(text)]
     if peer == "H" and len(loads) >= 3 or peer == "D" and loads:
         return f"saw the level change ({loads[-1]}), not the next level's mark"
@@ -3101,7 +3320,7 @@ def spec_toml(plan: Plan) -> str:
            'server = "host"',
            f'description = "The automatic level pass of {plan.level}{" without its end (--no-end)" if plan.no_end else ""}'
            ' (skytest levelpass; generated, not committed)"',
-           f"timeout = {int(CASE_TIMEOUT_S + plan.scene_extra_s)}",
+           f"timeout = {int(CASE_TIMEOUT_S + plan.scene_extra_s + plan.required_s)}",
            *(['scenes = "play"', 'scenes_reason = "the level check grades the cutscenes, played in full on both clients"']
              if plan.scenes else ['scenes = "skip"']),
            f"show_server_window = {'false' if plan.server_hidden else 'true'}",
