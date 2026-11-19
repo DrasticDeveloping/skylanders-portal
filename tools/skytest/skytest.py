@@ -134,6 +134,7 @@ import memory_growth  # noqa: E402  (stage 5's soak grade)
 import occurrence_outcomes  # noqa: E402  (stage 5's occurrence grade)
 import known_failures  # noqa: E402  (a pointless rerun refused: the last two results failed alike)
 import build_guard  # noqa: E402  (no session while a build holds its slot)
+import preflight_gate  # noqa: E402  (a case whose preflight has an error starts no game)
 import script_checks  # noqa: E402  (a script that waits on a session it never starts; a wait whose peer is gone)
 
 STORE = ".replication-tests"
@@ -2818,6 +2819,8 @@ class CaseResult:
     # build_guard.py: `started beside a build (...): --ignore-build: <why>` when it started while a build
     # held its slot; '' otherwise.
     ignored_build: str = ""
+    # preflight_gate.py: {errors, warnings, ignored} of the case's preflight before it started; {} for none.
+    preflight: dict = field(default_factory=dict)
 
 
 def crash_exit_code(code: int | None) -> bool:
@@ -6245,7 +6248,7 @@ def build_results(cfg: Config, build: str, current: Path | None = None) -> dict[
 
 # A result that never started the game (no machine room, the circuit breaker, not ready) does not decide a
 # per-build case: the result before it stands.
-PER_BUILD_NOT_RUN = ("capacity", "breaker", "not ready", "known failure", "build running")
+PER_BUILD_NOT_RUN = ("capacity", "breaker", "not ready", "known failure", "build running", "preflight")
 
 
 def per_build_state(cfg: Config, spec: Spec, entries: list[tuple[str, str, dict]], build: str) -> dict:
@@ -7558,6 +7561,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     if getattr(a, "ignore_build", None) is not None and not ignore_build:
         raise SystemExit("--ignore-build needs the reason: why this case may run beside a build")
     build_wait_s = 60.0 * float(getattr(a, "build_wait_min", None) or build_guard.BUILD_WAIT_MIN)
+    ignore_preflight = (getattr(a, "ignore_preflight", None) or "").strip()
+    if getattr(a, "ignore_preflight", None) is not None and not ignore_preflight:
+        raise SystemExit("--ignore-preflight needs the reason: why this case may start with a preflight error")
+    preflight_cache: dict = {}
     if getattr(a, "rerun_known_failure", None) is not None and not rerun_why:
         raise SystemExit("--rerun-known-failure needs the reason: why this rerun can end otherwise")
     bulk_on = bool(getattr(a, "bulk", False))
@@ -7785,9 +7792,25 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             if refusal is not None and rerun_why:
                 print(f"{spec.name}: a known failure, run again (--rerun-known-failure: {rerun_why}): "
                       f"{refusal.reason}", flush=True)
+            gate = None
+            if not unit and (refusal is None or rerun_why):
+                # preflight_gate.py: an error of the case's preflight starts no game (--ignore-preflight says why).
+                try:
+                    problems = preflight_check(cfg, spec, preflight_cache)
+                except Exception as e:  # noqa: BLE001 (the preflight's own fault never stops a run unsaid)
+                    problems = []
+                    print(f"{spec.name}: preflight could not run ({type(e).__name__}: {e}); the case starts", flush=True)
+                gate = preflight_gate.decide([(p.severity, p.line()) for p in problems], ignore_preflight)
+                for line in gate.printed:
+                    print(line, flush=True)
             if refusal is not None and not rerun_why:
                 print(refusal.line(spec.name), flush=True)
                 r = known_failure_result(spec, refusal)
+            elif gate is not None and not gate.start:
+                r = CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage, status=preflight_gate.PREFLIGHT,
+                               reasons=[gate.reason] + gate.errors, exclusive=runs_alone(spec),
+                               started=time.strftime("%Y%m%d-%H%M%S"))
+                r.preflight = gate.record()
             elif (t := tripped(spec)) is not None:
                 r = breaker_result(spec, t)
             elif budget is not None and not unit and len(spec.peers) <= max_games:
@@ -7837,6 +7860,8 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 r.machine["not_alone"] = note
                 print(f"{spec.name}: NOT ALONE: {note}", flush=True)
             r.provenance = prov
+            if gate is not None and not r.preflight:
+                r.preflight = gate.record()
             stamps = sorted({p.build for p in r.peers if p.build})
             if stamps:
                 r.provenance = {**prov, "build_stamp": " ".join(stamps)}  # the game's own (its log's first line)
@@ -7978,6 +8003,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     if building:
         print(f"{len(building)} case(s) not started: a build held its slot past the wait (not met): "
               f"{', '.join(r.case for r in building)}")
+    refused = [r for r in results if r.status == preflight_gate.PREFLIGHT]
+    if refused:
+        print(f"{len(refused)} case(s) not started: an error in their preflight (not met): "
+              f"{', '.join(r.case for r in refused)}")
     known = [r for r in results if r.status == known_failures.KNOWN_FAILURE]
     if known:
         print(f"{len(known)} case(s) not started as a known failure (their last two results on this build failed"
@@ -7989,11 +8018,14 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         return EXIT_KNOWN_FAILURE  # its own exit code: nothing ran that failed anew
     if building and len(building) == len(failed) and not touched and not queue_unmatched:
         return EXIT_BUILD_RUNNING
+    if refused and len(refused) == len(failed) and not touched and not queue_unmatched:
+        return EXIT_PREFLIGHT
     return 1 if failed or touched or queue_unmatched else 0
 
 
 EXIT_KNOWN_FAILURE = 3   # `test`: every case that did not pass was refused as a known failure (no game started)
 EXIT_BUILD_RUNNING = 4   # `test`: every case that did not pass waited for a build past the limit (no game started)
+EXIT_PREFLIGHT = 6       # `test`: every case that did not pass had an error in its preflight (no game started)
 
 
 def build_holders() -> list[dict]:
@@ -8051,6 +8083,57 @@ def cmd_list(cfg: Config, a: argparse.Namespace) -> int:
     return 0
 
 
+def preflight_context(cfg: Config, folder: str | None = None, extra_runs: list[str] | None = None,
+                      wording: bool = False):
+    """The preflight's context (preflight.py): the stored level data, the source's log texts, the allow
+    list, the conditions and the recorded runs; (ctx, runs, corpus, levels, wakes)."""
+    import preflight as pf
+    try:
+        lp_folder = levelpass_folder(cfg, folder)
+    except SystemExit:
+        lp_folder = None
+    levels: dict = {}
+    for lvl_dir in sorted(lp_folder.glob("*-manifest.txt")) if lp_folder is not None and lp_folder.is_dir() else []:
+        name = lvl_dir.name[: -len("-manifest.txt")]
+        lv = pf.load_level(lp_folder, name)
+        if lv is not None:
+            levels[name] = lv
+    roots = [cfg.repo / "src" / "online", cfg.repo / "thirdparty" / "skylanders-portal" / "src",
+             cfg.repo / "thirdparty" / "rexglue-sdk" / "src"]
+    corpus = pf.build_corpus(roots)
+    allow = set(la.AllowList.load(cfg.launch_allow).rules) if cfg.launch_allow.is_file() else None
+    conditions = None
+    if cfg.script_commands.is_file():
+        conditions = set(tomllib.loads(cfg.script_commands.read_text(encoding="utf-8")).get("conditions", []))
+    runs = [cfg.store / "runs"] + [expand(r) for r in (extra_runs or [])]
+    wakes = pf.build_wake_index(runs, cfg.store / "preflight-wakes.json")
+    ctx = pf.Context(levels, corpus, wakes, allow, conditions, runs, wording=wording)
+    return ctx, runs, corpus, levels, wakes
+
+
+def preflight_case(ctx, runs: list[Path], name: str, d: dict, current: bool = True) -> list:
+    """One case's preflight problems (preflight.Problem): its checks, and a replay on its newest recorded
+    run when the text is the current one."""
+    import preflight as pf
+    probs = pf.check_spec(name, d, ctx)
+    run = pf.latest_run(runs, name) if current else None  # an older text: no replay on newer runs
+    if run is not None:
+        probs += pf.replay(name, d, run)
+    return probs
+
+
+def preflight_check(cfg: Config, spec: Spec, cache: dict) -> list:
+    """The runner's gate (preflight_gate.py): the case's preflight problems, the context built once per
+    run (`cache`). The tests of the runner replace this (their throwaway game has no source or level data)."""
+    if "ctx" not in cache:
+        cache["ctx"], cache["runs"], *_ = preflight_context(cfg)
+    try:
+        d = tomllib.loads(spec.path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []  # load_spec read it: a file changed since is said by run_one
+    return preflight_case(cache["ctx"], cache["runs"], spec.name, d, True)
+
+
 def cmd_preflight(cfg: Config, a: argparse.Namespace) -> int:
     """Each problem one line (preflight.py); exit 1 on an error (on a warning too with --strict)."""
     import preflight as pf
@@ -8080,32 +8163,13 @@ def cmd_preflight(cfg: Config, a: argparse.Namespace) -> int:
             print(f"{fp.name}: error spec -: {e}")
     if not chosen:
         raise SystemExit("preflight: no case chosen (name cases or give --all-ready)")
-    folder = levelpass_folder(cfg, a.folder)
-    levels: dict = {}
-    for lvl_dir in sorted(folder.glob("*-manifest.txt")):
-        name = lvl_dir.name[: -len("-manifest.txt")]
-        lv = pf.load_level(folder, name)
-        if lv is not None:
-            levels[name] = lv
-    roots = [cfg.repo / "src" / "online", cfg.repo / "thirdparty" / "skylanders-portal" / "src",
-             cfg.repo / "thirdparty" / "rexglue-sdk" / "src"]
-    corpus = pf.build_corpus(roots)
-    allow = set(la.AllowList.load(cfg.launch_allow).rules) if cfg.launch_allow.is_file() else None
-    conditions = None
-    if cfg.script_commands.is_file():
-        conditions = set(tomllib.loads(cfg.script_commands.read_text(encoding="utf-8")).get("conditions", []))
-    runs = [cfg.store / "runs"] + [expand(r) for r in (a.runs or [])]
-    wakes = pf.build_wake_index(runs, cfg.store / "preflight-wakes.json")
-    ctx = pf.Context(levels, corpus, wakes, allow, conditions, runs, wording=a.wording)
+    ctx, runs, corpus, levels, wakes = preflight_context(cfg, a.folder, a.runs, a.wording)
     errors = warns = 0
     for line in pf.check_table(corpus):
         print(line)
         warns += 1
     for name, d, current in chosen:
-        probs = pf.check_spec(name, d, ctx)
-        run = pf.latest_run(runs, name) if current else None  # an older text: no replay on newer runs
-        if run is not None:
-            probs += pf.replay(name, d, run)
+        probs = preflight_case(ctx, runs, name, d, current)
         for pr in probs:
             print(pr.line())
             if pr.severity == "error":
@@ -9190,10 +9254,12 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                             allow_restricted=False, jobs=1, run_not_ready=False, no_breaker=False, queue=None,
                             remote=None, remote_manifest=None, remote_token_file=None,
                             rerun_known_failure=a.rerun_known_failure, ignore_build=a.ignore_build,
-                            build_wait_min=a.build_wait_min)
+                            build_wait_min=a.build_wait_min, ignore_preflight=a.ignore_preflight)
     code = cmd_test(replace(cfg, cases_dir=cases), ns)
-    if code in (EXIT_KNOWN_FAILURE, EXIT_BUILD_RUNNING):
-        print(f"levelpass {a.level}: not started ({'a known failure' if code == EXIT_KNOWN_FAILURE else 'a build held its slot'}, above); no report", flush=True)
+    if code in (EXIT_KNOWN_FAILURE, EXIT_BUILD_RUNNING, EXIT_PREFLIGHT):
+        why = {EXIT_KNOWN_FAILURE: "a known failure", EXIT_BUILD_RUNNING: "a build held its slot",
+               EXIT_PREFLIGHT: "an error in its preflight"}[code]
+        print(f"levelpass {a.level}: not started ({why}, above); no report", flush=True)
         return code
     wall = time.monotonic() - t0
     runs = sorted(p for p in (cfg.store / "runs").glob(f"*-{case}")
@@ -9339,6 +9405,8 @@ def main(argv: list[str] | None = None) -> int:
                    f" {build_guard.BUILD_WAIT_MIN:.0f})")
     t.add_argument("--ignore-build", default=None, metavar="WHY", help="start cases even while a build holds its"
                    " slot; WHY (required) is written into the result")
+    t.add_argument("--ignore-preflight", default=None, metavar="WHY", help="start a case although its preflight"
+                   " (preflight.py) found an error; WHY (required) is written into the result")
     t.set_defaults(fn=cmd_test)
     ls = sub.add_parser("list")
     ls.add_argument("--gate", action="store_true", help="the gate cases and their expected minutes (from each"
@@ -9400,6 +9468,8 @@ def main(argv: list[str] | None = None) -> int:
     lp_.add_argument("--build-wait-min", type=float, default=None, metavar="MIN", help="as `test`'s")
     lp_.add_argument("--ignore-build", default=None, metavar="WHY", help="as `test`'s: start beside a build, WHY"
                      " written into the result")
+    lp_.add_argument("--ignore-preflight", default=None, metavar="WHY", help="as `test`'s: start the generated case"
+                     " although its preflight found an error, WHY written into the result")
     lp_.add_argument("--rerun-known-failure", default=None, metavar="WHY", help="as `test`'s: run the pass although"
                      " its last two results on this build with the same generated case failed with the same first"
                      " reason; WHY is written into the result")

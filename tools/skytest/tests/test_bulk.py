@@ -32,6 +32,8 @@ def setUpModule() -> None:
     # build_guard.py: a build of this PC holding its slot must not make these cases wait (the guard's own
     # tests set it); a runner these tests start as a process reads an empty slot folder.
     skytest.build_holders = lambda: []
+    # preflight_gate.py: the throwaway game has no source or level data to check a spec against.
+    skytest.preflight_check = lambda cfg, spec, cache: []
     os.environ["SFO_BUILD_SLOT_DIR"] = tempfile.mkdtemp(prefix="skytest-no-builds-")
 
 
