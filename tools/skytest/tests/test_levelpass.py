@@ -1207,6 +1207,51 @@ class FoundScreenDismissal(unittest.TestCase):
         self.assertEqual(FoundScreen(new).play(W3_DISMISS), "found")        # what the new run did
         self.assertEqual(FoundScreen(new).play(self.gem_step()), "closed")  # what W7 does from there
 
+
+MARK_RACE_RUN = Path("D:/SwapForceOnline-data/tests/int2/runs/20261119-120551-levelpass-tutorial_b")
+
+
+class MarkRace(unittest.TestCase):
+    """W11 (batch 12 run 2): D's mark of its first level landed 0.02 s after the level under test began loading, so
+    its wait for the next level was met only in the hub. D now marks before its first level's barrier."""
+
+    def test_d_marks_in_play_before_the_barrier_and_h_marks_before_its_level_command(self) -> None:
+        p = lp.make_plan(content(), d_lobby=True)
+        d = lp.script_d(p).splitlines()
+        k = d.index("waitfor online_in_play 300")
+        self.assertEqual(d[k + 1:k + 3], ["online_mark_level", "waitfor online_barrier 300"])
+        first_in = d.index("log LEVELPASS D in the first level")
+        self.assertNotIn("online_mark_level", d[k + 2:first_in])   # no second mark after the barrier (the race)
+        self.assertEqual(d[first_in + 1], f"waitfor {lp.NEXT_LEVEL} 600")
+        h = lp.script_h(p, None).splitlines()
+        self.assertEqual(h[h.index(f"level {p.level}") - 1], "online_mark_level")
+
+    def test_a_mark_inside_a_load_is_named(self) -> None:
+        log = "\n".join([
+            "[2026-11-19 12:07:45.115] [info] [core] [t1] Online: barrier 1 released at tick 6079",
+            "[2026-11-19 12:07:45.454] [info] [core] [t1] Online: level 2 tutorial/tutorial_b/tutorial_b: load",
+            "[2026-11-19 12:07:45.472] [info] [core] [t2] Online: online_mark_level: generation 2",
+            "[2026-11-19 12:07:58.244] [info] [core] [t1] Online: barrier 2 released at tick 6867",
+            "[2026-11-19 12:07:58.256] [info] [core] [t2] Online: online_mark_level: generation 2"])
+        late = lp.late_marks(log)
+        self.assertEqual([(m.generation, m.load_no, m.mark_no, m.mark_at) for m in late], [(2, 2, 3, "12:07:45.472")])
+        self.assertTrue(lp.client_progress(log + "\nInput script: LEVELPASS D in", "D", "tutorial_b").startswith(
+            "its mark landed inside a load: `online_mark_level: generation 2` at 12:07:45.472"))
+
+    @unittest.skipUnless((MARK_RACE_RUN / "D" / "game.log").is_file() and (MARK_RACE_RUN / "H" / "game.log").is_file(),
+                         "batch 12's tutorial_b run is not on this machine")
+    def test_the_recorded_run(self) -> None:
+        read = lambda who: (MARK_RACE_RUN / who / "game.log").read_text(encoding="utf-8", errors="replace")
+        d, h = read("D"), read("H")
+        late = lp.late_marks(d)
+        self.assertEqual([(m.generation, m.load_at, m.mark_at) for m in late], [(2, "12:07:45.454", "12:07:45.472")])
+        self.assertEqual(lp.late_marks(h), [])  # H marks before its own `level`
+        # Where the new order marks: right after D's `waitfor online_in_play` was met, D's latest generation was 1.
+        lines = d.splitlines()
+        met = next(i for i, l in enumerate(lines) if "Input script: waitfor online_in_play met" in l)
+        loads = [int(m.group(1)) for m in map(lp.LEVEL_LOAD_LINE.search, lines[:met]) if m]
+        self.assertEqual(loads[-1], 1)
+
 class HeldFights(unittest.TestCase):
     """A fight is planned only when its held enemies' release is on the route before it (levelpass_holds)."""
 

@@ -1728,6 +1728,15 @@ def next_level_reached(log: Log, level: str) -> tuple[Line | None, str]:
     return played[0], ""
 
 
+def _levelpass():
+    """The level pass module (its log readers), or None when it cannot be loaded beside this one."""
+    try:
+        import levelpass
+        return levelpass
+    except Exception:
+        return None
+
+
 def grade_completable(run: Run, data: LevelData | None = None) -> Verdict:
     """The level pass's verdict (result.json `levelpass`, written by `levelpass`) and each client's mark of
     the next level. Two players: a run without D does not show it (NOT TESTED)."""
@@ -1750,6 +1759,13 @@ def grade_completable(run: Run, data: LevelData | None = None) -> Verdict:
     example = next((line.cite() for line in reached.values() if line), "")
     notes = [f"not covered: {m}" for m in missed]
     notes += [f"{w} did not reach the next level: {why}" for w, why in why_not.items() if reached.get(w) is None and why]
+    # A client's mark that landed inside a load (levelpass.late_marks): its script ran a level late; the run's
+    # failure is the test tool's (batch 12 run 2: D's mark 0.02 s after tutorial_b began loading).
+    lpm = _levelpass()
+    for who in ("H", "D"):
+        log = run.clients.get(who)
+        for lm in (lpm.late_marks("\n".join(log.lines)) if log is not None and lpm is not None else [])[:1]:
+            notes.insert(0, f"tool fault: {lm.words(who)} ({log.line(lm.mark_no - 1).cite()})")
     # The pass teleports: it can reach the end without doing what a player must on the way.
     shut, done = required_steps(run, data)
     if data is None:
