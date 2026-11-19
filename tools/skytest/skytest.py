@@ -3664,7 +3664,17 @@ def case_history(cfg: Config, case: str) -> list[known_failures.Prior]:
                 except (OSError, ValueError, AttributeError):
                     sessions[sess] = ""
             snapshot = sessions[sess]
-        out.append(known_failures.prior_from_result(str(d), res, snapshot))
+        script, log = "", ""
+        if res.get("status") in known_failures.FAILED and (d / "H" / "script.txt").is_file():
+            # A phased script (the level pass): the part its failure belongs to (known_failures.script_parts).
+            try:
+                script = (d / "H" / "script.txt").read_text(encoding="utf-8", errors="replace")
+                if known_failures.PHASE_MARK.search(script.replace("\r", "")) or "log LEVELPASS phase" in script:
+                    log = (d / "H" / "game.log").read_text(encoding="utf-8", errors="replace") \
+                        if (d / "H" / "game.log").is_file() else ""
+            except OSError:
+                script, log = "", ""
+        out.append(known_failures.prior_from_result(str(d), res, snapshot, script, log))
     return out
 
 
@@ -7734,8 +7744,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             prov = case_provenance(cfg, spec, fixtures, build=game.name if game is not None else "")
             # A pointless rerun (known_failures.py): the last two results on this build with this case
             # content failed with the same first reason; no game starts unless --rerun-known-failure says why.
+            parts = known_failures.script_parts(spec.peers["H"].script, prov["args_sha256"], prov["fixture_sha256"]) \
+                if "H" in spec.peers else {}
             refusal = None if unit else known_failures.known_failure(case_history(cfg, spec.name), prov["build"],
-                                                                     prov["case_sha256"])
+                                                                     prov["case_sha256"], parts)
             if refusal is not None and rerun_why:
                 print(f"{spec.name}: a known failure, run again (--rerun-known-failure: {rerun_why}): "
                       f"{refusal.reason}", flush=True)

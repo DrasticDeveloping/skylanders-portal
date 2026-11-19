@@ -54,12 +54,43 @@ class KnownFailureTest(unittest.TestCase):
         h = [prior("fail", "20261118-160000"), prior("fail", "20261118-163634", reason=other)]
         self.assertIsNotNone(kf.known_failure(h, "b1", HASH))
 
-    def test_another_build_is_not_refused(self):
-        h = [prior("fail", "20261118-160000"), prior("fail", "20261118-163634")]
-        self.assertIsNone(kf.known_failure(h, "b2", HASH))
-        # One failure on each build: neither build has two.
+    def test_any_build_counts_and_the_message_names_the_builds(self):
+        # The owner's call of 18 November: today's reruns were each on a new build.
         h = [prior("fail", "20261118-160000", build="b1"), prior("fail", "20261118-163634", build="b2")]
-        self.assertIsNone(kf.known_failure(h, "b2", HASH))
+        r = kf.known_failure(h, "b3", HASH)
+        self.assertIsNotNone(r)
+        self.assertEqual(r.builds, ["b1", "b2"])
+        self.assertIn("on builds b1 and b2 (this one: b3)", r.line("levelpass-ww1"))
+        self.assertIn("a new build: what it changes that is the cause", r.line("levelpass-ww1"))
+        same = kf.known_failure([prior("fail", "20261118-160000"), prior("fail", "20261118-163634")], "b1", HASH)
+        self.assertIn("on this build (b1)", same.line("levelpass-ww1"))
+
+    def test_the_part_a_failure_belongs_to(self):
+        """A phased script (the level pass): another sweep, the same exit phase; the failure at the exit."""
+        def script(sweep: str, exit_: str) -> str:
+            return ("waitfor online_title 300\nlog LEVELPASS phase sweep\n" + sweep +
+                    "\nlog LEVELPASS phase exit\n" + exit_ + "\nlog LEVELPASS done\nquit\n")
+        exit_lines = "enter_trigger auth:ww1:13618\nwaitfor online_level_end 150"
+        log = "[t1] Input script: LEVELPASS phase sweep\n[t1] Input script: LEVELPASS phase exit\n[t1] Input script: waitfor online_level_end timed out after 150.0 s\n"
+        runs = [kf.prior_from_result(f"runs/{s}-levelpass-ww1", result("fail", s, build=b, spec=sp), "",
+                                     script(sw, exit_lines), log)
+                for s, b, sp, sw in (("20261118-160000", "b1", "s1", "goto_entity auth:ww1:1"),
+                                     ("20261118-163634", "b2", "s2", "goto_entity auth:ww1:2"))]
+        self.assertEqual(runs[0].part[0], "exit")
+        self.assertEqual(runs[0].part, runs[1].part)
+        now = kf.script_parts(script("goto_entity auth:ww1:3", exit_lines), "a1", "f1")
+        r = kf.known_failure(runs, "b3", kf.case_sha256("s3", "a1", "f1"), now)
+        self.assertIsNotNone(r)
+        self.assertIn("exit phase", r.line("levelpass-ww1"))
+        # Another exit: another case.
+        other = kf.script_parts(script("goto_entity auth:ww1:3", "enter_trigger auth:ww1:9\nwaitfor online_level_end 150"), "a1", "f1")
+        self.assertIsNone(kf.known_failure(runs, "b3", kf.case_sha256("s3", "a1", "f1"), other))
+        # Other arguments (another --game-arg): another case.
+        self.assertIsNone(kf.known_failure(runs, "b3", kf.case_sha256("s3", "a2", "f1"),
+                                           kf.script_parts(script("x", exit_lines), "a2", "f1")))
+        # A script with no phases has no parts; a log with no phase line gives the result none.
+        self.assertEqual(kf.script_parts("waitfor title_ready 75\nquit\n"), {})
+        self.assertEqual(kf.last_phase("[t1] Input script: hello\n"), "")
 
     def test_another_case_content_is_not_refused(self):
         h = [prior("fail", "20261118-160000"), prior("fail", "20261118-163634")]
@@ -100,9 +131,9 @@ class KnownFailureTest(unittest.TestCase):
         h = [p, prior("fail", "20261118-163634")]
         self.assertIsNotNone(kf.known_failure(h, "b1", HASH))
 
-    def test_no_build_or_no_hash_is_never_refused(self):
+    def test_no_hash_is_never_refused_an_unknown_build_still_is(self):
         h = [prior("fail", "20261118-160000"), prior("fail", "20261118-163634")]
-        self.assertIsNone(kf.known_failure(h, "", HASH))
+        self.assertIsNotNone(kf.known_failure(h, "", HASH))  # the build only names it
         self.assertIsNone(kf.known_failure(h, "b1", ""))
         self.assertEqual(kf.case_sha256("", "a1", "f1"), "")
 
