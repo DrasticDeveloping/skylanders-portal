@@ -380,11 +380,12 @@ struct CurrentFigure {
 // n = button n, the three attack slots left out: they go as PlayerAction), one wrapping press counter (u8) per
 // button in kPlayerCommandPressButtons (a press between two poses is never lost with a pose that is), the move
 // magnitude and the move vector (f32, finite). A pose without the block has has_command false. A block whose
-// version byte is another one is skipped (has_command false; a later version's). A version 1 block cut short, or
-// with a float not finite, makes the message invalid. A reader that does not know the block stops after
+// version byte is another one is skipped (has_command false; a later version's). A version 1 block cut short, one
+// longer than its 28 bytes, or one with a float not finite, makes the message invalid. A reader that does not know the block stops after
 // `teleports` and ignores the bytes past it (the rule above), so an older game never misreads a pose that has
 // one; the protocol version stays 3. 28 bytes.
 constexpr uint8_t kPlayerCommandVersion = 1;
+constexpr size_t kPlayerCommandBytes = 28;  // the version 1 block, its version byte included
 constexpr size_t kPlayerCommandPresses = 3;  // JUMP (logical button 4), POWER (7), BLOCK (11)
 inline constexpr std::array<uint8_t, kPlayerCommandPresses> kPlayerCommandPressButtons = {4, 7, 11};
 struct PlayerCommand {

@@ -425,6 +425,8 @@ bool ReadPose(ByteReader& r, PlayerPose& m) {
     // The moves' command block (protocol.h PlayerCommand): another version's is skipped, a cut one is invalid.
     const uint8_t version = r.U8();
     if (r.Ok() && version == kPlayerCommandVersion) {
+      // Exactly its size (the 27 bytes after the version byte): a longer version 1 block is not a version 1 one.
+      if (r.Remaining() != kPlayerCommandBytes - 1) return false;
       m.command.peer_epoch = r.U32();
       m.command.held = r.U32();
       for (uint8_t& p : m.command.presses) p = r.U8();

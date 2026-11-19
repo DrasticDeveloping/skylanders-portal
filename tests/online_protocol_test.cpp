@@ -961,7 +961,7 @@ void Moves() {
   c.command.move = {0.6f, -0.8f, 0.f};
   CHECK(RoundTrip(c));
   const std::vector<uint8_t> with = EncodeMessage(c);
-  REQUIRE_OR_RETURN_VOID(with.size() == plain.size() + 28);
+  REQUIRE_OR_RETURN_VOID(with.size() == plain.size() + kPlayerCommandBytes);
   // Past the header (whose length differs) the plain pose's fields are the first bytes of the new one.
   CHECK(std::equal(plain.begin() + kMessageHeaderSize, plain.end(), with.begin() + kMessageHeaderSize));
   {
@@ -985,6 +985,14 @@ void Moves() {
   {
     std::vector<uint8_t> b = with;
     b.resize(b.size() - 3);
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);
+    b[3] = 0;
+    CHECK(!DecodeMessages(b).has_value());
+  }
+  // A version 1 block one byte longer than its size: invalid (never read as a version 1 block).
+  {
+    std::vector<uint8_t> b = with;
+    b.push_back(0);
     b[2] = uint8_t(b.size() - kMessageHeaderSize);
     b[3] = 0;
     CHECK(!DecodeMessages(b).has_value());
