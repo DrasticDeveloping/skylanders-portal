@@ -8188,6 +8188,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 breaker.record(spec.name, r.folder, r.signature)
                 if (t := breaker.tripped()) is not None:
                     tell_breaker(t)
+            # A caller's own verdict of the case (the level pass: W15), decided before the case's status line is
+            # printed and its result.json, report.md and results.json are written, so all of them carry one verdict.
+            if (case_verdict := getattr(a, "case_verdict", None)) is not None:
+                case_verdict(spec, r)
             return r
 
         def finished() -> list[CaseResult]:
@@ -9653,11 +9657,28 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         return 0
     t0 = time.monotonic()
     started = time.strftime("%Y%m%d-%H%M%S")
+    # The pass's verdict (R3), decided as the case ends (W15): batch 12 case 7 printed the runner's `PASS` while
+    # the level pass's verdict and result.json said INCOMPLETE (its sweep skipped steps for time). An incomplete
+    # pass is the case's status `incomplete` from the first line printed about it on.
+    decided: dict = {}
+
+    def case_verdict(_spec, r) -> None:
+        if not r.folder or not Path(r.folder).is_dir():
+            return
+        run_dir = Path(r.folder)
+        d_text = read_peer_log(run_dir, "D", False) if (run_dir / "D").is_dir() else ""
+        verdict, missed = lp.pass_verdict(r.status, list(r.reasons), read_peer_log(run_dir, "H", False), plan, d_text)
+        decided["verdict"] = (verdict, missed)
+        if verdict == lp.INCOMPLETE and r.status in ("pass", "fail"):
+            r.status = "incomplete"
+            r.reasons.append("levelpass: incomplete: " + "; ".join(missed))
+
     ns = argparse.Namespace(cases=[case], stage=None, max_games=0, gate=False, per_build=False,
                             allow_restricted=False, jobs=1, run_not_ready=False, no_breaker=False, queue=None,
                             remote=None, remote_manifest=None, remote_token_file=None,
                             rerun_known_failure=a.rerun_known_failure, ignore_build=a.ignore_build,
-                            build_wait_min=a.build_wait_min, ignore_preflight=a.ignore_preflight)
+                            build_wait_min=a.build_wait_min, ignore_preflight=a.ignore_preflight,
+                            case_verdict=case_verdict)
     code = cmd_test(replace(cfg, cases_dir=cases), ns)
     if code in (EXIT_KNOWN_FAILURE, EXIT_BUILD_RUNNING, EXIT_PREFLIGHT):
         why = {EXIT_KNOWN_FAILURE: "a known failure", EXIT_BUILD_RUNNING: "a build held its slot",
@@ -9737,8 +9758,9 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         rj_now = json.loads(result.read_text(encoding="utf-8")) if result.is_file() else {}
     except (OSError, ValueError):
         rj_now = {}
-    verdict, missed = lp.pass_verdict(str(rj_now.get("status", "fail")), list(rj_now.get("reasons", [])), texts["H"],
-                                      plan, texts.get("D", ""))
+    # The verdict decided as the case ended (case_verdict), else (a run folder of an older runner) from result.json.
+    verdict, missed = decided.get("verdict") or lp.pass_verdict(
+        str(rj_now.get("status", "fail")), list(rj_now.get("reasons", [])), texts["H"], plan, texts.get("D", ""))
     if crash:
         verdict = lp.FAIL
     head = f"verdict: {verdict}" + (f" (not covered: {'; '.join(missed)})" if missed else "") + \
