@@ -678,7 +678,7 @@ void Version2Scenes() {
   // Every phase and kind survives a round trip; a level-load scene has no recipient (kNone).
   const SceneKey loaded{1, EntityRef{RefKind::kNone, 2}, NameHash("Tutorial_B_Intro")};
   for (ScenePhase p : {ScenePhase::kOpen, ScenePhase::kAck, ScenePhase::kRelease, ScenePhase::kSkip,
-                       ScenePhase::kHold, ScenePhase::kUnhold, ScenePhase::kShare}) {
+                       ScenePhase::kHold, ScenePhase::kUnhold, ScenePhase::kShare, ScenePhase::kStart}) {
     CHECK(RoundTrip(SceneBarrier{p, 2, loaded, SceneKind::kCutscene}));
     CHECK(RoundTrip(SceneBarrier{p, 2, Scene(), SceneKind::kConversation}));
   }
@@ -722,7 +722,8 @@ void Version2Scenes() {
   // Not encoded: an unknown phase or kind, an end reason outside kEnd (or none in it), skips
   // outside kEnd, a recipient ref with stray fields.
   CHECK(EncodeMessage(SceneBarrier{ScenePhase(0), 2, loaded, SceneKind::kCutscene}).empty());
-  CHECK(EncodeMessage(SceneBarrier{ScenePhase(9), 2, loaded, SceneKind::kCutscene}).empty());
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase(10), 2, loaded, SceneKind::kCutscene}).empty());
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase::kStart, 2, Scene(), SceneKind::kCutscene})[4] == 9);
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kOpen, 2, loaded, SceneKind(3)}).empty());
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kOpen, 2, loaded, SceneKind::kCutscene, SceneEndReason::kStop}).empty());
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kEnd, 2, loaded, SceneKind::kCutscene, SceneEndReason::kNone}).empty());
@@ -737,7 +738,7 @@ void Version2Scenes() {
     REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 33);
     const size_t phase = kMessageHeaderSize, kind = kMessageHeaderSize + 30, end = kind + 1;
     CHECK(DecodeMessages(b).has_value());
-    b[phase] = 9;  // past kShare
+    b[phase] = 10;  // past kStart
     CHECK(!DecodeMessages(b).has_value());
     b[phase] = uint8_t(ScenePhase::kHold);  // a hold with an end reason
     CHECK(!DecodeMessages(b).has_value());
