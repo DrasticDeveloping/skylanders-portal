@@ -304,6 +304,33 @@ class RequiredSteps(unittest.TestCase):
         self.assertIn("; interact on H: H/game.log:", first)
         self.assertIn("; D's own key: no line after its level start", first)
 
+    def test_s_opening_by_a_press_counts_on_s_and_a_press_on_an_earlier_gate_is_named(self) -> None:
+        # W9/W10 (tutorial_b 20261119-065111): S writes no `world gate ... open apply`; its own `gate.open applied
+        # <h> key <k>`, named by H's `backend press held <Name#id> key <k>`, is S's opening. Step 2 pressed gate 1.
+        import levelpass_holds as lh
+        g = lh.Gate("TutorialLockedGate", "a2", lh.KEY_GATE, True, "fetch its key K", key_data="LockedDoorKey_Intro")
+        data = lc.LevelData("madeup", {}, [g, lh.Gate("TutorialLockedGate", "a4", lh.KEY_GATE, True, "fetch its key K2",
+                                                      key_data="LockedDoorKey_2")])
+        h = [(60, "Input script: LEVELPASS required r1 key_gate TutorialLockedGate (fetch its key LockedDoorKey_Intro)"),
+             (61, "Online: backend press held TutorialLockedGate#2607 key 1/1/2/29"),
+             (64, "Online: world gate TutorialLockedGate#2607 open apply: 1 lock(s) set UnLocked first (x)"),
+             (70, "Input script: LEVELPASS required r2 key_gate TutorialLockedGate (fetch its key LockedDoorKey_2)"),
+             (75, "Online: backend press held TutorialLockedGate#2607 key 1/1/2/43")]
+        d = [(62, "Online: world gate TutorialLockedGate#2636 open apply: 1 lock(s) set UnLocked first (x)")]
+        s = [(61.1, "Online: backend gate.open run b838f920 key 1/1/2/29"),
+             (61.2, "Online: backend gate.open applied b838f920 key 1/1/2/29"),
+             (75.1, "Online: backend gate.open refused peer 1 a00000a2f.2d1accae.ada5591b@2 (kind already_open; row 1)")]
+        v = lc.grade_completable(RunFolder(s, H_JOIN + h + H_NEXT, D_JOIN + d + D_NEXT, result=self.PASSED).run(), data)
+        self.assertEqual(v.status, lc.BY_TELEPORT)
+        done = [n for n in v.notes if n.startswith("required, done: ")]
+        self.assertEqual(len(done), 1, v.notes)
+        self.assertIn("opened on S, H, D: S at ", done[0])
+        self.assertIn("Online: backend gate.open applied b838f920 key 1/1/2/29", done[0])
+        first = v.counts.split("first step not done: ")[1]
+        self.assertIn("opened on no game, not on S, H, D", first)
+        self.assertIn("S's decision: H/data/Online/session/game.log:3: Online: backend gate.open refused", first)
+        self.assertIn("the press went to TutorialLockedGate#2607, the gate an earlier step pressed", first)
+
     def test_no_level_data_is_said(self) -> None:
         run = RunFolder([], H_JOIN + H_NEXT, D_JOIN + D_NEXT, result={"levelpass": {"verdict": "PASS", "not_covered": []}}).run()
         v = lc.grade_completable(run, None)
@@ -371,7 +398,22 @@ class Coins(unittest.TestCase):
              (61, "Online: coin paid here bd35d565.4 (taken by another player; player 0, gold 30 -> 35, +5)")]
         v = lc.grade_coins(RunFolder(s, H_JOIN + h + LEVEL_END, D_JOIN + d + LEVEL_END).run())
         self.assertEqual(v.status, lc.PASS, v.findings)
-        self.assertIn("coins taken 1, paid on another game 1", v.counts)
+        self.assertIn("coins taken: H 1, D 0; S handled 1 claim(s); paid on another game 1", v.counts)
+
+    def test_takes_with_no_claim_handled_fail_and_a_coin_taken_twice_is_named(self) -> None:
+        # Batch 11 second round (ww1 20261119-111305): H took 3, D 7, three of them the same places; S no claim.
+        s = self.ON + [(30, "Online: coins walked bd35d565 241 placed money coins mapped (246 CCollectibles)")]
+        walked = [(30, "Online: coins walked bd35d565 241 placed money coins mapped (246 CCollectibles)")]
+        h = walked + [(60, "Online: coin taken here bd35d565.8532 (player b662efd0, gold 315 -> 316, +1; S is told)"),
+             (60.1, "Online: coin claim sent bd35d565.8532")]
+        d = walked + [(61, "Online: coin taken here bd35d565.8532 (player b6642820, gold 9 -> 10, +1; S is told)"),
+             (62, "Online: coin taken here bd35d565.8514 (player b6642820, gold 7 -> 8, +1; S is told)")]
+        v = lc.grade_coins(RunFolder(s, H_JOIN + h + LEVEL_END, D_JOIN + d + LEVEL_END).run())
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual([x.what for x in v.findings],
+                         ["1 coin(s) taken on H, 2 coin(s) taken on D; S handled 0 claim(s): shared coins did nothing",
+                          "taken twice: 1 coin(s) taken on more than one game (bd35d565.8532)"])
+        self.assertIn("coins taken: H 1, D 2; S handled 0 claim(s)", v.counts)
 
     def test_none_mapped_with_coins_on_fails_never_untested(self) -> None:
         s = self.ON + [(90, "Online: coins 2: 0 claims granted, 0 refused, 0 placed money coins mapped here (0 this "
@@ -566,6 +608,30 @@ class ScenesWhereCalibration(unittest.TestCase):
                       "1500 (test)", v.counts)
         self.assertTrue(all(x.what.startswith("D was not there (test): 4287") for x in v.findings), v.findings)
         self.assertTrue(v.findings[0].lines[-1].startswith("H/data/Online/session/game.log:"))
+
+
+
+@unittest.skipUnless((CALIBRATION_RUNS / "20261119-065111-levelpass-tutorial_b").is_dir() and
+                     (Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass/tutorial_b") / "manifest.json").is_file(),
+                     "the key-gate run or tutorial_b's data is not here")
+class KeyGateCalibration(unittest.TestCase):
+    def test_gate_one_opened_on_s_and_gate_two_pressed_gate_ones_lock(self) -> None:
+        run = lc.load_run(CALIBRATION_RUNS / "20261119-065111-levelpass-tutorial_b")
+        shut, done = lc.required_steps(run, lc.level_data(Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass"), "tutorial_b"))
+        self.assertEqual(len(done), 1, done)
+        self.assertIn("opened on S, H, D: S at 06:54:11.795 ", done[0])
+        self.assertEqual(len(shut), 1, shut)
+        self.assertIn("the press went to TutorialLockedGate#2607, the gate an earlier step pressed", shut[0])
+
+@unittest.skipUnless((CALIBRATION_RUNS / "20261119-111305-levelpass-ww1").is_dir(), "batch 11's ww1 coins run is not here")
+class CoinsCalibration(unittest.TestCase):
+    def test_the_second_rounds_coins(self) -> None:
+        v = lc.grade_coins(lc.load_run(CALIBRATION_RUNS / "20261119-111305-levelpass-ww1"))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.findings[0].what, "3 coin(s) taken on H, 7 coin(s) taken on D; S handled 0 claim(s): shared "
+                                             "coins did nothing")
+        self.assertTrue(v.findings[1].what.startswith("taken twice: 3 coin(s)"))
+
 
 FIGHT = "-535,-2875,303"
 PLACED = [(30, f"Online: enemy placed {K1} as GreebleMelee#3531 hp 96 pose 26 (S)")]

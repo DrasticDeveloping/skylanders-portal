@@ -435,8 +435,8 @@ class Pause(unittest.TestCase):
         lines = lp.action_lines(lp.Action(lp.PICKUP, gem, "x"), "v19_1")
         seq = list(lp.DISMISS_LINES)
         # A (on to the Yes/No prompt), then B (No) twice; one A only (a second A would answer Yes), no d-pad.
-        self.assertEqual(seq, ["tap a", "waitfor hero_free 3", "tap b", "waitfor hero_free 4", "tap b",
-                               "waitfor hero_free 4"])
+        self.assertEqual(seq, list(lp.DISMISS_LINES))
+        self.assertEqual(seq[:2], [f"waitfor hero_free {lp.FOUND_SCREEN_SETTLE_S}", "tap a"])  # the screen first (W7)
         self.assertEqual(seq.count("tap a"), 1)
         self.assertFalse(any(p in seq for p in ("tap up", "tap down", "tap left", "tap right")))
         self.assertEqual(lines[1:], ["goto_entity auth:ww1:12086", *seq,

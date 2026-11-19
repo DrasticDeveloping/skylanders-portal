@@ -1187,9 +1187,17 @@ def gates_words(content: Content) -> list[str]:
 #   `nearest:<gate>_key`), from beside its own gate: two gates share a name (tutorial_b) and so do their keys,
 #   each key starts at its own lock. TODO(next build): a selector `key_of:<gate>` reading the gate's
 #   KeyLock._key (+48, `backend field Scripts.KeyLock._key +48`) would address the gate's own key whatever the
-#   distances; no command reads it today. The press: `interact <gate>_keylock`, which walks (no teleport: a
-#   teleport may end the carry, the key's OnTeleport subscription) and presses until the interaction fires;
-#   the client's gate press then holds that fire until S decides (adapters/gate_press.h), no button is held.
+#   distances; no command reads it today. A key whose gate is open already is skipped by the game's pickup by
+#   name only when the hero carries it (the integration build: tutorial_b 20261119-065111 `skips
+#   TutorialLockedGate_key#2609: already carried by the hero`) or its pickups are off (online/6-carried-keys: a
+#   spent key); a used key lying free is not told apart until that selector exists. The press: back to the gate
+#   (`goto_entity <gate ref>`), then `interact nearest:<gate>_keylock:<KEY_LOCK_NEAR>`: the lock nearest the hero
+#   standing at THAT gate, within KEY_LOCK_NEAR (a lock is spawned at its gate, about 120 from its origin), so a
+#   failed goto fails the press instead of pressing another gate's lock. Never the bare name from wherever the
+#   pickup left the hero: tutorial_b's second key lies 38000 from its gate and 20800 from the first gate, and
+#   `interact <gate>_keylock` pressed gate 1's lock again (S refused: already_open; 20261119-065111). The
+#   substring `<gate>_keylock` matches only locks (a key is `<gate>_key`). The client's gate press holds the
+#   fire until S decides (adapters/gate_press.h), no button is held.
 # - a battle gate (DemonGateSeal): the enemies and encounters whose telegrams reach it (Gate.openers): a held
 #   one's release first (enter its trigger, break what releases it: the holds), an encounter's start trigger
 #   entered (its CEncounterToggleMessage on eMAF_OnEnter), then the fight, bounded (`encounter_clear <manager> ...
@@ -1198,13 +1206,14 @@ def gates_words(content: Content) -> list[str]:
 #   when the build's command table has lock_solve, lock_move and the condition lock_ready; otherwise not performed,
 #   said so.
 # D, not following H, comes to each gate (d_come_lines). The level check grades each gate's opening on S, H and D.
-REQ_KEY_S = 45.0          # pickup (a navto to its key), the press, the gate's move
+REQ_KEY_S = 50.0          # pickup (a navto to its key), back to the gate, the press, the gate's move
 REQ_BATTLE_S = 80.0       # the release, the fight (GATE_FIGHT_S), the gate's move
 REQ_SPARK_S = 90.0        # the press, the board, its solve
 GATE_FIGHT_S = 60         # a gate's fight is bounded by this (encounter_clear exact, fight_near)
 GATE_OPEN_WAIT_S = 20     # wait_moved on the gate after its step
 KEY_PICKUP_S = 40         # pickup: onto the key (tutorial_b's lies about 1400 from its gate) and its follow
 KEY_PRESS_S = 60          # interact: the walk back to the lock with the key and the press
+KEY_LOCK_NEAR = 1000      # the press takes a `<gate>_keylock` within this of the hero standing at the gate
 TOGGLE = "CEncounterToggleMessage"
 
 
@@ -1252,7 +1261,8 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
             step.why_not = "no live reference to the gate"
         elif g.kind == lh.KEY_GATE:
             step.h = [f"{head} (fetch its key {_safe(g.key_data)})", f"goto_entity {ref}",
-                      f"pickup {g.name}_key {KEY_PICKUP_S}", f"interact {g.name}_keylock {KEY_PRESS_S}",
+                      f"pickup {g.name}_key {KEY_PICKUP_S}", f"goto_entity {ref}",
+                      f"interact nearest:{g.name}_keylock:{KEY_LOCK_NEAR} {KEY_PRESS_S}",
                       f"wait_moved {ref} 50 {GATE_OPEN_WAIT_S}", f"online_audit {label}"]
             step.est_s = REQ_KEY_S
         elif g.kind == lh.SPARK_LOCK:
@@ -1754,9 +1764,13 @@ def action_lines(a: Action, label: str, after: str = "", cap: int = 0, long_paus
         # The inner lines end with this collectible's own dismissal (dismiss_after) when it has one: one is enough.
         while inner and inner[-len(DISMISS_LINES):] == list(DISMISS_LINES):
             inner = inner[:-len(DISMISS_LINES)]
+        # Still held after A, B, B: the step ends here, not the run; one more B (a prompt the first B missed),
+        # then the pass's own cap bounds what is left, and wait_free's line names the hero's state.
         return [*head, f"hold_cap {short}", *inner,
                 f"log LEVELPASS pause check {label}: a screen that holds the hero is dismissed as a player does",
-                *DISMISS_LINES, f"hold_cap {cap}", f"wait_free {cap}"]
+                *DISMISS_LINES,
+                f"log LEVELPASS pause check {label}: one more B if the hero is still held", "tap b", "waitfor hero_free 5",
+                f"hold_cap {cap}", f"wait_free {cap}"]
     o = a.obj
     ref = o.ref
     out = [f"log LEVELPASS act {label} {a.action} {_safe(o.name) or '-'} {o.cls} ref {ref}"]
@@ -1799,7 +1813,14 @@ FIGHT_RADIUS = 1500
 # a jump and two attacks. A screen this does not close: the next step's pause line is H's forbidden line
 # (PAUSE_FATAL), the pass ends INCOMPLETE. The stored data does not say which collectibles are major, so the
 # rule is the component's, never a name's.
-DISMISS_LINES = ("tap a", "waitfor hero_free 3", "tap b", "waitfor hero_free 4", "tap b", "waitfor hero_free 4")
+# The screen takes no press in its first seconds (batch 11 second round, ww1 20261119-110623: A 5.1 s after the
+# collect did nothing, and the B, B after it nothing either, the game paused 54 s until fail-fast; A 12 s and
+# 13 s after the collect was taken in the 18 November probes, 92 s in 20261119-051557). So the dismissal first
+# waits on the game's own state: `waitfor hero_free FOUND_SCREEN_SETTLE_S` passes at once on a free hero (no
+# screen up) and on a held one gives the screen its seconds before the one A; then B, and B once more.
+FOUND_SCREEN_SETTLE_S = 12   # the one A comes 12 s or more after the screen came up (taken at 12 s in a probe)
+DISMISS_LINES = (f"waitfor hero_free {FOUND_SCREEN_SETTLE_S}", "tap a", "waitfor hero_free 3", "tap b",
+                 "waitfor hero_free 5", "tap b", "waitfor hero_free 5")
 
 
 def is_collectible(o: Obj) -> bool:
