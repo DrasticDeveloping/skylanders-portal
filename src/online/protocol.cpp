@@ -421,6 +421,19 @@ bool ReadPose(ByteReader& r, PlayerPose& m) {
     if (r.Ok() && !ValidElements(m.figure.elements)) return false;
   }
   if (ok && r.Ok() && r.Remaining() > 0) m.teleports = r.U16();  // stage 4 (absent before: 0)
+  if (ok && r.Ok() && r.Remaining() > 0) {
+    // The moves' command block (protocol.h PlayerCommand): another version's is skipped, a cut one is invalid.
+    const uint8_t version = r.U8();
+    if (r.Ok() && version == kPlayerCommandVersion) {
+      m.command.held = r.U32();
+      for (uint8_t& p : m.command.presses) p = r.U8();
+      std::array<float, 1> magnitude{};
+      ok = GetFloats(r, magnitude) && GetFloats(r, m.command.move);
+      m.command.magnitude = magnitude[0];
+      m.has_command = ok && r.Ok();
+      if (!m.has_command) return false;
+    }
+  }
   return ok && r.Ok();
 }
 
@@ -506,6 +519,14 @@ bool Fields(ByteWriter& w, const PlayerPose& m) {
   w.U16(m.figure.bottom_variant);
   w.U16(m.figure.elements);  // item 11: a trailing field, so a pose without it reads as 0 (not read)
   w.U16(m.teleports);        // stage 4: trailing too, so a pose without it reads as 0
+  if (m.has_command) {
+    // The moves' command block, last (protocol.h PlayerCommand).
+    w.U8(kPlayerCommandVersion);
+    w.U32(m.command.held);
+    for (const uint8_t p : m.command.presses) w.U8(p);
+    const std::array<float, 1> magnitude{m.command.magnitude};
+    if (!PutFloats(w, magnitude) || !PutFloats(w, m.command.move)) return false;
+  }
   return true;
 }
 bool Fields(ByteWriter& w, const PlayerActionShown& m) {

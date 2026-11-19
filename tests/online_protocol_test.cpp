@@ -939,6 +939,74 @@ void Stage4() {
   }
 }
 
+// Stage 4, the other player's moves: the pose's command block. The bytes of a pose with a block begin with the
+// bytes of the same pose without one (an older reader reads exactly its fields there and ignores the rest), a pose
+// without one reads has_command false, another version's block is skipped, a cut or non-finite one is invalid,
+// and the shown pose carries it.
+void Moves() {
+  PlayerPose p;
+  p.pose_sequence = 31;
+  p.generation = 4;
+  p.position = {10.f, -20.f, 30.f};
+  p.figure.elements = uint16_t(kElementsKnown | (1u << 3));
+  p.teleports = 2;
+  const std::vector<uint8_t> plain = EncodeMessage(p);
+  CHECK(RoundTrip(p));
+  PlayerPose c = p;
+  c.has_command = true;
+  c.command.held = 0x00000810u;  // JUMP and BLOCK held
+  c.command.presses = {7, 0, 255};
+  c.command.magnitude = 0.75f;
+  c.command.move = {0.6f, -0.8f, 0.f};
+  CHECK(RoundTrip(c));
+  const std::vector<uint8_t> with = EncodeMessage(c);
+  REQUIRE_OR_RETURN_VOID(with.size() == plain.size() + 24);
+  // Past the header (whose length differs) the plain pose's fields are the first bytes of the new one.
+  CHECK(std::equal(plain.begin() + kMessageHeaderSize, plain.end(), with.begin() + kMessageHeaderSize));
+  {
+    auto back = DecodeMessages(plain);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<PlayerPose>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    CHECK(!got->has_command && got->teleports == 2);
+  }
+  // Another version's block: skipped, the pose itself read.
+  {
+    std::vector<uint8_t> b = with;
+    b[plain.size()] = uint8_t(kPlayerCommandVersion + 1);
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<PlayerPose>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    CHECK(!got->has_command && got->pose_sequence == 31 && got->teleports == 2);
+  }
+  // A version 1 block cut short: invalid.
+  {
+    std::vector<uint8_t> b = with;
+    b.resize(b.size() - 3);
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);
+    b[3] = 0;
+    CHECK(!DecodeMessages(b).has_value());
+  }
+  // A float not finite: not written, and not read.
+  {
+    PlayerPose bad = c;
+    bad.command.move[1] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(EncodeMessage(bad).empty());
+    std::vector<uint8_t> b = with;
+    const uint32_t nan = 0x7FC00000u;
+    for (int i = 0; i < 4; ++i) b[b.size() - 4 + i] = uint8_t(nan >> (8 * i));
+    CHECK(!DecodeMessages(b).has_value());
+  }
+  // The shown pose carries the block (it ends the message).
+  {
+    PlayerPoseShown s;
+    s.peer = 5;
+    s.pose = c;
+    CHECK(RoundTrip(s));
+  }
+}
+
 // Stage 5 (future/online-5.md sections 3.4, 3.6, D16, D28): the records_enemies bit, the accepted
 // occurrence keys and the attack press outside replay.
 void Stage5() {
@@ -1320,6 +1388,7 @@ int main() {
   Version3();
   OwnerFlagsMessage();
   Stage4();
+  Moves();
   Stage5();
   Stage6();
 

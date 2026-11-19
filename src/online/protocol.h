@@ -372,6 +372,27 @@ struct CurrentFigure {
 // after `elements` (a pose without it reads as 0). The owning client moves it at a teleport, a
 // bounce pad or a fall reset, so S's rate check lets that pose through.
 
+// Stage 4, the other player's moves (the game's online_remote_moves): the hero's own command as its ActorInput held
+// it at the pose, so another game's body of that hero runs the same jumps, specials and blocks itself. A block
+// after `teleports`: a version byte (kPlayerCommandVersion), the held word (u32: the game's 27 logical buttons, bit
+// n = button n, the three attack slots left out: they go as PlayerAction), one wrapping press counter (u8) per
+// button in kPlayerCommandPressButtons (a press between two poses is never lost with a pose that is), the move
+// magnitude and the move vector (f32, finite). A pose without the block has has_command false. A block whose
+// version byte is another one is skipped (has_command false; a later version's). A version 1 block cut short, or
+// with a float not finite, makes the message invalid. A reader that does not know the block stops after
+// `teleports` and ignores the bytes past it (the rule above), so an older game never misreads a pose that has
+// one; the protocol version stays 3. 24 bytes.
+constexpr uint8_t kPlayerCommandVersion = 1;
+constexpr size_t kPlayerCommandPresses = 3;  // JUMP (logical button 4), POWER (7), BLOCK (11)
+inline constexpr std::array<uint8_t, kPlayerCommandPresses> kPlayerCommandPressButtons = {4, 7, 11};
+struct PlayerCommand {
+  uint32_t held = 0;
+  std::array<uint8_t, kPlayerCommandPresses> presses{};
+  float magnitude = 0;
+  std::array<float, 3> move{};
+  bool operator==(const PlayerCommand&) const = default;
+};
+
 // Client to server, fast lane, about 20 Hz (tests/thresholds.toml players_hz): the hero's pose.
 // `pose_sequence` counts the peer's poses from 1 (0 is never sent: only a scene skip's request
 // carries pose sequence 0, for "needs no pose"). The server drops a pose not newer than the last one it has from that peer in
@@ -384,6 +405,8 @@ struct PlayerPose {
   std::array<float, 4> rotation{0, 0, 0, 1};
   CurrentFigure figure;
   uint16_t teleports = 0;  // stage 4: the teleport counter (above)
+  bool has_command = false;  // the moves' command block (above); false: none on the wire
+  PlayerCommand command;     // read only when has_command
   bool operator==(const PlayerPose&) const = default;
 };
 
