@@ -3077,9 +3077,13 @@ class LateMark:
 
 
 def late_marks(text: str) -> list[LateMark]:
-    """Each `online_mark_level` that came while a later generation was loading here: its `level <g> <path>: load`
-    already logged and its `barrier <g> released` not yet (D_MARK_BEFORE_BARRIER)."""
+    """Each `online_mark_level` that kept a level announced after the one this game was in: its `level <g> <path>:
+    load` already logged, its `barrier <g> released` not yet, and an earlier level's start released here (the race:
+    batch 12 run 2 marked generation 2 after barrier 1). A mark of the session's first level while it loads (no
+    start released yet) is D's own order (D_MARK_BEFORE_BARRIER) and the level it is in: never named (W20, batch 13
+    case 7, tutorial_b 20261119-141657: D's `online_mark_level: generation 1` 1.0 s before barrier 1 was flagged)."""
     loading: dict[int, tuple[str, int, str]] = {}
+    released = 0
     out = []
     for no, line in enumerate(text.splitlines(), 1):
         stamp = LOG_STAMP.match(line)
@@ -3091,9 +3095,10 @@ def late_marks(text: str) -> list[LateMark]:
         m = CLIENT_BARRIER.search(line)
         if m:
             loading.pop(int(m.group(1)), None)
+            released = max(released, int(m.group(1)))
             continue
         m = MARK_LINE.search(line)
-        if m and int(m.group(1)) in loading:
+        if m and int(m.group(1)) in loading and 0 < released < int(m.group(1)):
             path, load_no, load_at = loading[int(m.group(1))]
             out.append(LateMark(int(m.group(1)), path, load_no, load_at, no, at))
     return out

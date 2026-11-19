@@ -1263,6 +1263,17 @@ class MarkRace(unittest.TestCase):
         self.assertTrue(lp.client_progress(log + "\nInput script: LEVELPASS D in", "D", "tutorial_b").startswith(
             "its mark landed inside a load: `online_mark_level: generation 2` at 12:07:45.472"))
 
+    def test_the_first_levels_mark_before_its_barrier_is_not_named(self) -> None:
+        # W20 (batch 13 case 7, 20261119-141657): D's own order marks the hub while it loads, no start released yet.
+        log = "\n".join([
+            "[2026-11-19 14:17:35.922] [info] [core] [t1] Online: level 1 town/town_state10/town_state10: load",
+            "[2026-11-19 14:18:50.743] [info] [core] [t2] Online: online_mark_level: generation 1",
+            "[2026-11-19 14:18:51.739] [info] [core] [t1] Online: barrier 1 released at tick 6091",
+            "[2026-11-19 14:18:51.833] [info] [core] [t1] Online: level 2 tutorial/tutorial_b/tutorial_b: load",
+            "[2026-11-19 14:19:05.077] [info] [core] [t1] Online: barrier 2 released at tick 6891",
+            "[2026-11-19 14:19:05.402] [info] [core] [t2] Online: online_mark_level: generation 2"])
+        self.assertEqual(lp.late_marks(log), [])
+
     @unittest.skipUnless((MARK_RACE_RUN / "D" / "game.log").is_file() and (MARK_RACE_RUN / "H" / "game.log").is_file(),
                          "batch 12's tutorial_b run is not on this machine")
     def test_the_recorded_run(self) -> None:
