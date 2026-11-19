@@ -9519,6 +9519,16 @@ def lock_commands_known(cfg: Config) -> bool:
         "lock_ready" in table.conditions
 
 
+def launch_pad_known(cfg: Config) -> bool:
+    """The game registers `launch_pad` (W27b; the checkout's tests/script_commands.toml)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        return "launch_pad" in la.CommandTable.load(path).registered
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+
+
 def pass_gate_known(cfg: Config) -> bool:
     """The game registers `pass_gate` (W23; the checkout's tests/script_commands.toml)."""
     import launch_args as la
@@ -9588,6 +9598,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         raise SystemExit(f"levelpass: {e}") from None
     if a.no_end and a.predictions:
         raise SystemExit("levelpass: --no-end is for the generated pass, not --predictions")
+    # W27b: the launch pads ridden only with the build's launch_pad and without --no-launch-rides.
+    lp.LAUNCH_RIDES = launch_pad_known(cfg) and not getattr(a, "no_launch_rides", False)
     plan = lp.make_plan(content, full=a.full, late_join=not a.no_late_join, provoke=a.provoke or "",
                         no_end=a.no_end, d_stays=not a.d_leaves_before_end,
                         d_lobby=not getattr(a, "d_joins_late", False), new_slot=getattr(a, "new_slot", False),
@@ -9832,6 +9844,9 @@ def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
                      " dismisses a pause screen within seconds")
     lp_.add_argument("--long-pause-at", default="", metavar="NAME", help="the object whose pickup takes the long"
                      " pause (default: the plan's first pickup of a collectible)")
+    lp_.add_argument("--no-launch-rides", action="store_true", help="the launch pad microgames are only visited, not "
+                     "pressed and ridden (launch_pad), even where the build has the command: for runs that must not "
+                     "depend on a ride rail-launch-tb has not shown yet")
     lp_.add_argument("--h-figure", default=None, metavar="NAME", help="H's figure from the copied figure folder"
                      " (default Roller Brawl): `<NAME>.dump`, or a swapper's two halves (`<NAME> Top.dump` in slot 0,"
                      " `<NAME> Bottom.dump` in slot 1)")
