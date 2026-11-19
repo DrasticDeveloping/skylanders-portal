@@ -169,6 +169,11 @@ class RouteHead(unittest.TestCase):
         self.assertTrue(head[0].startswith("not visited on H: no floor (a trigger in the air): v100 "
                                            "CScriptTriggerEntityData001#2561 (no floor: no ground a player can stand on"),
                         head)
+        page = lc.page(f.path, [], [])
+        self.assertIn("  - CScriptTriggerEntityData001: no ground a player can stand on near it (a target in the air): "
+                      "the level reaches it another way (a ride, a launch, a script that moves it) the pass does not take; not "
+                      "covered by the pass",
+                      page)
         self.assertTrue(head[1].startswith("H held too long at the same spot twice, 1 time(s): at "
                                            "28013.73,23385.52,-500.00: taken out to the last ground it stood on "
                                            "14176.00,21295.00,40.00"), head)

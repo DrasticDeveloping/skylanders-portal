@@ -1822,6 +1822,22 @@ def key_gate_trail(run: Run, name: str, k: int) -> list[str]:
                                                 absent(h, f"`pickup {name}_key ... done`") if h else "no H log"))
     else:
         out.append(f"key touched and following on H: {picked[k][0].cite()}")
+    # W25: the key by name, who carried it and when (a client's `carried key <ref> row carried by <p>/<e> here (key
+    # <Name#id>)`), and S's `carried key <ref> row consumed (by <p>)`.
+    if h is not None and len(picked) > k and picked[k][1].group(1) == "done":
+        label = re.search(r"pickup (\S+_key#\d+)", picked[k][0].text)
+        carried = h.find(re.compile(r"Online: carried key (\S+) row carried by (\d+)/\d+ here \(key "
+                                    + re.escape(label.group(1)) + r"\)")) if label else []
+        if carried:
+            line, m = carried[0]
+            who = peer_numbers(run).get(int(m.group(2)), f"peer {m.group(2)}")
+            words = f"its key {label.group(1)}: carried by {who} from {when(line)}"
+            if run.server is not None:
+                gone = run.server.find(re.compile(r"Online: carried key " + re.escape(m.group(1))
+                                                  + r" row consumed \(by (\d+)\)"))
+                if gone:
+                    words += f", consumed at {when(gone[0][0])} (S)"
+            out.append(words + f" ({line.cite()})")
     if run.server is not None:
         # What S tracked or did with the key (its row, a carry, a claim), not its level-start volume line.
         s_key = [l for l, _m in run.server.find(re.compile(r"Online: .*\b" + key + r".*"))
@@ -2206,7 +2222,25 @@ def page(folder: Path, verdicts: list[Verdict], head: list[str] | None = None) -
             out.append(f"  {v.name}: {f.what}")
             out += [f"      {x}" for x in f.lines]
     out += not_covered_lines()
+    out += [f"  - {name}: no ground a player can stand on near it (a target in the air): the level reaches it "
+            "another way (a ride, a launch, a script that moves it) the pass does not take; not covered by the pass"
+            for name in no_floor_targets(folder)]
     return "\n".join(out)
+
+
+def no_floor_targets(folder: Path) -> list[str]:
+    """W27: the targets the route refused for having no floor near them (`route teleport ... failed (no floor: ...)
+    (target <Name#id>)`) on any client, each once, by name without its id."""
+    seen: list[str] = []
+    for who in ("H", "D"):
+        log = read_log(folder, f"{who}/game.log", who)
+        for _line, m in (log.find(NO_FLOOR) if log is not None else []):
+            if not re.fullmatch(r"\S+#\d+", m.group(2)):
+                continue  # a fight's area or an asleep target's stored position: no entity of the level by name
+            name = m.group(2).split("#")[0]
+            if name not in seen:
+                seen.append(name)
+    return seen
 
 
 # --- the static table: every level's end and mechanics from its data, no game ----------------------------

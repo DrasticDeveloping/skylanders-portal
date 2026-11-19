@@ -1032,13 +1032,15 @@ class RequiredStepsPlan(unittest.TestCase):
         h = lp.script_h(p, None).splitlines()
         k = h.index("log LEVELPASS phase required")
         self.assertLess(h.index("sweep_deadline 0"), k)
-        self.assertIn(f"pickup TutorialLockedGate_key {lp.KEY_PICKUP_S}", h[k:])  # the exact name, never nearest:
+        # W25: each gate's own key (key_of:<gate>), never a key of the same name by distance.
+        for r in p.required:
+            self.assertIn(f"pickup key_of:{r.gate_ref} {lp.KEY_PICKUP_S}", h[k:])
         # W10: back to the gate, then the lock nearest the hero there (a bounded nearest: of the lock's own name):
         # the bare name from the pickup's end pressed gate 1's lock for gate 2 (tutorial_b 20261119-065111).
         for r in p.required:
             press = f"interact nearest:TutorialLockedGate_keylock:{lp.KEY_LOCK_NEAR} {lp.KEY_PRESS_S}"
             i = h.index(f"log LEVELPASS required {r.label} key_gate TutorialLockedGate (fetch its key {r.gate.key_data})")
-            self.assertEqual(h[i + 1:i + 6], [f"goto_entity {r.gate_ref}", f"pickup TutorialLockedGate_key {lp.KEY_PICKUP_S}",
+            self.assertEqual(h[i + 1:i + 6], [f"goto_entity {r.gate_ref}", f"pickup key_of:{r.gate_ref} {lp.KEY_PICKUP_S}",
                                               f"goto_entity {r.gate_ref}", press, f"online_audit {r.label}"])
         self.assertNotIn(f"interact TutorialLockedGate_keylock {lp.KEY_PRESS_S}", h)
         self.assertEqual([l for l in h if "nearest:" in l and "_keylock:" not in l], [])  # the key: exact name only
@@ -1079,6 +1081,26 @@ class RequiredStepsPlan(unittest.TestCase):
         off = self.plan("tutorial_b")  # a build without pass_gate: no walk
         self.assertFalse([l for l in lp.script_h(off, None).splitlines() + lp.script_d(off).splitlines()
                           if l.startswith("pass_gate")])
+
+    def test_a_gate_h_cannot_pass_stops_the_level(self) -> None:
+        # W26: H's walk failing right after its own step is H's fatal line; the verdict names the gate and why.
+        p = self.plan("tutorial_b")
+        p.pass_gates = True
+        import tomllib
+        self.assertIn(lp.REQUIRED_GATE_FATAL, tomllib.loads(lp.spec_toml(p))["peer"]["H"]["forbid"])
+        self.assertNotIn("pass_gate", lp.spec_toml(self.plan("tutorial_b")))  # no pass_gate in the build: as before
+        h = "\n".join([
+            "[2026-11-19 15:48:00.000] [info] [core] [t1] Input script: LEVELPASS required r2 key_gate TutorialLockedGate (x)",
+            "[2026-11-19 15:48:06.744] [info] [core] [t1] Dev: pickup TutorialLockedGate_key#2609 failed (not carried after "
+            "the teleports: carrier none) after 5.3 s",
+            "[2026-11-19 15:48:48.956] [info] [core] [t1] Dev: pass_gate TutorialLockedGate#2574 failed (not passed on "
+            "foot: stopped at 1,2,3, 56 before the gate's plane (x)) after 31.0 s"])
+        self.assertEqual(lp.required_gate_stop(h), "gate TutorialLockedGate not opened: pickup "
+                         "TutorialLockedGate_key#2609 failed (not carried after the teleports: carrier none); the rest of "
+                         "the level not attempted")
+        verdict, missed = lp.pass_verdict("fail", ["forbidden line"], h, p)
+        self.assertEqual(verdict, lp.FAIL)
+        self.assertTrue(missed[0].startswith("gate TutorialLockedGate not opened: "), missed)
 
     def test_no_gates_keeps_the_full_sweep_and_says_so(self) -> None:
         gated, free = self.plan("tutorial_b"), self.plan("tutorial_b", no_gates=True)
