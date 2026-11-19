@@ -196,6 +196,20 @@ class EnemyKinds(unittest.TestCase):
         self.assertIn("died with no attacker at -442,-58676,64", v.findings[0].lines[1])
         self.assertEqual(len(v.findings), 1)  # not named twice as `existed on no client`
 
+    def test_a_spawn_slept_on_s_before_any_copy_is_set_apart(self) -> None:
+        # Batch 11 tutorial_b 20261119-061110: CrashSP_04_Spawned1 slept on S 3.04 s after its spawn, far from both
+        # players; both clients only retired it. Not graded; a spawn a client had in its interest still is.
+        s = [(30, f"Online: enemy run-time spawn {K3} as CrashSP_04_Spawned1#3956 hp 45 pose 22 source e1 (CActorData) (S)"),
+             (33.04, f"Online: enemy {K3} streamed out on the server: no end published (its row retired)")]
+        retired = [(33.06, f"Online: enemy retired {K3} (streamed out on the server)")]
+        v = self.grade(s, retired, retired)
+        self.assertEqual(v.status, lc.NOT_TESTED, v.findings)  # nothing else to grade in this made-up run
+        self.assertIn("gone to sleep on the server before any player's game made it (not graded): "
+                      "CrashSP_04_Spawned1#3956", v.notes[-1])
+        seen = [(30.5, f"Online: enemy bind {K3} (pending past grace: missing)")] + retired
+        v = self.grade(s, seen, retired)
+        self.assertEqual([x.what.split(":")[0] for x in v.findings], [f"H never found {K3} (CrashSP_04_Spawned1#3956)"])
+
     def test_a_death_by_another_entity_is_counted(self) -> None:
         # ww1 20261119-051557: `dead by none (S, placed; attacker (null)#3457)`, the seventh death the counts missed.
         v = self.grade([(30, f"Online: enemy run-time spawn {K3} as Sawmouth_Spawned1#3 hp 45 pose 3 source 1 (S)"),
@@ -283,9 +297,11 @@ class RequiredSteps(unittest.TestCase):
         self.assertEqual(v.status, lc.BY_TELEPORT)
         first = v.counts.split("first step not done: ")[1]
         self.assertTrue(first.startswith("TutorialLockedGate (key gate): performed ("), first)
-        self.assertIn("opened on H, not on S, D; picked up on H: H/game.log:", first)
-        self.assertIn("; no carried key row on S: H/data/Online/session/game.log:1:", first)
-        self.assertIn("; pressed at the lock on H: H/game.log:", first)
+        self.assertIn("opened on H at 00:11:25.000, not on S, D; key touched and following on H: H/game.log:", first)
+        self.assertIn("; S for the key: H/data/Online/session/game.log:1: Online: world unsupported carried_item", first)
+        self.assertIn("; no held press at the lock on H (", first)
+        self.assertIn("; interact on H: H/game.log:", first)
+        self.assertIn("; D's own key: no line after its level start", first)
 
     def test_no_level_data_is_said(self) -> None:
         run = RunFolder([], H_JOIN + H_NEXT, D_JOIN + D_NEXT, result={"levelpass": {"verdict": "PASS", "not_covered": []}}).run()
@@ -326,6 +342,15 @@ class Together(unittest.TestCase):
         self.assertEqual(v.counts, "D near H (within 400 on S's poses) at 1 of 2 stop(s) where H acted; apart at 1")
         self.assertEqual(v.notes, ["near: v3 (112)"])
         self.assertTrue(v.findings[0].what.startswith("v4: D was 7900 from H while H acted"))
+
+    def test_a_follow_with_nothing_to_read_is_not_called_no_follow(self) -> None:
+        # Batch 11 run 3: D followed H, H hung before any stop; the rows said "no follow in this run".
+        d = [(45, "Online: auto follow the host (peer 1) (script)")]
+        rows = lc.grade(RunFolder(self.S, H_JOIN + LEVEL_END, D_JOIN + d + LEVEL_END).path, None)
+        notes = [n for v in rows if v.name in ("enemies", "loot") for n in v.notes]
+        self.assertTrue(notes and all("no follow in this run" not in n for n in notes), notes)
+        self.assertTrue(any(n.startswith("D followed H (its `auto follow ... (script)` line), but where both stood was "
+                                         "not read") for n in notes), notes)
 
     def test_no_follow_is_not_tested_and_the_rows_say_where_they_were_read(self) -> None:
         v = lc.grade_together(RunFolder(self.S, H_JOIN + self.H + LEVEL_END, D_JOIN + LEVEL_END).run())
@@ -465,6 +490,13 @@ class HeldEnemiesCalibration(unittest.TestCase):
         self.assertIn("SwapPartsHint_RemoveTrigger", held[0])
         self.assertIn("hit only held enemies (Ambi_Chompy_03 scenery)", v.counts)
         self.assertIn("set apart: 9 scenery, 4 held and not released in this run", v.counts)
+
+    @unittest.skipUnless((CALIBRATION_RUNS / "20261119-061110-levelpass-tutorial_b").is_dir(), "batch 11's run is not here")
+    def test_batch_11_follow_run_passes_with_its_slept_spawn_apart(self) -> None:
+        v = self.grade(CALIBRATION_RUNS / "20261119-061110-levelpass-tutorial_b")
+        self.assertEqual(v.status, lc.PASS, [x.what for x in v.findings])
+        self.assertIn("D: bound 11 of 11", v.counts)
+        self.assertIn("gone to sleep on the server before any player's game made it: 1", v.counts)
 
     def test_033620_fails_only_on_the_bomber_no_client_had(self) -> None:
         v = self.grade(TUTORIAL_B)

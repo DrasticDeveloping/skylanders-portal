@@ -1032,8 +1032,9 @@ class RequiredStepsPlan(unittest.TestCase):
         h = lp.script_h(p, None).splitlines()
         k = h.index("log LEVELPASS phase required")
         self.assertLess(h.index("sweep_deadline 0"), k)
-        self.assertIn("pickup nearest:TutorialLockedGate_key:8000 40", h[k:])
-        self.assertIn("interact nearest:TutorialLockedGate_keylock:1500 30", h[k:])
+        self.assertIn(f"pickup TutorialLockedGate_key {lp.KEY_PICKUP_S}", h[k:])  # the exact name, never nearest:
+        self.assertIn(f"interact TutorialLockedGate_keylock {lp.KEY_PRESS_S}", h[k:])
+        self.assertFalse([l for l in h if "nearest:" in l])
         self.assertEqual(lp.position_literals("\n".join(h)), [])
         d = lp.script_d(p)
         self.assertIn(f"online_wait_peer_near_entity {p.required[0].gate_ref} {lp.D_NEAR} {lp.D_COME_WAIT_S}", d)
@@ -1087,6 +1088,32 @@ class PauseScreens(unittest.TestCase):
         self.assertTrue(lines[0].startswith("log LEVELPASS long pause v3_1: the screen stays up 60 s"))
         self.assertEqual(lines[1], "hold_cap 60")
         self.assertEqual(lines[-2:], ["hold_cap 20", "wait_free 20"])
+
+
+class FixedWaits(unittest.TestCase):
+    """No generated step waits longer than the pass can (the input script's `wait` takes seconds: batch 11 run 3's
+    `wait 25000` held ww1's game slot for its whole 660 s)."""
+
+    def test_the_checker(self) -> None:
+        self.assertEqual(lp.wait_errors("wait 25\nwait 3\n", 100), [])
+        self.assertEqual(lp.wait_errors("wait 25000\n", 600)[0], "wait 25000 is over 120 s (the input script's wait "
+                                                                  "takes seconds)")
+        self.assertIn("add up to", lp.wait_errors("wait 100\nwait 100\n", 150)[-1])
+
+    def test_every_generated_script(self) -> None:
+        plans = [lp.make_plan(content(), d_lobby=True), lp.make_plan(content(), d_lobby=True, scenes=True)]
+        if (LEVELPASS_DATA / "ww1" / "logic.json").is_file():
+            for level in ("tutorial_a", "tutorial_b", "ww1"):
+                c = lp.load_content(LEVELPASS_DATA, level)
+                plans += [lp.make_plan(c, d_lobby=True), lp.make_plan(c, d_lobby=True, scenes=True, lock_commands=True),
+                          lp.make_plan(c, d_lobby=True, no_gates=True)]
+        for p in plans:
+            p.long_pause_s = 60 if lp.long_pause_label(p) is None else 0  # the option's own hold is no fixed wait
+            for script in (lp.script_h(p, lp.LATE_JOIN_MARK), lp.script_h(p, None), lp.script_d(p)):
+                self.assertEqual(lp.wait_errors(script, p.estimate_s), [], p.level)
+        ww1 = [p for p in plans if p.level == "ww1" and p.pieces]
+        if ww1:
+            self.assertIn("wait 25", lp.script_h(ww1[0], None).splitlines())  # the islands' stay, in seconds
 
 class HeldFights(unittest.TestCase):
     """A fight is planned only when its held enemies' release is on the route before it (levelpass_holds)."""

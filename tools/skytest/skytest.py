@@ -9582,6 +9582,10 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         literals = lp.position_literals(lp.script_h(plan, lp.LATE_JOIN_MARK)) + lp.position_literals(lp.script_d(plan))
     if literals:  # the owner's rule: a level pass names objects; the game reads where they are
         raise SystemExit(f"levelpass: the generated scripts carry positions: {literals[:3]}")
+    if not a.predictions:  # a fixed wait in the wrong unit hangs the game slot (batch 11 run 3: wait 25000)
+        bad = lp.wait_errors(lp.script_h(plan, lp.LATE_JOIN_MARK), plan.estimate_s) +             lp.wait_errors(lp.script_d(plan), plan.estimate_s)
+        if bad:
+            raise SystemExit(f"levelpass: the generated scripts' waits: {bad[:3]}")
     spec_path.write_text(text, encoding="utf-8")
     # The plan's first line: its estimate and which budget it is in (the gates phase, or --no-gates).
     print(f"levelpass {a.level}: estimate {plan.estimate_s:.0f} s ({lp.budget_words(plan)}); content {plan.source}; "

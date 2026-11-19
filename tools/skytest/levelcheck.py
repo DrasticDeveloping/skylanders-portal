@@ -330,6 +330,7 @@ class ClientEnemy:
     seen_dead: Line | None = None  # `life <key> alive -> dead` / `dead <key> by`: the death shown on its copy
     skipped: Line | None = None    # `skipped <key> (dead before bind)`: S's death came before any bind here
     retired_alive: Line | None = None
+    retired_streamed: Line | None = None  # `retired <key> (streamed out on the server)`: S slept it, its row went
     last: Line | None = None
 
     def status(self) -> str:
@@ -360,7 +361,18 @@ def client_enemies(log: Log) -> dict[str, ClientEnemy]:
             c.seen_dead = c.seen_dead or line
         elif kind == "retired alive":
             c.retired_alive = c.retired_alive or line
+        elif kind == "retired" and "streamed out on the server" in rest:
+            c.retired_streamed = c.retired_streamed or line
     return out
+
+
+def slept_before_made(k: "EnemyKey", c: "ClientEnemy | None") -> bool:
+    """A run-time spawn S put to sleep (streamed out, its row retired) before this client made a copy: it never
+    died, and the client's only line for it is that retirement (never bound, waited for, looked for or killed
+    here). Nobody could see it (batch 11 tutorial_b 20261119-061110: CrashSP_04_Spawned1 slept on S 3.04 s after
+    its spawn, far from both players, and both clients dropped it before their 3 s wait for a copy ran out)."""
+    return (k.kind == "run-time" and k.dead is None and k.streamed is not None and c is not None
+            and c.retired_streamed is not None and not (c.bound or c.waits or c.pending or c.skipped or c.seen_dead))
 
 
 def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
@@ -412,6 +424,7 @@ def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
               f"no attacker {len(no_attacker)}; attacker not recorded {len(unrecorded)})"]
     findings: list[Finding] = []
     expected: dict[str, list[str]] = {}       # key -> the clients that should have had it
+    slept: dict[str, list[str]] = {}          # key -> the clients it went to sleep on S before they made it
     there: dict[str, dict[str, ClientEnemy | None]] = {}
     for who in order:
         log = run.clients[who]
@@ -426,9 +439,12 @@ def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
             gone = k.dead or k.streamed
             if k.placed.t is None or k.placed.t > w.end - BIND_GRACE or (gone and gone.t and gone.t < w.start):
                 continue  # made too late for this client, or gone before it came
+            c = seen.get(k.key)
+            if slept_before_made(k, c):
+                slept.setdefault(k.key, []).append(who)
+                continue  # listed apart, never graded (slept_before_made)
             n_exp += 1
             expected.setdefault(k.key, []).append(who)
-            c = seen.get(k.key)
             there.setdefault(k.key, {})[who] = c
             died_here = bool(k.dead and k.dead.t and w.start <= k.dead.t <= w.end - DEATH_GRACE)
             n_deaths += died_here
@@ -502,7 +518,16 @@ def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
     counts.append(fights)
     if scenery or unreleased:
         counts.append(f"set apart: {len(scenery)} scenery, {len(unreleased)} held and not released in this run")
+    gone_early = [k for k in slept if k not in expected]
+    if gone_early:
+        counts.append(f"gone to sleep on the server before any player's game made it: {len(gone_early)}")
+        held_notes.append("gone to sleep on the server before any player's game made it (not graded): " + "; ".join(
+            f"{keys[k].name} ({k}): {keys[k].streamed.cite()}" for k in gone_early[:6]))
     findings = fight_findings + findings  # the fights first: the most telling
+    if not expected and not findings:
+        # Nothing a client should have had (every key set apart, made too late or gone before it came): not a pass.
+        return Verdict("enemies", NOT_TESTED, "; ".join(counts) + "; no enemy any client should have had", first,
+                       notes=held_notes)
     return Verdict("enemies", FAIL if findings else PASS, "; ".join(counts), first, findings, held_notes)
 
 
@@ -1509,6 +1534,11 @@ REQ_LINE = re.compile(r"Input script: LEVELPASS required (r\d+) (\S+) (\S+)(?: n
 GATES_SKIPPED = re.compile(r"Input script: LEVELPASS gates not attempted \(--no-gates\)")
 
 
+def when(line: Line) -> str:
+    """A line's time of day to the millisecond, or ?."""
+    return line.t.strftime("%H:%M:%S.%f")[:-3] if line.t is not None else "?"
+
+
 def gate_open_ids(log: Log, name: str, mover: bool = False) -> list[Line]:
     """One line per distinct `<name>#<id>` this game shows opened, in order."""
     n = re.escape(name)
@@ -1532,26 +1562,39 @@ def gate_opened(run: Run, name: str) -> Line | None:
 
 
 def key_gate_trail(run: Run, name: str, k: int) -> list[str]:
-    """Where a carried key's way broke, in order: picked up on H, its row on S, pressed at the lock."""
+    """A key gate's carried key, in order (the k-th gate of that name): touched and following on H, what S
+    logged for the key, the held press at the lock on H, S's decision, and D's own copy of the key."""
     h = run.clients.get("H")
-    out = []
-    picked = h.find(re.compile(r"Dev: pickup " + re.escape(name) + r"_key#\S+ (done|failed)")) if h else []
+    out: list[str] = []
+    key = re.escape(name) + r"_key#\S+"
+    picked = h.find(re.compile(r"Dev: pickup " + key + r" (done|failed)")) if h else []
     if len(picked) <= k or picked[k][1].group(1) != "done":
-        out.append("not picked up on H: " + (picked[k][0].cite() if len(picked) > k else
-                                              absent(h, f"`pickup {name}_key ... done`") if h else "no H log"))
-        return out
-    out.append(f"picked up on H: {picked[k][0].cite()}")
-    if run.server is not None:
-        row = run.server.find(re.compile(r"Online: world (?:unsupported carried_item|tracked carried_item) "
-                                         + re.escape(name) + r"_key#\S+ .*"))
-        if row and "unsupported" in row[0][0].text:
-            out.append(f"no carried key row on S: {row[0][0].cite()}")
-    pressed = h.find(re.compile(r"Dev: interact " + re.escape(name) + r"_keylock#\S+ (done|failed)"))
-    if len(pressed) <= k or pressed[k][1].group(1) != "done":
-        out.append("not pressed at the lock on H: " + (pressed[k][0].cite() if len(pressed) > k else
-                                                         absent(h, f"`interact {name}_keylock ... done`")))
+        out.append("key not carried on H: " + (picked[k][0].cite() if len(picked) > k else
+                                                absent(h, f"`pickup {name}_key ... done`") if h else "no H log"))
     else:
-        out.append(f"pressed at the lock on H: {pressed[k][0].cite()}")
+        out.append(f"key touched and following on H: {picked[k][0].cite()}")
+    if run.server is not None:
+        # What S tracked or did with the key (its row, a carry, a claim), not its level-start volume line.
+        s_key = [l for l, _m in run.server.find(re.compile(r"Online: .*\b" + key + r".*"))
+                 if "single-fire volume" not in l.text]
+        out.append(f"S for the key: {s_key[-1].cite()}" if s_key else
+                   absent(run.server, f"naming {name}_key (other than its level-start volume)"))
+        decided = run.server.find(re.compile(r"Online: .*gate\.open.*|Online: decided .*gate.*"))
+        if decided:
+            out.append(f"S's decision: {decided[0][0].cite()}")
+    if h is not None:
+        held = h.find(re.compile(r"Online: backend press (held|released|cancelled|refused|slow)[^\n]*" + re.escape(name)))
+        out.append("press at the lock on H: " + "; ".join(l.cite() for l, _m in held[:3]) if held else
+                   "no held press at the lock on H (" + absent(h, f"`backend press held ... {name}`") + ")")
+        pressed = h.find(re.compile(r"Dev: interact " + re.escape(name) + r"_keylock#\S+ (done|failed).*"))
+        if len(pressed) > k:
+            out.append(f"interact on H: {pressed[k][0].cite()}")
+    d = run.clients.get("D")
+    if d is not None:
+        d_key = [l for l, _m in d.find(re.compile(r"Online: .*\b" + key + r".*"))
+                 if "single-fire volume" not in l.text and "unsupported carried_item" not in l.text]
+        out.append(f"D's own key: {d_key[-1].cite()}" if d_key else
+                   "D's own key: no line after its level start (still at home: nothing on D moves or removes it)")
     return out
 
 
@@ -1607,13 +1650,14 @@ def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[st
         if g.kind == "battle gate" and where.get("S") is None:
             trail.append(battle_gate_left(run, data, g))
         if missing:
-            opened_on = [w for w in where if where[w] is not None]
+            opened_on = [f"{w} at {when(where[w])}" for w in where if where[w] is not None]
             shut.append(f"{g.name} ({g.kind}): performed ({req[0].cite()}); opened on "
                         f"{', '.join(opened_on) or 'no game'}, not on {', '.join(missing)}"
                         + ("; " + "; ".join(trail) if trail else ""))
         else:
             done.append(f"{g.name} ({g.kind}): opened on {', '.join(where)}: "
-                        + "; ".join(f"{w} {line.cite()}" for w, line in where.items()))
+                        + "; ".join(f"{w} at {when(line)} {line.cite()}" for w, line in where.items())
+                        + ("; " + "; ".join(trail) if trail else ""))
     return shut, done
 
 
@@ -1679,9 +1723,15 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run),
             grade_pieces(run, data)]
     # The enemies and the loot are read where both players stand only when D followed H: each says which.
-    where = (f"read with D following H: {together.counts}" if together.status in (PASS, FAIL) else
-             "read with D where it entered the level (no follow in this run): D's enemies and loot far from H are "
-             "asleep there")
+    followed = bool(run.clients.get("D") and run.clients["D"].find(FOLLOW_ON))
+    if together.status in (PASS, FAIL):
+        where = f"read with D following H: {together.counts}"
+    elif followed:
+        # D's follow ran, but the together row had nothing to read (batch 11 run 3: H hung before any stop).
+        where = f"D followed H (its `auto follow ... (script)` line), but where both stood was not read: {together.counts}"
+    else:
+        where = ("read with D where it entered the level (no follow in this run): D's enemies and loot far from H "
+                 "are asleep there")
     for v in rows:
         if v.name in ("enemies", "loot"):
             v.notes.append(where)

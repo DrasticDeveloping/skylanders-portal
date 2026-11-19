@@ -1178,9 +1178,18 @@ def gates_words(content: Content) -> list[str]:
 # The owner's definition is "completable the way a player plays": the pass opens each gate the data counts as
 # required, after its sweep (phase required, past the sweep's deadline, so none is skipped by it), in the order
 # along the level:
-# - a key gate (KeyLockData): stand at the gate, pick its key up the way a player does (`pickup`: walk into it;
-#   the key a KeyLockData gate spawns is named `<gate>_key`, its lock `<gate>_keylock`, as the runs log them, so
-#   `nearest:` finds this gate's from beside it), press the lock (`interact`), wait for the gate to move;
+# - a key gate (KeyLockData): stand at the gate, pick its key up the way a player does, press the lock, wait for
+#   the gate to move. The gate's KeyLock spawns its key at the level's start (`<gate>_key` at its KeyLocation;
+#   the lock entity is `<gate>_keylock`: logs/carried-notes.txt, the decompiled scripts); the first hero to
+#   touch the key carries it (Scripts.FollowPlayerOnTouchComponent), so the step is `pickup` (onto the key, wait
+#   for it to follow). The key is addressed by its EXACT name (the selector's plain `<Name>` form, the nearest
+#   of that name to the hero), never `nearest:` (a substring: batch 11 run 2 picked `<gate>_keylock` for
+#   `nearest:<gate>_key`), from beside its own gate: two gates share a name (tutorial_b) and so do their keys,
+#   each key starts at its own lock. TODO(next build): a selector `key_of:<gate>` reading the gate's
+#   KeyLock._key (+48, `backend field Scripts.KeyLock._key +48`) would address the gate's own key whatever the
+#   distances; no command reads it today. The press: `interact <gate>_keylock`, which walks (no teleport: a
+#   teleport may end the carry, the key's OnTeleport subscription) and presses until the interaction fires;
+#   the client's gate press then holds that fire until S decides (adapters/gate_press.h), no button is held.
 # - a battle gate (DemonGateSeal): the enemies and encounters whose telegrams reach it (Gate.openers): a held
 #   one's release first (enter its trigger, break what releases it: the holds), an encounter's start trigger
 #   entered (its CEncounterToggleMessage on eMAF_OnEnter), then the fight, bounded (`encounter_clear <manager> ...
@@ -1194,8 +1203,8 @@ REQ_BATTLE_S = 80.0       # the release, the fight (GATE_FIGHT_S), the gate's mo
 REQ_SPARK_S = 90.0        # the press, the board, its solve
 GATE_FIGHT_S = 60         # a gate's fight is bounded by this (encounter_clear exact, fight_near)
 GATE_OPEN_WAIT_S = 20     # wait_moved on the gate after its step
-KEY_RADIUS = 8000         # its key is looked for this far from the gate (tutorial_b's: about 1400)
-KEYLOCK_RADIUS = 1500
+KEY_PICKUP_S = 40         # pickup: onto the key (tutorial_b's lies about 1400 from its gate) and its follow
+KEY_PRESS_S = 60          # interact: the walk back to the lock with the key and the press
 TOGGLE = "CEncounterToggleMessage"
 
 
@@ -1243,7 +1252,7 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
             step.why_not = "no live reference to the gate"
         elif g.kind == lh.KEY_GATE:
             step.h = [f"{head} (fetch its key {_safe(g.key_data)})", f"goto_entity {ref}",
-                      f"pickup nearest:{g.name}_key:{KEY_RADIUS} 40", f"interact nearest:{g.name}_keylock:{KEYLOCK_RADIUS} 30",
+                      f"pickup {g.name}_key {KEY_PICKUP_S}", f"interact {g.name}_keylock {KEY_PRESS_S}",
                       f"wait_moved {ref} 50 {GATE_OPEN_WAIT_S}", f"online_audit {label}"]
             step.est_s = REQ_KEY_S
         elif g.kind == lh.SPARK_LOCK:
@@ -1349,7 +1358,7 @@ def pieces_lines(plan: Plan) -> list[str]:
     for k, (m, trig, spawner) in enumerate(plan.pieces, 1):
         out += [f"log LEVELPASS pieces p{k} {_safe(m.name)} starts {', '.join(_safe(n) for n in m.spawner_names)} "
                 f"stay {m.stay_s:.0f} s", f"enter_trigger {trig.ref}", f"goto_entity {spawner.ref} {PIECES_STANDOFF}",
-                f"wait {int(m.stay_s * 1000)}", f"online_audit p{k}"]
+                f"wait {int(round(m.stay_s))}", f"online_audit p{k}"]
     return out
 
 
@@ -2324,6 +2333,28 @@ def script_d(plan: Plan) -> str:
 
 POSITION_LITERAL = re.compile(r"(?<![\w:.\-])-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?|at:-?\d|\bgoto -?\d|fight_area\b|"
                               r"online_wait_peer_near\b|online_server_goto\b|walkto\b|navto\b")
+
+
+# The input script's `wait` takes SECONDS (dev/input_script: `wait 8`); a generated fixed wait is never longer than
+# MAX_FIXED_WAIT_S, and the fixed waits of one script together stay within the pass's estimate. Batch 11 run 3
+# (ww1, 20261119-062358) lost its whole 660 s slot to `wait 25000` (the pieces step's 25 s written in ms).
+MAX_FIXED_WAIT_S = 120
+FIXED_WAIT = re.compile(r"^wait\s+(\d+(?:\.\d+)?)\s*$", re.M)
+
+
+def fixed_waits(script: str) -> list[float]:
+    """Every fixed `wait <seconds>` of a script, in order."""
+    return [float(m.group(1)) for m in FIXED_WAIT.finditer(script)]
+
+
+def wait_errors(script: str, estimate_s: float) -> list[str]:
+    """What is wrong with a script's fixed waits: one over MAX_FIXED_WAIT_S, or their sum over the estimate."""
+    waits = fixed_waits(script)
+    out = [f"wait {w:g} is over {MAX_FIXED_WAIT_S} s (the input script's wait takes seconds)"
+           for w in waits if w > MAX_FIXED_WAIT_S]
+    if sum(waits) > estimate_s:
+        out.append(f"the fixed waits add up to {sum(waits):g} s, over the pass's estimate {estimate_s:.0f} s")
+    return out
 
 
 def position_literals(script: str) -> list[str]:
