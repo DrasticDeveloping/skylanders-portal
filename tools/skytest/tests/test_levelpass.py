@@ -120,7 +120,8 @@ class Readers(unittest.TestCase):
         self.assertTrue(p.timed)
         self.assertIsNone(p.exit_stop)
         h = lp.script_h(p, lp.LATE_JOIN_MARK)
-        self.assertIn(f"waitfor online_level_end {lp.TIMED_END_S}", h)
+        self.assertIn(f"waitfor online_level_after_mark {lp.TIMED_END_S + lp.NEXT_LOAD_S}", h)
+        self.assertNotIn("online_level_end", h)  # the server's LevelEnd may never come (a held end): the next level
         self.assertLess(h.index("LEVELPASS late-join start"), h.index("LEVELPASS visit v1"))
 
     def test_load_content_prefers_static(self):
@@ -332,7 +333,9 @@ class Scripts(unittest.TestCase):
         self.assertIn("level madeup", h)
         self.assertIn("log LEVELPASS late-join start", h)
         self.assertIn("waitfor online_peer_was_in 300", h)  # D may have come and gone already
-        self.assertIn("waitfor online_past_level_end 240", h)
+        self.assertIn(f"waitfor online_level_after_mark {int(lp.EXIT_WAIT_S) + lp.NEXT_LOAD_S}", h)
+        # The level under test is marked once it is up (the exit's wait is for a later one), on H and D.
+        self.assertLess(h.index("online_mark_level", h.index("level madeup")), h.index("LEVELPASS phase sweep"))
         self.assertLess(h.index("LEVELPASS phase late-join"), h.index("LEVELPASS phase exit"))
         self.assertIn("attack_until auth:madeup:6 12", h)
         self.assertIn("interact auth:madeup:10 10", h)
@@ -349,7 +352,8 @@ class Scripts(unittest.TestCase):
         self.assertLess(h.index("online_wait_peers 2 120"), h.index("LEVELPASS phase exit"))
         self.assertNotIn("waitfor online_alone 300", h)
         self.assertLess(h.index("online_audit next"), h.index(f"waitfor online_alone {lp.D_ALONE_WAIT_S}"))
-        for line in (f"waitfor online_level_end {lp.D_LEVEL_END_WAIT_S}", "waitfor online_past_level_end 240",
+        self.assertLess(d.index("online_mark_level"), d.index("LEVELPASS D in"))
+        for line in (f"waitfor online_level_after_mark {lp.D_LEVEL_END_WAIT_S}",
                      "log LEVELPASS D next level", "online_audit d-next"):
             self.assertIn(line, d)
         self.assertLess(d.index("log LEVELPASS D next level"), d.index("online_end"))
@@ -359,7 +363,7 @@ class Scripts(unittest.TestCase):
         ho, do = lp.script_h(old, lp.LATE_JOIN_MARK), lp.script_d(old)
         self.assertLess(ho.index("waitfor online_alone 300"), ho.index("LEVELPASS phase exit"))
         self.assertNotIn("online_wait_peers 2", ho)
-        self.assertNotIn("online_level_end", do)
+        self.assertNotIn("online_level_after_mark", do)
         self.assertNotIn("wait_needs", lp.spec_toml(old))
         # --no-end: no end to reach, D leaves as before.
         self.assertFalse(lp.d_through_end(lp.make_plan(content(), no_end=True)))
@@ -384,7 +388,7 @@ class Scripts(unittest.TestCase):
         p = lp.make_plan(c, late_join=False)
         h = lp.script_h(p, late_join_after=None)
         self.check_script(h)
-        self.assertNotIn("online_level_end", h)
+        self.assertNotIn("online_level_after_mark", h.split("online_mark_level")[-1])
         self.assertIn("LEVELPASS exit none", h)
         self.assertNotIn("online_wait_peers", h)
 
@@ -396,7 +400,8 @@ class Scripts(unittest.TestCase):
         self.assertIsNotNone(p.exit_stop)  # found, named in the line below
         h = lp.script_h(p, lp.LATE_JOIN_MARK)
         self.check_script(h)
-        for words in ("online_level_end", "online_past_level_end", "online_audit next", "LEVELPASS phase exit",
+        for words in ("online_level_end", "online_past_level_end", f"waitfor online_level_after_mark {int(lp.EXIT_WAIT_S) + lp.NEXT_LOAD_S}",
+                      "online_audit next", "LEVELPASS phase exit",
                       "enter_trigger auth:madeup:2"):
             self.assertNotIn(words, h)
         self.assertIn("LEVELPASS exit not attempted (--no-end)", h)
@@ -421,7 +426,7 @@ class Scripts(unittest.TestCase):
         t = lp.make_plan(c, no_end=True)
         self.assertTrue(t.timed)
         ht = lp.script_h(t, lp.LATE_JOIN_MARK)
-        self.assertNotIn("online_level_end", ht)
+        self.assertNotIn(f"waitfor online_level_after_mark {lp.TIMED_END_S + lp.NEXT_LOAD_S}", ht)
         self.assertIn("the level ends on its own", ht)
 
     def test_no_probe(self):
