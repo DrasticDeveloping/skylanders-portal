@@ -70,8 +70,13 @@ class SnapshotsFolderTest(unittest.TestCase):
     def test_a_run_takes_its_snapshot_and_its_build_copy_from_the_named_folder(self) -> None:
         outside = Path(self.tmp.name) / "internal" / "snapshots" / "wt"
         self.name(f"# the snapshots stay on the internal drive\n{outside}\n")
+        with self.assertRaises(SystemExit) as no_marker:  # no folder, no marker: refused, with what to create
+            self.reload()
+        self.assertIn(store_marker := "SFO-TEST-STORE.txt", str(no_marker.exception))
+        outside.mkdir(parents=True)
+        (outside / store_marker).write_text(f"{os.path.abspath(self.cfg.store)}\n", encoding="utf-8")
         self.cfg = self.reload()
-        self.assertEqual(self.cfg.snapshots, skytest.resolved(outside))
+        self.assertEqual(self.cfg.snapshots, Path(skytest.store_paths.real(outside)))
         self.assertTrue(outside.is_dir())
         self.routes_in_the_build()
         self.spec("copied", 'layout = "solo"\nstage = "8"\n'
@@ -80,7 +85,7 @@ class SnapshotsFolderTest(unittest.TestCase):
         r = self.run_cases("copied", "shared")
         self.assertEqual({c["case"]: c["status"] for c in r["cases"]}, {"copied": "pass", "shared": "pass"}, r)
         snap = Path(r["snapshot"])
-        self.assertEqual(snap.parent, skytest.resolved(outside))
+        self.assertEqual(skytest.store_paths.real(snap.parent), skytest.store_paths.real(outside))
         self.assertTrue((snap / "game.exe").is_file())
         self.assertFalse((self.cfg.store / "snapshots").exists())
         # The guard takes the named folder and the store, nothing else.
@@ -131,15 +136,29 @@ class SnapshotsFolderTest(unittest.TestCase):
         self.session(stamp(2), "lane", in_progress=True)
         self.session(stamp(1), "cur")
         self.assertEqual(skytest.snapshots_in_use(self.cfg, "cur"), ["cur", "prev", "lane"])
+        # A second session started in the same second is `-session-2` (fresh_dir): its snapshot is kept too.
+        d = self.cfg.store / "runs" / f"{stamp(1.5)}-session-2"
+        d.mkdir(parents=True)
+        (d / "results.json").write_text(json.dumps({"snapshot": "x/lane2", "in_progress": "starting"}), encoding="utf-8")
+        self.assertEqual(skytest.snapshots_in_use(self.cfg, "cur"), ["cur", "prev", "lane2", "lane"])  # newest session first
         # A young session with no results.json yet: its snapshot is unknown, nothing goes.
         self.session(stamp(0.5), None)
         self.assertIsNone(skytest.snapshots_in_use(self.cfg, "cur"))
+
+    def test_prune_hours_must_be_finite_and_above_zero(self) -> None:
+        for bad in (0.0, -1.0, float("nan"), float("inf")):
+            with self.assertRaises(SystemExit, msg=str(bad)):
+                skytest.cmd_prune(self.cfg, argparse.Namespace(older_than=bad, dry_run=True))
 
     def with_janitor(self) -> None:
         if not JANITOR.is_file():
             self.skipTest("no game repository janitor beside this portal")
         (self.repo / "tools").mkdir(exist_ok=True)
         shutil.copy2(JANITOR, self.repo / "tools" / JANITOR.name)
+        # Its store_paths import, as in a game repository (a copy: no link to the real portal in a temp folder).
+        portal = self.repo / "thirdparty" / "skylanders-portal" / "tools" / "skytest"
+        portal.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(HERE.parent / "store_paths.py", portal / "store_paths.py")
 
     def test_after_a_run_only_the_current_build_and_the_one_before_stay(self) -> None:
         self.with_janitor()
@@ -159,8 +178,10 @@ class SnapshotsFolderTest(unittest.TestCase):
         for d in (old, new):
             d.mkdir(parents=True)
             (d / "log.txt").write_text("x", encoding="utf-8")
+            (d / "result.json").write_text("{}", encoding="utf-8")  # finished runs
         t = time.time() - 3 * 86400
         os.utime(old / "log.txt", (t, t))
+        os.utime(old / "result.json", (t, t))
         snap = fake_snapshot(self.cfg.store / "snapshots", "cccccccccccc")
         os.utime(snap / "runtime.dll", (t, t))
         self.assertEqual(skytest.cmd_prune(self.cfg, argparse.Namespace(older_than=24.0, dry_run=False)), 0)
@@ -174,12 +195,15 @@ class SnapshotsFolderTest(unittest.TestCase):
         target = Path(self.tmp.name) / "external" / "tests" / "wt"
         shutil.move(str(self.cfg.store), str(target))
         junction(self.cfg.store, target)
+        # The owner's marker in the target: without it the cleanup is refused (store cleanup review, item 1).
+        (target / "SFO-TEST-STORE.txt").write_text(f"{os.path.abspath(self.cfg.store)}\n", encoding="utf-8")
         fake_snapshot(target / "snapshots", "dddddddddddd")
         self.spec("solo", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
         r = self.run_cases("solo")
         self.assertEqual(r["cases"][0]["status"], "pass", r)
         current = Path(r["snapshot"]).name
         self.assertEqual([p.name for p in (target / "snapshots").iterdir()], [current])
+        self.assertTrue((target / "SFO-TEST-STORE.txt").is_file())
         self.assertTrue(os.path.isjunction(self.cfg.store))
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(skytest.cmd_prune(self.cfg, argparse.Namespace(older_than=1000.0, dry_run=True)), 0)

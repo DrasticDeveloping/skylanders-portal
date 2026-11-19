@@ -134,6 +134,7 @@ import memory_growth  # noqa: E402  (stage 5's soak grade)
 import occurrence_outcomes  # noqa: E402  (stage 5's occurrence grade)
 import known_failures  # noqa: E402  (a pointless rerun refused: the last two results failed alike)
 import build_guard  # noqa: E402  (no session while a build holds its slot)
+import store_paths  # noqa: E402  (which folders a cleanup may touch; shared with the janitor)
 import preflight_gate  # noqa: E402  (a case whose preflight has an error starts no game)
 import script_checks  # noqa: E402  (a script that waits on a session it never starts; a wait whose peer is gone)
 
@@ -780,9 +781,11 @@ SNAPSHOTS_FILE = "snapshots-folder.txt"
 
 
 def snapshots_setting(cfg: Config) -> Path | None:
-    """The snapshots folder the store's SNAPSHOTS_FILE names (made when missing), None without the file.
-    Refused (SystemExit): not one absolute path; a drive root; inside or around the owner's data, the
-    disc, the repository or the store; a junction, link or other reparse point on its way."""
+    """The snapshots folder the store's SNAPSHOTS_FILE names, None without the file; refused (SystemExit)
+    as store_paths.validate_snapshots_folder says (the janitor's own check): one absolute plain drive path to
+    an existing folder with no link on its way, holding this store's SFO-TEST-STORE.txt, not equal to, inside
+    or around a git checkout, a disc, the owner's data, the user profile's root, a drive root, the repository
+    or the store. Resolved once (its real path); the runner hands that to the janitor."""
     f = cfg.store / SNAPSHOTS_FILE
     if not f.is_file():
         return None
@@ -791,26 +794,24 @@ def snapshots_setting(cfg: Config) -> Path | None:
     where = f"{f}: the snapshots folder"
     if len(lines) != 1:
         raise SystemExit(f"{where}: one line with one absolute path, found {len(lines)}")
-    given = Path(lines[0])
-    if not given.is_absolute() or not given.drive:
-        raise SystemExit(f"{where} {lines[0]!r} is not an absolute path with its drive")
-    folder = resolved(given)
-    if folder.parent == folder:
-        raise SystemExit(f"{where} {folder} is a drive root")
-    walk = Path(given.anchor)
-    for part in Path(os.path.normpath(given)).parts[1:]:
-        walk = walk / part
-        if not os.path.lexists(walk):
-            break
-        if la.is_reparse_point(walk):
-            raise SystemExit(f"{where}: {walk} is a junction, link or other reparse point")
-    guarded = [("the owner's data folder", r) for r in owner_data_roots()] + [
-        ("the disc", cfg.rom), ("the repository", cfg.repo), ("the test store", cfg.store)]
-    for what, root in guarded:
-        if inside(folder, root) or inside(root, folder):
-            raise SystemExit(f"{where} {folder} is inside or around {what} {root}")
-    folder.mkdir(parents=True, exist_ok=True)
+    folder, why = store_paths.validate_snapshots_folder(
+        lines[0], os.path.abspath(cfg.store),
+        [("the disc", cfg.rom), ("the repository", cfg.repo), ("the test store", cfg.store)], owner_data_roots())
+    if folder is None:
+        raise SystemExit(f"{where}: {why}")
     return folder
+
+
+def remove_temporary(cfg: Config, tmp: Path) -> None:
+    """A partial snapshot folder of this process removed: only while its real path is inside the snapshots
+    root (the store's snapshots/ or the outside folder) and it is no link; else the run stops."""
+    if not os.path.lexists(tmp):
+        return
+    root = snapshots_root(cfg)
+    why = store_paths.check_victim(tmp, store_paths.real(root))
+    if why:
+        raise SystemExit(f"refusing to remove {tmp}: {why}")
+    shutil.rmtree(tmp, ignore_errors=True)
 
 
 def snapshots_root(cfg: Config) -> Path:
@@ -2690,7 +2691,7 @@ def snapshot_build(cfg: Config) -> Path:
     # put the same snapshot there first, that one is used.
     tmp = snap.with_name(f"{snap.name}.partial-{os.getpid()}-{threading.get_ident()}")
     check_output_path(cfg, tmp)
-    shutil.rmtree(tmp, ignore_errors=True)
+    remove_temporary(cfg, tmp)
     try:
         tmp.mkdir(parents=True)
         for f in files:
@@ -2703,7 +2704,7 @@ def snapshot_build(cfg: Config) -> Path:
                 raise SystemExit(f"could not put the snapshot in place at {snap} ({e}), and no complete one is"
                                  " there") from e
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        remove_temporary(cfg, tmp)
     return snap
 
 
@@ -2757,7 +2758,7 @@ def snapshot_unit(cfg: Config, binary: str) -> Path:
     # renames it into place; a rename that loses to another one's complete snapshot uses that one.
     tmp = snap.with_name(f"{snap.name}.partial-{os.getpid()}-{threading.get_ident()}")
     check_output_path(cfg, tmp)
-    shutil.rmtree(tmp, ignore_errors=True)
+    remove_temporary(cfg, tmp)
     try:
         tmp.mkdir(parents=True)
         for f in files:
@@ -2769,7 +2770,7 @@ def snapshot_unit(cfg: Config, binary: str) -> Path:
                 raise SpecError(f"could not put the unit snapshot in place at {snap} ({e}), and no complete one"
                                 " is there") from e
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        remove_temporary(cfg, tmp)
     return snap / src.name
 
 
@@ -7561,6 +7562,20 @@ class StoreJanitor:
 # ran), and any a session still in progress names. `prune --older-than <hours>`: the run and session
 # folders whose newest file is older than that.
 SESSION_RECENT_S = 24 * 3600.0   # a session this young with no results.json yet may still be running
+SESSION_NAME = re.compile(r"-session(?:-\d+)?$")  # fresh_dir names a same-second second session -session-2
+
+
+def publish_session(out: Path, snap: Path | None) -> None:
+    """A session's results.json from its first moment (in progress, naming its snapshot), so every runner's
+    after-run cleanup keeps the snapshot it uses; write_progress replaces it as cases end."""
+    if (out / "results.json").is_file():
+        try:
+            if json.loads((out / "results.json").read_text(encoding="utf-8")).get("cases"):
+                return  # a case has ended: write_progress names the snapshot from now on
+        except (OSError, ValueError, AttributeError):
+            pass
+    write_text_replacing(out / "results.json", json.dumps({"in_progress": "starting: no case ended yet",
+                                                            "snapshot": str(snap) if snap else "", "cases": []}))
 
 
 def janitor_script(cfg: Config) -> Path | None:
@@ -7580,7 +7595,7 @@ def snapshots_in_use(cfg: Config, current: str) -> list[str] | None:
     previous = ""
     runs = cfg.store / "runs"
     try:
-        sessions = sorted((d for d in runs.iterdir() if d.name.endswith("-session")), key=lambda d: d.name,
+        sessions = sorted((d for d in runs.iterdir() if SESSION_NAME.search(d.name)), key=lambda d: d.name,
                           reverse=True)
     except OSError:
         return keep
@@ -7629,7 +7644,8 @@ def prune_snapshots(cfg: Config, current: str) -> str:
         return "snapshots: none removed (a session younger than a day has no results.json yet)"
     try:
         r = subprocess.run([sys.executable, "-I", str(script), "--store", str(cfg.store), "--apply", "--line",
-                            "--only", "snapshots", "--keep-snapshot-names", ",".join(keep)],
+                            "--only", "snapshots", "--keep-snapshot-names", ",".join(keep)]
+                           + (["--snapshots-folder", str(cfg.snapshots)] if cfg.snapshots is not None else []),
                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"snapshots: not cleaned ({e})"
@@ -7639,8 +7655,8 @@ def prune_snapshots(cfg: Config, current: str) -> str:
 def cmd_prune(cfg: Config, a: argparse.Namespace) -> int:
     """`prune --older-than <hours>`: the store's run and session folders older than that, through the
     janitor (never through a directory link); it prints what it removed and what that freed."""
-    if a.older_than <= 0:
-        raise SystemExit("prune: --older-than takes a number of hours above 0")
+    if not (math.isfinite(a.older_than) and a.older_than > 0):
+        raise SystemExit(f"prune: --older-than takes a finite number of hours above 0, not {a.older_than}")
     script = janitor_script(cfg)
     if script is None:
         raise SystemExit(f"prune: {cfg.repo / 'tools' / 'test_store_janitor.py'} is missing or has no cleanup options")
@@ -7867,6 +7883,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         print(rank.line(runnable), flush=True)
     janitor = StoreJanitor(cfg)
     budget = machine_budget(cfg)
+
+    def machine_lock():
+        """The machine-wide lock (machine.lock) when this machine has a budget; else nothing to share."""
+        return budget.mutex() if budget is not None else contextlib.nullcontext()
     if any(runs_alone(sp) for sp in runnable):
         janitor.skip("a case of this run runs alone: the janitor's walk never runs beside a measured case")
     else:
@@ -7883,16 +7903,29 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             with snapshot_lock:
                 if snap is None:
                     check_disc(cfg)
-                    snap = snapshot_build(cfg)
+                    if session_out:
+                        # Chosen later by a case: under the machine lock, and this session's results.json
+                        # names it at once (the after-run cleanup of every runner keeps what a session names).
+                        with machine_lock():
+                            snap = snapshot_build(cfg)
+                            publish_session(session_out[0], snap)
+                    else:
+                        snap = snapshot_build(cfg)  # the caller holds the machine lock (below)
                     breaker = CircuitBreaker(budget, snap.name) if budget is not None else None
                 return snap
 
-        if any(starts_games(sp) for sp in runnable):
-            game_snapshot()
         guarded = guarded_folders(cfg)
         before_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        out = make_run_dir(cfg, cfg.store / "runs" / f"{stamp}-session")
+        # The snapshot is chosen and the session folder that names it is written under the machine lock,
+        # which every runner's after-run snapshot cleanup also holds: no cleanup runs between the two.
+        session_out: list[Path] = []
+        with machine_lock():
+            if any(starts_games(sp) for sp in runnable):
+                game_snapshot()
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            out = make_run_dir(cfg, cfg.store / "runs" / f"{stamp}-session")
+            publish_session(out, snap)
+        session_out.append(out)
         thresholds = tomllib.loads(cfg.thresholds.read_text(encoding="utf-8")) if cfg.thresholds.is_file() else {}
         baseline = tomllib.loads(cfg.baseline.read_text(encoding="utf-8")) if cfg.baseline.is_file() else {}
         # The last recorded status of each case before this run (findings, the checkpoint's "passed before").
@@ -8168,7 +8201,8 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     if store_line:
         print(store_line)
     if snap is not None:
-        snaps_line = prune_snapshots(cfg, snap.name)
+        with machine_lock():  # no other runner chooses a snapshot or starts a session meanwhile
+            snaps_line = prune_snapshots(cfg, snap.name)
         if snaps_line:
             print(snaps_line)
     print(f"report: {out / 'report.md'}")
@@ -8925,7 +8959,6 @@ def live_serve(cfg: Config, a: argparse.Namespace) -> int:
         spec = load_spec(folder / "spec.toml", cfg.timeout)
         token_preflight(bool(a.allow_restricted))
         check_disc(cfg)
-        snap = snapshot_build(cfg)
         budget = machine_budget(cfg)
         if budget is not None:
             budget.owner = f"skytest live pid {os.getpid()}, {info.name}"
@@ -8935,6 +8968,9 @@ def live_serve(cfg: Config, a: argparse.Namespace) -> int:
             if lease.capacity:
                 say("failed", lease.capacity)
                 return 1
+        # The snapshot only once the slots are held (store cleanup review, item 5b).
+        with (budget.mutex() if budget is not None else contextlib.nullcontext()):
+            snap = snapshot_build(cfg)
         hooks = LiveHooks(folder, info, spec, st)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         res = run_case(cfg, spec, snap, len(spec.peers), stamp, {}, {}, (),
