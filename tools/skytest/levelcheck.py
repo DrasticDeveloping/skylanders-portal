@@ -1613,21 +1613,86 @@ def server_gate_opens(run: Run, name: str) -> list[tuple[str, Line]]:
     return [(pressed[m.group(1)], line) for line, m in run.server.find(GATE_APPLIED_S) if m.group(1) in pressed]
 
 
+# A gate's lock state (W17: a Scripts.LockedObjectComponent gate opens in place, its origin never moves, so
+# wait_moved never sees it). A gate's row is named by S's reference: `a<S's entity id, 8 hex>.<name hash>.<class>`
+# (S's `authored obj <zone> <i> <index> class <class> entity 1 name <hash> ... mid <id hex> ... text <Name>` line).
+# Every game logs the same authored list with its own entity ids, so S's reference names a gate by its authored
+# index, and each game's own line for that index names its `<Name>#<id>` (ww1: Finale_DemonGate008 is S's and H's
+# 0x93d, D's 0x95a). A client shows the opening as `backend key gate <S's ref>@<g> watched <p> (unlocked
+# Scripts.<Lock>=<n>)`; S writes the gate's row once when the level starts (`world 2 <ref>@<g> written`) and again
+# when the gate opens (batch 12 case 7, ww1: Finale_DemonGate008 S 12:54:21.128, H 12:54:21.454, D 12:54:21.363;
+# PuzzleGateSawtooth001 12:56:09.599, 56:10.041, 56:10.016).
+AUTHORED_GATE = re.compile(r"Online: authored obj (\S+) \d+ (\d+) class ([0-9a-f]{8}) entity \d+ name ([0-9a-f]{8}) "
+                           r"name0 \S+ mid ([0-9a-f]+) .* text (\S+)$")
+KEY_GATE_UNLOCKED = re.compile(r"Online: backend key gate (a[0-9a-f]{8}\.[0-9a-f]{8}\.[0-9a-f]{8})@\d+ watched \S+ "
+                               r"\(unlocked ")
+GATE_ROW_WRITTEN = re.compile(r"Online: world 2 (a[0-9a-f]{8}\.[0-9a-f]{8}\.[0-9a-f]{8})@\d+ written")
+
+
+def authored_gates(log: Log, name: str) -> dict[tuple[str, str], tuple[str, str]]:
+    """This game's gates of this name: (zone, authored index) -> (its reference, its `<name>#<id>`)."""
+    out = {}
+    for _line, m in log.find(AUTHORED_GATE):
+        if m.group(6) == name:
+            ident = int(m.group(5), 16)
+            out[(m.group(1), m.group(2))] = (f"a{ident:08x}.{m.group(4)}.{m.group(3)}", f"{name}#{ident}")
+    return out
+
+
+def gate_refs(log: Log, name: str, server: Log | None = None) -> dict[str, str]:
+    """The row references of the gates of this name (S's, from `server` when given, else this game's own), each to
+    this game's `<name>#<id>` of the same authored gate."""
+    own = authored_gates(log, name)
+    named = authored_gates(server, name) if server is not None else own
+    out = {}
+    for key, (ref, _ident) in named.items():
+        if key in own:
+            out[ref] = own[key][1]
+    return out
+
+
+def lock_state_opens(log: Log, name: str, server: bool, s_log: Log | None = None) -> list[tuple[str, Line]]:
+    """(<name>#<id>, the line) for each opening this game shows by the gate's lock state: on S a gate's row written
+    again after its first write, on a client its `backend key gate <S's ref> ... (unlocked ...)` (`s_log`: S's log,
+    whose references the rows carry; None: this game's own)."""
+    refs = gate_refs(log, name, None if server else s_log)
+    if not refs:
+        return []
+    out: list[tuple[str, Line]] = []
+    if server:
+        written: set[str] = set()
+        for line, m in log.find(GATE_ROW_WRITTEN):
+            ref = m.group(1)
+            if ref in refs:
+                if ref in written:
+                    out.append((refs[ref], line))
+                written.add(ref)
+    else:
+        out = [(refs[m.group(1)], line) for line, m in log.find(KEY_GATE_UNLOCKED) if m.group(1) in refs]
+    return out
+
+
 def gate_open_ids(log: Log, name: str, mover: bool = False, run: Run | None = None) -> list[Line]:
-    """One line per distinct `<name>#<id>` this game shows opened, in order (on S, with `run`, also S's own
-    applied opens: server_gate_opens)."""
+    """One line per distinct `<name>#<id>` this game shows opened, in time order: S's own and each client's lines,
+    the lock state (lock_state_opens), on S with `run` also S's own applied opens (server_gate_opens: one that
+    follows S's write of a gate's row within 2 s is that gate's)."""
     n = re.escape(name)
     rx = re.compile(r"(?:Online: (?:world gate (" + n + r"#\d+) (?:open apply|tombstoned)|availability (" + n +
                     r"#\d+) removed|backend key gate (" + n + r"#\d+)\S* unlocked)" +
                     (r"|Dev: wait_moved (" + n + r"#\d+) done \()" if mover else ")"))
+    server = run is not None and log is run.server
     seen: dict[str, Line] = {}
-    for line, m in log.find(rx):
-        ident = next(g for g in m.groups() if g)
+    found = [(next(g for g in m.groups() if g), line) for line, m in log.find(rx)]
+    found += lock_state_opens(log, name, server, run.server if run is not None else None)
+    for ident, line in sorted(found, key=lambda x: (x[1].t or datetime.min, x[1].no)):
         seen.setdefault(ident, line)
-    if run is not None and log is run.server:
-        for ident, line in server_gate_opens(run, name):
-            seen.setdefault("pressed " + ident, line)
-    return sorted(seen.values(), key=lambda l: l.no)
+    if server:
+        rows = [(ident, line) for ident, line in lock_state_opens(log, name, True)]
+        for who_ident, line in server_gate_opens(run, name):
+            near = [ident for ident, row in rows if row.t is not None and line.t is not None and
+                    timedelta(0) <= line.t - row.t <= timedelta(seconds=2)]
+            seen.setdefault(near[-1] if near else "pressed " + who_ident, line)
+    return sorted(seen.values(), key=lambda l: (l.t or datetime.min, l.no))
 
 
 def gate_opened(run: Run, name: str) -> Line | None:
