@@ -587,6 +587,9 @@ class Config:
     # worktree; machine_slots_dir). Missing key: MACHINE_GAMES.
     machine_games: int = 4
     slots: Path | None = None
+    # The build snapshots' folder when it is not the store's own snapshots/ (the store's one-line
+    # snapshots-folder.txt, snapshots_setting): None, the store's.
+    snapshots: Path | None = None
     # A unit case's ctest command (default: `ctest` on PATH, as the build prompt has it), and a
     # command put in front of its test binary (only the runner's own tests set that one).
     ctest: list[str] = field(default_factory=list)
@@ -682,7 +685,7 @@ def load_config(repo: Path) -> Config:
         for ph in ARG_PLACEHOLDER.findall(x):
             if ph not in SYNTHETIC_ARG_PLACEHOLDERS:
                 raise SystemExit(f"{f}: [synthetic] args: {ph} is not one of {', '.join(SYNTHETIC_ARG_PLACEHOLDERS)}")
-    return Config(
+    cfg = Config(
         repo=repo,
         store=repo / STORE,
         exe=g["exe"],
@@ -717,6 +720,8 @@ def load_config(repo: Path) -> Config:
         synthetic_launcher=[os.path.expandvars(x) for x in syn.get("launcher", [])],
         bulk_settings=BulkSettings(games=bulk_games, wait_factor=float(factor), gb_per_game=float(gb)),
     )
+    cfg.snapshots = snapshots_setting(cfg)
+    return cfg
 
 
 # --- safety ---------------------------------------------------------------------------------------
@@ -763,10 +768,62 @@ def inside(path: Path, folder: Path) -> bool:
     return p == f or f in p.parents
 
 
+# --- where the build snapshots live ------------------------------------------------------------------
+#
+# The store may sit behind a directory junction on a slow drive (the owner's external drive since 19
+# November: 6 MB a second with small files); the build snapshots (the exe and DLLs every game starts from,
+# large files) may then stay on the internal one. The store's one-line file snapshots-folder.txt names
+# that folder, an absolute path (`#` starts a comment); snapshots_setting checks it at every start, and
+# the guards (check_output_path, launch_args.copy_build) accept it besides the store and nothing else.
+# Without the file the snapshots stay in the store's snapshots/.
+SNAPSHOTS_FILE = "snapshots-folder.txt"
+
+
+def snapshots_setting(cfg: Config) -> Path | None:
+    """The snapshots folder the store's SNAPSHOTS_FILE names (made when missing), None without the file.
+    Refused (SystemExit): not one absolute path; a drive root; inside or around the owner's data, the
+    disc, the repository or the store; a junction, link or other reparse point on its way."""
+    f = cfg.store / SNAPSHOTS_FILE
+    if not f.is_file():
+        return None
+    lines = [ln.split("#", 1)[0].strip() for ln in f.read_text(encoding="utf-8-sig", errors="replace").splitlines()]
+    lines = [ln for ln in lines if ln]
+    where = f"{f}: the snapshots folder"
+    if len(lines) != 1:
+        raise SystemExit(f"{where}: one line with one absolute path, found {len(lines)}")
+    given = Path(lines[0])
+    if not given.is_absolute() or not given.drive:
+        raise SystemExit(f"{where} {lines[0]!r} is not an absolute path with its drive")
+    folder = resolved(given)
+    if folder.parent == folder:
+        raise SystemExit(f"{where} {folder} is a drive root")
+    walk = Path(given.anchor)
+    for part in Path(os.path.normpath(given)).parts[1:]:
+        walk = walk / part
+        if not os.path.lexists(walk):
+            break
+        if la.is_reparse_point(walk):
+            raise SystemExit(f"{where}: {walk} is a junction, link or other reparse point")
+    guarded = [("the owner's data folder", r) for r in owner_data_roots()] + [
+        ("the disc", cfg.rom), ("the repository", cfg.repo), ("the test store", cfg.store)]
+    for what, root in guarded:
+        if inside(folder, root) or inside(root, folder):
+            raise SystemExit(f"{where} {folder} is inside or around {what} {root}")
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def snapshots_root(cfg: Config) -> Path:
+    """The folder the build snapshots are in: the store's snapshots/ or the one snapshots-folder.txt names."""
+    return cfg.snapshots if cfg.snapshots is not None else cfg.store / "snapshots"
+
+
 def check_output_path(cfg: Config, path: Path) -> None:
-    """Everything a run writes goes inside the worktree's store, never the owner's data or the disc."""
-    if not inside(path, cfg.store):
-        raise SystemExit(f"refusing to write {path}: outside the test store {cfg.store}")
+    """Everything a run writes goes inside the worktree's store (or its snapshots folder, snapshots_setting),
+    never the owner's data or the disc."""
+    if not inside(path, cfg.store) and not (cfg.snapshots is not None and inside(path, cfg.snapshots)):
+        raise SystemExit(f"refusing to write {path}: outside the test store {cfg.store}"
+                         + (f" and its snapshots folder {cfg.snapshots}" if cfg.snapshots is not None else ""))
     for root in owner_data_roots():
         if inside(path, root):
             raise SystemExit(f"refusing to write {path}: inside the owner's data folder {root}")
@@ -2623,7 +2680,7 @@ def snapshot_build(cfg: Config) -> Path:
     files = build_files(cfg)
     if not files:
         raise SystemExit(f"no build at {cfg.build / cfg.exe}: build the release first (`just build-release`)")
-    snap = cfg.store / "snapshots" / build_hash(cfg, files)
+    snap = snapshots_root(cfg) / build_hash(cfg, files)
     check_output_path(cfg, snap)
     if snapshot_complete(snap, files, cfg):
         return snap
@@ -2670,7 +2727,8 @@ def case_build_copy(cfg: Config, spec: Spec, snap: Path, run: Path) -> Path:
     check_output_path(cfg, dest)
     try:
         copy = la.copy_build(snap.resolve(), run.resolve() / la.BUILD_COPY_DIR, spec.build_copy,
-                             store=cfg.store.resolve(), exe=cfg.exe)
+                             store=cfg.store.resolve(), exe=cfg.exe,
+                             snapshots=cfg.snapshots.resolve() if cfg.snapshots is not None else None)
     except (la.LaunchError, OSError) as e:
         raise SpecError(f"[build_copy]: {e}") from None
     done = [f"removed {f}" for f in spec.build_copy.remove] + \
@@ -2691,7 +2749,7 @@ def snapshot_unit(cfg: Config, binary: str) -> Path:
     for f in files:
         st = f.stat()
         h.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns}\n".encode())
-    snap = cfg.store / "snapshots" / f"unit-{h.hexdigest()[:12]}"
+    snap = snapshots_root(cfg) / f"unit-{h.hexdigest()[:12]}"
     check_output_path(cfg, snap)
     if snapshot_complete(snap, files):
         return snap / src.name
@@ -7495,6 +7553,102 @@ class StoreJanitor:
                     pass
 
 
+# --- cleaning up: old snapshots after a run, old runs on request -----------------------------------------
+#
+# Both through the game repository's janitor (tools/test_store_janitor.py: its link-safe delete, its
+# refusals, its keep rules), never a deletion of the runner's own. After a run: every build snapshot
+# but the current build's and the one before it (the newest other build a finished session of this store
+# ran), and any a session still in progress names. `prune --older-than <hours>`: the run and session
+# folders whose newest file is older than that.
+SESSION_RECENT_S = 24 * 3600.0   # a session this young with no results.json yet may still be running
+
+
+def janitor_script(cfg: Config) -> Path | None:
+    """The game repository's janitor when it has the cleanup options, else None."""
+    script = cfg.repo / "tools" / "test_store_janitor.py"
+    try:
+        return script if "--keep-snapshot-names" in script.read_text(encoding="utf-8", errors="replace") else None
+    except OSError:
+        return None
+
+
+def snapshots_in_use(cfg: Config, current: str) -> list[str] | None:
+    """The snapshot names to keep after a run: `current`, the newest other one a finished session named,
+    and every one a session in progress names. None when a recent session has no results.json yet (its
+    snapshot is unknown: nothing is removed this time)."""
+    keep = [current]
+    previous = ""
+    runs = cfg.store / "runs"
+    try:
+        sessions = sorted((d for d in runs.iterdir() if d.name.endswith("-session")), key=lambda d: d.name,
+                          reverse=True)
+    except OSError:
+        return keep
+    now = time.time()
+    for d in sessions:
+        stamp = known_failures.RUN_NAME.match(d.name)
+        young = False
+        if stamp:
+            try:
+                young = now - time.mktime(time.strptime(stamp.group(1)[:15], "%Y%m%d-%H%M%S")) < SESSION_RECENT_S
+            except (ValueError, OverflowError):
+                young = False
+        try:
+            res = json.loads((d / "results.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            if young:
+                return None
+            continue
+        except (OSError, ValueError):
+            continue
+        if not isinstance(res, dict):
+            continue
+        name = Path(str(res.get("snapshot") or "")).name
+        if not name:
+            continue
+        if res.get("in_progress"):
+            if young and name not in keep:
+                keep.append(name)
+        elif not previous and name != current:
+            previous = name
+        if previous and not young:
+            break
+    if previous and previous not in keep:
+        keep.insert(1, previous)
+    return keep
+
+
+def prune_snapshots(cfg: Config, current: str) -> str:
+    """After a run: the janitor removes the build snapshots no longer in use (snapshots_in_use). Its line,
+    or '' when this game repository's janitor has no such option."""
+    script = janitor_script(cfg)
+    if script is None or not current:
+        return ""
+    keep = snapshots_in_use(cfg, current)
+    if keep is None:
+        return "snapshots: none removed (a session younger than a day has no results.json yet)"
+    try:
+        r = subprocess.run([sys.executable, "-I", str(script), "--store", str(cfg.store), "--apply", "--line",
+                            "--only", "snapshots", "--keep-snapshot-names", ",".join(keep)],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"snapshots: not cleaned ({e})"
+    return "snapshots: " + ((r.stdout or "").strip() or (r.stderr or "").strip()[-300:])
+
+
+def cmd_prune(cfg: Config, a: argparse.Namespace) -> int:
+    """`prune --older-than <hours>`: the store's run and session folders older than that, through the
+    janitor (never through a directory link); it prints what it removed and what that freed."""
+    if a.older_than <= 0:
+        raise SystemExit("prune: --older-than takes a number of hours above 0")
+    script = janitor_script(cfg)
+    if script is None:
+        raise SystemExit(f"prune: {cfg.repo / 'tools' / 'test_store_janitor.py'} is missing or has no cleanup options")
+    cmd = [sys.executable, "-I", str(script), "--store", str(cfg.store), "--only", "runs",
+           "--older-than-hours", str(a.older_than)] + ([] if a.dry_run else ["--apply"])
+    return subprocess.run(cmd).returncode
+
+
 def not_in_bulk_result(spec: Spec, why: str) -> CaseResult:
     """A case bulk mode leaves out (bulk_exclusion), reported at 0 s without a game; not failed."""
     return CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage, status=NOT_IN_BULK,
@@ -8013,6 +8167,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
               f" with the same first reason; not met): {', '.join(r.case for r in known)}")
     if store_line:
         print(store_line)
+    if snap is not None:
+        snaps_line = prune_snapshots(cfg, snap.name)
+        if snaps_line:
+            print(snaps_line)
     print(f"report: {out / 'report.md'}")
     if known and len(known) == len(failed) and not touched and not queue_unmatched:
         return EXIT_KNOWN_FAILURE  # its own exit code: nothing ran that failed anew
@@ -9474,6 +9632,11 @@ def main(argv: list[str] | None = None) -> int:
                      " its last two results on this build with the same generated case failed with the same first"
                      " reason; WHY is written into the result")
     lp_.set_defaults(fn=cmd_levelpass)
+    pr = sub.add_parser("prune", help="remove the store's run folders older than some hours (through the janitor)")
+    pr.add_argument("--older-than", type=float, required=True, metavar="HOURS",
+                    help="a run or session folder whose newest file is older than this many hours goes")
+    pr.add_argument("--dry-run", action="store_true", help="say what would go, remove nothing")
+    pr.set_defaults(fn=cmd_prune)
     pf = sub.add_parser("preflight", help="a spec's mistakes before any game runs (preflight.py)")
     pf.add_argument("cases", nargs="*", help="case names (tests/runtime/<case>.toml)")
     pf.add_argument("--all-ready", action="store_true", help="every spec that is ready")
