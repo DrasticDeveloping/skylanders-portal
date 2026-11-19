@@ -228,7 +228,7 @@ class StoredLevels(unittest.TestCase):
         self.assertEqual(steps[:2], ["enter_trigger auth:ww1:13618",
                                      f"waitfor online_level_after_mark {lp.TRIGGER_END_S + lp.NEXT_LOAD_S}"])
         self.assertNotIn("LevelOutro_Trigger", "\n".join(steps))  # by its id, never the literal of 18 November
-        self.assertEqual(lp.exit_forbid(h), [r"Dev: \S+ (?:auth:ww1:13618) failed \(no entity"])
+        self.assertEqual(lp.exit_forbid(h), [r"Dev: (?:goto_entity|enter_trigger|interact) (?:auth:ww1:13618) failed \(no entity"])
         # Not entered before the exit: the council's NPCs are not talked to in the sweep either.
         self.assertNotIn("CouncilGillmen", h.split("log LEVELPASS phase exit")[0])
 

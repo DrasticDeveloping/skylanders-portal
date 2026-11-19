@@ -734,6 +734,17 @@ class Case(unittest.TestCase):
         line = prefix + "Dev: enter_trigger auth:madeup:2 failed (no entity: no authored object madeup:2 in this level's walks) after 0.0 s"
         self.assertTrue(rx.search(line))
         self.assertTrue(rx.search(prefix + "Dev: goto_entity auth:madeup:2 failed (no entity: no such entity) after 0.0 s"))
+        # tutorial_b 20261118-230020: the fight won, the town loaded, a later round's fight_near on the anchor the
+        # approach named found no entity: not the line (it failed the pass); the approach's own is.
+        fx = re.compile(lp.exit_forbid("log LEVELPASS phase exit\ngoto_entity auth:tutorial_b:12036\nwait_free 60\n"
+                                       "fight_near auth:tutorial_b:12036 1800 60\nlog LEVELPASS done\n")[0])
+        self.assertFalse(fx.search(prefix + "Dev: fight_near auth:tutorial_b:12036 failed (no entity: no authored object "
+                                   "tutorial_b:12036 in this level's walks) after 1.0 s"))
+        self.assertTrue(fx.search(prefix + "Dev: goto_entity auth:tutorial_b:12036 failed (no entity: x) after 0.0 s"))
+        self.assertEqual(lp.unresolved_exit(prefix + "Input script: LEVELPASS phase exit\n" + prefix +
+                                            "Dev: fight_near auth:tutorial_b:12036 failed (no entity: x) after 1.0 s\n",
+                                            "log LEVELPASS phase exit\ngoto_entity auth:tutorial_b:12036\n"
+                                            "fight_near auth:tutorial_b:12036 1800 60\nlog LEVELPASS done\n"), "")
         # A sweep target, another failure of the exit's own target, and a longer id are not the line.
         self.assertFalse(rx.search(prefix + "Dev: goto_entity auth:madeup:6 failed (no entity: no such entity) after 0.0 s"))
         self.assertFalse(rx.search(prefix + "Dev: enter_trigger auth:madeup:2 failed (teleport failed) after 3.0 s"))
