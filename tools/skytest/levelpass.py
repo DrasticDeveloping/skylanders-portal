@@ -1039,13 +1039,21 @@ FIGHT_RADIUS = 1500
 # A major collectible (the game's CollectibleComponent: a Soul Gem, a story scroll, a map, a hat, a legendary
 # treasure, a butterfly) is collected as soon as the hero lands on it or picks it up: every hero's controls
 # go off and the game's found screen (CollectibleData.displayUI) pauses the game until a press closes it
-# (its controls come back on CCollectibleTrackerUIClosedMessage). B closes it, A does not (soulgem-found-
-# screen, 20261118-212923: `try a` timed out, `try b` freed the game after 1.5 s; back opened the session's
-# pause, which nothing freed: no back or start press in a pass). The stored data does not say which
-# collectibles are major, so every step that teleports to an object of the collectible component, or picks
-# it up, is followed by B and the wait for the hero (on a minor one, or a free hero, B is an attack). A
-# screen B does not close: the next step's pause line is H's forbidden line (PAUSE_FATAL), the pass ends.
-DISMISS_LINES = ("tap b", "wait_free 15")
+# (its controls come back on CCollectibleTrackerUIClosedMessage). The screen is a Yes/No prompt whether to
+# play the collectible's preview movie (the tracker names one, and a "play soul gem movie" button), its
+# selection on Yes (the owner, 18 November: "you select the no option and press a"): A first plays the movie
+# and the hero stays locked (ww1 20261118-195819), one B did not close it (ww1 20261118-221508). So every
+# step that teleports to an object of the collectible component, or picks it up, is followed by: the
+# selection moved to No (FOUND_SCREEN_TO_NO, the d-pad), then A, each press followed by a short wait for the
+# hero (a free hero passes each at once; a script cannot condition on the pause). Never A first, never back
+# or start (back opened the session's pause, which nothing freed). A screen this does not close: the next
+# step's pause line is H's forbidden line (PAUSE_FATAL), the pass ends INCOMPLETE. The stored data does not
+# say which collectibles are major, so the rule is the component's, never a name's.
+# The direction is provisional until the soulgem-found-screen-right-a and -down-a cases ran: the menus'
+# confirmations are horizontal (host-button.toml answers the online page's with `tap left`, `tap a`), and No
+# would be right of a selected Yes. One word to change when the cases say otherwise.
+FOUND_SCREEN_TO_NO = "right"
+DISMISS_LINES = (f"tap {FOUND_SCREEN_TO_NO}", "waitfor hero_free 2", "tap a", "waitfor hero_free 6")
 
 
 def is_collectible(o: Obj) -> bool:
