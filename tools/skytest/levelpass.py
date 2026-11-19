@@ -1154,8 +1154,11 @@ def end_words(plan: Plan) -> str:
 # times). The route helpers log `Dev: <command> <selector> failed (no entity: <why>)` with the selector
 # as the script gave it (route_actions.cpp, RouteRun::Fail). A sweep step's unresolved target stays a
 # tool finding and the sweep goes on: no later step waits on it.
-# Only the approach: a fight's anchor that is gone after the level ended (its outro, the next level's load)
-# is no failure of the pass, and the approach to the same anchor already resolved it.
+# Only the approach commands, in the pattern itself and not only in the targets it names: a fight's
+# anchor that is gone after the level ended (its outro, the next level's load) is no failure of the pass,
+# and the approach to the same anchor already resolved it. tutorial_b 20261118-230020 won its end fight,
+# the town loaded, and a later round's `fight_near auth:tutorial_b:12036 failed (no entity ...)` matched the
+# pattern by its target (the approach's anchor) and failed the pass.
 EXIT_STEP_COMMANDS = ("goto_entity", "enter_trigger", "interact")
 EXIT_FATAL_WHAT = "the exit's target did not resolve: the pass ends here, no wait for the level end"
 
@@ -1183,7 +1186,8 @@ def exit_forbid(script: str) -> list[str]:
     out = [r"Input script: " + END_IMPOSSIBLE] if f"log {END_IMPOSSIBLE}" in script else []
     if not refs:
         return out
-    return [r"Dev: \S+ (?:" + "|".join(re.escape(r) for r in refs) + r") failed \(no entity"] + out
+    return [r"Dev: (?:" + "|".join(EXIT_STEP_COMMANDS) + r") (?:" + "|".join(re.escape(r) for r in refs)
+            + r") failed \(no entity"] + out
 
 
 EXIT_UNRESOLVED = re.compile(r"Dev: (\S+) (\S+) failed \((no entity[^)]*)\)")
@@ -1196,7 +1200,7 @@ def unresolved_exit(h_text: str, script: str) -> str:
     if at < 0 or not refs:
         return ""
     for m in EXIT_UNRESOLVED.finditer(h_text[at:]):
-        if m.group(2) in refs:
+        if m.group(1) in EXIT_STEP_COMMANDS and m.group(2) in refs:
             return f"`{m.group(1)} {m.group(2)}` found {m.group(3)}: {EXIT_FATAL_WHAT}"
     return ""
 

@@ -42,6 +42,8 @@ def setUpModule() -> None:
     # build_guard.py: a build of this PC holding its slot must not make these cases wait (the guard's own
     # tests set it); a runner these tests start as a process reads an empty slot folder.
     skytest.build_holders = lambda: []
+    # preflight_gate.py: the throwaway game has no source or level data to check a spec against.
+    skytest.preflight_check = lambda cfg, spec, cache: []
     os.environ["SFO_BUILD_SLOT_DIR"] = tempfile.mkdtemp(prefix="skytest-no-builds-")
 
 
@@ -709,6 +711,46 @@ quit
             self.assertIn("--ignore-build: a test of the override", res["ignored_build"])
         finally:
             skytest.build_holders = lambda: []
+
+    def test_a_preflight_error_starts_no_game_unless_a_reason_is_given(self) -> None:
+        # preflight_gate.py: an error of the case's preflight: `preflight`, no game, its lines in the result, exit
+        # 6; a warning only: printed and the case runs; --ignore-preflight starts it and the result says why.
+        import preflight
+        self.spec("pf", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB)
+        err = preflight.Problem("error", "pf", "H", "objects", "goto_entity Gem: no run-time name")
+        warn = preflight.Problem("warn", "pf", "H", "lines", "pattern /Foo/ names no literal of the code")
+        seen: list = []
+
+        def fake(cfg, spec, cache):
+            seen.append((spec.name, id(cache)))
+            return problems
+        skytest.preflight_check = fake
+        try:
+            problems = [warn, err]
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = skytest.cmd_test(self.cfg, argparse.Namespace(cases=["pf"], stage=None, max_games=5))
+            self.assertEqual(code, skytest.EXIT_PREFLIGHT)
+            self.assertIn(f"preflight error: {err.line()}", out.getvalue())
+            self.assertIn(f"preflight warning: {warn.line()}", out.getvalue())
+            self.assertEqual(list((self.cfg.store / "runs").glob("*-pf")), [])
+            r = self.run_cases("pf")["cases"][0]
+            self.assertEqual(r["status"], "preflight")
+            self.assertIn(err.line(), r["reasons"])
+            self.assertEqual(r["preflight"]["errors"], [err.line()])
+            problems = [warn]
+            r = self.run_cases("pf")["cases"][0]
+            self.assertEqual(r["status"], "pass")
+            self.assertEqual(r["preflight"], {"errors": [], "warnings": [warn.line()]})
+            problems = [err]
+            a = argparse.Namespace(cases=["pf"], stage=None, max_games=5, ignore_preflight="the level data is older")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(skytest.cmd_test(self.cfg, a), 0)
+            res = json.loads((sorted((self.cfg.store / "runs").glob("*-pf"))[-1] / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual((res["status"], res["preflight"]["ignored"]), ("pass", "the level data is older"))
+            with self.assertRaises(SystemExit):
+                skytest.cmd_test(self.cfg, argparse.Namespace(cases=["pf"], stage=None, max_games=5, ignore_preflight=" "))
+        finally:
+            skytest.preflight_check = lambda cfg, spec, cache: []
 
     def write_janitor(self, body: str) -> None:
         tools = self.repo / "tools"

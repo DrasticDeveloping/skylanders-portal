@@ -228,7 +228,7 @@ class StoredLevels(unittest.TestCase):
         self.assertEqual(steps[:2], ["enter_trigger auth:ww1:13618",
                                      f"waitfor online_level_after_mark {lp.TRIGGER_END_S + lp.NEXT_LOAD_S}"])
         self.assertNotIn("LevelOutro_Trigger", "\n".join(steps))  # by its id, never the literal of 18 November
-        self.assertEqual(lp.exit_forbid(h), [r"Dev: \S+ (?:auth:ww1:13618) failed \(no entity"])
+        self.assertEqual(lp.exit_forbid(h), [r"Dev: (?:goto_entity|enter_trigger|interact) (?:auth:ww1:13618) failed \(no entity"])
         # Not entered before the exit: the council's NPCs are not talked to in the sweep either.
         self.assertNotIn("CouncilGillmen", h.split("log LEVELPASS phase exit")[0])
 
@@ -485,6 +485,20 @@ class HeldLevelEnd(unittest.TestCase):
             self.assertNotIn("online_past_level_end", text)
             self.assertIn("online_mark_level", text)
         self.assertIn("online_level_after_mark", lp.D_WAIT_NEEDS)
+
+
+class LevelChangedFight(unittest.TestCase):
+    """fight_area's end when the level changes under it is normal: no finding, no forbidden line, no tool kind."""
+    LINE = ("[2026-11-18 23:03:49.100] [info] [core] [t42892] Dev: fight_area 36764,17631,-2184 done (ended: the level "
+            "changed (zone 0xB52D7D38 -> 0x1234ABCD): 14 bursts, 19 enemies seen, 0 lowered) after 7.4 s")
+
+    def test_the_line_is_normal(self):
+        self.assertEqual(lp.findings_from_log("H", self.LINE, {}), [])
+        self.assertEqual(lp.tool_kind(self.LINE), "")
+        h = ("log LEVELPASS phase exit\ngoto_entity auth:tutorial_b:12036\n"
+             "fight_near auth:tutorial_b:12036 1800 60\nlog LEVELPASS done\n")
+        for rx in lp.exit_forbid(h) + [lp.PAUSE_FATAL]:
+            self.assertIsNone(re.search(rx, self.LINE), rx)
 
 
 if __name__ == "__main__":
