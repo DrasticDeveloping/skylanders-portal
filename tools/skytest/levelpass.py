@@ -728,6 +728,9 @@ class Plan:
     # pickup or else the first pickup of a collectible; every other step dismisses a pause screen within seconds.
     long_pause_s: int = 0
     long_pause_at: str = ""
+    # --no-gates: no required phase (a run about something else: coins, loot, enemy motion, the pause): the full
+    # sweep and the ten-minute budget; the page says "completable by teleport; gates not attempted (--no-gates)".
+    no_gates: bool = False
                                     # (--d-leaves-before-end: D ends its session before the exit, as before)
 
 
@@ -758,7 +761,8 @@ def estimate_seconds(stops: list[Stop], late_join: bool, end: bool = True) -> fl
 def make_plan(content: Content, full: bool = False, late_join: bool = True, budget_s: float = BUDGET_S,
               sample: int = SAMPLE, provoke: str = "", no_end: bool = False, d_stays: bool = True,
               d_lobby: bool = False, new_slot: bool = False, scenes: bool = False,
-              scene_lengths: dict[str, float] | None = None, lock_commands: bool = False) -> Plan:
+              scene_lengths: dict[str, float] | None = None, lock_commands: bool = False,
+              no_gates: bool = False) -> Plan:
     """The plan; without --full, over the budget, the sample per family goes down to 2, then 1 (the
     plan says so), after the quiet visits were dropped. `no_end` (--no-end): the level's end is found
     (the plan names it) but not attempted, and its time is not in the estimate."""
@@ -780,13 +784,15 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
         for o, r in refs:
             o.ref = r
     plan = _make_plan(content, full, late_join, budget_s, sample, provoke, no_end=no_end, d_stays=d_stays,
-                      scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands)
+                      scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands,
+                      no_gates=no_gates)
     n = sample
     while not full and plan.estimate_s > budget_s and n > 1:
         n -= 1
         fresh()
         plan = _make_plan(content, full, late_join, budget_s, n, provoke, no_end=no_end, d_stays=d_stays,
-                      scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands)
+                      scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands,
+                      no_gates=no_gates)
         plan.left_out.append(f"each action family sampled {n} time(s), not {sample}, to fit the budget")
     # Still over at one per family (a level with many archetypes): at most `cap` actions of each kind
     # (fight, attack, interact, pickup, enter, talk), the first ones along the path, the cap going down
@@ -795,7 +801,8 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
     while not full and plan.estimate_s > budget_s and cap >= 1:
         fresh()
         plan = _make_plan(content, full, late_join, budget_s, n, provoke, kind_cap=cap, no_end=no_end,
-                          d_stays=d_stays, scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands)
+                          d_stays=d_stays, scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands,
+                      no_gates=no_gates)
         plan.left_out.append(f"each action family sampled {n} time(s), not {sample}, to fit the budget")
         plan.left_out.append(f"each kind of action at most {cap} times, to fit the budget (--full acts on all)")
         cap -= 1
@@ -811,7 +818,7 @@ KIND_CAP_START = 8   # the first per-kind cap tried when one action per family i
 def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, sample: int,
                provoke: str, kind_cap: int = 0, no_end: bool = False, d_stays: bool = True,
                scenes: bool = False, scene_lengths: dict[str, float] | None = None,
-               lock_commands: bool = False) -> Plan:
+               lock_commands: bool = False, no_gates: bool = False) -> Plan:
     visited = [o for o in content.objects if o.group in GROUPS_VISITED]
     # A sub-zone (a swap zone, a staging map) is its own map that a player reaches only through its own
     # entry: its objects are never visited, even when the probe walked its package at the level's load
@@ -1021,7 +1028,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
     pieces, pieces_s = plan_pieces(content, set(end.keys() | set(end.path_keys)) if end is not None else set(),
                                    left_out)
     required = plan_required(content, holds, set(end.keys() | set(end.path_keys)) if end is not None else set(),
-                             lock_commands) if not no_end else []
+                             lock_commands) if not no_end and not no_gates else []
     pieces_s += sum(r.est_s for r in required if not r.why_not)
     timed = (end.kind == le.TIMED) if end is not None else (bool(content.level_end) and exit_stop is None)
     scene_list, scene_at, scene_s, load_s = (plan_scenes(content, end, stops, exit_stop, scene_lengths or {})
@@ -1054,7 +1061,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
                 unplaced=unplaced, estimate_s=round(est, 1), full=full, late_join=late_join, exit_stop=exit_stop,
                 provoke=provoke, no_end=no_end, end=end, end_objs=end_objs, end_missing=end_missing, timed=timed,
                 d_stays=d_stays, scenes=scenes, scene_list=scene_list, scene_at=scene_at, scene_load_s=load_s,
-                held=held_notes, pieces=pieces, required=required)
+                held=held_notes, pieces=pieces, required=required, no_gates=no_gates)
 
 
 # --- fights the level's script holds (levelpass_holds) ------------------------------------------------------
@@ -1204,6 +1211,18 @@ class ReqStep:
     why_not: str = ""         # "" when the pass performs it
 
 
+def budget_words(plan: Plan) -> str:
+    """Which of the two budgets the plan is in: the gates phase (its steps and seconds, the sweep shrunk for them)
+    or --no-gates (the full sweep, the ten-minute budget)."""
+    if plan.no_gates:
+        return f"--no-gates: gates not attempted, the full sweep in the {BUDGET_S / 60:.0f}-minute budget"
+    done = [r for r in plan.required if not r.why_not]
+    if not plan.required:
+        return "no required gate in this level: the full sweep"
+    return (f"gates phase: {len(done)} of {len(plan.required)} required gate(s) performed, "
+            f"{sum(r.est_s for r in done):.0f} s, the sweep shrunk for them (a level with gates takes what it takes)")
+
+
 def plan_required(content: Content, holds: dict, forbidden: set[str], lock_commands: bool) -> list[ReqStep]:
     """The required gates' steps (the section's head), in the order along the level."""
     if not content.manifest or not content.logic:
@@ -1281,8 +1300,14 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
     return out
 
 
+GATES_SKIPPED = "LEVELPASS gates not attempted (--no-gates)"
+
+
 def required_lines(plan: Plan) -> list[str]:
-    """H's required phase: each step's lines, or the reason it is not performed."""
+    """H's required phase: each step's lines, or the reason it is not performed; with --no-gates one line that
+    says the gates were not attempted."""
+    if plan.no_gates:
+        return [f"log {GATES_SKIPPED}"]
     if not plan.required:
         return []
     out = ["log LEVELPASS phase required"]

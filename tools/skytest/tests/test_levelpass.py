@@ -1038,6 +1038,15 @@ class RequiredStepsPlan(unittest.TestCase):
         d = lp.script_d(p)
         self.assertIn(f"online_wait_peer_near_entity {p.required[0].gate_ref} {lp.D_NEAR} {lp.D_COME_WAIT_S}", d)
 
+    def test_no_gates_keeps_the_full_sweep_and_says_so(self) -> None:
+        gated, free = self.plan("tutorial_b"), self.plan("tutorial_b", no_gates=True)
+        self.assertEqual(free.required, [])
+        self.assertGreater(len(free.stops), len(gated.stops))
+        self.assertLessEqual(free.estimate_s, lp.BUDGET_S)
+        self.assertIn(f"log {lp.GATES_SKIPPED}", lp.script_h(free, None).splitlines())
+        self.assertTrue(lp.budget_words(free).startswith("--no-gates: gates not attempted"))
+        self.assertTrue(lp.budget_words(gated).startswith("gates phase: 2 of 2 required gate(s) performed"))
+
     def test_ww1_fights_its_battle_gates_and_waits_for_the_lock_commands(self) -> None:
         p = self.plan("ww1")
         kinds = [(r.kind, bool(r.why_not)) for r in p.required]
