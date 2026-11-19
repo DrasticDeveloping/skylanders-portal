@@ -9160,6 +9160,7 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         except (OSError, ValueError):
             pass
     notes += lp.counted_fight_notes(plan, texts["S"], texts["H"])
+    notes += lp.level_end_notes(texts["S"], texts)
     unresolved = lp.unresolved_exit(texts["H"], script)
     if unresolved:
         notes.insert(0, f"pass ended at the exit: {unresolved}")

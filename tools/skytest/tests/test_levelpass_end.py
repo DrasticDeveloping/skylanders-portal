@@ -167,7 +167,7 @@ class Steps(unittest.TestCase):
         # With its reference the trigger is entered, by it.
         content.objects[0].ref = "auth:lvl:7"
         h = lp.script_h(lp.make_plan(content, late_join=False), None)
-        self.assertIn("enter_trigger auth:lvl:7\nwaitfor online_level_end", h)
+        self.assertIn("enter_trigger auth:lvl:7\nwaitfor online_level_after_mark", h)
         self.assertNotIn(lp.END_IMPOSSIBLE, h)
 
 
@@ -225,7 +225,8 @@ class StoredLevels(unittest.TestCase):
         h = lp.script_h(p, lp.LATE_JOIN_MARK)
         self.check_common(p, h)
         steps = [l for l in end_part(h) if not l.startswith("log ")]
-        self.assertEqual(steps[:2], ["enter_trigger auth:ww1:13618", f"waitfor online_level_end {lp.TRIGGER_END_S}"])
+        self.assertEqual(steps[:2], ["enter_trigger auth:ww1:13618",
+                                     f"waitfor online_level_after_mark {lp.TRIGGER_END_S + lp.NEXT_LOAD_S}"])
         self.assertNotIn("LevelOutro_Trigger", "\n".join(steps))  # by its id, never the literal of 18 November
         self.assertEqual(lp.exit_forbid(h), [r"Dev: \S+ (?:auth:ww1:13618) failed \(no entity"])
         # Not entered before the exit: the council's NPCs are not talked to in the sweep either.
@@ -252,7 +253,7 @@ class StoredLevels(unittest.TestCase):
         self.assertEqual(len(fights), 5)  # the first round, one per wave, one for late arrivals
         self.assertTrue(all(l.startswith(f"fight_near {anchor} ") for l in fights))
         self.assertNotIn("11560", h)  # never the flying bomber spawner of the run of 18 November
-        self.assertEqual(steps[len(fights) + 3], f"waitfor online_level_end {int(lp.EXIT_WAIT_S)}")
+        self.assertEqual(steps[len(fights) + 3], f"waitfor online_level_after_mark {int(lp.EXIT_WAIT_S) + lp.NEXT_LOAD_S}")
 
     def test_tutorial_a_ends_on_its_own(self):
         p = self.plan("tutorial_a")
@@ -260,7 +261,7 @@ class StoredLevels(unittest.TestCase):
         self.assertTrue(p.timed)
         h = lp.script_h(p, lp.LATE_JOIN_MARK)
         self.check_common(p, h)
-        self.assertIn(f"waitfor online_level_end {lp.TIMED_END_S}", h)
+        self.assertIn(f"waitfor online_level_after_mark {lp.TIMED_END_S + lp.NEXT_LOAD_S}", h)
         self.assertEqual(lp.exit_forbid(h), [])
 
     def test_the_passes_fit_the_budget_and_no_end_still_says_the_end(self):
@@ -270,6 +271,7 @@ class StoredLevels(unittest.TestCase):
             n = self.plan(level, no_end=True)
             h = lp.script_h(n, lp.LATE_JOIN_MARK)
             self.assertNotIn("online_level_end", h)
+            self.assertEqual(h.count("waitfor online_level_after_mark"), 1)  # only the level under test's own load
             self.assertRegex(h, re.escape("exit not attempted (--no-end), the end would be: ")
                              + {"ww1": "enter the trigger", "tutorial_b": "the counted fight",
                                 "tutorial_a": "the level ends on its own"}[level])
@@ -425,9 +427,10 @@ class BothClients(unittest.TestCase):
     def test_pass_only_when_both_reached_the_next_level(self):
         p = self.plan()
         self.assertEqual(lp.pass_verdict("pass", [], self.H_DONE, p, self.D_DONE), (lp.PASS, []))
-        v, missed = lp.pass_verdict("pass", [], self.H_DONE, p, self.D_IN + "[t2] Input script: waitfor online_level_end met after 9.0 s\n")
+        v, missed = lp.pass_verdict("pass", [], self.H_DONE, p, self.D_IN + "[t2] Online: level 3 tutorial/x/x: load\n")
         self.assertEqual(v, lp.INCOMPLETE)
-        self.assertIn("D did not reach the next level (saw the level end, not the next level)", missed[0])
+        self.assertIn("D did not reach the next level (saw the level change (tutorial/x/x), not the next level's mark)",
+                      missed[0])
         v, missed = lp.pass_verdict("pass", [], self.H_DONE, p, "[t2] Input script: waitfor online_in_play met\n")
         self.assertIn("(never joined): the pass shows one client only", missed[0])
         self.assertEqual(lp.clients_line(p, self.H_DONE, self.D_DONE),
@@ -444,6 +447,33 @@ class BothClients(unittest.TestCase):
         stays, leaves = self.plan(), self.plan(d_stays=False)
         self.assertEqual(lp.exit_seconds(stays) - lp.exit_seconds(leaves), lp.D_END_S)
         self.assertLessEqual(stays.estimate_s, lp.BUDGET_S)
+
+
+class HeldLevelEnd(unittest.TestCase):
+    """tutorial_a 20261118-215638: S held its level end for D, the level changed first, no client got the
+    LevelEnd, both followed the change; the pass's old wait for online_level_end ran 240 s. Its lines."""
+    S = ("[2026-11-18 21:59:52.118] [info] [core] [t43188] Online: level end CLevelCompleteMessage to WorldInstance#2048 held "
+         "(#1 of the generation): waiting for peer 2: less than 10 s since the hold began (generation 2)\n"
+         "[2026-11-18 21:59:53.131] [info] [core] [t43188] Online: level end held not sent (the level changed)\n")
+    H = "[2026-11-18 21:59:53.122] [info] [core] [t42324] Online: level 3 tutorial/tutorial_b/tutorial_b: load\n"
+
+    def test_the_notes_say_the_level_end_was_held_and_never_came(self):
+        notes = lp.level_end_notes(self.S, {"H": self.H, "D": self.H})
+        self.assertIn("S held its level end CLevelCompleteMessage (#1 of the generation): waiting for peer 2", notes[0])
+        self.assertIn("S did not send its level end to any client: held, then not sent (the level changed)", notes[1])
+        self.assertIn("H: the server's level end never came", notes[2])
+        played = "[t1] Online: level end CLevelCompleteMessage from the server played here (generation 2, x)\n"
+        self.assertEqual(lp.level_end_notes("", {"H": played}), ["H: the server's level end played here"])
+
+    def test_the_next_level_wait_does_not_need_the_level_end(self):
+        c = lp.parse_probe_manifest("", "madeup")
+        chains, logic = trigger_level()
+        p = BothClients().plan()
+        for text in (lp.script_h(p, lp.LATE_JOIN_MARK), lp.script_d(p)):
+            self.assertNotIn("online_level_end", text)
+            self.assertNotIn("online_past_level_end", text)
+            self.assertIn("online_mark_level", text)
+        self.assertIn("online_level_after_mark", lp.D_WAIT_NEEDS)
 
 
 if __name__ == "__main__":

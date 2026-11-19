@@ -1067,6 +1067,7 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
     lines = boot_lines(True, FIGURE_H)
     lines += ["waitfor online_server_hub 300", "online_mark_level", f"level {plan.level}",
               "waitfor online_level_after_mark 300", "waitfor online_barrier 300", "wait_free 120",
+              "online_mark_level",  # the level under test: its next level is `online_level_after_mark` (NEXT_LEVEL)
               "log LEVELPASS phase sweep", "online_audit start", f"hold_cap {HOLD_CAP_S}",
               f"sweep_deadline {sweep_share(plan):.0f}"]
     n_stops = len(plan.stops)
@@ -1105,16 +1106,16 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
     lines.append("log LEVELPASS phase exit")
     if plan.end is not None and plan.end.kind in (le.TRIGGER, le.FIGHT):
         lines += end_lines(plan)
-        lines += [f"waitfor online_level_end {end_wait_s(plan.end)}", "waitfor online_past_level_end 240",
+        lines += [f"waitfor {NEXT_LEVEL} {end_wait_s(plan.end) + NEXT_LOAD_S}",
                   "wait_free 120", "log LEVELPASS phase next-level", "online_audit next"]
     elif plan.exit_stop is not None:
         lines += stop_lines(plan.exit_stop)
-        lines += ["waitfor online_level_end 60", "waitfor online_past_level_end 240", "wait_free 120",
+        lines += [f"waitfor {NEXT_LEVEL} {int(EXIT_WAIT_S) + NEXT_LOAD_S}", "wait_free 120",
                   "log LEVELPASS phase next-level", "online_audit next"]
     elif plan.timed:
         # A timed level: its own end, then the next level (TIMED_END_S at most).
-        lines += ["log LEVELPASS exit timed (the level ends on its own)", f"waitfor online_level_end {TIMED_END_S}",
-                  "waitfor online_past_level_end 240", "wait_free 120", "log LEVELPASS phase next-level",
+        lines += ["log LEVELPASS exit timed (the level ends on its own)", f"waitfor {NEXT_LEVEL} {TIMED_END_S + NEXT_LOAD_S}",
+                  "wait_free 120", "log LEVELPASS phase next-level",
                   "online_audit next"]
     else:
         lines.append("log LEVELPASS exit none (no level-end candidate in the content)")
@@ -1307,7 +1308,15 @@ D_END_S = 20.0   # H's wait for D's own next-level audit and D's leave after the
 D_ALONE_WAIT_S = 60  # at most this for D to leave after its own next level (its time beyond D_END_S is the grace's)
 # D's level-end waits can be met only while H's game runs (the session ends with it): wait_needs, so a pass
 # whose H ended without the level end stops at once instead of D waiting out D_LEVEL_END_WAIT_S.
-D_WAIT_NEEDS = '{ online_level_end = ["H"], online_past_level_end = ["H"] }'
+D_WAIT_NEEDS = '{ online_level_after_mark = ["H"] }'
+# The next level on this client: a level of a later generation than the one `online_mark_level` kept (the level
+# under test) is up here, its barrier released. Not `online_level_end`/`online_past_level_end`: those hold only
+# once the server's LevelEnd message came, and a server that held its level end for a client and then saw the
+# level change first sends none (tutorial_a 20261118-215638: "level end held not sent (the level changed)",
+# H then waited 240 s for a level end that had happened during the sweep). The condition reads the state, so
+# a level change before the wait (a timed level, another player's end) is met at once.
+NEXT_LEVEL = "online_level_after_mark"
+NEXT_LOAD_S = 90     # the next level's load after the level end, within the wait for it
 
 
 def ends_level(no_end: bool, end, exit_stop: Stop | None, timed: bool) -> bool:
@@ -1396,7 +1405,7 @@ def script_d(plan: Plan) -> str:
     that: online_alone)."""
     lines = boot_lines(False, FIGURE_D)
     lines += ["waitfor online_in_play 300", "online_join {join}", "waitfor online_barrier 300", "wait_free 120",
-              f"hold_cap {HOLD_CAP_S}",
+              "online_mark_level", f"hold_cap {HOLD_CAP_S}",
               "log LEVELPASS D in", "online_audit d-in"]
     acted = [s for s in plan.stops if s.actions and s is not plan.exit_stop and visit_ref(s)]
     if len(acted) > D_VISITS:
@@ -1409,7 +1418,7 @@ def script_d(plan: Plan) -> str:
         # D stays through the level end and must reach the next level itself: the same waits as H's, as
         # long as the case may run (the level ends when H's exit or the level's own timer ends it).
         lines += ["log LEVELPASS D visits done, stays for the level end",
-                  f"waitfor online_level_end {D_LEVEL_END_WAIT_S}", "waitfor online_past_level_end 240",
+                  f"waitfor {NEXT_LEVEL} {D_LEVEL_END_WAIT_S}",
                   "wait_free 120", "log LEVELPASS D next level", "online_audit d-next"]
     lines += ["log LEVELPASS D done", "online_end", "quit"]
     return "\n".join(lines) + "\n"
@@ -1667,7 +1676,8 @@ def exit_not_reached(findings: list[Finding], h_text: str) -> list[Finding]:
         return findings
     out = []
     for f in findings:
-        if f.severity == "step failed" and f.lines and "waitfor online_level_end timed out" in f.lines[0] \
+        if f.severity == "step failed" and f.lines and re.search(r"waitfor online_(level_end|level_after_mark) timed out",
+                                                                f.lines[0]) \
                 and f.lines[0] in after:
             f = Finding(severity=TOOL, kind="tool", family="exit", what=EXIT_NOT_ACTED, obj="", step="",
                         lines=f.lines, peer=f.peer)
@@ -1973,7 +1983,10 @@ def counted_fight_notes(plan: Plan, s_text: str, h_text: str) -> list[str]:
 H_NEXT = "Input script: LEVELPASS phase next-level"
 D_IN = "Input script: LEVELPASS D in"
 D_NEXT = "Input script: LEVELPASS D next level"
-LEVEL_END_MET = "Input script: waitfor online_level_end met"
+LEVEL_LOAD_LINE = re.compile(r"Online: level (\d+) (\S+): load")
+LEVEL_END_PLAYED = re.compile(r"Online: level end \S+ from the server played here")
+LEVEL_END_DROPPED = re.compile(r"Online: level end held not sent \(([^)]*)\)")
+LEVEL_END_HELD = re.compile(r"Online: level end (\S+) to (\S+) held \(([^)]*)\): ([^(]*)")
 
 
 def client_progress(text: str, peer: str) -> str:
@@ -1984,9 +1997,26 @@ def client_progress(text: str, peer: str) -> str:
         return "never joined"
     if (H_NEXT if peer == "H" else D_NEXT) in text:
         return "reached the next level"
-    if LEVEL_END_MET in text:
-        return "saw the level end, not the next level"
-    return "did not see the level end"
+    loads = [m.group(2) for m in LEVEL_LOAD_LINE.finditer(text)]
+    if peer == "H" and len(loads) >= 3 or peer == "D" and loads:
+        return f"saw the level change ({loads[-1]}), not the next level's mark"
+    return "did not see the level change"
+
+
+def level_end_notes(s_text: str, texts: dict[str, str]) -> list[str]:
+    """Whether the server's level end reached each client (its LevelEnd played there), and S's own hold or
+    drop of it: a level that changed without its level end is a finding about the session, not the pass."""
+    out = []
+    for m in LEVEL_END_HELD.finditer(s_text):
+        out.append(f"S held its level end {m.group(1)} ({m.group(3)}): {m.group(4).strip()}")
+        break
+    for m in LEVEL_END_DROPPED.finditer(s_text):
+        out.append(f"S did not send its level end to any client: held, then not sent ({m.group(1)})")
+    for peer, text in texts.items():
+        if peer in ("H", "D") and text:
+            out.append(f"{peer}: the server's level end " + ("played here" if LEVEL_END_PLAYED.search(text) else
+                                                               "never came (no `level end ... from the server played here`)"))
+    return out
 
 
 def clients_line(plan: Plan, h_text: str, d_text: str) -> str:
