@@ -133,6 +133,61 @@ class Enemies(unittest.TestCase):
         self.assertEqual(self.grade([], []).status, lc.NOT_TESTED)
 
 
+FIGHT = "-535,-2875,303"
+PLACED = [(30, f"Online: enemy placed {K1} as GreebleMelee#3531 hp 96 pose 26 (S)")]
+SEEN = [(31, f"Online: enemy spawn {K1} as GreebleMelee#b848ac60 (bind placed)")]
+
+
+def fight(hp_after: str, end: str = "failed (time: 2 enemies within 1500, 2 bursts, 2 enemies seen)") -> list:
+    return [(50, f"Dev: fight_area {FIGHT} start: radius 1500, 2 enemies within it; hero at 1,2,3, 9 from the area"),
+            (51, f"Dev: fight_area {FIGHT} try 1: x at GreebleMelee#3531 d 72: hp 96 -> 96 (2 enemies within 1500)"),
+            (52, f"Dev: fight_area {FIGHT} try 2: x at GreebleMelee#3531 d 73: hp 96 -> {hp_after} (2 enemies)"),
+            (76, f"Dev: fight_area {FIGHT} {end} after 25.8 s")]
+
+
+class Fights(unittest.TestCase):
+    """A fight step that took no hit point, and a route that fought where nothing died by a player, are
+    findings of the enemies row, never its pass (ww1 20261119-035316: 16 bursts, hp 96 -> 96, "enemies PASS")."""
+
+    def grade(self, s, h) -> lc.Verdict:
+        return lc.grade_enemies(RunFolder(PLACED + s, H_JOIN + SEEN + h + LEVEL_END).run())
+
+    def test_a_failed_fight_with_no_damage_is_a_finding(self) -> None:
+        v = self.grade([], fight("96"))
+        self.assertEqual(v.status, lc.FAIL)
+        whats = [x.what for x in v.findings]
+        self.assertTrue(whats[0].startswith(f"a fight step failed with no damage done: 2 burst(s) at {FIGHT}"), whats)
+        self.assertTrue(whats[1].startswith("the route fought 1 time(s) (2 burst(s)) and no enemy died"), whats)
+        lines = v.findings[0].lines
+        self.assertTrue(lines[0].startswith("H/game.log:") and "failed" in lines[0], lines)
+        self.assertIn("try 1", lines[1])
+        self.assertIn("damage trace is off", lines[2])  # no S check line: the plain fact
+        self.assertIn("fights: 1 step(s), 1 with bursts, 0 took hit points; 0 enemy death(s) by a player", v.counts)
+
+    def test_the_servers_damage_check_is_cited(self) -> None:
+        refused = (60, "Online: puppet 1 damage check on GreebleMelee#3531 amount 12 result 0 reason out of range")
+        v = self.grade([refused, (61, "Online: puppet 1 damage check on GreebleMelee#3531 result 0 reason x")],
+                       fight("96"))
+        line = v.findings[0].lines[2]
+        self.assertTrue(line.startswith("H/data/Online/session/game.log:2:"), line)
+        self.assertTrue(line.endswith("(and 1 more)"), line)
+
+    def test_a_fight_that_hurt_and_killed_passes(self) -> None:
+        v = self.grade([(53, f"Online: enemy {K1} dead by 1 (S, placed; attacker PeerPuppet_1#3829)")],
+                       fight("gone", "done (no enemy within 1500 of the area for 10 s: 2 bursts, 1 enemies seen)")
+                       + [(54, f"Online: enemy life {K1} alive -> dead")])
+        self.assertEqual(v.status, lc.PASS, v.findings)
+        self.assertIn("1 took hit points; 1 enemy death(s) by a player on S", v.counts)
+
+    def test_a_fight_that_never_burst_is_counted_not_a_finding_of_its_own(self) -> None:
+        held = [(50, f"Dev: fight_area {FIGHT} start: radius 1500, 0 enemies within it"),
+                (70, f"Dev: fight_area {FIGHT} failed (held too long: 0 bursts) after 20.0 s")]
+        v = self.grade([(80, f"Online: enemy {K1} dead by 1 (S, placed; attacker PeerPuppet_1#3829)")],
+                       held + [(81, f"Online: enemy life {K1} alive -> dead")])
+        self.assertEqual(v.status, lc.PASS, v.findings)
+        self.assertIn("1 failed before any burst (held too long: 0 bursts)", v.counts)
+
+
 class Pickups(unittest.TestCase):
     def test_the_partners_copy(self) -> None:
         s = [(60, "Online: collect applied 000b0017 for peer 1"), (70, "Online: collect applied 000b0018 for peer 1")]
@@ -231,6 +286,11 @@ class Completable(unittest.TestCase):
         self.assertEqual(lc.overall([v, lc.Verdict("x", lc.PASS, "")]), "INCOMPLETE")
         self.assertEqual(lc.overall([lc.Verdict("x", lc.PASS, ""), lc.Verdict("y", lc.NOT_TESTED, "")]),
                          "NOT ALL TESTED: y")
+        # A FAIL names every row nobody tested next to it, so the rest is never read as passed.
+        rows = [lc.Verdict("other player", lc.FAIL, ""), lc.Verdict("completable", lc.NOT_TESTED, ""),
+                lc.Verdict("lobby", lc.NOT_TESTED, ""), lc.Verdict("pickups", lc.PASS, "")]
+        self.assertEqual(lc.overall(rows), "FAIL: other player; NOT TESTED: completable, lobby")
+        self.assertEqual(lc.overall([v, rows[1]]), "INCOMPLETE; NOT TESTED: completable")
 
 
 class Command(unittest.TestCase):

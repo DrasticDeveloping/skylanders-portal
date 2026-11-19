@@ -691,6 +691,10 @@ class Plan:
     # into the level under test (the parked path; --d-joins-late).
     d_lobby: bool = False
     new_slot: bool = False          # --new-slot: H starts a new game in the lobby instead of the save's continue
+    # The server's window: shown at 640x360 as in every playtest the owner watches (the case's
+    # show_server_window: H gets --dev_show_server_window=true and Host starts its server with it); hidden,
+    # with the release's draw skip, only with --server-hidden (real play's hidden server).
+    server_hidden: bool = False
     # --scenes play: the cutscenes play in full, each trigger-started scene's trigger is entered in the sweep
     # (scene_at: by stop label), the expected list goes into H's script, their lengths into the estimate.
     scenes: bool = False
@@ -2477,12 +2481,13 @@ def case_name(level: str, no_end: bool = False) -> str:
 
 
 def spec_from_scripts(level: str, h: str, d: str | None, d_args: list[str] | None = None,
-                      name: str | None = None) -> str:
-    """A case from ready scripts (the predictions mode): H hosts, S hidden, D (when given) starts at H's
-    LEVELPASS late-join start mark."""
+                      name: str | None = None, server_hidden: bool = False) -> str:
+    """A case from ready scripts (the predictions mode): H hosts, S shown (hidden with `server_hidden`), D
+    (when given) starts at H's LEVELPASS late-join start mark."""
     out = [f'name = "{name or case_name(level)}"', f'layout = "{"server+2" if d else "server+1"}"', 'stage = "8"',
            'server = "host"', f'description = "The level pass of {level} (skytest levelpass; generated, not committed)"',
-           f"timeout = {CASE_TIMEOUT_S}", 'scenes = "skip"', "show_server_window = false", 'shader_cache = "snapshot"',
+           f"timeout = {CASE_TIMEOUT_S}", 'scenes = "skip"',
+           f"show_server_window = {'false' if server_hidden else 'true'}", 'shader_cache = "snapshot"',
            "", "[peer.H]", f"args = {_toml_list(H_ARGS)}", "script = '''\n" + h + "'''"]
     if d:
         out += ["", "[peer.D]", f"args = {_toml_list(D_ARGS + (d_args or []))}", f"start_after = '{LATE_JOIN_MARK}'",
@@ -2491,7 +2496,8 @@ def spec_from_scripts(level: str, h: str, d: str | None, d_args: list[str] | Non
 
 
 def spec_toml(plan: Plan) -> str:
-    """The generated case (a skytest spec): H hosts with a hidden server (the release's draw skip), D
+    """The generated case (a skytest spec): H hosts; its server's window is shown at 640x360 (hidden, with the
+    release's draw skip, only with --server-hidden: Plan.server_hidden), D
     starts once H's log says LEVELPASS late-join start and joins by the loopback address. The shader
     cache comes from the build snapshot. Fail fast on a dead session or a crash; nothing else stops the
     pass: every step's failure is a finding of the report, not a failed expectation."""
@@ -2511,7 +2517,7 @@ def spec_toml(plan: Plan) -> str:
            f"timeout = {int(CASE_TIMEOUT_S + plan.scene_extra_s)}",
            *(['scenes = "play"', 'scenes_reason = "the level check grades the cutscenes, played in full on both clients"']
              if plan.scenes else ['scenes = "skip"']),
-           "show_server_window = false",
+           f"show_server_window = {'false' if plan.server_hidden else 'true'}",
            'shader_cache = "snapshot"',
            "",
            "[peer.H]",

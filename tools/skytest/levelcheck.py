@@ -366,7 +366,73 @@ def grade_enemies(run: Run) -> Verdict:
         else:
             counts.append(f"{who}: in no level")
     first = next(iter(keys.values())).placed.cite()
+    fights, fight_findings = fight_findings_of(run)
+    counts.append(fights)
+    findings = fight_findings + findings  # the fights first: the most telling
     return Verdict("enemies", FAIL if findings else PASS, "; ".join(counts), first, findings)
+
+
+# The fights a run's steps made (H's route helpers, route_actions.cpp fight_area: `start`, one `try <k>: x at
+# <Name#id> d <d>: hp <a> -> <b|gone>` per burst, then `done (...)` or `failed (...)`) and S's deaths by a player
+# (`enemy <key> dead by <peer> (S, ...; attacker PeerPuppet_<n>#..)`; `dead by none` is no player's kill). A
+# fight step that failed with no hit point taken, and a route that fought where no enemy died by a player, are
+# findings of the enemies row, never a pass (ww1 20261119-035316: 16 bursts, hp 96 -> 96 each, "enemies
+# PASS"). With S's damage trace on, its `puppet <n> damage check on ... result 0 reason ...` lines say why.
+FIGHT_START = re.compile(r"Dev: fight_area (\S+) start: ")
+FIGHT_TRY = re.compile(r"Dev: fight_area (\S+) try \d+: x at (\S+) d [\d.]+: hp (-?\d+) -> (\S+)")
+FIGHT_END = re.compile(r"Dev: fight_area (\S+) (done|failed) \((.*)\) after ([\d.]+) s")
+PLAYER_KILL = re.compile(r"Online: enemy " + KEY + r" dead by (\d+) ")
+DAMAGE_REFUSED = re.compile(r"Online: puppet \d+ damage check on .*result 0 reason .*")
+
+
+def fight_findings_of(run: Run) -> tuple[str, list[Finding]]:
+    h = run.clients.get("H")
+    if h is None:
+        return "fights: no H log", []
+    fights: list[dict] = []
+    cur: dict | None = None
+    for i, raw in enumerate(h.lines):
+        m = FIGHT_START.search(raw)
+        if m:
+            cur = {"area": m.group(1), "start": h.line(i), "tries": [], "hit": False, "end": None}
+            fights.append(cur)
+            continue
+        m = FIGHT_TRY.search(raw)
+        if m and cur is not None and m.group(1) == cur["area"]:
+            cur["tries"].append(h.line(i))
+            after = m.group(4)
+            if after == "gone" or (after.lstrip("-").isdigit() and int(after) < int(m.group(3))):
+                cur["hit"] = True
+            continue
+        m = FIGHT_END.search(raw)
+        if m and cur is not None and m.group(1) == cur["area"]:
+            cur["end"] = (h.line(i), m.group(2), m.group(3))
+            cur = None
+    kills = run.server.find(PLAYER_KILL) if run.server is not None else []
+    refused = run.server.find(DAMAGE_REFUSED) if run.server is not None else []
+    findings: list[Finding] = []
+    for fg in fights:
+        if fg["end"] is None or fg["end"][1] != "failed" or fg["hit"] or not fg["tries"]:
+            continue  # a fight that failed before any burst is the tool's (a hold, out of reach): counted below
+        lines = [fg["end"][0].cite()] + ([fg["tries"][0].cite()] if fg["tries"] else [])
+        lines.append(refused[0][0].cite() + f" (and {len(refused) - 1} more)" if refused else
+                     "S logged no damage check line (its damage trace is off in this run): the hits are not "
+                     "explained, only that none took a hit point")
+        findings.append(Finding(f"a fight step failed with no damage done: {len(fg['tries'])} burst(s) at "
+                                f"{fg['area']}, no hit took a hit point", lines))
+    with_bursts = [fg for fg in fights if fg["tries"]]
+    if fights and not kills:
+        findings.append(Finding(
+            f"the route fought {len(fights)} time(s) ({sum(len(fg['tries']) for fg in fights)} burst(s)) and no "
+            "enemy died by a player on S",
+            [fights[0]["start"].cite(),
+             absent(run.server, "`enemy ... dead by <peer>` (a player's kill)") if run.server else "no S log"]))
+    no_burst = [fg for fg in fights if fg["end"] is not None and fg["end"][1] == "failed" and not fg["tries"]]
+    text = (f"fights: {len(fights)} step(s), {len(with_bursts)} with bursts, "
+            f"{sum(1 for fg in fights if fg['hit'])} took hit points"
+            + (f", {len(no_burst)} failed before any burst ({no_burst[0]['end'][2][:60]})" if no_burst else "")
+            + f"; {len(kills)} enemy death(s) by a player on S")
+    return text, findings
 
 
 # --- pickups (and the coins slot) ----------------------------------------------------------------------
@@ -767,14 +833,17 @@ def run_head(folder: Path) -> list[str]:
 
 
 def overall(verdicts: list[Verdict]) -> str:
-    """The page's one word: FAIL when a grader failed, INCOMPLETE when the pass did not cover its plan, PASS
-    only when every row passed, else NOT ALL TESTED (and which rows)."""
+    """The page's one line: FAIL (and which rows) when a grader failed, INCOMPLETE when the pass did not cover
+    its plan, PASS only when every row passed; with every row NOT TESTED named next to it, so nobody reads the
+    rest as passed."""
+    untested = [v.name for v in verdicts if v.status == NOT_TESTED]
+    tail = f"; NOT TESTED: {', '.join(untested)}" if untested else ""
     if any(v.status == FAIL for v in verdicts):
-        return "FAIL: " + ", ".join(v.name for v in verdicts if v.status == FAIL)
+        return "FAIL: " + ", ".join(v.name for v in verdicts if v.status == FAIL) + \
+            ("; INCOMPLETE" if any(v.status == INCOMPLETE for v in verdicts) else "") + tail
     if any(v.status == INCOMPLETE for v in verdicts):
-        return "INCOMPLETE"
-    rest = [v.name for v in verdicts if v.status != PASS]
-    return "PASS" if not rest else "NOT ALL TESTED: " + ", ".join(rest)
+        return "INCOMPLETE" + tail
+    return "PASS" if not untested else "NOT ALL TESTED: " + ", ".join(untested)
 
 
 def page(folder: Path, verdicts: list[Verdict], head: list[str] | None = None) -> str:

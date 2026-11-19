@@ -16,6 +16,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import levelpass as lp  # noqa: E402
 
+# A runner config as a machine without [defaults] show_server_window has it (a visible run, server hidden unless the
+# case says otherwise): what show_server_args reads.
+SHOWN_DEFAULT_OFF = type("Cfg", (), {"bulk": None, "show_server_window": False})()
+
 PROBE = """Level manifest: madeup (level request 2 in game.log)
 Level start: Start_01 at 0.0 0.0 0.0
 
@@ -802,7 +806,15 @@ class Case(unittest.TestCase):
         p = lp.make_plan(content())
         s = self.load(lp.spec_toml(p))
         self.assertEqual((s.name, s.layout, s.server, s.shader_cache, s.show_server_window),
-                         ("levelpass-madeup", "server+2", "host", "snapshot", False))
+                         ("levelpass-madeup", "server+2", "host", "snapshot", True))
+        # The host's server is shown at 640x360 as in every playtest: H gets --dev_show_server_window=true (Host
+        # starts its server with it); --server-hidden keeps real play's hidden server.
+        self.assertEqual(self.sk.show_server_args(SHOWN_DEFAULT_OFF, s, "H"), ["--dev_show_server_window=true"])
+        p.server_hidden = True
+        hidden = self.load(lp.spec_toml(p))
+        self.assertFalse(hidden.show_server_window)
+        self.assertEqual(self.sk.show_server_args(SHOWN_DEFAULT_OFF, hidden, "H"), [])
+        p.server_hidden = False
         self.assertEqual(s.peers["D"].start_after, lp.LATE_JOIN_MARK)
         self.assertEqual(s.peers["D"].start_peer, "H")
         self.assertIn("--dev_backend_commands=true", s.peers["H"].args)
