@@ -9531,17 +9531,22 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                         d_lobby=not getattr(a, "d_joins_late", False), new_slot=getattr(a, "new_slot", False),
                         scenes=getattr(a, "scenes", "skip") == "play",
                         scene_lengths=measured_scene_lengths(cfg, a.level) if getattr(a, "scenes", "skip") == "play"
-                        else None, lock_commands=lock_commands_known(cfg))
+                        else None, lock_commands=lock_commands_known(cfg), no_gates=getattr(a, "no_gates", False))
     plan.probe = not a.no_probe
     plan.server_hidden = bool(getattr(a, "server_hidden", False))
+    plan.long_pause_s = int(getattr(a, "long_pause", 0) or 0)
+    plan.long_pause_at = getattr(a, "long_pause_at", "") or ""
+    if plan.long_pause_s and lp.long_pause_label(plan) is None:
+        raise SystemExit(f"levelpass: --long-pause: the plan has no pickup of "
+                         f"{plan.long_pause_at or 'a collectible'} to leave its screen up at")
     # D follows H by default once the game registers online_auto_follow (the checkout's command table, which
     # the launch builder checks every script against: before that build nothing changes); --d-stays keeps D
     # where it entered.
     follow_known = auto_follow_known(cfg)
     plan.d_follow = plan.d_lobby and not getattr(a, "d_stays", False) and follow_known
+    notices = []
     if plan.d_lobby and not getattr(a, "d_stays", False) and not follow_known:
-        print(f"levelpass {a.level}: D stays where it entered: this game does not register online_auto_follow yet",
-              flush=True)
+        notices.append("D stays where it entered: this game does not register online_auto_follow yet")
     try:
         plan.game_args = [lp.check_game_arg(g) for g in (a.game_arg or [])]
     except ValueError as e:
@@ -9578,9 +9583,11 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     if literals:  # the owner's rule: a level pass names objects; the game reads where they are
         raise SystemExit(f"levelpass: the generated scripts carry positions: {literals[:3]}")
     spec_path.write_text(text, encoding="utf-8")
-    print(f"levelpass {a.level}: content {plan.source}; {len(plan.stops)} stops, "
-          f"{sum(len(st.actions) for st in plan.stops)} actions, estimate {plan.estimate_s:.0f} s; case {spec_path}",
-          flush=True)
+    # The plan's first line: its estimate and which budget it is in (the gates phase, or --no-gates).
+    print(f"levelpass {a.level}: estimate {plan.estimate_s:.0f} s ({lp.budget_words(plan)}); content {plan.source}; "
+          f"{len(plan.stops)} stops, {sum(len(st.actions) for st in plan.stops)} actions; case {spec_path}", flush=True)
+    for n in notices:
+        print(f"levelpass {a.level}: {n}", flush=True)
     for h in plan.held:  # the fights the level's script holds (levelpass_holds), in words
         print(f"levelpass {a.level}: held: {h}", flush=True)
     for r in plan.required:  # the gates a player opens on the way, performed or why not
@@ -9715,6 +9722,14 @@ def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
     lp_.add_argument("--d-joins-late", action="store_true", help="D joins late, into the level under test (the"
                      " parked path); by default both clients join in the lobby, the host picks the slot and the"
                      " party enters the level together (the owner's order)")
+    lp_.add_argument("--no-gates", action="store_true", help="no required phase: the gates a player opens on the way"
+                     " are not attempted (the page says completable by teleport); the full sweep and the ten-minute"
+                     " budget, for runs about something else")
+    lp_.add_argument("--long-pause", type=int, default=0, metavar="SECONDS", help="one pickup leaves the game's"
+                     " found screen up this long on purpose (the run a pause crash's fix needs); every other step"
+                     " dismisses a pause screen within seconds")
+    lp_.add_argument("--long-pause-at", default="", metavar="NAME", help="the object whose pickup takes the long"
+                     " pause (default: the plan's first pickup of a collectible)")
     lp_.add_argument("--d-stays", action="store_true", help="D stays where it entered the level (the old"
                      " behaviour); by default D's hero follows H's through the stops (the game's Auto follow,"
                      " online_auto_follow on) once the game registers that command")

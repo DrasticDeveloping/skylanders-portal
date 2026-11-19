@@ -1038,6 +1038,15 @@ class RequiredStepsPlan(unittest.TestCase):
         d = lp.script_d(p)
         self.assertIn(f"online_wait_peer_near_entity {p.required[0].gate_ref} {lp.D_NEAR} {lp.D_COME_WAIT_S}", d)
 
+    def test_no_gates_keeps_the_full_sweep_and_says_so(self) -> None:
+        gated, free = self.plan("tutorial_b"), self.plan("tutorial_b", no_gates=True)
+        self.assertEqual(free.required, [])
+        self.assertGreater(len(free.stops), len(gated.stops))
+        self.assertLessEqual(free.estimate_s, lp.BUDGET_S)
+        self.assertIn(f"log {lp.GATES_SKIPPED}", lp.script_h(free, None).splitlines())
+        self.assertTrue(lp.budget_words(free).startswith("--no-gates: gates not attempted"))
+        self.assertTrue(lp.budget_words(gated).startswith("gates phase: 2 of 2 required gate(s) performed"))
+
     def test_ww1_fights_its_battle_gates_and_waits_for_the_lock_commands(self) -> None:
         p = self.plan("ww1")
         kinds = [(r.kind, bool(r.why_not)) for r in p.required]
@@ -1051,6 +1060,33 @@ class RequiredStepsPlan(unittest.TestCase):
         spark = self.plan("ww1", lock_commands=True).required[0]
         self.assertEqual(spark.h[2:5], [f"interact {spark.gate_ref} 20", "waitfor lock_ready 30", "lock_solve 120"])
         self.assertEqual(spark.d, [f"interact {spark.gate_ref} 20", "waitfor lock_ready 30", "lock_solve 120"])
+
+
+class PauseScreens(unittest.TestCase):
+    """A pickup may bring up the game's found screen, which pauses the game until a press (ww1 20261119-051557: 90 s
+    held next to SoulGem_lockjaw): the step runs under a short hold cap, then the screen is dismissed as a player
+    does and the pass's own cap comes back; --long-pause keeps one screen up on purpose."""
+
+    def gem(self) -> "lp.Action":
+        o = lp.Obj("SoulGem_x", "CPhysicalEntity", (0.0, 0.0, 0.0), lp.GROUP_PICKUPS, ident="u", ref="auth:lvl:9")
+        o.components = [lp.COMP_COLLECTIBLE]
+        return lp.Action(action=lp.PICKUP, obj=o, why="a collectible")
+
+    def test_a_pickup_dismisses_its_screen_within_seconds(self) -> None:
+        lines = lp.action_lines(self.gem(), "v3_1", after="auth:lvl:9", cap=90)
+        self.assertEqual(lines[0], f"hold_cap {lp.PAUSE_HOLD_S}")
+        k = lines.index("pickup auth:lvl:9 10")
+        self.assertTrue(lines[k + 1].startswith("log LEVELPASS pause check v3_1"))
+        self.assertEqual(lines[k + 2:], [*lp.DISMISS_LINES, "hold_cap 90", "wait_free 90"])
+        lever = lp.Action(action=lp.INTERACT_A, obj=lp.Obj("Lever", "C", (0.0, 0.0, 0.0), lp.GROUP_INTERACT, ref="auth:lvl:4"),
+                          why="a switch")
+        self.assertNotIn("hold_cap 4", lp.action_lines(lever, "v3_2", cap=90))  # a microgame may hold it on purpose
+
+    def test_one_long_pause_on_purpose(self) -> None:
+        lines = lp.action_lines(self.gem(), "v3_1", after="auth:lvl:9", cap=20, long_pause=60)
+        self.assertTrue(lines[0].startswith("log LEVELPASS long pause v3_1: the screen stays up 60 s"))
+        self.assertEqual(lines[1], "hold_cap 60")
+        self.assertEqual(lines[-2:], ["hold_cap 20", "wait_free 20"])
 
 class HeldFights(unittest.TestCase):
     """A fight is planned only when its held enemies' release is on the route before it (levelpass_holds)."""

@@ -196,6 +196,15 @@ class EnemyKinds(unittest.TestCase):
         self.assertIn("died with no attacker at -442,-58676,64", v.findings[0].lines[1])
         self.assertEqual(len(v.findings), 1)  # not named twice as `existed on no client`
 
+    def test_a_death_by_another_entity_is_counted(self) -> None:
+        # ww1 20261119-051557: `dead by none (S, placed; attacker (null)#3457)`, the seventh death the counts missed.
+        v = self.grade([(30, f"Online: enemy run-time spawn {K3} as Sawmouth_Spawned1#3 hp 45 pose 3 source 1 (S)"),
+                        (60, f"Online: enemy {K3} dead by none (S, placed; attacker (null)#3457)")],
+                       [(31, f"Online: enemy spawn {K3} as Sawmouth_Spawned1#b8 (spawn other)"),
+                        (61, f"Online: enemy life {K3} alive -> dead")])
+        self.assertIn("1 died on S (by a player: H 0; by another entity 1 ((null)#3457); no attacker 0; attacker not "
+                      "recorded 0)", v.counts)
+
     def test_an_encounter_spawn_counts_and_its_unnamed_attacker_is_no_finding(self) -> None:
         # tutorial_a's encounter actors: `enemy spawn <key> ... (S)`, dead `by none (S)` with no attacker field
         # (a player's kill may read so: one died 4 ms after H's press started on S).
@@ -206,7 +215,7 @@ class EnemyKinds(unittest.TestCase):
                         (30.1, f"Online: enemy bind {enc} (resolved)"),
                         (34.8, f"Online: enemy life {enc} alive -> dead")])
         self.assertEqual(v.status, lc.PASS, v.findings)
-        self.assertIn("S 1 (0 placed, 1 encounter, 0 run-time), 1 died on S (by a player: H 0; no attacker 0; "
+        self.assertIn("S 1 (0 placed, 1 encounter, 0 run-time), 1 died on S (by a player: H 0; by another entity 0; no attacker 0; "
                       "attacker not recorded 1)", v.counts)
 
 
@@ -251,6 +260,14 @@ class RequiredSteps(unittest.TestCase):
         v = lc.grade_completable(run, data)
         self.assertEqual(v.status, lc.PASS, v.counts)
         self.assertTrue(v.counts.startswith("completable by play: 1 required step(s) performed, every gate opened on S, H, D"))
+
+    def test_no_gates_says_the_gates_were_not_attempted(self) -> None:
+        h = [(60, "Input script: LEVELPASS gates not attempted (--no-gates)")]
+        run = RunFolder([], H_JOIN + h + H_NEXT, D_JOIN + D_NEXT, result=self.PASSED).run()
+        v = lc.grade_completable(run, self.data())
+        self.assertEqual(v.status, lc.BY_TELEPORT)
+        self.assertTrue(v.counts.startswith("completable by teleport; gates not attempted (--no-gates); required steps "
+                                            "not performed: 2;"), v.counts)
 
     def test_a_carried_key_says_where_it_broke(self) -> None:
         import levelpass_holds as lh
@@ -363,7 +380,7 @@ class EnemiesCalibration(unittest.TestCase):
     def test_tutorial_a_counts_every_enemy_s_had(self) -> None:
         v = lc.grade_enemies(lc.load_run(TUTORIAL_A))
         self.assertTrue(v.counts.startswith("S 32 (0 placed, 28 encounter, 4 run-time), 32 died on S (by a player: "
-                                            "H 0, D 0; no attacker 4; attacker not recorded 28)"), v.counts)
+                                            "H 0, D 0; by another entity 0; no attacker 4; attacker not recorded 28)"), v.counts)
         for who in "HD":
             self.assertIn(f"{who}: bound 30 of 32, waiting asleep 0 (its copy asleep, far from this player: not a "
                           "fault by itself), never existed here 2; deaths 32: 30 seen on a bound copy, 2 dead before "

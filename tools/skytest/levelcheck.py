@@ -403,9 +403,13 @@ def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
                  for who in order}
     no_attacker = [k for k in dead if k.attacker == "-"]
     unrecorded = [k for k in dead if k.attacker is None and not k.by.isdigit()]
+    # Killed by an entity that is no player (`dead by none (S, placed; attacker (null)#3457)`: ww1 20261119-051557,
+    # the seventh death the counts missed): named, so the totals add up.
+    by_other = [k for k in dead if k.attacker not in (None, "-") and not k.by.isdigit()]
     counts = [f"S {len(keys)} ({', '.join(f'{n} {kd}' for kd, n in kinds.items())}), {len(dead)} died on S (by a "
-              f"player: {', '.join(f'{w} {n}' for w, n in by_player.items()) or '-'}; no attacker {len(no_attacker)}; "
-              f"attacker not recorded {len(unrecorded)})"]
+              f"player: {', '.join(f'{w} {n}' for w, n in by_player.items()) or '-'}; by another entity "
+              f"{len(by_other)}{' (' + ', '.join(sorted({k.attacker for k in by_other})[:4]) + ')' if by_other else ''}; "
+              f"no attacker {len(no_attacker)}; attacker not recorded {len(unrecorded)})"]
     findings: list[Finding] = []
     expected: dict[str, list[str]] = {}       # key -> the clients that should have had it
     there: dict[str, dict[str, ClientEnemy | None]] = {}
@@ -1502,6 +1506,7 @@ def gate_opened(run: Run, name: str) -> Line | None:
 # Gates of the same name (tutorial_b's two TutorialLockedGate) are told apart by their order along the level and
 # the distinct ids each game opened.
 REQ_LINE = re.compile(r"Input script: LEVELPASS required (r\d+) (\S+) (\S+)(?: not performed: (.*))?")
+GATES_SKIPPED = re.compile(r"Input script: LEVELPASS gates not attempted \(--no-gates\)")
 
 
 def gate_open_ids(log: Log, name: str, mover: bool = False) -> list[Line]:
@@ -1641,7 +1646,11 @@ def grade_completable(run: Run, data: LevelData | None = None) -> Verdict:
     if "D" not in run.clients:
         return Verdict("completable", NOT_TESTED, counts + " (one client in this run: two players not shown)", example,
                        notes=notes)
+    gates_skipped = bool(run.clients.get("H") and run.clients["H"].find(GATES_SKIPPED))
     if verdict == "PASS" and all(reached.values()):
+        if shut and gates_skipped:
+            return Verdict("completable", BY_TELEPORT, f"completable by teleport; gates not attempted (--no-gates); "
+                           f"required steps not performed: {len(shut)}; {counts}", example, notes=notes)
         if shut:
             return Verdict("completable", BY_TELEPORT, f"completable by teleport; first step not done: {shut[0]}; "
                            f"required steps not done: {len(shut)} of {len(shut) + len(done)}; {counts}", example,

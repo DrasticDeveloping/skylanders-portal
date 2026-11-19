@@ -723,6 +723,14 @@ class Plan:
     # The required steps a player does on the way (plan_required): each gate of levelpass_holds.required_gates
     # the pass opens the way a player does, after the sweep; one it cannot names why (why_not).
     required: list = field(default_factory=list)
+    # --long-pause <seconds> [--long-pause-at <name>]: one pickup leaves the game's found screen up that long on
+    # purpose (a pause of a minute crashed H; its fix needs a run that keeps the screen up), the named object's
+    # pickup or else the first pickup of a collectible; every other step dismisses a pause screen within seconds.
+    long_pause_s: int = 0
+    long_pause_at: str = ""
+    # --no-gates: no required phase (a run about something else: coins, loot, enemy motion, the pause): the full
+    # sweep and the ten-minute budget; the page says "completable by teleport; gates not attempted (--no-gates)".
+    no_gates: bool = False
                                     # (--d-leaves-before-end: D ends its session before the exit, as before)
 
 
@@ -753,7 +761,8 @@ def estimate_seconds(stops: list[Stop], late_join: bool, end: bool = True) -> fl
 def make_plan(content: Content, full: bool = False, late_join: bool = True, budget_s: float = BUDGET_S,
               sample: int = SAMPLE, provoke: str = "", no_end: bool = False, d_stays: bool = True,
               d_lobby: bool = False, new_slot: bool = False, scenes: bool = False,
-              scene_lengths: dict[str, float] | None = None, lock_commands: bool = False) -> Plan:
+              scene_lengths: dict[str, float] | None = None, lock_commands: bool = False,
+              no_gates: bool = False) -> Plan:
     """The plan; without --full, over the budget, the sample per family goes down to 2, then 1 (the
     plan says so), after the quiet visits were dropped. `no_end` (--no-end): the level's end is found
     (the plan names it) but not attempted, and its time is not in the estimate."""
@@ -775,13 +784,15 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
         for o, r in refs:
             o.ref = r
     plan = _make_plan(content, full, late_join, budget_s, sample, provoke, no_end=no_end, d_stays=d_stays,
-                      scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands)
+                      scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands,
+                      no_gates=no_gates)
     n = sample
     while not full and plan.estimate_s > budget_s and n > 1:
         n -= 1
         fresh()
         plan = _make_plan(content, full, late_join, budget_s, n, provoke, no_end=no_end, d_stays=d_stays,
-                      scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands)
+                      scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands,
+                      no_gates=no_gates)
         plan.left_out.append(f"each action family sampled {n} time(s), not {sample}, to fit the budget")
     # Still over at one per family (a level with many archetypes): at most `cap` actions of each kind
     # (fight, attack, interact, pickup, enter, talk), the first ones along the path, the cap going down
@@ -790,7 +801,8 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
     while not full and plan.estimate_s > budget_s and cap >= 1:
         fresh()
         plan = _make_plan(content, full, late_join, budget_s, n, provoke, kind_cap=cap, no_end=no_end,
-                          d_stays=d_stays, scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands)
+                          d_stays=d_stays, scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands,
+                      no_gates=no_gates)
         plan.left_out.append(f"each action family sampled {n} time(s), not {sample}, to fit the budget")
         plan.left_out.append(f"each kind of action at most {cap} times, to fit the budget (--full acts on all)")
         cap -= 1
@@ -806,7 +818,7 @@ KIND_CAP_START = 8   # the first per-kind cap tried when one action per family i
 def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, sample: int,
                provoke: str, kind_cap: int = 0, no_end: bool = False, d_stays: bool = True,
                scenes: bool = False, scene_lengths: dict[str, float] | None = None,
-               lock_commands: bool = False) -> Plan:
+               lock_commands: bool = False, no_gates: bool = False) -> Plan:
     visited = [o for o in content.objects if o.group in GROUPS_VISITED]
     # A sub-zone (a swap zone, a staging map) is its own map that a player reaches only through its own
     # entry: its objects are never visited, even when the probe walked its package at the level's load
@@ -1016,7 +1028,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
     pieces, pieces_s = plan_pieces(content, set(end.keys() | set(end.path_keys)) if end is not None else set(),
                                    left_out)
     required = plan_required(content, holds, set(end.keys() | set(end.path_keys)) if end is not None else set(),
-                             lock_commands) if not no_end else []
+                             lock_commands) if not no_end and not no_gates else []
     pieces_s += sum(r.est_s for r in required if not r.why_not)
     timed = (end.kind == le.TIMED) if end is not None else (bool(content.level_end) and exit_stop is None)
     scene_list, scene_at, scene_s, load_s = (plan_scenes(content, end, stops, exit_stop, scene_lengths or {})
@@ -1049,7 +1061,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
                 unplaced=unplaced, estimate_s=round(est, 1), full=full, late_join=late_join, exit_stop=exit_stop,
                 provoke=provoke, no_end=no_end, end=end, end_objs=end_objs, end_missing=end_missing, timed=timed,
                 d_stays=d_stays, scenes=scenes, scene_list=scene_list, scene_at=scene_at, scene_load_s=load_s,
-                held=held_notes, pieces=pieces, required=required)
+                held=held_notes, pieces=pieces, required=required, no_gates=no_gates)
 
 
 # --- fights the level's script holds (levelpass_holds) ------------------------------------------------------
@@ -1199,6 +1211,18 @@ class ReqStep:
     why_not: str = ""         # "" when the pass performs it
 
 
+def budget_words(plan: Plan) -> str:
+    """Which of the two budgets the plan is in: the gates phase (its steps and seconds, the sweep shrunk for them)
+    or --no-gates (the full sweep, the ten-minute budget)."""
+    if plan.no_gates:
+        return f"--no-gates: gates not attempted, the full sweep in the {BUDGET_S / 60:.0f}-minute budget"
+    done = [r for r in plan.required if not r.why_not]
+    if not plan.required:
+        return "no required gate in this level: the full sweep"
+    return (f"gates phase: {len(done)} of {len(plan.required)} required gate(s) performed, "
+            f"{sum(r.est_s for r in done):.0f} s, the sweep shrunk for them (a level with gates takes what it takes)")
+
+
 def plan_required(content: Content, holds: dict, forbidden: set[str], lock_commands: bool) -> list[ReqStep]:
     """The required gates' steps (the section's head), in the order along the level."""
     if not content.manifest or not content.logic:
@@ -1276,8 +1300,14 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
     return out
 
 
+GATES_SKIPPED = "LEVELPASS gates not attempted (--no-gates)"
+
+
 def required_lines(plan: Plan) -> list[str]:
-    """H's required phase: each step's lines, or the reason it is not performed."""
+    """H's required phase: each step's lines, or the reason it is not performed; with --no-gates one line that
+    says the gates were not attempted."""
+    if plan.no_gates:
+        return [f"log {GATES_SKIPPED}"]
     if not plan.required:
         return []
     out = ["log LEVELPASS phase required"]
@@ -1499,6 +1529,18 @@ def scene_lengths_from_log(text: str) -> dict[str, float]:
     return out
 
 
+def long_pause_label(plan: Plan) -> tuple[str, int] | None:
+    """(the action label, its seconds) of the pass's one long pause (--long-pause), or None: the named object's
+    pickup, else the first pickup of a collectible."""
+    if not plan.long_pause_s:
+        return None
+    for s in plan.stops:
+        for k, a in enumerate(s.actions):
+            if a.action == PICKUP and (a.obj.name == plan.long_pause_at if plan.long_pause_at else is_collectible(a.obj)):
+                return f"{s.label}_{k + 1}", int(plan.long_pause_s)
+    return None
+
+
 def scene_hold_cap(plan: Plan) -> int:
     """hold_cap with scenes in full: a scene the sweep did not start itself (after a fight) holds the hero for
     its length; that is no failed step."""
@@ -1673,9 +1715,39 @@ def exit_kind(o: Obj) -> str:
     return ENTER
 
 
-def action_lines(a: Action, label: str, after: str = "") -> list[str]:
+# A step that may bring up a pause screen (the game's found screen of a major collectible, a chest's treasure:
+# a pickup, a chest's press, a step onto a collectible) runs under a short hold cap: the route command waits out a
+# hold for at most PAUSE_HOLD_S (a teleport's own landing hold is about 1 s), then the found screen's dismissal
+# (DISMISS_LINES: A, B, B with short waits, as a player presses within a second or two; on a free hero a jump and
+# two attacks), then the pass's own cap again and a wait for the hero, which bounds every hold that is not a
+# dismissable screen (a cutscene, a conversation) as before. Before: ww1 20261119-051557, the pickup next to
+# SoulGem_lockjaw held 90 s (hold_cap with scenes played) under the Soul Gem's found screen until a later tap b.
+# Not around other presses: a winch's or a switch's interaction may start a microgame that holds the controls
+# while the command plays it.
+PAUSE_HOLD_S = 4
+
+
+def pause_screen_step(a: Action) -> bool:
+    """A step after which the game may show a pause screen until a press (the section's head)."""
+    return a.action == PICKUP or is_collectible(a.obj) or (a.action == INTERACT_A and a.obj.state == "chest")
+
+
+def action_lines(a: Action, label: str, after: str = "", cap: int = 0, long_pause: int = 0) -> list[str]:
     """An action's steps; `after`: the target the step before teleported to (its own teleport is not
-    repeated: the visit's goto_entity to the same object already woke it, or was held and would be again)."""
+    repeated: the visit's goto_entity to the same object already woke it, or was held and would be again).
+    `cap`: the pass's hold cap, restored after a step that may show a pause screen (pause_screen_step), which
+    runs under PAUSE_HOLD_S, or under `long_pause` seconds when this is the pass's one long pause (--long-pause)."""
+    if cap and pause_screen_step(a):
+        short = long_pause or PAUSE_HOLD_S
+        head = ([f"log LEVELPASS long pause {label}: the screen stays up {long_pause} s on purpose (--long-pause)"]
+                if long_pause else [])
+        inner = action_lines(a, label, after)
+        # The inner lines end with this collectible's own dismissal (dismiss_after) when it has one: one is enough.
+        while inner and inner[-len(DISMISS_LINES):] == list(DISMISS_LINES):
+            inner = inner[:-len(DISMISS_LINES)]
+        return [*head, f"hold_cap {short}", *inner,
+                f"log LEVELPASS pause check {label}: a screen that holds the hero is dismissed as a player does",
+                *DISMISS_LINES, f"hold_cap {cap}", f"wait_free {cap}"]
     o = a.obj
     ref = o.ref
     out = [f"log LEVELPASS act {label} {a.action} {_safe(o.name) or '-'} {o.cls} ref {ref}"]
@@ -1764,7 +1836,7 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
             # Scenes played: the deadline moves by what the scenes took. After the wait for no scene open here,
             # the deadline is set again to this stop's planned share of the sweep and the stops after it.
             lines += ["wait_free 120", f"sweep_deadline {rearm[i]:.0f}"]
-        lines += stop_lines(s)
+        lines += stop_lines(s, scene_hold_cap(plan), long_pause_label(plan))
         lines += scene_lines(plan, s)
         if plan.provoke and i == 0:
             # The audit's own proof: one object of the kind made different on H alone, then audited.
@@ -1797,7 +1869,7 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
         lines += [f"waitfor {NEXT_LEVEL} {end_wait_s(plan.end) + NEXT_LOAD_S}",
                   "wait_free 120", "log LEVELPASS phase next-level", "online_audit next"]
     elif plan.exit_stop is not None:
-        lines += stop_lines(plan.exit_stop)
+        lines += stop_lines(plan.exit_stop, scene_hold_cap(plan), long_pause_label(plan))
         lines += [f"waitfor {NEXT_LEVEL} {int(EXIT_WAIT_S) + NEXT_LOAD_S}", "wait_free 120",
                   "log LEVELPASS phase next-level", "online_audit next"]
     elif plan.timed:
@@ -2156,7 +2228,7 @@ def visit_ref(s: Stop) -> str:
     return o.ref if o is not None else ""
 
 
-def stop_lines(s: Stop) -> list[str]:
+def stop_lines(s: Stop, cap: int = 0, long_pause: tuple[str, int] | None = None) -> list[str]:
     c = s.cluster
     names = ", ".join(sorted({_safe(o.name) for o in c.objects if o.name})[:6]) or "-"
     ref = visit_ref(s)
@@ -2166,7 +2238,8 @@ def stop_lines(s: Stop) -> list[str]:
         out += dismiss_after(visit_obj(s))
     out.append(f"online_audit {s.label}")
     for k, a in enumerate(s.actions):
-        out += action_lines(a, f"{s.label}_{k + 1}", after=ref if k == 0 else "")
+        lp_s = long_pause[1] if long_pause is not None and long_pause[0] == f"{s.label}_{k + 1}" else 0
+        out += action_lines(a, f"{s.label}_{k + 1}", after=ref if k == 0 else "", cap=cap, long_pause=lp_s)
     if s.actions:
         out.append(f"online_audit {s.label}_a")
     return out
