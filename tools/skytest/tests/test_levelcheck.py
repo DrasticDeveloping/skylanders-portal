@@ -343,6 +343,15 @@ class Together(unittest.TestCase):
         self.assertEqual(v.notes, ["near: v3 (112)"])
         self.assertTrue(v.findings[0].what.startswith("v4: D was 7900 from H while H acted"))
 
+    def test_a_follow_with_nothing_to_read_is_not_called_no_follow(self) -> None:
+        # Batch 11 run 3: D followed H, H hung before any stop; the rows said "no follow in this run".
+        d = [(45, "Online: auto follow the host (peer 1) (script)")]
+        rows = lc.grade(RunFolder(self.S, H_JOIN + LEVEL_END, D_JOIN + d + LEVEL_END).path, None)
+        notes = [n for v in rows if v.name in ("enemies", "loot") for n in v.notes]
+        self.assertTrue(notes and all("no follow in this run" not in n for n in notes), notes)
+        self.assertTrue(any(n.startswith("D followed H (its `auto follow ... (script)` line), but where both stood was "
+                                         "not read") for n in notes), notes)
+
     def test_no_follow_is_not_tested_and_the_rows_say_where_they_were_read(self) -> None:
         v = lc.grade_together(RunFolder(self.S, H_JOIN + self.H + LEVEL_END, D_JOIN + LEVEL_END).run())
         self.assertEqual(v.status, lc.NOT_TESTED)

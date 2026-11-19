@@ -1723,9 +1723,15 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run),
             grade_pieces(run, data)]
     # The enemies and the loot are read where both players stand only when D followed H: each says which.
-    where = (f"read with D following H: {together.counts}" if together.status in (PASS, FAIL) else
-             "read with D where it entered the level (no follow in this run): D's enemies and loot far from H are "
-             "asleep there")
+    followed = bool(run.clients.get("D") and run.clients["D"].find(FOLLOW_ON))
+    if together.status in (PASS, FAIL):
+        where = f"read with D following H: {together.counts}"
+    elif followed:
+        # D's follow ran, but the together row had nothing to read (batch 11 run 3: H hung before any stop).
+        where = f"D followed H (its `auto follow ... (script)` line), but where both stood was not read: {together.counts}"
+    else:
+        where = ("read with D where it entered the level (no follow in this run): D's enemies and loot far from H "
+                 "are asleep there")
     for v in rows:
         if v.name in ("enemies", "loot"):
             v.notes.append(where)

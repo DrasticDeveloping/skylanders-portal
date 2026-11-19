@@ -1358,7 +1358,7 @@ def pieces_lines(plan: Plan) -> list[str]:
     for k, (m, trig, spawner) in enumerate(plan.pieces, 1):
         out += [f"log LEVELPASS pieces p{k} {_safe(m.name)} starts {', '.join(_safe(n) for n in m.spawner_names)} "
                 f"stay {m.stay_s:.0f} s", f"enter_trigger {trig.ref}", f"goto_entity {spawner.ref} {PIECES_STANDOFF}",
-                f"wait {int(m.stay_s * 1000)}", f"online_audit p{k}"]
+                f"wait {int(round(m.stay_s))}", f"online_audit p{k}"]
     return out
 
 
@@ -2333,6 +2333,28 @@ def script_d(plan: Plan) -> str:
 
 POSITION_LITERAL = re.compile(r"(?<![\w:.\-])-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?\s+-?\d+(?:\.\d+)?|at:-?\d|\bgoto -?\d|fight_area\b|"
                               r"online_wait_peer_near\b|online_server_goto\b|walkto\b|navto\b")
+
+
+# The input script's `wait` takes SECONDS (dev/input_script: `wait 8`); a generated fixed wait is never longer than
+# MAX_FIXED_WAIT_S, and the fixed waits of one script together stay within the pass's estimate. Batch 11 run 3
+# (ww1, 20261119-062358) lost its whole 660 s slot to `wait 25000` (the pieces step's 25 s written in ms).
+MAX_FIXED_WAIT_S = 120
+FIXED_WAIT = re.compile(r"^wait\s+(\d+(?:\.\d+)?)\s*$", re.M)
+
+
+def fixed_waits(script: str) -> list[float]:
+    """Every fixed `wait <seconds>` of a script, in order."""
+    return [float(m.group(1)) for m in FIXED_WAIT.finditer(script)]
+
+
+def wait_errors(script: str, estimate_s: float) -> list[str]:
+    """What is wrong with a script's fixed waits: one over MAX_FIXED_WAIT_S, or their sum over the estimate."""
+    waits = fixed_waits(script)
+    out = [f"wait {w:g} is over {MAX_FIXED_WAIT_S} s (the input script's wait takes seconds)"
+           for w in waits if w > MAX_FIXED_WAIT_S]
+    if sum(waits) > estimate_s:
+        out.append(f"the fixed waits add up to {sum(waits):g} s, over the pass's estimate {estimate_s:.0f} s")
+    return out
 
 
 def position_literals(script: str) -> list[str]:
