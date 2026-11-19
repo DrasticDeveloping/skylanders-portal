@@ -424,8 +424,11 @@ bool ReadPose(ByteReader& r, PlayerPose& m) {
   if (ok && r.Ok() && r.Remaining() > 0) {
     // The moves' command block (protocol.h PlayerCommand): another version's is skipped, a cut one is invalid.
     const uint8_t version = r.U8();
-    if (r.Ok() && version == kPlayerCommandVersion) {
-      // Exactly its size (the 27 bytes after the version byte): a longer version 1 block is not a version 1 one.
+    if (r.Ok() && version == kPlayerCommandVersion1) {
+      // The first layout (no peer epoch): exactly its size, and read as no command (it names no player).
+      if (r.Remaining() != kPlayerCommandV1Bytes - 1) return false;
+    } else if (r.Ok() && version == kPlayerCommandVersion) {
+      // Exactly its size (the 27 bytes after the version byte): a longer version 2 block is not a version 2 one.
       if (r.Remaining() != kPlayerCommandBytes - 1) return false;
       m.command.peer_epoch = r.U32();
       m.command.held = r.U32();

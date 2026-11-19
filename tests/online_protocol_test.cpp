@@ -975,7 +975,7 @@ void Moves() {
   // Another version's block: skipped, the pose itself read.
   {
     std::vector<uint8_t> b = with;
-    b[plain.size()] = uint8_t(kPlayerCommandVersion + 1);
+    b[plain.size()] = uint8_t(kPlayerCommandVersion + 1);  // version 3: unknown
     auto back = DecodeMessages(b);
     REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
     const auto* got = std::get_if<PlayerPose>(&(*back)[0]);
@@ -990,7 +990,32 @@ void Moves() {
     b[3] = 0;
     CHECK(!DecodeMessages(b).has_value());
   }
-  // A version 1 block one byte longer than its size: invalid (never read as a version 1 block).
+  // Version 1, the first layout (24 bytes, no epoch): read as no command, the pose kept; one byte more or less:
+  // invalid. Version 2 is not read as version 1 nor the other way round.
+  {
+    std::vector<uint8_t> b = plain;
+    b.push_back(kPlayerCommandVersion1);
+    for (size_t i = 1; i < kPlayerCommandV1Bytes; ++i) b.push_back(0);
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);
+    b[3] = 0;
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<PlayerPose>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    CHECK(!got->has_command && got->pose_sequence == 31);
+    std::vector<uint8_t> longer = b;
+    longer.push_back(0);
+    longer[2] = uint8_t(longer.size() - kMessageHeaderSize);
+    CHECK(!DecodeMessages(longer).has_value());
+    std::vector<uint8_t> shorter = b;
+    shorter.pop_back();
+    shorter[2] = uint8_t(shorter.size() - kMessageHeaderSize);
+    CHECK(!DecodeMessages(shorter).has_value());
+    std::vector<uint8_t> v2_as_v1 = with;  // a version 2 block's bytes under version 1: 28 bytes, not 24
+    v2_as_v1[plain.size()] = kPlayerCommandVersion1;
+    CHECK(!DecodeMessages(v2_as_v1).has_value());
+  }
+  // A version 2 block one byte longer than its size: invalid (never read as a version 2 block).
   {
     std::vector<uint8_t> b = with;
     b.push_back(0);
