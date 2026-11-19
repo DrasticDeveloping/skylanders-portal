@@ -2922,13 +2922,34 @@ LEVEL_END_DROPPED = re.compile(r"Online: level end held not sent \(([^)]*)\)")
 LEVEL_END_HELD = re.compile(r"Online: level end (\S+) to (\S+) held \(([^)]*)\): ([^(]*)")
 
 
-def client_progress(text: str, peer: str) -> str:
-    """How far one client got, in words, from its log's marks."""
+CONNECTED_LEVEL = re.compile(r"Online: connected as peer \d+ \(server tick \d+, level (\d+) (\S+)\)")
+CLIENT_BARRIER = re.compile(r"Online: barrier (\d+) released at tick")
+
+
+def next_level_seen(text: str, level: str) -> bool:
+    """The game's own evidence that this client reached the level after `level`: a later generation loaded
+    (`Online: level <g> <path>: load`) and its start released there (`Online: barrier <g> released`). The script's
+    marker is never enough: it runs whatever its wait's outcome (batch 11 run 4, tutorial_b 20261119-063529: H's
+    `LEVELPASS phase next-level` right after `waitfor online_level_after_mark timed out`)."""
+    loads = [(int(m.group(1)), m.group(2)) for m in LEVEL_LOAD_LINE.finditer(text)]
+    joined = [(int(m.group(1)), m.group(2)) for m in CONNECTED_LEVEL.finditer(text)]
+    under = [g for g, path in loads + joined if path.split("/")[-1].lower() == level.lower()]
+    if not under:
+        return False
+    later = [g for g, _path in loads if g > min(under)]
+    released = {int(m.group(1)) for m in CLIENT_BARRIER.finditer(text)}
+    return bool(later) and later[0] in released
+
+
+def client_progress(text: str, peer: str, level: str = "") -> str:
+    """How far one client got, in words, from its log: its marks, and for the next level the game's own
+    evidence (next_level_seen) when the level is known."""
     if not text:
         return "no log"
     if peer == "D" and D_IN not in text:
         return "never joined"
-    if (H_NEXT if peer == "H" else D_NEXT) in text:
+    marked = (H_NEXT if peer == "H" else D_NEXT) in text
+    if marked and (not level or next_level_seen(text, level)):
         return "reached the next level"
     loads = [m.group(2) for m in LEVEL_LOAD_LINE.finditer(text)]
     if peer == "H" and len(loads) >= 3 or peer == "D" and loads:
@@ -2954,10 +2975,10 @@ def level_end_notes(s_text: str, texts: dict[str, str]) -> list[str]:
 
 def clients_line(plan: Plan, h_text: str, d_text: str) -> str:
     """Each client's progress, for the report's head."""
-    out = [f"H {client_progress(h_text, 'H')}"]
+    out = [f"H {client_progress(h_text, 'H', plan.level)}"]
     if plan.late_join:
         how = "stays through the end" if d_through_end(plan) else "leaves before the end (--d-leaves-before-end)"
-        out.append(f"D ({how}) {client_progress(d_text, 'D')}")
+        out.append(f"D ({how}) {client_progress(d_text, 'D', plan.level)}")
     return "clients: " + "; ".join(out)
 
 
@@ -2978,10 +2999,11 @@ def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan, d_tex
         missed.append(f"stopped by the runner at the soft budget ({CASE_TIMEOUT_S} s)")
     planned_end = not plan.no_end and (plan.end is not None and plan.end.kind != le.TIMED or plan.exit_stop is not None
                                        or plan.timed)
-    if planned_end and H_NEXT not in h_text:
+    if planned_end and not (H_NEXT in h_text and next_level_seen(h_text, plan.level)):
         missed.append("the level's end and the next level (not reached)")
-    if d_through_end(plan) and D_NEXT not in d_text:
-        missed.append(f"D did not reach the next level ({client_progress(d_text, 'D')}): the pass shows one client only")
+    if d_through_end(plan) and not (D_NEXT in d_text and next_level_seen(d_text, plan.level)):
+        missed.append(f"D did not reach the next level ({client_progress(d_text, 'D', plan.level)}): the pass shows "
+                      "one client only")
     paused = paused_after(h_text) if any(PAUSE_LINE.search(r) for r in reasons) else ""
     if paused:
         missed.insert(0, f"the game stayed paused with its frames stopped after `{paused}` (a screen the pass's press"

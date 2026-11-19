@@ -59,7 +59,8 @@ class RunFolder:
             (self.path / "D" / "game.log").write_text(log(d), encoding="utf-8")
         if peers is not None or result is not None:
             import json
-            (self.path / "result.json").write_text(json.dumps({"peers": peers or [], **(result or {})}),
+            (self.path / "result.json").write_text(json.dumps({"peers": peers or [], "case": "levelpass-tutorial_b",
+                                                               **(result or {})}),
                                                    encoding="utf-8")
 
     def run(self) -> lc.Run:
@@ -296,7 +297,7 @@ class RequiredSteps(unittest.TestCase):
         v = lc.grade_completable(run, data)
         self.assertEqual(v.status, lc.BY_TELEPORT)
         first = v.counts.split("first step not done: ")[1]
-        self.assertTrue(first.startswith("TutorialLockedGate (key gate): performed ("), first)
+        self.assertTrue(first.startswith("TutorialLockedGate (key gate): attempted by the pass ("), first)
         self.assertIn("opened on H at 00:11:25.000, not on S, D; key touched and following on H: H/game.log:", first)
         self.assertIn("; S for the key: H/data/Online/session/game.log:1: Online: world unsupported carried_item", first)
         self.assertIn("; no held press at the lock on H (", first)
@@ -736,8 +737,12 @@ class Scenes(unittest.TestCase):
         self.assertEqual(lc.grade_scenes(skipped.run(), GAME_REPO).status, lc.NOT_TESTED)
 
 
-H_NEXT = [(216, "Input script: LEVELPASS phase next-level")]
-D_NEXT = [(216, "Input script: LEVELPASS D next level")]
+# The next level reached: its load after the level under test and its start released on that game (the game's
+# own evidence; the script's marker after it proves nothing by itself).
+H_NEXT = [(214, "Online: level 3 town/town_state10/town_state10: load"), (216, "Online: barrier 3 released at tick 900"),
+          (216.5, "Input script: LEVELPASS phase next-level")]
+D_NEXT = [(214, "Online: level 3 town/town_state10/town_state10: load"), (216, "Online: barrier 3 released at tick 900"),
+          (216.5, "Input script: LEVELPASS D next level")]
 
 
 class Completable(unittest.TestCase):
@@ -749,12 +754,24 @@ class Completable(unittest.TestCase):
         v = self.verdict({"verdict": "PASS", "not_covered": []}, H_NEXT, D_NEXT)
         self.assertEqual(v.status, lc.PASS)
         self.assertIn("H yes, D yes", v.counts)
-        self.assertTrue(v.example.startswith("H/game.log:4:"), v.example)
+        self.assertTrue(v.example.startswith("H/game.log:5: Online: barrier 3 released"), v.example)  # the game's line
+
+    def test_a_marker_after_a_timed_out_wait_is_not_reached(self) -> None:
+        # Batch 11 run 4 (tutorial_b 20261119-063529): the marker came right after the wait for the level change
+        # timed out; the level never ended.
+        h = [(200, "Input script: waitfor online_level_after_mark timed out after 150.0 s"),
+             (200.1, "Input script: LEVELPASS phase next-level")]
+        v = self.verdict({"verdict": "PASS", "not_covered": []}, h, D_NEXT)
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertIn("next level reached (the level change and play on that game): H no, D yes", v.counts)
+        self.assertTrue(v.findings[0].lines[0].startswith("H: no level loaded after tutorial_b; H/game.log:4: Input "
+                                                          "script: waitfor online_level_after_mark timed out"),
+                        v.findings[0].lines)
 
     def test_incomplete_failed_and_no_pass_are_never_a_pass(self) -> None:
         v = self.verdict({"verdict": "INCOMPLETE", "not_covered": ["the level's end and the next level (not reached)"]})
         self.assertEqual(v.status, lc.INCOMPLETE)
-        self.assertEqual(v.notes, ["not covered: the level's end and the next level (not reached)"])
+        self.assertEqual(v.notes[0], "not covered: the level's end and the next level (not reached)")
         self.assertEqual(self.verdict({"verdict": "PASS", "not_covered": []}, H_NEXT).status, lc.FAIL)  # D no mark
         self.assertEqual(self.verdict(None).status, lc.NOT_TESTED)
         self.assertEqual(lc.overall([v, lc.Verdict("x", lc.PASS, "")]), "INCOMPLETE")
