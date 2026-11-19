@@ -1011,6 +1011,7 @@ def action_lines(a: Action, label: str, after: str = "") -> list[str]:
     if ref.startswith("auth:") and a.action in (ATTACK, INTERACT_A, TALK, PICKUP) and ref != after:
         # The helpers find a live object; goto_entity first wakes an asleep one (its area streamed in).
         out.append(f"goto_entity {ref}")
+        out += dismiss_after(o)
     if a.action == FIGHT:
         out.append(f"fight_near {ref} {FIGHT_RADIUS} {ACTION_TIMEOUT[FIGHT]}")
     elif a.action == ATTACK:
@@ -1019,14 +1020,7 @@ def action_lines(a: Action, label: str, after: str = "") -> list[str]:
         out.append(f"interact {ref} {ACTION_TIMEOUT[a.action]}")
     elif a.action == PICKUP:
         out.append(f"pickup {ref} {ACTION_TIMEOUT[PICKUP]}")
-        # A major collectible's pickup (the game's CollectibleComponent: a Soul Gem, a story scroll, a map, a
-        # hat, a legendary treasure, a butterfly) locks every hero's controls and opens the game's found
-        # screen (CollectibleData.displayUI), which pauses the game until a press closes it (its controls come
-        # back on CCollectibleTrackerUIClosedMessage). The stored data does not say which collectibles are
-        # major, so every pickup of the collectible component gets the press once and the wait for the hero
-        # (a minor one's press is a jump). A screen it does not close: the next step's pause line is H's
-        # forbidden line (PAUSE_FATAL), the pass ends there.
-        out += list(DISMISS_LINES)
+        out += dismiss_after(o)
     elif a.action == EXIT_A and exit_kind(o) == FIGHT:
         out += [f"fight_near {ref} {EXIT_FIGHT_RADIUS} {EXIT_FIGHT_S}",
                 f"fight_near {ref} {EXIT_FIGHT_RADIUS} {EXIT_LATE_WAVE_S}"]
@@ -1038,7 +1032,26 @@ def action_lines(a: Action, label: str, after: str = "") -> list[str]:
 
 
 FIGHT_RADIUS = 1500
-DISMISS_LINES = ("tap a", "wait_free 15")
+# A major collectible (the game's CollectibleComponent: a Soul Gem, a story scroll, a map, a hat, a legendary
+# treasure, a butterfly) is collected as soon as the hero lands on it or picks it up: every hero's controls
+# go off and the game's found screen (CollectibleData.displayUI) pauses the game until a press closes it
+# (its controls come back on CCollectibleTrackerUIClosedMessage). B closes it, A does not (soulgem-found-
+# screen, 20261118-212923: `try a` timed out, `try b` freed the game after 1.5 s; back opened the session's
+# pause, which nothing freed: no back or start press in a pass). The stored data does not say which
+# collectibles are major, so every step that teleports to an object of the collectible component, or picks
+# it up, is followed by B and the wait for the hero (on a minor one, or a free hero, B is an attack). A
+# screen B does not close: the next step's pause line is H's forbidden line (PAUSE_FATAL), the pass ends.
+DISMISS_LINES = ("tap b", "wait_free 15")
+
+
+def is_collectible(o: Obj) -> bool:
+    """An object of the collectible component (the static reader's components, or the probe's class)."""
+    return COMP_COLLECTIBLE in o.components or o.cls in CLASS_PICKUP
+
+
+def dismiss_after(o: Obj | None) -> list[str]:
+    """B and the wait for the hero after a step that teleports to or picks up a collectible; [] else."""
+    return list(DISMISS_LINES) if o is not None and is_collectible(o) else []
 # A route step that finds the game paused with its player frames stopped (`no player frame took a read for
 # 3 s (paused, ...)`): nothing after it can run until a press closes what paused it. H's forbidden line, so
 # the pass ends at once instead of failing every later step after 23 s (ww1, 20261118-195819: 3.5 minutes).
@@ -1313,12 +1326,17 @@ LATE_JOIN_LEAD = 6     # D starts this many stops before the sweep ends (its boo
 D_VISITS = 6           # the late joiner's visits (each streams an area in; every audit covers all its rows)
 
 
-def visit_ref(s: Stop) -> str:
-    """The object a stop's teleport goes to: its first object with a live reference, "" for none."""
+def visit_obj(s: Stop) -> Obj | None:
+    """The object a stop's teleport goes to: its first object with a live reference, None for none."""
     for o in s.cluster.objects:
         if o.ref:
-            return o.ref
-    return ""
+            return o
+    return None
+
+
+def visit_ref(s: Stop) -> str:
+    o = visit_obj(s)
+    return o.ref if o is not None else ""
 
 
 def stop_lines(s: Stop) -> list[str]:
@@ -1328,6 +1346,7 @@ def stop_lines(s: Stop) -> list[str]:
     out = [f"log LEVELPASS visit {s.label} objects {len(c.objects)} ({names}) ref {ref or '-'}"]
     if ref:
         out.append(f"goto_entity {ref}")
+        out += dismiss_after(visit_obj(s))
     out.append(f"online_audit {s.label}")
     for k, a in enumerate(s.actions):
         out += action_lines(a, f"{s.label}_{k + 1}", after=ref if k == 0 else "")
@@ -1349,7 +1368,8 @@ def script_d(plan: Plan) -> str:
         step = len(acted) / D_VISITS
         acted = [acted[int(i * step)] for i in range(D_VISITS - 1)] + [acted[-1]]
     for s in acted:
-        lines += [f"log LEVELPASS D visit {s.label}", f"goto_entity {visit_ref(s)}", f"online_audit d-{s.label}"]
+        lines += [f"log LEVELPASS D visit {s.label}", f"goto_entity {visit_ref(s)}", *dismiss_after(visit_obj(s)),
+                  f"online_audit d-{s.label}"]
     lines += ["log LEVELPASS D done", "online_end", "quit"]
     return "\n".join(lines) + "\n"
 
