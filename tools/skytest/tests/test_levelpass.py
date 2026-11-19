@@ -703,7 +703,7 @@ class Case(unittest.TestCase):
         h = lp.script_h(p, lp.LATE_JOIN_MARK)
         self.assertEqual(lp.exit_refs(h), ["auth:madeup:2"])
         s = self.load(lp.spec_toml(p))
-        self.assertEqual(s.peers["H"].forbid, lp.exit_forbid(h) + [lp.PAUSE_FATAL])
+        self.assertEqual(s.peers["H"].forbid, lp.exit_forbid(h) + [lp.PAUSE_FATAL, lp.MADE_COPY_LEFT])
         self.assertEqual(s.peers["D"].forbid, [])
         rx = re.compile(s.peers["H"].forbid[0])
         prefix = "[2026-11-18 16:42:12.345] [info] [core] [t2144] "
@@ -724,7 +724,18 @@ class Case(unittest.TestCase):
                                                  "enter_trigger LevelOutro_Trigger\nlog LEVELPASS done\n")[0],
                                   "Dev: goto_entity LevelOutro_Trigger failed (no entity: no such entity) after 0.0 s"))
         # --no-end and a timed level address no exit target: no forbid.
-        self.assertIn(f"forbid = {lp._toml_list([lp.PAUSE_FATAL])}", lp.spec_toml(lp.make_plan(content(), no_end=True)))
+        self.assertIn(f"forbid = {lp._toml_list([lp.PAUSE_FATAL, lp.MADE_COPY_LEFT])}",
+                      lp.spec_toml(lp.make_plan(content(), no_end=True)))
+        # The made-copy line (online/5-endfight-spawns) at the level change, a twin, a dependent: forbidden.
+        rx = re.compile(lp.MADE_COPY_LEFT)
+        for line in ("Online: runtime spawn made copy s1.52540001#1/0@2 Foo_Spawned1#33 still in the entity table after "
+                     "its despawn (the level request)",
+                     "Online: runtime spawn made copy dependent Foo_Spawned1_Fx#34 still in the entity table after its "
+                     "despawn (the level request)",
+                     "Online: runtime spawn twin Foo_Spawned2#35 still in the entity table after its despawn"):
+            self.assertTrue(rx.search(line), line)
+        self.assertFalse(rx.search("Online: runtime spawn made copy s1.52540001#1/0@2 Foo_Spawned1#33 removed (the "
+                                   "level request; 0 dependent(s) before it)"))
 
     def base(self, d_extra: str = "", top: str = "") -> str:
         return "\n".join([
