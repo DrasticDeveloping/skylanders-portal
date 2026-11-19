@@ -92,11 +92,17 @@ class Walk(unittest.TestCase):
         self.assertNotIn("Gate", e.path)
 
     def test_without_the_self_role_the_cutscene_has_no_cause(self):
+        """A cutscene no telegram in the level plays (a script's): the end is not guessed, it is UNKNOWN at
+        that node (before 19 November: a timed level, and the pass waited for an end that never came)."""
         chains, logic = trigger_level()
         for ed in logic["edges"]:
             if ed["roles"] == "1":
                 ed["roles"] = None
-        self.assertEqual(le.derive_end(chains, logic, "lvl").kind, le.TIMED)
+        e = le.derive_end(chains, logic, "lvl")
+        self.assertEqual((e.kind, e.family), (le.UNSUPPORTED, le.UNKNOWN))
+        self.assertEqual([k for _f, k, _w in e.blockers], ["u.Movie"])
+        self.assertIn("at Movie (u.Movie;", e.why)
+
 
     def test_a_trigger_of_another_zone_is_never_the_end(self):
         chains, logic = trigger_level()
@@ -130,8 +136,93 @@ class Walk(unittest.TestCase):
     def test_no_chain_or_no_logic(self):
         self.assertIsNone(le.derive_end([], trigger_level()[1], "lvl"))
         self.assertIsNone(le.derive_end(trigger_level()[0], {"nodes": [], "edges": []}, "lvl"))
+        # A map load the logic does not hold: read as unknown at the chain's sender (brn4), not a timed level.
         e = le.derive_end(["A -[CLoadMapComponentMessage]-> roles 4"], trigger_level()[1], "lvl")
+        self.assertEqual((e.kind, e.family, e.blockers[0][1]), (le.UNSUPPORTED, le.UNKNOWN, "A"))
+
+
+def dead_end_level(components: list[str], when: str):
+    """The map load after a sender `u.Thing` whose telegram goes on `when` (no telegram into it)."""
+    thing = node("u.Thing", "CEntity", "other")
+    thing["components"] = [{"key": c, "class": c} for c in components]
+    edges = [edge("u.Thing", [], "CLoadMapComponentMessage", when, roles="4")]
+    return ["Thing -[CLoadMapComponentMessage {_fade: true}]-> roles 4"], {"schema": 1, "nodes": [thing], "edges": edges}
+
+
+class Families(unittest.TestCase):
+    """An end the pass cannot carry out, classed by the level's own data (FAMILIES), never guessed."""
+
+    def end(self, components, when):
+        chains, logic = dead_end_level(components, when)
+        return le.derive_end(chains, logic, "lvl")
+
+    def test_the_component_the_telegram_names_first(self):
+        # brn3: an unscrew mini-game's success list; outlands01: a rail pad that is a mini-game and a ride.
+        e = self.end(["CInteractionComponentData", "Scripts.MicrogameComponentData"], "Scripts.EffectEventData.TelegramList")
+        self.assertEqual((e.kind, e.family), (le.UNSUPPORTED, "A"))
+        e = self.end(["Scripts.LaunchPathComponentData", "Scripts.MicrogameComponentData"],
+                     "Scripts.MicrogameComponentData.SuccessTelegrams")
+        self.assertEqual(e.family, "A")
+        # finale01: a launch pad's spline event is the ride's, though the pad also has an interaction.
+        e = self.end(["CInteractionComponentData", "Scripts.LaunchPathComponentData", "Scripts.MicrogameComponentData"],
+                     "CSplineMoverComponentEventData._telegrams")
+        self.assertEqual(e.family, "G")
+        # verdant1: a turret vehicle's exit; a boss's own end telegram; a hub's dialog option.
+        self.assertEqual(self.end(["Scripts.EnterVehicleComponentData", "Scripts.TurretMinigameComponentData"],
+                                  "Scripts.EnterVehicleComponentData.OnExit").family, "D")
+        self.assertEqual(self.end(["CBossHealthBarComponentData"], "CSheepMonsterLevelComponentData._endTelegram").family, "F")
+        self.assertEqual(self.end(["CDialogBoxComponentData"], "CUIDialogBoxOption._optionSelectedTelegrams").family, "M")
+        # A boss quest is no boss.
+        self.assertEqual(self.end(["Scripts.BossQuestComponentData"], "messenger activationFlags 1 = eMAF_OnAct  count 1").family,
+                         le.UNKNOWN)
+
+    def test_a_scripted_sequence_is_a_timed_level(self):
+        e = self.end(["Scripts.AnimateEntitySequenceComponentData"],
+                     "Scripts.AnimateEntitySequenceComponentData.OnSequenceEndTelegrams")
         self.assertEqual(e.kind, le.TIMED)
+
+    def test_a_fight_of_spawnees_is_run_time_spawns_on_the_path(self):
+        chains, logic = fight_level()
+        e = le.derive_end(chains, logic, "lvl")
+        self.assertEqual(e.kind, le.FIGHT)
+        self.assertIn(("E", "a.Counter"), e.on_path)
+
+    def test_the_pass_does_not_attempt_an_unsupported_end(self):
+        chains, logic = dead_end_level(["Scripts.EnterVehicleComponentData"], "Scripts.EnterVehicleComponentData.OnExit")
+        c = lp.Content("lvl", "made", (0.0, 0.0, 0.0), [lp.Obj("Lever_1", "C", (500.0, 0.0, 0.0), lp.GROUP_INTERACT)])
+        c.logic, c.level_end_chains, c.level_end = logic, chains, ["Thing"]
+        plan = lp.make_plan(c, late_join=False)
+        self.assertTrue(plan.no_end)
+        self.assertEqual(plan.end.kind, le.UNSUPPORTED)
+        verdict, missed = lp.pass_verdict("pass", [], "Input script: LEVELPASS done", plan)
+        self.assertEqual(verdict, lp.INCOMPLETE)
+        self.assertIn("the level's end, not attempted: the end needs a turret or vehicle at Thing", missed[0])
+        self.assertNotIn("enter_trigger", lp.script_h(plan, None))
+
+    def test_a_debug_trigger_is_never_the_end(self):
+        # fg1: the only trigger the walk finds is the makers' A1_Outro_DebugTrigger.
+        chains, logic = trigger_level()
+        for n in logic["nodes"]:
+            if n["key"] == "u.Outro_Trigger":
+                n["name"] = "A1_Outro_DebugTrigger"
+        e = le.derive_end(chains, logic, "lvl")
+        self.assertEqual((e.kind, e.family), (le.UNSUPPORTED, le.UNKNOWN))
+        self.assertIn("debug trigger", e.why)
+
+    def test_a_count_of_switches_is_no_fight(self):
+        # ww3: a relay counts two monkey switches' successes (sent by their scripts), not deaths.
+        sw = [node(f"u.MonkeySwitch0{i}", "CPhysicalEntity", "switch") for i in (2, 3)]
+        for n in sw:
+            n["components"] = [{"key": "r", "class": "Scripts.RotatingDoorComponentData"}]
+        nodes = sw + [node("u.Relay"), node("u.Outro", "CEntity", "cutscene")]
+        edges = [edge(n["key"], ["u.Relay"], "Scripts.StringMessage", "messenger activationFlags 0 = none (default)  count 1",
+                      {"MessageString": "Success"}) for n in sw]
+        edges += [edge("u.Relay", [], "CLoadMapComponentMessage",
+                       ON.format(m="Scripts.StringMessage {MessageString: Success}", n=2), roles="4")]
+        e = le.derive_end(["Relay -[CLoadMapComponentMessage {_fade: true}]-> roles 4"], {"schema": 1, "nodes": nodes, "edges": edges}, "lvl")
+        self.assertEqual((e.kind, e.family), (le.UNSUPPORTED, "A"))
+        self.assertEqual(sorted(k for _f, k, _w in e.blockers), ["u.MonkeySwitch02", "u.MonkeySwitch03"])
+
 
 
 class Steps(unittest.TestCase):

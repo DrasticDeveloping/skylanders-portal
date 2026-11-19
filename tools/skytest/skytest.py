@@ -134,6 +134,7 @@ import memory_growth  # noqa: E402  (stage 5's soak grade)
 import occurrence_outcomes  # noqa: E402  (stage 5's occurrence grade)
 import known_failures  # noqa: E402  (a pointless rerun refused: the last two results failed alike)
 import build_guard  # noqa: E402  (no session while a build holds its slot)
+import store_paths  # noqa: E402  (which folders a cleanup may touch; shared with the janitor)
 import preflight_gate  # noqa: E402  (a case whose preflight has an error starts no game)
 import script_checks  # noqa: E402  (a script that waits on a session it never starts; a wait whose peer is gone)
 
@@ -587,6 +588,9 @@ class Config:
     # worktree; machine_slots_dir). Missing key: MACHINE_GAMES.
     machine_games: int = 4
     slots: Path | None = None
+    # The build snapshots' folder when it is not the store's own snapshots/ (the store's one-line
+    # snapshots-folder.txt, snapshots_setting): None, the store's.
+    snapshots: Path | None = None
     # A unit case's ctest command (default: `ctest` on PATH, as the build prompt has it), and a
     # command put in front of its test binary (only the runner's own tests set that one).
     ctest: list[str] = field(default_factory=list)
@@ -682,7 +686,7 @@ def load_config(repo: Path) -> Config:
         for ph in ARG_PLACEHOLDER.findall(x):
             if ph not in SYNTHETIC_ARG_PLACEHOLDERS:
                 raise SystemExit(f"{f}: [synthetic] args: {ph} is not one of {', '.join(SYNTHETIC_ARG_PLACEHOLDERS)}")
-    return Config(
+    cfg = Config(
         repo=repo,
         store=repo / STORE,
         exe=g["exe"],
@@ -717,6 +721,8 @@ def load_config(repo: Path) -> Config:
         synthetic_launcher=[os.path.expandvars(x) for x in syn.get("launcher", [])],
         bulk_settings=BulkSettings(games=bulk_games, wait_factor=float(factor), gb_per_game=float(gb)),
     )
+    cfg.snapshots = snapshots_setting(cfg)
+    return cfg
 
 
 # --- safety ---------------------------------------------------------------------------------------
@@ -763,10 +769,62 @@ def inside(path: Path, folder: Path) -> bool:
     return p == f or f in p.parents
 
 
+# --- where the build snapshots live ------------------------------------------------------------------
+#
+# The store may sit behind a directory junction on a slow drive (the owner's external drive since 19
+# November: 6 MB a second with small files); the build snapshots (the exe and DLLs every game starts from,
+# large files) may then stay on the internal one. The store's one-line file snapshots-folder.txt names
+# that folder, an absolute path (`#` starts a comment); snapshots_setting checks it at every start, and
+# the guards (check_output_path, launch_args.copy_build) accept it besides the store and nothing else.
+# Without the file the snapshots stay in the store's snapshots/.
+SNAPSHOTS_FILE = "snapshots-folder.txt"
+
+
+def snapshots_setting(cfg: Config) -> Path | None:
+    """The snapshots folder the store's SNAPSHOTS_FILE names, None without the file; refused (SystemExit)
+    as store_paths.validate_snapshots_folder says (the janitor's own check): one absolute plain drive path to
+    an existing folder with no link on its way, holding this store's SFO-TEST-STORE.txt, not equal to, inside
+    or around a git checkout, a disc, the owner's data, the user profile's root, a drive root, the repository
+    or the store. Resolved once (its real path); the runner hands that to the janitor."""
+    f = cfg.store / SNAPSHOTS_FILE
+    if not f.is_file():
+        return None
+    lines = [ln.split("#", 1)[0].strip() for ln in f.read_text(encoding="utf-8-sig", errors="replace").splitlines()]
+    lines = [ln for ln in lines if ln]
+    where = f"{f}: the snapshots folder"
+    if len(lines) != 1:
+        raise SystemExit(f"{where}: one line with one absolute path, found {len(lines)}")
+    folder, why = store_paths.validate_snapshots_folder(
+        lines[0], os.path.abspath(cfg.store),
+        [("the disc", cfg.rom), ("the repository", cfg.repo), ("the test store", cfg.store)], owner_data_roots())
+    if folder is None:
+        raise SystemExit(f"{where}: {why}")
+    return folder
+
+
+def remove_temporary(tmp: Path, root: str) -> None:
+    """A partial snapshot folder of this process removed: only while its real path is inside `root` (the
+    snapshots root's real path, resolved once by the caller: the store's snapshots/ or the outside folder) and
+    it is no link; else the run stops."""
+    if not os.path.lexists(tmp):
+        return
+    why = store_paths.check_victim(tmp, root)
+    if why:
+        raise SystemExit(f"refusing to remove {tmp}: {why}")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def snapshots_root(cfg: Config) -> Path:
+    """The folder the build snapshots are in: the store's snapshots/ or the one snapshots-folder.txt names."""
+    return cfg.snapshots if cfg.snapshots is not None else cfg.store / "snapshots"
+
+
 def check_output_path(cfg: Config, path: Path) -> None:
-    """Everything a run writes goes inside the worktree's store, never the owner's data or the disc."""
-    if not inside(path, cfg.store):
-        raise SystemExit(f"refusing to write {path}: outside the test store {cfg.store}")
+    """Everything a run writes goes inside the worktree's store (or its snapshots folder, snapshots_setting),
+    never the owner's data or the disc."""
+    if not inside(path, cfg.store) and not (cfg.snapshots is not None and inside(path, cfg.snapshots)):
+        raise SystemExit(f"refusing to write {path}: outside the test store {cfg.store}"
+                         + (f" and its snapshots folder {cfg.snapshots}" if cfg.snapshots is not None else ""))
     for root in owner_data_roots():
         if inside(path, root):
             raise SystemExit(f"refusing to write {path}: inside the owner's data folder {root}")
@@ -2623,7 +2681,8 @@ def snapshot_build(cfg: Config) -> Path:
     files = build_files(cfg)
     if not files:
         raise SystemExit(f"no build at {cfg.build / cfg.exe}: build the release first (`just build-release`)")
-    snap = cfg.store / "snapshots" / build_hash(cfg, files)
+    root = snapshots_root(cfg)
+    snap = root / build_hash(cfg, files)
     check_output_path(cfg, snap)
     if snapshot_complete(snap, files, cfg):
         return snap
@@ -2632,8 +2691,10 @@ def snapshot_build(cfg: Config) -> Path:
     # with FileExistsError), then renames it into place; when the rename fails because another runner
     # put the same snapshot there first, that one is used.
     tmp = snap.with_name(f"{snap.name}.partial-{os.getpid()}-{threading.get_ident()}")
+    root.mkdir(parents=True, exist_ok=True)
+    pinned = store_paths.real(root)  # resolved once; every cleanup of tmp below uses it
     check_output_path(cfg, tmp)
-    shutil.rmtree(tmp, ignore_errors=True)
+    remove_temporary(tmp, pinned)
     try:
         tmp.mkdir(parents=True)
         for f in files:
@@ -2646,7 +2707,7 @@ def snapshot_build(cfg: Config) -> Path:
                 raise SystemExit(f"could not put the snapshot in place at {snap} ({e}), and no complete one is"
                                  " there") from e
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        remove_temporary(tmp, pinned)
     return snap
 
 
@@ -2670,7 +2731,8 @@ def case_build_copy(cfg: Config, spec: Spec, snap: Path, run: Path) -> Path:
     check_output_path(cfg, dest)
     try:
         copy = la.copy_build(snap.resolve(), run.resolve() / la.BUILD_COPY_DIR, spec.build_copy,
-                             store=cfg.store.resolve(), exe=cfg.exe)
+                             store=cfg.store.resolve(), exe=cfg.exe,
+                             snapshots=cfg.snapshots.resolve() if cfg.snapshots is not None else None)
     except (la.LaunchError, OSError) as e:
         raise SpecError(f"[build_copy]: {e}") from None
     done = [f"removed {f}" for f in spec.build_copy.remove] + \
@@ -2691,15 +2753,18 @@ def snapshot_unit(cfg: Config, binary: str) -> Path:
     for f in files:
         st = f.stat()
         h.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns}\n".encode())
-    snap = cfg.store / "snapshots" / f"unit-{h.hexdigest()[:12]}"
+    root = snapshots_root(cfg)
+    snap = root / f"unit-{h.hexdigest()[:12]}"
     check_output_path(cfg, snap)
     if snapshot_complete(snap, files):
         return snap / src.name
     # As snapshot_build (PS11): each runner and each case thread copies into its own partial folder and
     # renames it into place; a rename that loses to another one's complete snapshot uses that one.
     tmp = snap.with_name(f"{snap.name}.partial-{os.getpid()}-{threading.get_ident()}")
+    root.mkdir(parents=True, exist_ok=True)
+    pinned = store_paths.real(root)  # resolved once; every cleanup of tmp below uses it
     check_output_path(cfg, tmp)
-    shutil.rmtree(tmp, ignore_errors=True)
+    remove_temporary(tmp, pinned)
     try:
         tmp.mkdir(parents=True)
         for f in files:
@@ -2711,7 +2776,7 @@ def snapshot_unit(cfg: Config, binary: str) -> Path:
                 raise SpecError(f"could not put the unit snapshot in place at {snap} ({e}), and no complete one"
                                 " is there") from e
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        remove_temporary(tmp, pinned)
     return snap / src.name
 
 
@@ -7495,6 +7560,187 @@ class StoreJanitor:
                     pass
 
 
+# --- cleaning up: old snapshots after a run, old runs on request -----------------------------------------
+#
+# Both through the game repository's janitor (tools/test_store_janitor.py: its link-safe delete, its
+# refusals, its keep rules), never a deletion of the runner's own. After a run: every build snapshot
+# but the current build's and the one before it (the newest other build a finished session of this store
+# ran), and any a session still in progress names. `prune --older-than <hours>`: the run and session
+# folders whose newest file is older than that.
+SESSION_RECENT_S = 24 * 3600.0   # a session this young with no results.json yet may still be running
+SESSION_NAME = re.compile(r"-session(?:-\d+)?$")  # fresh_dir names a same-second second session -session-2
+
+
+def publish_live_session(cfg: Config, name: str, snap: Path) -> Path:
+    """A live session's own session folder (runs/<stamp>-live-<name>-session) naming its snapshot, written
+    while the caller holds the machine lock; it stays `in_progress` (active while a game runs in this store)."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:40] or "live"
+    out = make_run_dir(cfg, cfg.store / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-live-{safe}-session")
+    publish_session(out, snap)
+    return out
+
+
+def publish_session(out: Path, snap: Path | None) -> None:
+    """A session's results.json from its first moment (in progress, naming its snapshot), so every runner's
+    after-run cleanup keeps the snapshot it uses; write_progress replaces it as cases end."""
+    if (out / "results.json").is_file():
+        try:
+            if json.loads((out / "results.json").read_text(encoding="utf-8")).get("cases"):
+                return  # a case has ended: write_progress names the snapshot from now on
+        except (OSError, ValueError, AttributeError):
+            pass
+    write_text_replacing(out / "results.json", json.dumps({"in_progress": "starting: no case ended yet",
+                                                            "snapshot": str(snap) if snap else "", "cases": []}))
+
+
+def janitor_script(cfg: Config) -> Path | None:
+    """The game repository's janitor when it has the cleanup options, else None."""
+    script = cfg.repo / "tools" / "test_store_janitor.py"
+    try:
+        return script if "--keep-snapshot-names" in script.read_text(encoding="utf-8", errors="replace") else None
+    except OSError:
+        return None
+
+
+def snapshots_in_use(cfg: Config, current: str) -> list[str] | None:
+    """The snapshot names to keep after a run: `current`, the newest other one a finished session named,
+    and every one a session in progress names. None when a recent session has no results.json yet (its
+    snapshot is unknown: nothing is removed this time)."""
+    keep = [current]
+    previous = ""
+    runs = cfg.store / "runs"
+    games: list[bool] = []  # once: does a running game have its data folder in this store (None: cannot tell)
+
+    def games_here() -> bool:
+        """A session without a finished results file counts as active, whatever its age, while a running game
+        has its data folder in this store, or when that cannot be told."""
+        if not games:
+            roots = store_paths.data_roots_in_use()
+            store_real = store_paths.real(cfg.store)
+            games.append(roots is None or any(store_paths.within(r, store_real) for r in roots))
+        return games[0]
+    try:
+        sessions = sorted((d for d in runs.iterdir() if SESSION_NAME.search(d.name)), key=lambda d: d.name,
+                          reverse=True)
+    except OSError:
+        return keep
+    now = time.time()
+    for d in sessions:
+        stamp = known_failures.RUN_NAME.match(d.name)
+        young = False
+        if stamp:
+            try:
+                young = now - time.mktime(time.strptime(stamp.group(1)[:15], "%Y%m%d-%H%M%S")) < SESSION_RECENT_S
+            except (ValueError, OverflowError):
+                young = False
+        try:
+            res = json.loads((d / "results.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            res = None
+        if not isinstance(res, dict):
+            # No results file yet, or one that does not read: its snapshot is unknown; while it may be running
+            # (young, or a game runs in this store) nothing is removed this time.
+            if young or games_here():
+                return None
+            continue
+        name = Path(str(res.get("snapshot") or "")).name
+        if not name:
+            continue
+        if res.get("in_progress"):
+            if (young or games_here()) and name not in keep:
+                keep.append(name)
+        elif not previous and name != current:
+            previous = name
+        if previous and not young:
+            break
+    if previous and previous not in keep:
+        keep.insert(1, previous)
+    return keep
+
+
+def prune_snapshots(cfg: Config, current: str) -> str:
+    """After a run: the janitor removes the build snapshots no longer in use (snapshots_in_use). Its line,
+    or '' when this game repository's janitor has no such option."""
+    script = janitor_script(cfg)
+    if script is None or not current:
+        return ""
+    keep = snapshots_in_use(cfg, current)
+    if keep is None:
+        return "snapshots: none removed (a session younger than a day has no results.json yet)"
+    try:
+        r = subprocess.run([sys.executable, "-I", str(script), "--store", str(cfg.store), "--apply", "--line",
+                            "--only", "snapshots", "--keep-snapshot-names", ",".join(keep)]
+                           + (["--snapshots-folder", str(cfg.snapshots)] if cfg.snapshots is not None
+                              else ["--no-snapshots-folder"]),
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"snapshots: not cleaned ({e})"
+    return "snapshots: " + ((r.stdout or "").strip() or (r.stderr or "").strip()[-300:])
+
+
+def cmd_levelcheck(cfg: Config, a: argparse.Namespace) -> int:
+    """`levelcheck --grade <run folder>`: the level check's graders (levelcheck.py) on a run that exists, no
+    game: lobby, save slot, cutscenes, enemies, pickups, loot, each with its counts and one cited line.
+    Exit 0 when nothing failed (NOT TESTED included: it is said, never counted as a pass), 1 when a grader
+    found a difference."""
+    import levelcheck as lc
+    if getattr(a, "static", False):
+        text = lc.static_table(levelpass_folder(cfg, getattr(a, "folder", None)))
+        if getattr(a, "out", None):
+            Path(a.out).write_text(text + "\n", encoding="utf-8")
+        print(text)
+        return 0
+    if bool(a.grade) == bool(a.level):
+        raise SystemExit("levelcheck: give a level (a level pass, then its grade), --grade <run folder> or --static")
+    if a.grade:
+        folder = Path(a.grade)
+        if not folder.is_dir():
+            raise SystemExit(f"levelcheck: no run folder {folder}")
+        verdicts = lc.grade(folder, cfg.repo)
+        print(lc.page(folder, verdicts, lc.run_head(folder)))
+        return levelcheck_exit(lc, verdicts)
+    if a.predictions:
+        raise SystemExit("levelcheck: --predictions is levelpass's own mode; the check grades the generated pass")
+    # The level pass itself (its case through `test`: the known-failure refusal, the build-slot wait and the
+    # preflight gate), then the graders on its own run folder.
+    a.check = {}
+    code = cmd_levelpass(cfg, a)
+    run = a.check.get("run")
+    if a.plan_only or run is None:
+        if not a.plan_only:
+            print(f"levelcheck {a.level}: no run to grade (levelpass exit {code})", flush=True)
+        return code
+    verdicts = lc.grade(run, cfg.repo)
+    head = lc.run_head(run) + [f"level pass report: {a.check.get('report', '-')}"]
+    text = lc.page(run, verdicts, head)
+    out = levelpass_folder(cfg, getattr(a, "folder", None)) / f"{a.level}-check-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+    out.write_text(text + "\n", encoding="utf-8")
+    print(text, flush=True)
+    print(f"levelcheck {a.level}: page {out}", flush=True)
+    return levelcheck_exit(lc, verdicts)
+
+
+def levelcheck_exit(lc, verdicts) -> int:
+    """1 when a grader failed, EXIT_INCOMPLETE when the pass did not cover its plan, else 0 (NOT TESTED rows
+    are said on the page, never counted as passed)."""
+    if any(v.status == lc.FAIL for v in verdicts):
+        return 1
+    return EXIT_INCOMPLETE if any(v.status == lc.INCOMPLETE for v in verdicts) else 0
+
+
+def cmd_prune(cfg: Config, a: argparse.Namespace) -> int:
+    """`prune --older-than <hours>`: the store's run and session folders older than that, through the
+    janitor (never through a directory link); it prints what it removed and what that freed."""
+    if not (math.isfinite(a.older_than) and a.older_than > 0):
+        raise SystemExit(f"prune: --older-than takes a finite number of hours above 0, not {a.older_than}")
+    script = janitor_script(cfg)
+    if script is None:
+        raise SystemExit(f"prune: {cfg.repo / 'tools' / 'test_store_janitor.py'} is missing or has no cleanup options")
+    cmd = [sys.executable, "-I", str(script), "--store", str(cfg.store), "--only", "runs",
+           "--older-than-hours", str(a.older_than)] + ([] if a.dry_run else ["--apply"])
+    return subprocess.run(cmd).returncode
+
+
 def not_in_bulk_result(spec: Spec, why: str) -> CaseResult:
     """A case bulk mode leaves out (bulk_exclusion), reported at 0 s without a game; not failed."""
     return CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage, status=NOT_IN_BULK,
@@ -7713,6 +7959,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         print(rank.line(runnable), flush=True)
     janitor = StoreJanitor(cfg)
     budget = machine_budget(cfg)
+
+    def machine_lock():
+        """The machine-wide lock (machine.lock) when this machine has a budget; else nothing to share."""
+        return budget.mutex() if budget is not None else contextlib.nullcontext()
     if any(runs_alone(sp) for sp in runnable):
         janitor.skip("a case of this run runs alone: the janitor's walk never runs beside a measured case")
     else:
@@ -7729,16 +7979,29 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             with snapshot_lock:
                 if snap is None:
                     check_disc(cfg)
-                    snap = snapshot_build(cfg)
+                    if session_out:
+                        # Chosen later by a case: under the machine lock, and this session's results.json
+                        # names it at once (the after-run cleanup of every runner keeps what a session names).
+                        with machine_lock():
+                            snap = snapshot_build(cfg)
+                            publish_session(session_out[0], snap)
+                    else:
+                        snap = snapshot_build(cfg)  # the caller holds the machine lock (below)
                     breaker = CircuitBreaker(budget, snap.name) if budget is not None else None
                 return snap
 
-        if any(starts_games(sp) for sp in runnable):
-            game_snapshot()
         guarded = guarded_folders(cfg)
         before_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        out = make_run_dir(cfg, cfg.store / "runs" / f"{stamp}-session")
+        # The snapshot is chosen and the session folder that names it is written under the machine lock,
+        # which every runner's after-run snapshot cleanup also holds: no cleanup runs between the two.
+        session_out: list[Path] = []
+        with machine_lock():
+            if any(starts_games(sp) for sp in runnable):
+                game_snapshot()
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            out = make_run_dir(cfg, cfg.store / "runs" / f"{stamp}-session")
+            publish_session(out, snap)
+        session_out.append(out)
         thresholds = tomllib.loads(cfg.thresholds.read_text(encoding="utf-8")) if cfg.thresholds.is_file() else {}
         baseline = tomllib.loads(cfg.baseline.read_text(encoding="utf-8")) if cfg.baseline.is_file() else {}
         # The last recorded status of each case before this run (findings, the checkpoint's "passed before").
@@ -8013,6 +8276,11 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
               f" with the same first reason; not met): {', '.join(r.case for r in known)}")
     if store_line:
         print(store_line)
+    if snap is not None:
+        with machine_lock():  # no other runner chooses a snapshot or starts a session meanwhile
+            snaps_line = prune_snapshots(cfg, snap.name)
+        if snaps_line:
+            print(snaps_line)
     print(f"report: {out / 'report.md'}")
     if known and len(known) == len(failed) and not touched and not queue_unmatched:
         return EXIT_KNOWN_FAILURE  # its own exit code: nothing ran that failed anew
@@ -8767,7 +9035,6 @@ def live_serve(cfg: Config, a: argparse.Namespace) -> int:
         spec = load_spec(folder / "spec.toml", cfg.timeout)
         token_preflight(bool(a.allow_restricted))
         check_disc(cfg)
-        snap = snapshot_build(cfg)
         budget = machine_budget(cfg)
         if budget is not None:
             budget.owner = f"skytest live pid {os.getpid()}, {info.name}"
@@ -8777,6 +9044,12 @@ def live_serve(cfg: Config, a: argparse.Namespace) -> int:
             if lease.capacity:
                 say("failed", lease.capacity)
                 return 1
+        # The snapshot only once the slots are held (store cleanup review, item 5b), and named in a session
+        # folder of its own before the machine lock goes (re-check 3): every runner's after-run cleanup keeps
+        # what a session names.
+        with (budget.mutex() if budget is not None else contextlib.nullcontext()):
+            snap = snapshot_build(cfg)
+            publish_live_session(cfg, info.name, snap)
         hooks = LiveHooks(folder, info, spec, st)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         res = run_case(cfg, spec, snap, len(spec.peers), stamp, {}, {}, (),
@@ -9194,6 +9467,26 @@ def levelpass_folder(cfg: Config, given: str | None) -> Path:
     return folder
 
 
+def measured_scene_lengths(cfg: Config, level: str, runs: int = 5) -> dict[str, float]:
+    """The cutscene lengths measured in this store's newest level-pass runs of the level (H's log: each scene
+    played to its natural end), for --scenes play's estimate; empty when none was measured yet."""
+    import levelpass as lp
+    out: dict[str, float] = {}
+    folders = sorted((d for d in (cfg.store / "runs").glob(f"*-levelpass-{level}*") if d.is_dir()),
+                     key=lambda d: d.name, reverse=True) if (cfg.store / "runs").is_dir() else []
+    seen = 0
+    for d in folders:
+        log = d / "H" / "game.log"
+        if not log.is_file():
+            continue
+        for name, s in lp.scene_lengths_from_log(log.read_text(encoding="utf-8", errors="replace")).items():
+            out[name] = max(out.get(name, 0.0), s)
+        seen += 1
+        if seen >= runs:
+            break
+    return out
+
+
 def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     """One automatic level pass: the plan from the level's content, one generated case through `test`
     (its guards, the machine's slots, fail fast), then the report from the run's logs."""
@@ -9206,7 +9499,11 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     if a.no_end and a.predictions:
         raise SystemExit("levelpass: --no-end is for the generated pass, not --predictions")
     plan = lp.make_plan(content, full=a.full, late_join=not a.no_late_join, provoke=a.provoke or "",
-                        no_end=a.no_end, d_stays=not a.d_leaves_before_end)
+                        no_end=a.no_end, d_stays=not a.d_leaves_before_end,
+                        d_lobby=not getattr(a, "d_joins_late", False), new_slot=getattr(a, "new_slot", False),
+                        scenes=getattr(a, "scenes", "skip") == "play",
+                        scene_lengths=measured_scene_lengths(cfg, a.level) if getattr(a, "scenes", "skip") == "play"
+                        else None)
     plan.probe = not a.no_probe
     try:
         plan.game_args = [lp.check_game_arg(g) for g in (a.game_arg or [])]
@@ -9268,6 +9565,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         print(f"levelpass {a.level}: no run folder (the case did not start; exit {code})", flush=True)
         return code or 1
     run = runs[-1]
+    if isinstance(getattr(a, "check", None), dict):  # levelcheck grades this run after the report
+        a.check["run"] = run
     script = (run / "H" / "script.txt").read_text(encoding="utf-8", errors="replace") \
         if (run / "H" / "script.txt").is_file() else lp.script_h(plan, None)
     labels = lp.step_labels(script)
@@ -9350,6 +9649,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         report += "\n" + lpp.verdict_text(lpp.verdicts(bugs, texts))
     out = folder / f"{a.level}-{'predictions' if a.predictions else 'pass'}-{stamp}.txt"
     out.write_text(report, encoding="utf-8")
+    if isinstance(getattr(a, "check", None), dict):
+        a.check["report"] = out
     print(report, flush=True)
     print(f"levelpass {a.level}: report {out}", flush=True)
     print(f"levelpass {a.level}: {head}", flush=True)
@@ -9357,6 +9658,51 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
 
 
 EXIT_INCOMPLETE = 5   # levelpass: the pass did not cover its plan (soft budget, skipped steps, end not reached)
+
+
+def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
+    """The level pass's options (levelpass, and levelcheck which runs one)."""
+    lp_.add_argument("--full", action="store_true", help="act on every object (default: each action family at"
+                     " most 3 times, every cluster still visited)")
+    lp_.add_argument("--no-late-join", action="store_true", help="no second client D at all (one player)")
+    lp_.add_argument("--d-joins-late", action="store_true", help="D joins late, into the level under test (the"
+                     " parked path); by default both clients join in the lobby, the host picks the slot and the"
+                     " party enters the level together (the owner's order)")
+    lp_.add_argument("--scenes", choices=("skip", "play"), default="skip", help="play: the cutscenes in full,"
+                     " each scene's trigger entered in the sweep, the expected scenes in H's script for the level"
+                     " check's cutscenes row, their lengths (measured in earlier runs, else 60 s at the load and"
+                     " 15 s) in the estimate")
+    lp_.add_argument("--new-slot", action="store_true", help="the host starts a new game in the lobby instead of"
+                     " the save's continue")
+    lp_.add_argument("--d-leaves-before-end", action="store_true", help="D ends its session before the exit, as"
+                     " before 19 November (late join and leave without a second client at the end); by default D"
+                     " stays through the level end and must reach the next level itself for a PASS")
+    lp_.add_argument("--no-end", action="store_true", help="stop after the last mid-level step: the level's end is"
+                     " neither acted on nor waited for, the pass is judged on the mid-level steps, the report says"
+                     " the end was not attempted (its own case, levelpass-<level>-no-end): for evidence from the"
+                     " middle of a level")
+    lp_.add_argument("--folder", default=None, help="the levelpass folder (default: tests/skytest.toml's"
+                     " [levelpass] folder)")
+    lp_.add_argument("--provoke", default=None, metavar="KIND", help="the audit's proof: after the first visit H"
+                     " makes one object of KIND (breakable) differ on its own (dev_audit_diverge); the report must"
+                     " show it as a provoked difference")
+    lp_.add_argument("--predictions", action="store_true", help="the predictions run: each predicted co-op bug of"
+                     " the level (<levelpass>/predictions.toml) as steps, snapshots and a check, a verdict per bug")
+    lp_.add_argument("--no-probe", action="store_true", help="the authored probe off in every game: objects only by"
+                     " the names the probe saw live (no auth: ids); to tell a crash of the probe from the game's")
+    lp_.add_argument("--game-arg", action="append", default=None, metavar="--NAME=VALUE", help="one more game"
+                     " setting for H and D (repeatable; a setting Host forwards reaches the hosted S too), e.g."
+                     " --game-arg=--online_authored_ids=2")
+    lp_.add_argument("--plan-only", action="store_true", help="write the generated case and print the plan; start"
+                     " no game")
+    lp_.add_argument("--build-wait-min", type=float, default=None, metavar="MIN", help="as `test`'s")
+    lp_.add_argument("--ignore-build", default=None, metavar="WHY", help="as `test`'s: start beside a build, WHY"
+                     " written into the result")
+    lp_.add_argument("--ignore-preflight", default=None, metavar="WHY", help="as `test`'s: start the generated case"
+                     " although its preflight found an error, WHY written into the result")
+    lp_.add_argument("--rerun-known-failure", default=None, metavar="WHY", help="as `test`'s: run the pass although"
+                     " its last two results on this build with the same generated case failed with the same first"
+                     " reason; WHY is written into the result")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -9441,39 +9787,22 @@ def main(argv: list[str] | None = None) -> int:
     lp_ = sub.add_parser("levelpass", help="the automatic level pass: one session, a sweep generated from the"
                          " level's data, the audit's verdict, a report in the levelpass folder")
     lp_.add_argument("level", help="the level's short name (tutorial_a, tutorial_b, ww1)")
-    lp_.add_argument("--full", action="store_true", help="act on every object (default: each action family at"
-                     " most 3 times, every cluster still visited)")
-    lp_.add_argument("--no-late-join", action="store_true", help="no second client D near the end")
-    lp_.add_argument("--d-leaves-before-end", action="store_true", help="D ends its session before the exit, as"
-                     " before 19 November (late join and leave without a second client at the end); by default D"
-                     " stays through the level end and must reach the next level itself for a PASS")
-    lp_.add_argument("--no-end", action="store_true", help="stop after the last mid-level step: the level's end is"
-                     " neither acted on nor waited for, the pass is judged on the mid-level steps, the report says"
-                     " the end was not attempted (its own case, levelpass-<level>-no-end): for evidence from the"
-                     " middle of a level")
-    lp_.add_argument("--folder", default=None, help="the levelpass folder (default: tests/skytest.toml's"
-                     " [levelpass] folder)")
-    lp_.add_argument("--provoke", default=None, metavar="KIND", help="the audit's proof: after the first visit H"
-                     " makes one object of KIND (breakable) differ on its own (dev_audit_diverge); the report must"
-                     " show it as a provoked difference")
-    lp_.add_argument("--predictions", action="store_true", help="the predictions run: each predicted co-op bug of"
-                     " the level (<levelpass>/predictions.toml) as steps, snapshots and a check, a verdict per bug")
-    lp_.add_argument("--no-probe", action="store_true", help="the authored probe off in every game: objects only by"
-                     " the names the probe saw live (no auth: ids); to tell a crash of the probe from the game's")
-    lp_.add_argument("--game-arg", action="append", default=None, metavar="--NAME=VALUE", help="one more game"
-                     " setting for H and D (repeatable; a setting Host forwards reaches the hosted S too), e.g."
-                     " --game-arg=--online_authored_ids=2")
-    lp_.add_argument("--plan-only", action="store_true", help="write the generated case and print the plan; start"
-                     " no game")
-    lp_.add_argument("--build-wait-min", type=float, default=None, metavar="MIN", help="as `test`'s")
-    lp_.add_argument("--ignore-build", default=None, metavar="WHY", help="as `test`'s: start beside a build, WHY"
-                     " written into the result")
-    lp_.add_argument("--ignore-preflight", default=None, metavar="WHY", help="as `test`'s: start the generated case"
-                     " although its preflight found an error, WHY written into the result")
-    lp_.add_argument("--rerun-known-failure", default=None, metavar="WHY", help="as `test`'s: run the pass although"
-                     " its last two results on this build with the same generated case failed with the same first"
-                     " reason; WHY is written into the result")
+    add_levelpass_options(lp_)
     lp_.set_defaults(fn=cmd_levelpass)
+    lc_ = sub.add_parser("levelcheck", help="the level check: a level pass, then its run graded against the owner's"
+                         " definition of working on one page (levelcheck.py); or --grade an existing run")
+    lc_.add_argument("level", nargs="?", default=None, help="the level's short name (runs `levelpass <level>` first)")
+    lc_.add_argument("--grade", metavar="RUN", default=None, help="grade this run folder instead (no game)")
+    lc_.add_argument("--static", action="store_true", help="every level's end and mechanics from the levelpass"
+                     " folder's data, one table (no game)")
+    lc_.add_argument("--out", default=None, metavar="FILE", help="with --static: also write the table here")
+    add_levelpass_options(lc_)
+    lc_.set_defaults(fn=cmd_levelcheck)
+    pr = sub.add_parser("prune", help="remove the store's run folders older than some hours (through the janitor)")
+    pr.add_argument("--older-than", type=float, required=True, metavar="HOURS",
+                    help="a run or session folder whose newest file is older than this many hours goes")
+    pr.add_argument("--dry-run", action="store_true", help="say what would go, remove nothing")
+    pr.set_defaults(fn=cmd_prune)
     pf = sub.add_parser("preflight", help="a spec's mistakes before any game runs (preflight.py)")
     pf.add_argument("cases", nargs="*", help="case names (tests/runtime/<case>.toml)")
     pf.add_argument("--all-ready", action="store_true", help="every spec that is ready")

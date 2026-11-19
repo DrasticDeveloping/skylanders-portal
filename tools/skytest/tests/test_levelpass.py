@@ -390,7 +390,8 @@ class Scripts(unittest.TestCase):
         p = lp.make_plan(content())
         h = lp.script_h(p, late_join_after="LEVELPASS late-join start")
         self.check_script(h)
-        self.assertIn("online_host 0", h)
+        self.assertIn("online_host -1", h)  # the party boot: S waits for the owner's own pick
+        self.assertNotIn("online_join_pending", h)  # D joins late here: no lobby wait
         self.assertIn("level madeup", h)
         self.assertIn("log LEVELPASS late-join start", h)
         self.assertIn("waitfor online_peer_was_in 300", h)  # D may have come and gone already
@@ -768,6 +769,34 @@ class Case(unittest.TestCase):
         f = self.dir / "case.toml"
         f.write_text(text, encoding="utf-8")
         return self.sk.load_spec(f, 300)
+
+    def test_the_lobby_boot_is_the_owners_order(self):
+        """Both clients join in the lobby (D by the join code, H lets it in), then H picks the slot (the
+        save's continue, or a new game with --new-slot), the party enters the level together; D stays to the
+        next level; nothing waits for a late join."""
+        p = lp.make_plan(content(), d_lobby=True)
+        s = self.load(lp.spec_toml(p))
+        self.assertEqual(s.layout, "server+2")
+        self.assertFalse(s.peers["D"].start_after)  # starts with H: no late start
+        self.assertIn("--dev_hello_gate_loopback=true", s.peers["H"].args)
+        self.assertNotIn("--dev_hello_ungated_loopback=true", s.peers["H"].args)
+        h, d = s.peers["H"].script, s.peers["D"].script
+        order = ["online_host -1", "waitfor online_join_pending", "online_let_in", "online_wait_peers 2",
+                 "tap start", "waitfor front_end_left", "level madeup", "LEVELPASS phase sweep"]
+        self.assertEqual([h.index(x) for x in order], sorted(h.index(x) for x in order))
+        self.assertNotIn("late-join", h)
+        self.assertIn("waitfor online_alone", h)  # D's next level before H ends the session
+        self.assertIn("tap a\nwaitfor front_end_left", h)  # the continue
+        self.assertLess(d.index("online_join {joincode}"), d.index("waitfor online_in_play"))
+        self.assertNotIn("online_join {join}\n", d)
+        self.assertNotIn("LEVELPASS D visit", d)
+        self.assertIn("LEVELPASS D next level", d)
+        for text in (h, d):
+            self.assertFalse([l for l in text.splitlines() if re.match(r"^wait\s+\d", l)], "a fixed wait")
+        new = lp.make_plan(content(), d_lobby=True)
+        new.new_slot = True
+        hn = self.load(lp.spec_toml(new)).peers["H"].script
+        self.assertIn("tap down\nwaitfor menu_ready 60\ntap a\nwaitfor menu_ready 60\ntap a\nwaitfor front_end_left", hn)
 
     def test_generated_case_reads(self):
         p = lp.make_plan(content())

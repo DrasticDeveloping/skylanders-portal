@@ -850,15 +850,22 @@ def cut_before(data: bytes, markers: tuple[str, ...], what: str) -> bytes:
 
 
 def copy_build(snapshot: Path, dest: Path, edits: BuildEdits, *, store: Path, exe: str,
-               owner_roots: list[Path] | None = None) -> Path:
+               owner_roots: list[Path] | None = None, snapshots: Path | None = None) -> Path:
     """The case's own copy of the build snapshot at `dest` (which must not exist yet), with `edits`
     applied, as the rules above say. Returns the copy's folder; raises LaunchError before writing
-    anything when a rule does not hold."""
+    anything when a rule does not hold. The snapshot is inside the store, or inside `snapshots` (the
+    store's snapshots folder elsewhere, skytest's snapshots-folder.txt)."""
     owners = owner_data_roots() if owner_roots is None else owner_roots
     store_c = canonical(str(store), store, "the test store", must_exist=True)
     snap = canonical(str(snapshot), store_c, "the build snapshot", must_exist=True)
-    if not within(snap, store_c) or _norm(snap) == _norm(store_c):
-        raise LaunchError(f"the build snapshot {snap} is not inside the test store {store_c}")
+    snaps_c = canonical(str(snapshots), store_c, "the snapshots folder", must_exist=True) if snapshots else None
+    in_store = within(snap, store_c) and _norm(snap) != _norm(store_c)
+    in_snaps = snaps_c is not None and within(snap, snaps_c) and _norm(snap) != _norm(snaps_c)
+    if not in_store and not in_snaps:
+        raise LaunchError(f"the build snapshot {snap} is not inside the test store {store_c}"
+                          + (f" or its snapshots folder {snaps_c}" if snaps_c is not None else ""))
+    if snaps_c is not None:
+        _refuse_owner(snap, owners, "the build snapshot")
     if os.path.lexists(dest):
         raise LaunchError(f"the build copy {dest} exists already (a case's copy is made fresh)")
     d = canonical(str(dest), store_c, "the build copy")

@@ -16,7 +16,13 @@ along the telegrams that cause each sender to send, to what a player has to do:
   own telegrams at lower counts (each starts a spawner);
 - an enemy whose death sends the telegram (a fight of one);
 - nothing: the level ends on its own (tutorial_a: its intro cutscene's end starts the ride that loads
-  tutorial_b), a timed level.
+  tutorial_b), a timed level;
+- a mechanic the pass cannot carry out (UNSUPPORTED): a sender on the way back whose cause is none of the
+  above (a mini-game's success list, a turret's exit, a boss's own end telegram, a ride's spline event, a
+  message no telegram in the level sends: a script's). Each such dead end is classed by the components of
+  its node into a family of the co-op triage (FAMILIES: switch or mini-game result, fetch hand-in, thrown
+  object, turret or vehicle, run-time spawns, boss, ride); one with none of them is `unknown`, named by its
+  node, never guessed. A dead end that is a scripted sequence (SEQUENCE_ENDS) is how a timed level ends.
 
 How a sender is caused, read from its telegram's `when` (the reader's words):
   `messenger on <Message> {<fields>}`        telegrams into it of that message with those fields
@@ -39,9 +45,62 @@ MAX_DEPTH = 12            # telegrams walked back from the map load at most
 TRIGGER = "trigger"
 FIGHT = "fight"
 TIMED = "timed"
+UNSUPPORTED = "unsupported"   # the end needs a mechanic the pass cannot carry out (family, node)
+
+# The co-op triage's families (logs/triage/WHOLE-GAME.txt, section 2), by the component classes that carry
+# them in the level data; first match wins (a boss's turret is the boss's). `H` (the level change) and the
+# lines a run shows are not static.
+FAMILIES = {
+    "A": "a switch or mini-game result",
+    "B": "a fetch hand-in",
+    "C": "a thrown object",
+    "D": "a turret or vehicle",
+    "E": "run-time spawns",
+    "F": "a boss",
+    "G": "a ride (launch path, rail)",
+    "M": "a menu or dialog choice",
+}
+FAMILY_COMPONENTS = (
+    ("F", re.compile(r"Boss(?!Quest)|KalamityAI|SheepMonsterLevel|FightingBird")),
+    ("D", re.compile(r"Turret|EnterVehicle")),
+    ("B", re.compile(r"FetchBase|FetchManager")),
+    ("C", re.compile(r"ThrowEntityBeingCarried")),
+    ("A", re.compile(r"Microgame|Minigame|Hourglass|RotatingDoor|SequenceMatch")),
+    ("G", re.compile(r"LaunchPath|PlayerLaunch|GrindRail")),  # RIDE
+    ("M", re.compile(r"CUIDialogBoxOption")),
+)
+RIDE = dict(FAMILY_COMPONENTS)["G"]
+UNKNOWN = "unknown"
+# A dead end that is the level's own scripted sequence (an animation sequence's end): the level ends on its
+# own (tutorial_a's ride).
+SEQUENCE_ENDS = re.compile(r"AnimateEntitySequenceComponentData\.OnSequenceEndTelegrams")
+# A trigger the level's makers named a debug trigger (fg1's A1_Outro_DebugTrigger) is their shortcut to the
+# end, not a player's way: never the pass's end (it would "complete" the level by skipping it).
+DEBUG_NAME = re.compile(r"debug", re.I)
+
+
+def family_of(components: list[str]) -> str:
+    """The family a node's component classes carry ('' for none)."""
+    for fam, rx in FAMILY_COMPONENTS:
+        if any(rx.search(c) for c in components):
+            return fam
+    return ""
+
+
+def dead_end_family(components: list[str], when: str) -> str:
+    """A dead end's family: the component its telegram's `when` names first (a mini-game's success list,
+    a vehicle's exit, a boss's end telegram, a dialog option), a spline event as the node's ride, else the
+    node's own components; '' for none (then UNKNOWN)."""
+    fam = family_of([when])
+    if fam:
+        return fam
+    if "SplineMover" in when and any(RIDE.search(c) for c in components):
+        return "G"
+    return family_of(components)
 
 ON_ENTER = "eMAF_OnEnter"
 ON_DEATH = "eMAF_OnDeath"
+DEATHS = (ON_DEATH, "on a spawnee")  # what a counted fight counts
 LISTEN = re.compile(r"messenger on (\S+)(?: \{([^}]*)\})?")
 COUNT = re.compile(r"\bcount (\d+)")
 
@@ -67,6 +126,7 @@ class Node:
     group: str
     kind: str
     pos: tuple[float, float, float] | None
+    components: list[str] = field(default_factory=list)   # the node's component classes
 
 
 @dataclass
@@ -83,7 +143,10 @@ class End:
     starters: list[str] = field(default_factory=list)  # FIGHT: triggers that start counted enemies
     anchor: str = ""                                 # FIGHT: the key the fight is fought around
     waves: list[int] = field(default_factory=list)   # FIGHT: the counter's lower counts (each starts a wave)
-    why: str = ""                                    # TIMED: why no player act was found
+    why: str = ""                                    # TIMED, UNSUPPORTED: why no player act was found
+    family: str = ""                                 # UNSUPPORTED: FAMILIES' key, or UNKNOWN
+    blockers: list[tuple[str, str, str]] = field(default_factory=list)  # (family, node key, its `when`)
+    on_path: list[tuple[str, str]] = field(default_factory=list)        # (family, node key) on the end's path
 
     def keys(self) -> set[str]:
         """Every node the end acts on or counts (left out of the sweep)."""
@@ -106,7 +169,9 @@ def read_logic(logic: dict) -> tuple[dict[str, Node], list[Telegram]]:
         nodes[str(n["key"])] = Node(key=str(n["key"]), name=str(n.get("name") or ""), unit=str(n.get("unit") or ""),
                                     zone=str(n.get("zone") or ""), cls=str(n.get("class") or ""),
                                     group=str(n.get("group") or ""), kind=str(n.get("kind") or ""),
-                                    pos=_pos(n.get("position")))
+                                    pos=_pos(n.get("position")),
+                                    components=[str(c.get("class") or "") for c in n.get("components") or []
+                                                if isinstance(c, dict)])
     tels: list[Telegram] = []
     for e in logic.get("edges", []) if isinstance(logic, dict) else []:
         if not isinstance(e, dict) or not e.get("from"):
@@ -202,15 +267,28 @@ def derive_end(chains: list[str], logic: dict, level: str) -> End | None:
         if starts:
             break
     if not starts:
-        return End(kind=TIMED, why="the level-end chain's map load is not among the logic's telegrams")
+        # Read, not guessed: the chain names a map load this logic does not hold (brn4's outro cutscene).
+        link = next((last_link(c) for c in chains if last_link(c)), None)
+        who = ", ".join(link[0]) if link else "?"
+        return End(kind=UNSUPPORTED, family=UNKNOWN, blockers=[(UNKNOWN, who, "the map load is not in the logic")],
+                   why=f"the end needs a cause this reader does not know at {who} (the level-end chain's map load "
+                       "is not among the logic's telegrams)")
     # Breadth first: (telegram, path of names from it to the map load).
     frontier = [(t, [t.sender]) for t in starts]
 
     def done(e: End, keys: list[str]) -> End:
         e.path_keys = list(dict.fromkeys(keys))
         e.path = [name(k) for k in e.path_keys]
+        for k in e.path_keys + ([e.counter] if e.counter else []) + e.counted:
+            fam = family_of(nodes[k].components) if k in nodes else ""
+            if fam and (fam, k) not in e.on_path:
+                e.on_path.append((fam, k))
+        if e.kind == FIGHT and any("on a spawnee" in c.when for c in into.get(e.counter, []) + tels
+                                   if c.sender in e.counted and c.receiver in (e.counter, "")):
+            e.on_path.append(("E", e.counter))
         return e
 
+    dead: list[Telegram] = []   # senders on the way back whose cause this does not read
     seen: set[tuple[str, str, str]] = set()
     for _depth in range(MAX_DEPTH):
         nxt = []
@@ -221,11 +299,22 @@ def derive_end(chains: list[str], logic: dict, level: str) -> End | None:
             seen.add(ident)
             n = count_of(t.when)
             if ON_ENTER in t.when and own(t.sender):
+                if DEBUG_NAME.search(name(t.sender)):
+                    dead.append(Telegram(t.sender, t.receiver, t.message, t.fields,
+                                         "a debug trigger: the makers' shortcut to the end, not a player's way"))
+                    continue
                 return done(End(kind=TRIGGER, trigger=t.sender), path)
             if ON_DEATH in t.when or "on a spawnee" in t.when:
                 return done(fight(t.sender, 1, [t], nodes, into, tels, own), path)
             got = causes(t, into)
             if not got:
+                if got is not None:
+                    dead.append(t)
+                continue
+            if n > 1 and not any(d in c.when for c in got for d in DEATHS):
+                # A count of something other than deaths (ww3: two monkey switches' successes into a relay):
+                # no fight; what is counted is what the end needs.
+                dead.extend(got)
                 continue
             if n > 1:
                 return done(fight(t.sender, n, got, nodes, into, tels, own), path)
@@ -234,6 +323,19 @@ def derive_end(chains: list[str], logic: dict, level: str) -> End | None:
         frontier = nxt
         if not frontier:
             break
+    blockers = []
+    for t in dead:
+        if SEQUENCE_ENDS.search(t.when):
+            continue
+        fam = dead_end_family(nodes[t.sender].components if t.sender in nodes else [], t.when)
+        blockers.append((fam or UNKNOWN, t.sender, t.when))
+    if blockers:
+        blockers.sort(key=lambda b: b[0] == UNKNOWN)  # a classed mechanic first
+        fam, key, when = blockers[0]
+        what = FAMILIES.get(fam, "a cause this reader does not know")
+        e = End(kind=UNSUPPORTED, family=fam, blockers=blockers,
+                why=f"the end needs {what} at {name(key)} ({key}; `{when[:90]}`)")
+        return done(e, [t.sender for t in starts])
     return done(End(kind=TIMED, why="no trigger to enter or fight to win among the causes of the level-end chain "
                     "(the level ends on its own)"), [t.sender for t in starts])
 
