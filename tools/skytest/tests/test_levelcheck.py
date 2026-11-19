@@ -118,6 +118,43 @@ class FiguresHead(unittest.TestCase):
         self.assertEqual(lc.figures_head(f.path),
                          ["figures: H Roller Brawl; D Spy Rise (a swapper: Spy Rise Top + Spy Rise Bottom)"])
 
+
+class Objectives(unittest.TestCase):
+    """W22: S's objective rows against each client's applies, per generation and objective (the objectives' author's
+    grading)."""
+    LIST = "Online: objective list 3 tracker b84c05cc gen 2"
+    SHARED = "Online: objectives shared for the session (S's online_shared_objectives, in its rows)"
+
+    def run_of(self, s: list, h: list, d: list) -> lc.Run:
+        return RunFolder([(20, self.LIST)] + s, H_JOIN + [(21, self.LIST), (21.5, self.SHARED)] + h,
+                         D_JOIN + [(41, self.LIST), (41.5, self.SHARED)] + d).run()
+
+    def test_equal_sequences_pass(self) -> None:
+        s = [(50, "Online: objective 00000000 0/1 (S) active"), (80, "Online: objective 00000000 1/1 (S) active")]
+        c = [(50.1, "Online: objective applied 00000000 0/1 (active)"), (80.2, "Online: objective applied 00000000 1/1 (active)")]
+        v = lc.grade_objectives(self.run_of(s, c, c))
+        self.assertEqual(v.status, lc.PASS, v.findings)
+        self.assertIn("generation 2 objective 00000000: S ['0/1 active', '1/1 active'], H ['0/1 active', '1/1 active']",
+                      v.notes[0])
+
+    def test_a_missing_step_an_own_run_and_a_missing_cancel_fail(self) -> None:
+        s = [(50, "Online: objective 00000000 0/1 (S) active"), (60, "Online: objective 00000000 0/1 (S)")]
+        h = [(50.1, "Online: objective applied 00000000 0/1 (active)"), (60.1, "Online: objective applied 00000000 0/1"),
+             (55, "Online: objective 00000000 own start run here (S showed nothing in 3000 ms: this game's alone)")]
+        d = [(50.1, "Online: objective applied 00000000 0/1 (active)")]
+        v = lc.grade_objectives(self.run_of(s, h, d))
+        self.assertEqual(v.status, lc.FAIL)
+        whats = [f.what for f in v.findings]
+        self.assertIn("H ran its own start of objective 00000000, for which S has a row in generation 2", whats)
+        self.assertTrue(any(w.startswith("D's applies differ from S's rows: generation 2 objective 00000000: S ['0/1 "
+                                         "active', '0/1'], D ['0/1 active']") for w in whats), whats)
+        self.assertTrue(any(w.startswith("H: S's objective 00000000 went inactive") for w in whats), whats)
+
+    def test_off_is_not_tested(self) -> None:
+        v = lc.grade_objectives(RunFolder([(20, self.LIST)], H_JOIN, D_JOIN).run())
+        self.assertEqual(v.status, lc.NOT_TESTED)
+        self.assertIn("online_shared_objectives is off", v.counts)
+
 class Windows(unittest.TestCase):
     def test_a_clients_time_in_each_level(self) -> None:
         f = RunFolder([], H_JOIN + LEVEL_END, D_JOIN + LEVEL_END)
@@ -720,6 +757,17 @@ class FightGatesCalibration(unittest.TestCase):
         self.assertIn("S at 12:54:21.128", done[0])
         self.assertIn("H at 12:54:21.454", done[0])
         self.assertIn("D at 12:54:21.363", done[0])
+
+
+@unittest.skipUnless((CALIBRATION_RUNS / "20261119-135125-levelpass-tutorial_b").is_dir(), "batch 13's objectives run is not here")
+class ObjectivesCalibration(unittest.TestCase):
+    def test_batch_13s_own_start_beside_s_row_fails(self) -> None:
+        v = lc.grade_objectives(lc.load_run(CALIBRATION_RUNS / "20261119-135125-levelpass-tutorial_b"))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.counts, "S rows 3 for 2 objective(s) in 2 level(s); H applied 3; D applied 3")
+        self.assertEqual([f.what for f in v.findings],
+                         ["H ran its own start of objective 00000001, for which S has a row in generation 3",
+                          "D ran its own start of objective 00000001, for which S has a row in generation 3"])
 
 @unittest.skipUnless((CALIBRATION_RUNS / "20261119-111305-levelpass-ww1").is_dir(), "batch 11's ww1 coins run is not here")
 class CoinsCalibration(unittest.TestCase):

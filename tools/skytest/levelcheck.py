@@ -953,6 +953,107 @@ def grade_together(run: Run) -> Verdict:
     return Verdict("together", status, counts, on[0][0].cite(), findings, notes)
 
 
+# --- objectives: S's objective rows against each client's applies (online/6-progress-apply, the objectives' author's
+# grading, logs/progress-apply-notes.txt) ----------------------------------------------------------------------------
+# With online_shared_objectives on (each client's `objectives shared for the session (S's online_shared_objectives`),
+# per generation (each log's `objective list <n> tracker <t> gen <g>`, the level's list) and objective id: S's
+# sequence of `objective <id> <n>/<m> (S)[ active]` equals each client's `objective applied <id> <n>/<m>[ (active)]`,
+# each within OBJECTIVE_APPLY_S of S's; none of `objective <id> at ... after its apply, S has`, `objective apply
+# refused` or `objective <id> own <action> run here` for an id S has a row for in that generation; each S row going
+# inactive after it was active has an `objective cancelled <id>` on every client. Off: not tested.
+OBJECTIVE_APPLY_S = timedelta(seconds=10)
+OBJ_LIST = re.compile(r"Online: objective list \d+ tracker \S+ gen (\d+)")
+OBJ_S_ROW = re.compile(r"Online: objective ([0-9a-f]{8}) (\d+)/(\d+) \(S\)( active)?")
+OBJ_APPLIED = re.compile(r"Online: objective applied ([0-9a-f]{8}) (\d+)/(\d+)( \(active\))?")
+OBJ_SHARED = re.compile(r"Online: objectives shared for the session \(S's online_shared_objectives")
+OBJ_AFTER = re.compile(r"Online: objective ([0-9a-f]{8}) at .* after its apply, S has")
+OBJ_REFUSED = re.compile(r"Online: objective apply refused ([0-9a-f]{8})")
+OBJ_OWN_RUN = re.compile(r"Online: objective ([0-9a-f]{8}) own (\S+) run here")
+OBJ_CANCELLED = re.compile(r"Online: objective cancelled ([0-9a-f]{8})")
+
+
+def objective_lines(log: Log, rx: re.Pattern) -> list[tuple[int, Line, re.Match]]:
+    """Each line of `rx` with the generation of the objective list this game had then (0 before any)."""
+    gen, out = 0, []
+    for i, raw in enumerate(log.lines):
+        m = OBJ_LIST.search(raw)
+        if m:
+            gen = int(m.group(1))
+            continue
+        m = rx.search(raw)
+        if m:
+            out.append((gen, log.line(i), m))
+    return out
+
+
+def grade_objectives(run: Run) -> Verdict:
+    """S's objective rows against each client's applies, per generation and objective (the objectives' author's
+    grading)."""
+    if run.server is None:
+        return Verdict("objectives", NOT_TESTED, "no server log in this run folder")
+    shared = {who: log.find(OBJ_SHARED) for who, log in run.clients.items()}
+    if not any(shared.values()):
+        return Verdict("objectives", NOT_TESTED, "online_shared_objectives is off in this run (no client logged "
+                       "`objectives shared for the session`): each game runs its own objectives")
+    rows: dict[tuple[int, str], list[tuple[str, Line]]] = {}
+    for gen, line, m in objective_lines(run.server, OBJ_S_ROW):
+        rows.setdefault((gen, m.group(1)), []).append((f"{m.group(2)}/{m.group(3)}{' active' if m.group(4) else ''}",
+                                                      line))
+    findings: list[Finding] = []
+    order = sorted(run.clients, key=lambda w: (w != "H", w))
+    counts = [f"S rows {sum(len(v) for v in rows.values())} for {len(rows)} objective(s) in "
+              f"{len({g for g, _i in rows})} level(s)"]
+    for who in order:
+        log = run.clients[who]
+        applied: dict[tuple[int, str], list[tuple[str, Line]]] = {}
+        for gen, line, m in objective_lines(log, OBJ_APPLIED):
+            applied.setdefault((gen, m.group(1)), []).append(
+                (f"{m.group(2)}/{m.group(3)}{' active' if m.group(4) else ''}", line))
+        counts.append(f"{who} applied {sum(len(v) for v in applied.values())}")
+        for key in sorted(set(rows) | set(applied)):
+            s_seq, c_seq = rows.get(key, []), applied.get(key, [])
+            words = (f"generation {key[0]} objective {key[1]}: S {[v for v, _l in s_seq]}, {who} "
+                     f"{[v for v, _l in c_seq]}")
+            if [v for v, _l in s_seq] != [v for v, _l in c_seq]:
+                cite = [l.cite() for _v, l in s_seq[:3]] + [l.cite() for _v, l in c_seq[:3]]
+                findings.append(Finding(f"{who}'s applies differ from S's rows: {words}",
+                                        cite or [absent(log, "`objective applied`")]))
+                continue
+            late = [(s, c) for (_v, s), (_w, c) in zip(s_seq, c_seq)
+                    if s.t is not None and c.t is not None and c.t - s.t > OBJECTIVE_APPLY_S]
+            if late:
+                s, c = late[0]
+                findings.append(Finding(f"{who} applied S's row more than {OBJECTIVE_APPLY_S.seconds} s late "
+                                        f"({(c.t - s.t).total_seconds():.1f} s): {words}", [s.cite(), c.cite()]))
+        for gen, line, m in objective_lines(log, OBJ_AFTER):
+            findings.append(Finding(f"{who}: objective {m.group(1)} differs from S's after its apply", [line.cite()]))
+        for gen, line, m in objective_lines(log, OBJ_REFUSED):
+            findings.append(Finding(f"{who}: S's objective row {m.group(1)} was refused here", [line.cite()]))
+        for gen, line, m in objective_lines(log, OBJ_OWN_RUN):
+            if (gen, m.group(1)) in rows:
+                first = rows[(gen, m.group(1))][0][1]
+                findings.append(Finding(f"{who} ran its own {m.group(2)} of objective {m.group(1)}, for which S has a "
+                                        f"row in generation {gen}", [line.cite(), first.cite()]))
+        cancelled = {(gen, m.group(1)) for gen, _l, m in objective_lines(log, OBJ_CANCELLED)}
+        for key, seq in rows.items():
+            went = next((l for (a, _la), (b, l) in zip(seq, seq[1:]) if a.endswith(" active")
+                         and not b.endswith(" active")), None)
+            if went is not None and key not in cancelled:
+                findings.append(Finding(f"{who}: S's objective {key[1]} went inactive (generation {key[0]}) and "
+                                        "nothing cancelled it here", [went.cite(), absent(log, "`objective cancelled`")]))
+    example = next((l.cite() for seq in rows.values() for _v, l in seq), "")
+    # Each objective's sequences on S and each client (the row's evidence, PASS or FAIL).
+    notes = []
+    for key in sorted(rows):
+        per = [f"S {[v for v, _l in rows[key]]}"]
+        for who in order:
+            seq = [f"{m.group(2)}/{m.group(3)}{' active' if m.group(4) else ''}"
+                   for gen, _l, m in objective_lines(run.clients[who], OBJ_APPLIED) if (gen, m.group(1)) == key]
+            per.append(f"{who} {seq}")
+        notes.append(f"generation {key[0]} objective {key[1]}: " + ", ".join(per))
+    return Verdict("objectives", FAIL if findings else PASS, "; ".join(counts), example, findings, notes)
+
+
 # --- level pieces: run-time movers (ww1's travelling islands; docs/online-6.md "Spawned movers") ---------------
 #
 # With online_island_spawns on, S tracks each island spawner (`world tracked spawner_fires <Name#id> (...)`) and
@@ -1928,7 +2029,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     together = grade_together(run)
     rows = [grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run),
-            grade_pieces(run, data)]
+            grade_objectives(run), grade_pieces(run, data)]
     # The enemies and the loot are read where both players stand only when D followed H: each says which.
     followed = bool(run.clients.get("D") and run.clients["D"].find(FOLLOW_ON))
     if together.status in (PASS, FAIL):
