@@ -371,7 +371,22 @@ class Coins(unittest.TestCase):
              (61, "Online: coin paid here bd35d565.4 (taken by another player; player 0, gold 30 -> 35, +5)")]
         v = lc.grade_coins(RunFolder(s, H_JOIN + h + LEVEL_END, D_JOIN + d + LEVEL_END).run())
         self.assertEqual(v.status, lc.PASS, v.findings)
-        self.assertIn("coins taken 1, paid on another game 1", v.counts)
+        self.assertIn("coins taken: H 1, D 0; S handled 1 claim(s); paid on another game 1", v.counts)
+
+    def test_takes_with_no_claim_handled_fail_and_a_coin_taken_twice_is_named(self) -> None:
+        # Batch 11 second round (ww1 20261119-111305): H took 3, D 7, three of them the same places; S no claim.
+        s = self.ON + [(30, "Online: coins walked bd35d565 241 placed money coins mapped (246 CCollectibles)")]
+        walked = [(30, "Online: coins walked bd35d565 241 placed money coins mapped (246 CCollectibles)")]
+        h = walked + [(60, "Online: coin taken here bd35d565.8532 (player b662efd0, gold 315 -> 316, +1; S is told)"),
+             (60.1, "Online: coin claim sent bd35d565.8532")]
+        d = walked + [(61, "Online: coin taken here bd35d565.8532 (player b6642820, gold 9 -> 10, +1; S is told)"),
+             (62, "Online: coin taken here bd35d565.8514 (player b6642820, gold 7 -> 8, +1; S is told)")]
+        v = lc.grade_coins(RunFolder(s, H_JOIN + h + LEVEL_END, D_JOIN + d + LEVEL_END).run())
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual([x.what for x in v.findings],
+                         ["1 coin(s) taken on H, 2 coin(s) taken on D; S handled 0 claim(s): shared coins did nothing",
+                          "taken twice: 1 coin(s) taken on more than one game (bd35d565.8532)"])
+        self.assertIn("coins taken: H 1, D 2; S handled 0 claim(s)", v.counts)
 
     def test_none_mapped_with_coins_on_fails_never_untested(self) -> None:
         s = self.ON + [(90, "Online: coins 2: 0 claims granted, 0 refused, 0 placed money coins mapped here (0 this "
@@ -566,6 +581,17 @@ class ScenesWhereCalibration(unittest.TestCase):
                       "1500 (test)", v.counts)
         self.assertTrue(all(x.what.startswith("D was not there (test): 4287") for x in v.findings), v.findings)
         self.assertTrue(v.findings[0].lines[-1].startswith("H/data/Online/session/game.log:"))
+
+
+@unittest.skipUnless((CALIBRATION_RUNS / "20261119-111305-levelpass-ww1").is_dir(), "batch 11's ww1 coins run is not here")
+class CoinsCalibration(unittest.TestCase):
+    def test_the_second_rounds_coins(self) -> None:
+        v = lc.grade_coins(lc.load_run(CALIBRATION_RUNS / "20261119-111305-levelpass-ww1"))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.findings[0].what, "3 coin(s) taken on H, 7 coin(s) taken on D; S handled 0 claim(s): shared "
+                                             "coins did nothing")
+        self.assertTrue(v.findings[1].what.startswith("taken twice: 3 coin(s)"))
+
 
 FIGHT = "-535,-2875,303"
 PLACED = [(30, f"Online: enemy placed {K1} as GreebleMelee#3531 hp 96 pose 26 (S)")]

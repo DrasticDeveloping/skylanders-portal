@@ -746,8 +746,9 @@ C_COINS = re.compile(r"Online: coins (\d+): (\d+) placed money coins mapped, (\d
                      r"paid here, (\d+) pending, (\d+) unpaid, (\d+) collected without pay, (\d+) claims not sent yet")
 S_COINS = re.compile(r"Online: coins (\d+): (\d+) claims granted, (\d+) refused, (\d+) placed money coins mapped here "
                      r"\((\d+) this level\)")
-COIN_TAKEN = re.compile(r"Online: coin taken here (\S+) \(player \d+, gold (\d+) -> (\d+)")
-COIN_PAID = re.compile(r"Online: coin paid here (\S+) \(taken by another player; player \d+, gold (\d+) -> (\d+)")
+COIN_TAKEN = re.compile(r"Online: coin taken here (\S+) \(player \S+, gold (\d+) -> (\d+)")
+COIN_PAID = re.compile(r"Online: coin paid here (\S+) \(taken by another player; player \S+, gold (\d+) -> (\d+)")
+COIN_HANDLED = re.compile(r"Online: coin claim (\S+) peer (\d+) (granted|refused)")
 COIN_BAD = re.compile(r"Online: coin (?:unpaid|collected without pay) \S+ .*|Online: coin claim \S+ peer \d+ refused .*")
 
 
@@ -798,13 +799,29 @@ def grade_coins(run: Run) -> Verdict:
     if bad:
         findings.append(Finding(f"{len(bad)} coin(s) unpaid, collected without pay or refused",
                                 [f"{who}: {l.cite()}" for who, l in bad[:12]]))
-    taken = [(who, l) for who, log in run.clients.items() for l, _m in log.find(COIN_TAKEN)]
+    # Each client's own takes (`coin taken here <place> (player <hero>, gold a -> b, +d; S is told)`): batch 11's
+    # second round (ww1 20261119-111305) took 3 coins on H and 7 on D, and S handled no claim; the row had said
+    # "no coin was taken" (the player field is a hex hero, which the old pattern refused).
+    order = sorted(run.clients, key=lambda w: (w != "H", w))
+    takes = {who: {m.group(1): line for line, m in run.clients[who].find(COIN_TAKEN)} for who in order}
     paid = [(who, l) for who, log in run.clients.items() for l, _m in log.find(COIN_PAID)]
-    counts += f"; coins taken {len(taken)}, paid on another game {len(paid)}"
-    if not taken:
-        return Verdict("coins", FAIL if findings else NOT_TESTED, counts + " (no coin was taken in this run)",
+    handled = run.server.find(COIN_HANDLED)
+    n_taken = sum(len(v) for v in takes.values())
+    counts += (f"; coins taken: {', '.join(f'{w} {len(takes[w])}' for w in order)}; S handled {len(handled)} claim(s); "
+               f"paid on another game {len(paid)}")
+    if not n_taken:
+        return Verdict("coins", FAIL if findings else NOT_TESTED, counts + " (no game logged a take)",
                        sw[0][0].cite(), findings)
-    return Verdict("coins", FAIL if findings else PASS, counts, taken[0][1].cite(), findings)
+    first = next(line for who in order for line in takes[who].values())
+    if not handled:
+        findings.insert(0, Finding(
+            f"{', '.join(f'{len(takes[w])} coin(s) taken on {w}' for w in order)}; S handled 0 claim(s): shared coins "
+            "did nothing", [first.cite(), absent(run.server, "`coin claim <place> peer <p> granted|refused`")]))
+    twice = sorted(p for p in set().union(*[set(v) for v in takes.values()]) if sum(p in v for v in takes.values()) > 1)
+    if twice:
+        findings.append(Finding(f"taken twice: {len(twice)} coin(s) taken on more than one game ({', '.join(twice[:6])})",
+                                [f"{w}: {takes[w][p].cite()}" for p in twice[:3] for w in order if p in takes[w]]))
+    return Verdict("coins", FAIL if findings else PASS, counts, first.cite(), findings)
 
 
 # --- together: D near H where H acted (the second player follows the first) ------------------------------
