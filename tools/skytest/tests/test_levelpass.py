@@ -1102,6 +1102,23 @@ class RequiredStepsPlan(unittest.TestCase):
         self.assertEqual(verdict, lp.FAIL)
         self.assertTrue(missed[0].startswith("gate TutorialLockedGate not opened: "), missed)
 
+    def test_launch_pads_are_ridden_only_when_switched_on(self) -> None:
+        # W27b: tutorial_b's two rail pads from the data (B, 7 presses); each ridden, never sampled out.
+        content = lp.load_content(LEVELPASS_DATA, "tutorial_b")
+        self.assertEqual(lp.launch_pads(content.manifest),
+                         {"tutorial_b_gameplay_launchpad.EpicRailpad": ("b", 7),
+                          "tutorial_b_gameplay_launchpad.EpicRailpad001": ("b", 7)})
+        old = lp.LAUNCH_RIDES
+        self.addCleanup(setattr, lp, "LAUNCH_RIDES", old)
+        lp.LAUNCH_RIDES = True
+        h = lp.script_h(self.plan("tutorial_b", no_gates=True), None).splitlines()
+        for ref in ("auth:tutorial_b:6802", "auth:tutorial_b:6899"):
+            k = h.index(f"launch_pad {ref} b {7 + lp.LAUNCH_EXTRA_PRESSES} {lp.LAUNCH_RIDE_S}")
+            self.assertEqual(h[k - 1], f"interact {ref} 20")
+        lp.LAUNCH_RIDES = False
+        off = lp.script_h(self.plan("tutorial_b", no_gates=True), None)
+        self.assertNotIn("launch_pad", off)
+
     def test_no_gates_keeps_the_full_sweep_and_says_so(self) -> None:
         gated, free = self.plan("tutorial_b"), self.plan("tutorial_b", no_gates=True)
         self.assertEqual(free.required, [])

@@ -408,15 +408,48 @@ OUTLIER_FLOOR = 8000.0
 # Actions: what the generator does at an object.
 FIGHT, ATTACK, INTERACT_A, PICKUP, ENTER, TALK, EXIT_A, VISIT = (
     "fight", "attack", "interact", "pickup", "enter", "talk", "exit", "visit")
+LAUNCH = "launch"
+# W27b: a launch pad microgame from the level's data (Scripts.MicrogameComponentData with a button and a press count,
+# Scripts.LaunchPathComponentData, a SuccessTelegrams' LaunchPathComponentMessage with AddPlayers): pressed and ridden
+# (`interact`, then `launch_pad`: the presses and the ride to its landing); every player is carried by the game's own
+# launch. On only when the build has launch_pad (the checkout's command table) and the pass was not given
+# --no-launch-rides (skytest sets LAUNCH_RIDES); otherwise visited, as before. LAUNCH_PADS: the plan's pads.
+LAUNCH_RIDES = False
+LAUNCH_PADS: dict[str, tuple[str, int]] = {}   # obj key -> (button, presses)
+LAUNCH_EXTRA_PRESSES = 3
+LAUNCH_RIDE_S = 90
+XBUTTON_PAD = {"XBUTTON_JUMP": "a", "XBUTTON_LEGS_TAIL": "b", "XBUTTON_HEAD": "y", "XBUTTON_TORSO_ARMS": "x"}
+
+
+def launch_pads(manifest: dict | None) -> dict[str, tuple[str, int]]:
+    """The level's launch pad microgames (`<unit>.<name>` -> (pad button, presses its data asks for))."""
+    out = {}
+    for e in (manifest or {}).get("entities", []) or []:
+        if not isinstance(e, dict):
+            continue
+        comps = set(e.get("components") or [])
+        details = e.get("details") or {}
+        if "Scripts.MicrogameComponentData" not in comps or "Scripts.LaunchPathComponentData" not in comps:
+            continue
+        button = XBUTTON_PAD.get(str(details.get("Button", "")))
+        presses = str(details.get("RequiredButtonPresses", ""))
+        launches = any(isinstance(f, dict) and f.get("message") == "Scripts.LaunchPathComponentMessage"
+                       and str((f.get("fields") or {}).get("AddPlayers", "")).lower() == "true"
+                       for f in e.get("fires") or [])
+        if button and presses.isdigit() and launches:
+            out[f"{e.get('unit') or ''}.{e.get('name')}"] = (button, int(presses))
+    return out
 EXIT_FIGHT_S = 90
 EXIT_LATE_WAVE_S = 30
 EXIT_RADIUS = 3000.0
 EXIT_NEAR = 5000.0     # the level-end senders taken: those this close to the chain's receiver
 EXIT_FIGHT_RADIUS = 2500   # the level-end senders this close share one exit fight (an arena)
-ACTION_ORDER = {ENTER: 0, TALK: 1, FIGHT: 2, ATTACK: 3, PICKUP: 4, INTERACT_A: 5, VISIT: 6, EXIT_A: 7}
+ACTION_ORDER = {ENTER: 0, TALK: 1, FIGHT: 2, ATTACK: 3, PICKUP: 4, INTERACT_A: 5, VISIT: 6, EXIT_A: 7, LAUNCH: 8}
 # The timeout of each action's own command (seconds) and its expected share of it (estimate).
-ACTION_TIMEOUT = {FIGHT: 25, ATTACK: 12, INTERACT_A: 10, PICKUP: 10, ENTER: 0, TALK: 10, EXIT_A: 0, VISIT: 0}
-ACTION_EXPECT = {FIGHT: 15.0, ATTACK: 5.0, INTERACT_A: 6.0, PICKUP: 5.0, ENTER: 2.0, TALK: 6.0, EXIT_A: 30.0, VISIT: 0.0}
+ACTION_TIMEOUT = {FIGHT: 25, ATTACK: 12, INTERACT_A: 10, PICKUP: 10, ENTER: 0, TALK: 10, EXIT_A: 0, VISIT: 0,
+                  LAUNCH: LAUNCH_RIDE_S}
+ACTION_EXPECT = {FIGHT: 15.0, ATTACK: 5.0, INTERACT_A: 6.0, PICKUP: 5.0, ENTER: 2.0, TALK: 6.0, EXIT_A: 30.0, VISIT: 0.0,
+                 LAUNCH: 40.0}
 
 
 STATIC_ACTION = {
@@ -471,6 +504,8 @@ def action_from_components(o: Obj) -> tuple[str, str] | None:
     a player acts on directly (a chest spawner's chest comes at run time, a battle gate opens on its
     fight, a caged NPC is freed by breaking its cage): visited only, and said so."""
     comps = set(o.components)
+    if LAUNCH_RIDES and obj_key(o) in LAUNCH_PADS:
+        return LAUNCH, "a launch pad microgame: pressed and ridden to its landing (launch_pad)"
     if o.state == "minigame" or any(c.endswith("MinigameComponentData") for c in comps):
         # A mini-game (a winch, binoculars, a launch pad): pressing it enters a mode that locks the controls
         # and stopped every later audit in ww1's run 20261118-104911 (binoculars); no script plays one yet.
@@ -510,6 +545,8 @@ def classify(o: Obj) -> tuple[str, str]:
         # pass only visits (a teleporter, a mover, a mini-game, a bounce pad) is never made an action by
         # them: ww1's Cave03_TeleToInt (a teleporter with a trigger volume) was entered and dropped the
         # hero into an interior's endless fall (run 20261118-110326).
+        if LAUNCH_RIDES and obj_key(o) in LAUNCH_PADS:  # W27b: a launch pad microgame from its data
+            return LAUNCH, "a launch pad microgame: pressed and ridden to its landing (launch_pad)"
         by_comp = action_from_components(o) if act != VISIT else None
         if by_comp is not None:
             act, why = by_comp
@@ -771,6 +808,9 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
     """The plan; without --full, over the budget, the sample per family goes down to 2, then 1 (the
     plan says so), after the quiet visits were dropped. `no_end` (--no-end): the level's end is found
     (the plan names it) but not attempted, and its time is not in the estimate."""
+    LAUNCH_PADS.clear()
+    if LAUNCH_RIDES:
+        LAUNCH_PADS.update(launch_pads(content.manifest))
     # An end that needs a mechanic the pass cannot carry out (levelpass_end.UNSUPPORTED: a mini-game's result,
     # a turret, a boss, a ride, a cause the reader does not know): the sweep only, no end wait; the verdict
     # says INCOMPLETE with the end's family and node (pass_verdict).
@@ -989,13 +1029,13 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
                     o.ref = ""
                 continue  # one fight per cluster covers its spawners and encounters
             family = (act, family_of(o))
-            if not full and act != EXIT_A and taken.get(family, 0) >= sample:
+            if not full and act not in (EXIT_A, LAUNCH) and taken.get(family, 0) >= sample:
                 left[family] = left.get(family, 0) + 1
                 if unregistered:
                     o.ref = ""
                 visit_only.append((o, f"sampled out ({act}: {sample} of its family taken)"))
                 continue
-            if kind_cap and act != EXIT_A and per_kind.get(act, 0) >= kind_cap:
+            if kind_cap and act not in (EXIT_A, LAUNCH) and per_kind.get(act, 0) >= kind_cap:
                 left[family] = left.get(family, 0) + 1
                 if unregistered:
                     o.ref = ""
@@ -1942,7 +1982,7 @@ def action_lines(a: Action, label: str, after: str = "", cap: int = 0, long_paus
     o = a.obj
     ref = o.ref
     out = [f"log LEVELPASS act {label} {a.action} {_safe(o.name) or '-'} {o.cls} ref {ref}"]
-    if ref.startswith("auth:") and a.action in (ATTACK, INTERACT_A, TALK, PICKUP) and ref != after:
+    if ref.startswith("auth:") and a.action in (ATTACK, INTERACT_A, TALK, PICKUP, LAUNCH) and ref != after:
         # The helpers find a live object; goto_entity first wakes an asleep one (its area streamed in).
         out.append(f"goto_entity {ref}")
         out += dismiss_after(o)
@@ -1960,6 +2000,9 @@ def action_lines(a: Action, label: str, after: str = "", cap: int = 0, long_paus
                 f"fight_near {ref} {EXIT_FIGHT_RADIUS} {EXIT_LATE_WAVE_S}"]
     elif a.action == EXIT_A and exit_kind(o) == TALK:
         out.append(f"interact {ref} {ACTION_TIMEOUT[TALK]}")
+    elif a.action == LAUNCH:
+        button, presses = LAUNCH_PADS.get(obj_key(o), ("b", 7))
+        out += [f"interact {ref} 20", f"launch_pad {ref} {button} {presses + LAUNCH_EXTRA_PRESSES} {LAUNCH_RIDE_S}"]
     elif a.action in (ENTER, EXIT_A):
         out.append(f"enter_trigger {ref}")
     return out
