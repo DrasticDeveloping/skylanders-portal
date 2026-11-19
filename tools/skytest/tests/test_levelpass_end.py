@@ -407,5 +407,44 @@ class CountedFightNotes(unittest.TestCase):
         self.assertEqual(lp.counted_fight_notes(lp.make_plan(lp.Content("x", "x", (0.0, 0.0, 0.0), []), late_join=False), s, h), [])
 
 
+class BothClients(unittest.TestCase):
+    """A PASS says every client in the session at the exit reached the next level (D stays by default)."""
+    H_DONE = "[t1] Input script: waitfor online_level_end met after 3.0 s\n[t1] Input script: LEVELPASS phase next-level\n"
+    D_IN = "[t2] Input script: LEVELPASS D in\n"
+    D_DONE = D_IN + "[t2] Input script: waitfor online_level_end met after 9.0 s\n[t2] Input script: LEVELPASS D next level\n"
+
+    def plan(self, **kw):
+        chains, logic = trigger_level()
+        content = lp.Content(level="lvl", source="made up", start=(0.0, 0.0, 0.0), objects=[
+            lp.Obj("Outro_Trigger", "CScriptTriggerEntity", (5.0, 0.0, 0.0), lp.GROUP_TRIGGERS, ident="u", ref="auth:lvl:7"),
+            lp.Obj("Box", "C", (3000.0, 0.0, 0.0), lp.GROUP_INTERACT, ident="u", ref="auth:lvl:8",
+                   components=["Scripts.DestructibleComponentData"])])
+        content.level_end_chains, content.logic = chains, logic
+        return lp.make_plan(content, **kw)
+
+    def test_pass_only_when_both_reached_the_next_level(self):
+        p = self.plan()
+        self.assertEqual(lp.pass_verdict("pass", [], self.H_DONE, p, self.D_DONE), (lp.PASS, []))
+        v, missed = lp.pass_verdict("pass", [], self.H_DONE, p, self.D_IN + "[t2] Input script: waitfor online_level_end met after 9.0 s\n")
+        self.assertEqual(v, lp.INCOMPLETE)
+        self.assertIn("D did not reach the next level (saw the level end, not the next level)", missed[0])
+        v, missed = lp.pass_verdict("pass", [], self.H_DONE, p, "[t2] Input script: waitfor online_in_play met\n")
+        self.assertIn("(never joined): the pass shows one client only", missed[0])
+        self.assertEqual(lp.clients_line(p, self.H_DONE, self.D_DONE),
+                         "clients: H reached the next level; D (stays through the end) reached the next level")
+
+    def test_d_leaves_before_the_end_on_request_and_with_no_end(self):
+        old = self.plan(d_stays=False)
+        self.assertEqual(lp.pass_verdict("pass", [], self.H_DONE, old, ""), (lp.PASS, []))
+        self.assertIn("D (leaves before the end (--d-leaves-before-end))", lp.clients_line(old, self.H_DONE, ""))
+        self.assertEqual(lp.pass_verdict("pass", [], "", self.plan(no_end=True), ""), (lp.PASS, []))
+        self.assertEqual(lp.clients_line(self.plan(late_join=False), self.H_DONE, ""), "clients: H reached the next level")
+
+    def test_the_end_reserve_keeps_time_for_d(self):
+        stays, leaves = self.plan(), self.plan(d_stays=False)
+        self.assertEqual(lp.exit_seconds(stays) - lp.exit_seconds(leaves), lp.D_END_S)
+        self.assertLessEqual(stays.estimate_s, lp.BUDGET_S)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -337,13 +337,32 @@ class Scripts(unittest.TestCase):
         self.assertIn("attack_until auth:madeup:6 12", h)
         self.assertIn("interact auth:madeup:10 10", h)
         self.assertIn("goto_entity auth:madeup:", h)
-        self.assertIn("waitfor online_alone 300", h)
         d = lp.script_d(p)
         self.check_script(d)
         self.assertIn("online_join {join}", d)
         self.assertNotIn("online_host", d)
         self.assertIn("goto_entity auth:madeup:", d)
         self.assertLess(d.index("online_end"), d.index("quit"))
+        # By default D stays through the level end and reaches the next level itself; H waits for D in the
+        # session before its exit and for D gone only after the next level.
+        self.assertTrue(lp.d_through_end(p))
+        self.assertLess(h.index("online_wait_peers 2 120"), h.index("LEVELPASS phase exit"))
+        self.assertNotIn("waitfor online_alone 300", h)
+        self.assertLess(h.index("online_audit next"), h.index(f"waitfor online_alone {lp.D_ALONE_WAIT_S}"))
+        for line in (f"waitfor online_level_end {lp.D_LEVEL_END_WAIT_S}", "waitfor online_past_level_end 240",
+                     "log LEVELPASS D next level", "online_audit d-next"):
+            self.assertIn(line, d)
+        self.assertLess(d.index("log LEVELPASS D next level"), d.index("online_end"))
+        self.assertIn(f"wait_needs = {lp.D_WAIT_NEEDS}", lp.spec_toml(p))
+        # --d-leaves-before-end: as before (D gone before the exit, nothing of the end on D).
+        old = lp.make_plan(content(), d_stays=False)
+        ho, do = lp.script_h(old, lp.LATE_JOIN_MARK), lp.script_d(old)
+        self.assertLess(ho.index("waitfor online_alone 300"), ho.index("LEVELPASS phase exit"))
+        self.assertNotIn("online_wait_peers 2", ho)
+        self.assertNotIn("online_level_end", do)
+        self.assertNotIn("wait_needs", lp.spec_toml(old))
+        # --no-end: no end to reach, D leaves as before.
+        self.assertFalse(lp.d_through_end(lp.make_plan(content(), no_end=True)))
 
     def test_sweep_deadline(self):
         p = lp.make_plan(content())

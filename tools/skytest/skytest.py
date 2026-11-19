@@ -9042,7 +9042,7 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     if a.no_end and a.predictions:
         raise SystemExit("levelpass: --no-end is for the generated pass, not --predictions")
     plan = lp.make_plan(content, full=a.full, late_join=not a.no_late_join, provoke=a.provoke or "",
-                        no_end=a.no_end)
+                        no_end=a.no_end, d_stays=not a.d_leaves_before_end)
     plan.probe = not a.no_probe
     try:
         plan.game_args = [lp.check_game_arg(g) for g in (a.game_arg or [])]
@@ -9166,10 +9166,11 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     except (OSError, ValueError):
         rj_now = {}
     verdict, missed = lp.pass_verdict(str(rj_now.get("status", "fail")), list(rj_now.get("reasons", [])), texts["H"],
-                                      plan)
+                                      plan, texts.get("D", ""))
     if crash:
         verdict = lp.FAIL
-    head = f"verdict: {verdict}" + (f" (not covered: {'; '.join(missed)})" if missed else "")
+    head = f"verdict: {verdict}" + (f" (not covered: {'; '.join(missed)})" if missed else "") + \
+        "\n" + lp.clients_line(plan, texts["H"], texts.get("D", ""))
     report = report.replace("\n", "\n" + head + "\n", 1)
     if rj_now:
         rj_now["levelpass"] = {"verdict": verdict, "not_covered": missed}
@@ -9274,6 +9275,9 @@ def main(argv: list[str] | None = None) -> int:
     lp_.add_argument("--full", action="store_true", help="act on every object (default: each action family at"
                      " most 3 times, every cluster still visited)")
     lp_.add_argument("--no-late-join", action="store_true", help="no second client D near the end")
+    lp_.add_argument("--d-leaves-before-end", action="store_true", help="D ends its session before the exit, as"
+                     " before 19 November (late join and leave without a second client at the end); by default D"
+                     " stays through the level end and must reach the next level itself for a PASS")
     lp_.add_argument("--no-end", action="store_true", help="stop after the last mid-level step: the level's end is"
                      " neither acted on nor waited for, the pass is judged on the mid-level steps, the report says"
                      " the end was not attempted (its own case, levelpass-<level>-no-end): for evidence from the"
