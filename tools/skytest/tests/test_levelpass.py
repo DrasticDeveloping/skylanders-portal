@@ -1288,6 +1288,37 @@ class MarkRace(unittest.TestCase):
         loads = [int(m.group(1)) for m in map(lp.LEVEL_LOAD_LINE.search, lines[:met]) if m]
         self.assertEqual(loads[-1], 1)
 
+
+class Figures(unittest.TestCase):
+    """W21: a named figure for one player from the copied figure folder, a swapper as its two halves."""
+
+    def folder(self) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        f = Path(tmp.name)
+        for name in ("Scorp.dump", "Spy Rise Top.dump", "Spy Rise Bottom.dump", "Trap Shadow Top.dump"):
+            (f / name).write_bytes(b"x")
+        return f
+
+    def test_a_figure_a_swapper_and_a_refusal(self) -> None:
+        f = self.folder()
+        self.assertEqual(lp.figure_files(f, "Scorp"), ["Scorp.dump"])
+        self.assertEqual(lp.figure_files(f, "Spy Rise"), ["Spy Rise Top.dump", "Spy Rise Bottom.dump"])
+        self.assertEqual(lp.figure_words(["Spy Rise Top.dump", "Spy Rise Bottom.dump"]),
+                         "Spy Rise (a swapper: Spy Rise Top + Spy Rise Bottom)")
+        with self.assertRaises(ValueError) as e:
+            lp.figure_files(f, "Trap Shadow")  # a top half alone is no swapper
+        self.assertIn("its swappers: Spy Rise", str(e.exception))
+
+    def test_d_gets_both_halves_on_the_portal(self) -> None:
+        p = lp.make_plan(content(), d_lobby=True)
+        p.figures_d = ["Spy Rise Top.dump", "Spy Rise Bottom.dump"]
+        d = lp.script_d(p).splitlines()
+        k = d.index("place 0 {figures}/Spy Rise Top.dump")
+        self.assertEqual(d[k + 1], "place 1 {figures}/Spy Rise Bottom.dump")
+        self.assertNotIn(f"place 0 {{figures}}/{lp.FIGURE_D}", d)
+        self.assertIn(f"place 0 {{figures}}/{lp.FIGURE_H}", lp.script_h(p, None).splitlines())
+
 class HeldFights(unittest.TestCase):
     """A fight is planned only when its held enemies' release is on the route before it (levelpass_holds)."""
 

@@ -1976,7 +1976,31 @@ def run_head(folder: Path) -> list[str]:
     return [f"case {r.get('case', '?')}: runner status {r.get('status', '?')}, "
             f"{(secs / 60):.1f} min" if isinstance(secs, (int, float)) else f"case {r.get('case', '?')}",
             f"build snapshot {prov.get('build') or '?'}, runner {prov.get('runner') or '?'}",
+            *figures_head(folder),
             *skipped_head(read_log(folder, "H/game.log", "H"))]
+
+
+PLACE_LINE = re.compile(r"^\s*place (\d+) .*?([^/\\]+)\.dump\s*$")
+
+
+def figures_head(folder: Path) -> list[str]:
+    """The page's line naming each player's figures (W21), from its script's `place` lines; a Top and a Bottom of
+    one name are a swapper."""
+    out = []
+    for who in ("H", "D"):
+        script = folder / who / "script.txt"
+        if not script.is_file():
+            continue
+        names = [m.group(2) for m in map(PLACE_LINE.match, script.read_text(encoding="utf-8", errors="replace")
+                                         .splitlines()) if m]
+        if not names:
+            continue
+        if len(names) == 2 and names[0].endswith(" Top") and names[1].endswith(" Bottom") and \
+                names[0][:-4] == names[1][:-7]:
+            out.append(f"{who} {names[0][:-4]} (a swapper: {names[0]} + {names[1]})")
+        else:
+            out.append(f"{who} {' + '.join(names)}")
+    return [f"figures: {'; '.join(out)}"] if out else []
 
 
 def overall(verdicts: list[Verdict]) -> str:

@@ -40,6 +40,7 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import levelpass_end as le
 import levelpass_holds as lh
@@ -714,6 +715,8 @@ class Plan:
     scene_load_s: float = 0.0
     scene_extra_s: float = 0.0      # the scenes' own seconds: added to the budget and the case's timeout
     required_s: float = 0.0         # the gates phase's own budget (its performed steps' seconds): added the same way
+    figures_h: list[str] = field(default_factory=lambda: [FIGURE_H])  # H's figure files (W21: a swapper is two)
+    figures_d: list[str] = field(default_factory=lambda: [FIGURE_D])
     # The fights the level's script holds (levelpass_holds): what each fight did about them (a release entered
     # before it, or the fight left out: "needs a lock opened", nothing releases them), in words.
     held: list[str] = field(default_factory=list)
@@ -1706,6 +1709,39 @@ def _safe(name: str) -> str:
 
 FIGURE_H = "Roller Brawl.dump"
 FIGURE_D = "Scorp.dump"
+
+
+# W21: a named figure for one player (--h-figure / --d-figure), from the copied figure folder: `<name>.dump`, or a
+# SWAPPER, two figures on the portal at once (`<name> Top.dump` in slot 0 and `<name> Bottom.dump` in slot 1, as
+# swap-zone-tb places Spy Rise), so a level check can run with a swapper's halves on one player (the code that sets a
+# swapper's halves has never run in a real-body pass: Roller Brawl and Scorp are no swappers).
+def figure_files(folder: Path, name: str) -> list[str]:
+    """The figure files a player gets for `name`: [`<name>.dump`], or a swapper's [`<name> Top.dump`, `<name>
+    Bottom.dump`]; ValueError naming the folder's swappers when neither is there."""
+    plain = name if name.lower().endswith(".dump") else f"{name}.dump"
+    if (folder / plain).is_file():
+        return [plain]
+    base = name[:-5] if name.lower().endswith(".dump") else name
+    halves = [f"{base} Top.dump", f"{base} Bottom.dump"]
+    if all((folder / h).is_file() for h in halves):
+        return halves
+    swappers = sorted({f.name[:-len(" Top.dump")] for f in folder.glob("* Top.dump")
+                       if (folder / f.name.replace(" Top.dump", " Bottom.dump")).is_file()})
+    raise ValueError(f"no figure {plain!r} and no swapper {base!r} (both halves) in {folder}; its swappers: "
+                     f"{', '.join(swappers) or 'none'}")
+
+
+def figure_words(files: list[str]) -> str:
+    """A player's figures in words: the name, or `<swapper> (a swapper: <top> + <bottom>)`."""
+    names = [f[:-5] if f.lower().endswith(".dump") else f for f in files]
+    if len(names) == 2 and names[0].endswith(" Top") and names[1].endswith(" Bottom"):
+        return f"{names[0][:-4]} (a swapper: {names[0]} + {names[1]})"
+    return " + ".join(names)
+
+
+def place_lines(files: list[str]) -> list[str]:
+    """`place <slot> {figures}/<file>` for each of a player's figures (a swapper's top in 0, its bottom in 1)."""
+    return [f"place {slot} {{figures}}/{f}" for slot, f in enumerate(files)]
 GENERATED_NAME = re.compile(r"_componentDataOverrides_|_entityData$|^CEntityData|^CScriptTriggerEntityData|^CGameEntityData")
 JOIN_DISTANCE = 5.0     # a content object and a probe object this close (same name) are one object
 
@@ -1720,7 +1756,7 @@ LOBBY_H_ARGS_DROP = ("--dev_hello_ungated_loopback=true",)
 LOBBY_H_ARGS_ADD = ("--dev_hello_gate_loopback=true",)
 
 
-def party_boot_h(lobby: bool, new_slot: bool) -> list[str]:
+def party_boot_h(lobby: bool, new_slot: bool, figures: list[str] | None = None) -> list[str]:
     lines = ["waitfor online_title 300", "waitfor title_ready 240", "online_host -1", "waitfor online_connected 150"]
     if lobby:
         lines += ["waitfor online_join_pending 300", "online_let_in", "online_wait_peers 2 120",
@@ -1728,15 +1764,15 @@ def party_boot_h(lobby: bool, new_slot: bool) -> list[str]:
     lines += ["waitfor menu_ready 60", "tap start", "waitfor menu_ready 60", "tap a", "waitfor menu_ready 60"]
     lines += (["tap down", "waitfor menu_ready 60", "tap a", "waitfor menu_ready 60", "tap a"] if new_slot
               else ["tap a"])
-    lines += ["waitfor front_end_left 120", f"place 0 {{figures}}/{FIGURE_H}", "waitfor online_in_play 300",
+    lines += ["waitfor front_end_left 120", *place_lines(figures or [FIGURE_H]), "waitfor online_in_play 300",
               "waitfor online_barrier 300", "wait_free 120"]
     return lines
 
 
-def party_boot_d() -> list[str]:
+def party_boot_d(figures: list[str] | None = None) -> list[str]:
     """D in the lobby: its figure, the join by code, then it follows the host's pick into play. D marks its first
     level as soon as it is in play there, before that level's start is released (D_MARK_BEFORE_BARRIER)."""
-    return ["waitfor online_title 300", "waitfor title_ready 240", f"place 0 {{figures}}/{FIGURE_D}",
+    return ["waitfor online_title 300", "waitfor title_ready 240", *place_lines(figures or [FIGURE_D]),
             "online_join {joincode}", "waitfor online_in_play 300", "online_mark_level", "waitfor online_barrier 300",
             "wait_free 120"]
 
@@ -1757,14 +1793,14 @@ def party_boot_d() -> list[str]:
 D_MARK_BEFORE_BARRIER = True
 
 
-def boot_lines(host: bool, figure: str) -> list[str]:
+def boot_lines(host: bool, figure: str | list[str]) -> list[str]:
     """The shortest boot the specs use: title, Host (H), the two menu presses, the figure, the hub; no
     fixed wait anywhere (each step a condition)."""
     lines = ["waitfor online_title 300", "waitfor title_ready 240"]
     if host:
         lines += ["online_host 0", "waitfor online_connected 60"]
     lines += ["tap start", "waitfor menu_ready 60", "tap a", "waitfor menu_ready 60", "tap a",
-              "waitfor front_end_left 120", f"place 0 {{figures}}/{figure}"]
+              "waitfor front_end_left 120", *place_lines([figure] if isinstance(figure, str) else figure)]
     return lines
 
 
@@ -1936,7 +1972,7 @@ MADE_COPY_LEFT = r"Online: runtime spawn (?:made copy|twin) .* still in the enti
 def script_h(plan: Plan, late_join_after: str | None) -> str:
     """H's script: boot, Host, the level, the sweep, the late join's wait, the exit."""
     # The one boot (party_boot_h): the lobby (with D) or the host alone (D joins late, or no D).
-    lines = party_boot_h(plan.late_join and plan.d_lobby and late_join_after is None, plan.new_slot)
+    lines = party_boot_h(plan.late_join and plan.d_lobby and late_join_after is None, plan.new_slot, plan.figures_h)
     lines += ["online_mark_level", f"level {plan.level}",
               "waitfor online_level_after_mark 300", "waitfor online_barrier 300", "wait_free 120",
               "online_mark_level",  # the level under test: its next level is `online_level_after_mark` (NEXT_LEVEL)
@@ -2407,7 +2443,7 @@ def script_d(plan: Plan) -> str:
         # level), then the level under test when H's `level` command loads it. No visits of its own: no
         # condition tells D that H's sweep is over, and the graders read D's lines for every key wherever it
         # stands; D is in the session from the lobby to the next level, as a second player is.
-        lines = party_boot_d() + ["log LEVELPASS D in the first level",
+        lines = party_boot_d(plan.figures_d) + ["log LEVELPASS D in the first level",
                                   f"waitfor {NEXT_LEVEL} 600", "waitfor online_barrier 300", "wait_free 120",
                                   "online_mark_level", f"hold_cap {scene_hold_cap(plan)}", "log LEVELPASS D in",
                                   "online_audit d-in"]
@@ -2422,7 +2458,7 @@ def script_d(plan: Plan) -> str:
                       "wait_free 120", "log LEVELPASS D next level", "online_audit d-next"]
         lines += ["log LEVELPASS D done", "online_end", "quit"]
         return "\n".join(lines) + "\n"
-    lines = boot_lines(False, FIGURE_D)
+    lines = boot_lines(False, plan.figures_d or [FIGURE_D])
     lines += ["waitfor online_in_play 300", "online_join {join}", "waitfor online_barrier 300", "wait_free 120",
               "online_mark_level", f"hold_cap {HOLD_CAP_S}",
               "log LEVELPASS D in", "online_audit d-in"]

@@ -108,6 +108,16 @@ class SkippedForTime(unittest.TestCase):
 
 
 
+
+class FiguresHead(unittest.TestCase):
+    def test_the_page_names_each_players_figures(self) -> None:
+        f = RunFolder([], H_JOIN, D_JOIN)
+        (f.path / "H" / "script.txt").write_text("place 0 C:/x/figures/Roller Brawl.dump\nquit\n", encoding="utf-8")
+        (f.path / "D" / "script.txt").write_text("place 0 C:/x/figures/Spy Rise Top.dump\n"
+                                                 "place 1 C:/x/figures/Spy Rise Bottom.dump\nquit\n", encoding="utf-8")
+        self.assertEqual(lc.figures_head(f.path),
+                         ["figures: H Roller Brawl; D Spy Rise (a swapper: Spy Rise Top + Spy Rise Bottom)"])
+
 class Windows(unittest.TestCase):
     def test_a_clients_time_in_each_level(self) -> None:
         f = RunFolder([], H_JOIN + LEVEL_END, D_JOIN + LEVEL_END)

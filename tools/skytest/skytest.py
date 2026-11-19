@@ -9585,6 +9585,14 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                         scene_lengths=measured_scene_lengths(cfg, a.level) if getattr(a, "scenes", "skip") == "play"
                         else None, lock_commands=lock_commands_known(cfg), no_gates=getattr(a, "no_gates", False))
     plan.probe = not a.no_probe
+    # W21: a named figure (or a swapper's two halves) for H or D, from the copied figure folder.
+    for who, opt in (("h", "h_figure"), ("d", "d_figure")):
+        name = getattr(a, opt, None)
+        if name:
+            try:
+                setattr(plan, f"figures_{who}", lp.figure_files(fixture_dirs(cfg)[1], name))
+            except ValueError as e:
+                raise SystemExit(f"levelpass: --{who}-figure: {e}") from None
     plan.server_hidden = bool(getattr(a, "server_hidden", False))
     plan.long_pause_s = int(getattr(a, "long_pause", 0) or 0)
     plan.long_pause_at = getattr(a, "long_pause_at", "") or ""
@@ -9642,6 +9650,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     # The plan's first line: its estimate and which budget it is in (the gates phase, or --no-gates).
     print(f"levelpass {a.level}: estimate {plan.estimate_s:.0f} s ({lp.budget_words(plan)}); content {plan.source}; "
           f"{len(plan.stops)} stops, {sum(len(st.actions) for st in plan.stops)} actions; case {spec_path}", flush=True)
+    print(f"levelpass {a.level}: figures: H {lp.figure_words(plan.figures_h)}"
+          + (f"; D {lp.figure_words(plan.figures_d)}" if plan.late_join else ""), flush=True)
     for n in notices:
         print(f"levelpass {a.level}: {n}", flush=True)
     for h in plan.held:  # the fights the level's script holds (levelpass_holds), in words
@@ -9804,6 +9814,11 @@ def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
                      " dismisses a pause screen within seconds")
     lp_.add_argument("--long-pause-at", default="", metavar="NAME", help="the object whose pickup takes the long"
                      " pause (default: the plan's first pickup of a collectible)")
+    lp_.add_argument("--h-figure", default=None, metavar="NAME", help="H's figure from the copied figure folder"
+                     " (default Roller Brawl): `<NAME>.dump`, or a swapper's two halves (`<NAME> Top.dump` in slot 0,"
+                     " `<NAME> Bottom.dump` in slot 1)")
+    lp_.add_argument("--d-figure", default=None, metavar="NAME", help="D's figure, as --h-figure (default Scorp);"
+                     " e.g. --d-figure \"Spy Rise\" puts a swapper on D")
     lp_.add_argument("--d-stays", action="store_true", help="D stays where it entered the level (the old"
                      " behaviour); by default D's hero follows H's through the stops (the game's Auto follow,"
                      " online_auto_follow on) once the game registers that command")
