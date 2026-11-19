@@ -37,6 +37,8 @@ import math
 import re
 from dataclasses import dataclass, field
 
+import levelpass_end as le
+
 # --- content ------------------------------------------------------------------------------------------
 
 CLUSTER_RADIUS = 1200.0      # objects closer than this to a cluster's first object share its teleport
@@ -114,6 +116,8 @@ class Content:
     level_end: list[str] = field(default_factory=list)  # the names in the level-end chain
     level_end_receiver: str = ""  # the chain's first receiver (an encounter manager), when it names one
     authored: int = 0             # objects whose live reference is the probe's exact id
+    level_end_chains: list[str] = field(default_factory=list)  # the static manifest's level_end text
+    logic: dict | None = None     # logic.json itself (levelpass_end.derive_end walks it)
 
 
 PROBE_ROW = re.compile(
@@ -202,6 +206,8 @@ def parse_static_manifest(data: dict, level: str) -> Content:
     content = Content(level=level, source="static manifest", start=start, objects=objects)
     content.level_end = exit_senders(data.get("level_end"))
     content.level_end_receiver = exit_receiver(data.get("level_end"))
+    le_text = data.get("level_end")
+    content.level_end_chains = [str(c) for c in (le_text if isinstance(le_text, list) else [le_text] if le_text else [])]
     return content
 
 
@@ -349,6 +355,11 @@ def load_content(folder, level: str, probe_ids: bool = True) -> Content:
     else:
         content.authored = attach_refs(content.objects, None)
     logic = folder / level / "logic.json"
+    if logic.is_file():
+        try:
+            content.logic = json.loads(logic.read_text(encoding="utf-8"))
+        except ValueError:
+            content.logic = None
     if content.objects and any(o.fires for o in content.objects):
         # The static manifest carries every sender's telegrams itself.
         content.edges = [Edge(sender=o.name, message=f.split(" -> ")[0], target=t.strip())
@@ -661,6 +672,9 @@ class Plan:
     probe: bool = True              # the authored probe on (--no-probe: names only, no auth: ids)
     game_args: list[str] = field(default_factory=list)  # --game-arg: extra settings for H and D (Host forwards S's)
     no_end: bool = False            # --no-end: the pass ends after its last mid-level step (no exit, no level end)
+    end: object = None              # levelpass_end.End derived from logic.json (None: the older exit below)
+    end_objs: dict = field(default_factory=dict)  # node key -> Obj of the end's objects (their refs)
+    end_missing: str = ""           # why the derived end cannot be acted on (an object with no live reference)
 
 
 # Seconds the boot and the level load take, measured (the report prints the real ones); used for the
@@ -734,12 +748,27 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
         keep = [o for o in visited if dist(start, o.pos) <= limit or classify(o)[0] == EXIT_A]
         unplaced += len(visited) - len(keep)
         visited = keep
+    # The level's end from its own logic (levelpass_end.py): the chain walked back to a trigger to enter or a
+    # counted fight. Its objects, the nodes on its path and its fight's arena are the end's alone: never acted
+    # on during the sweep (entering the outro's trigger or fighting the counted enemies would end the level
+    # under the sweep).
+    end = derive(content)
+    end_objs: dict[str, Obj] = {}
+    end_missing = ""
+    if end is not None:
+        by_key = {obj_key(o): o for o in content.objects if o.name}
+        end_keys = end.keys() | set(end.path_keys)
+        end_objs = {k: by_key[k] for k in end_keys if k in by_key}
+        end_missing = end_unaddressable(end, end_objs)
+        arena = fight_area(end, end_objs)
+        visited = [o for o in visited if obj_key(o) not in end_keys and not (
+            arena is not None and placed(o) and dist(o.pos, arena[0]) <= arena[1])]
     # The level-end chain's first senders are the exit: acted on last, never during the sweep.
     # The exit: the first name of the level-end chain a player can act on (an end fight's spawners, an NPC,
     # a trigger); a chain with none (a scripted end, tutorial_a's ride) is a timed level: the pass waits
     # for the level's own end.
     exit_names: set[str] = set()
-    for n in content.level_end:
+    for n in (content.level_end if end is None else []):
         named = [o for o in content.objects if o.name == n and placed(o) and o.ref]
         if any(exit_kind(o) == FIGHT or classify(o)[0] in (ENTER, TALK, INTERACT_A) for o in named):
             exit_names = {n}
@@ -747,7 +776,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
             exit_names |= {m for m in content.level_end[:content.level_end.index(n) + 1]
                            if any(o.name == m and exit_kind(o) == exit_kind(named[0]) for o in content.objects)}
             break
-    if not exit_names and content.level_end:
+    if not exit_names and content.level_end and end is None:
         # No chain member a player acts on: one step back, a sender to the chain's first member that a
         # player does act on, a trigger first (ww1: LevelOutro_Trigger -> CouncilEsmeralda, whose own
         # conversation has no interaction; without it the pass waited 240 s for an end that never came).
@@ -861,6 +890,10 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
         left_out.append(f"{len(other_zone)} object(s) of sub-zones not loaded with the level ({', '.join(zones)})")
     # Over the budget: drop visits of stops with no action, farthest from the start first; then say so.
     est = estimate_seconds([s for s in stops if not (no_end and s is exit_stop)], late_join, end=not no_end)
+    if end is not None and not no_end:
+        # The estimate takes what the end is expected to take (END_EXPECT_S); its worst case is in the
+        # sweep's deadline (sweep_share, exit_seconds), which keeps the whole pass inside the budget.
+        est += END_EXPECT_S.get(end.kind, EXIT_S) - EXIT_S
     if est > budget_s:
         quiet = [s for s in stops if not s.actions]
         quiet.sort(key=lambda s: -(dist(start, s.cluster.center) if start else s.cluster.index))
@@ -875,7 +908,8 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
             left_out.append(f"{dropped} visit(s) of clusters with no sampled action (over the budget)")
     return Plan(level=content.level, source=content.source, stops=stops, left_out=left_out, no_action=no_action,
                 unplaced=unplaced, estimate_s=round(est, 1), full=full, late_join=late_join, exit_stop=exit_stop,
-                provoke=provoke, timed=bool(content.level_end) and exit_stop is None, no_end=no_end)
+                provoke=provoke, no_end=no_end, end=end, end_objs=end_objs, end_missing=end_missing,
+                timed=(end.kind == le.TIMED) if end is not None else (bool(content.level_end) and exit_stop is None))
 
 
 # --- the scripts -------------------------------------------------------------------------------------------
@@ -931,6 +965,13 @@ def attach_refs(objects: list[Obj], probe: list[Obj] | None, names_only: bool = 
     for o in objects:
         cands = by_name.get(o.name.lower(), []) if o.name else [p for p in unnamed if p.cls == o.cls]
         best = min(cands, key=lambda p: dist(p.pos, o.pos), default=None)
+        if o.name and (best is None or dist(best.pos, o.pos) > JOIN_DISTANCE):
+            # A named object the probe recorded without its name (its live name is another, or none: ww1's
+            # LevelOutro_Trigger is the probe's unnamed CScriptTriggerEntity ww1#13618 at its very place):
+            # the one unnamed probe object of its class at its place, when exactly one is there.
+            here = [p for p in unnamed if p.cls == o.cls and dist(p.pos, o.pos) <= JOIN_DISTANCE]
+            if len(here) == 1:
+                best = here[0]
         if not names_only and best is not None and dist(best.pos, o.pos) <= JOIN_DISTANCE:
             zone, index = best.ident.rsplit("#", 1)
             o.ref = f"auth:{zone}:{index}"
@@ -1020,7 +1061,11 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
                   "log LEVELPASS done", "online_end", "quit"]
         return "\n".join(lines) + "\n"
     lines.append("log LEVELPASS phase exit")
-    if plan.exit_stop is not None:
+    if plan.end is not None and plan.end.kind in (le.TRIGGER, le.FIGHT):
+        lines += end_lines(plan)
+        lines += [f"waitfor online_level_end {end_wait_s(plan.end)}", "waitfor online_past_level_end 240",
+                  "wait_free 120", "log LEVELPASS phase next-level", "online_audit next"]
+    elif plan.exit_stop is not None:
         lines += stop_lines(plan.exit_stop)
         lines += ["waitfor online_level_end 60", "waitfor online_past_level_end 240", "wait_free 120",
                   "log LEVELPASS phase next-level", "online_audit next"]
@@ -1037,6 +1082,8 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
 
 def end_words(plan: Plan) -> str:
     """The level end the plan found, in words (the report's and --no-end's line)."""
+    if plan.end is not None:
+        return derived_words(plan)
     if plan.exit_stop is not None:
         acts = ", ".join(f"{a.action} {exit_kind(a.obj)} {a.obj.name or '-'} {a.obj.ref}" for a in plan.exit_stop.actions)
         return f"the exit's actions: {acts}"
@@ -1051,8 +1098,9 @@ def end_words(plan: Plan) -> str:
 # times). The route helpers log `Dev: <command> <selector> failed (no entity: <why>)` with the selector
 # as the script gave it (route_actions.cpp, RouteRun::Fail). A sweep step's unresolved target stays a
 # tool finding and the sweep goes on: no later step waits on it.
-EXIT_STEP_COMMANDS = ("goto_entity", "enter_trigger", "fight_near", "interact", "attack_until", "pickup",
-                      "encounter_clear", "wait_entity_gone")
+# Only the approach: a fight's anchor that is gone after the level ended (its outro, the next level's load)
+# is no failure of the pass, and the approach to the same anchor already resolved it.
+EXIT_STEP_COMMANDS = ("goto_entity", "enter_trigger", "interact")
 EXIT_FATAL_WHAT = "the exit's target did not resolve: the pass ends here, no wait for the level end"
 
 
@@ -1076,9 +1124,10 @@ def exit_forbid(script: str) -> list[str]:
     """H's `forbid` for the exit: one pattern, a step of the exit naming one of its targets that found no
     entity; [] when the exit addresses none (a timed level, --no-end)."""
     refs = exit_refs(script)
+    out = [r"Input script: " + END_IMPOSSIBLE] if f"log {END_IMPOSSIBLE}" in script else []
     if not refs:
-        return []
-    return [r"Dev: \S+ (?:" + "|".join(re.escape(r) for r in refs) + r") failed \(no entity"]
+        return out
+    return [r"Dev: \S+ (?:" + "|".join(re.escape(r) for r in refs) + r") failed \(no entity"] + out
 
 
 EXIT_UNRESOLVED = re.compile(r"Dev: (\S+) (\S+) failed \((no entity[^)]*)\)")
@@ -1096,10 +1145,123 @@ def unresolved_exit(h_text: str, script: str) -> str:
     return ""
 
 
+# --- the derived end (levelpass_end.py) ---------------------------------------------------------------
+
+TRIGGER_END_S = 150      # after the outro's trigger: its conversations (skipped), its cutscenes, the results
+FIGHT_APPROACH_S = 25    # goto_entity's own limit
+FIRST_ROUND_S = 60       # the first round of a counted fight
+ROUND_S = 30             # each later round (a wave's arrival; each ends after 10 s with no enemy near)
+FIGHT_RADIUS_MIN, FIGHT_RADIUS_MAX, FIGHT_MARGIN = 1500, 3000, 500
+END_IMPOSSIBLE = "LEVELPASS exit impossible"
+# Expected (not worst-case) seconds of the derived end, for the estimate: a trigger's approach and the
+# scenes it starts (skipped), the results; a counted fight's approach and rounds with one-hit damage.
+END_EXPECT_S = {"trigger": 75.0, "fight": 150.0}
+
+
+def obj_key(o: Obj) -> str:
+    """The logic's node key of a static manifest object: <unit>.<name>."""
+    return f"{o.ident}.{o.name}"
+
+
+def derive(content: Content):
+    """The level's end from logic.json and the chain's text; None without them (the older exit then)."""
+    if not content.logic or not content.level_end_chains:
+        return None
+    return le.derive_end(content.level_end_chains, content.logic, content.level)
+
+
+def end_unaddressable(end, objs: dict) -> str:
+    """Why the end's needed objects cannot be named live ('' when they can)."""
+    need = [end.trigger] if end.kind == le.TRIGGER else [end.anchor] if end.kind == le.FIGHT else []
+    missing = [k for k in need if not k or k not in objs or not objs[k].ref]
+    if not missing:
+        return ""
+    return "no live reference (no probe id, no name the probe saw) for " + ", ".join(m or "(none found)" for m in missing)
+
+
+def fight_area(end, objs: dict) -> tuple[tuple[float, float, float], float] | None:
+    """A counted fight's centre (its anchor) and radius: the anchor to its farthest counted placed enemy
+    plus a margin, within FIGHT_RADIUS_MIN..MAX; None for other ends."""
+    if end is None or end.kind != le.FIGHT or end.anchor not in objs:
+        return None
+    a = objs[end.anchor].pos
+    far = max((dist(a, objs[k].pos) for k in end.enemies if k in objs), default=0.0)
+    return a, float(min(FIGHT_RADIUS_MAX, max(FIGHT_RADIUS_MIN, round(far + FIGHT_MARGIN, -2))))
+
+
+def fight_rounds(end) -> int:
+    """The first round, one per wave the counter starts, one for late arrivals."""
+    return 1 + len(end.waves) + 1
+
+
+def end_seconds(end) -> float:
+    if end.kind == le.TRIGGER:
+        return FIGHT_APPROACH_S + TRIGGER_END_S
+    if end.kind == le.FIGHT:
+        return (FIGHT_APPROACH_S * (1 + len(end.starters)) + FIRST_ROUND_S + ROUND_S * (fight_rounds(end) - 1)
+                + EXIT_WAIT_S)
+    return EXIT_WAIT_S
+
+
+def end_wait_s(end) -> int:
+    return TRIGGER_END_S if end.kind == le.TRIGGER else int(EXIT_WAIT_S)
+
+
+def _name(objs: dict, k: str) -> str:
+    return objs[k].name if k in objs else k.split(".")[-1]
+
+
+def _ref(objs: dict, k: str) -> str:
+    return objs[k].ref if k in objs else ""
+
+
+def derived_words(plan: Plan) -> str:
+    end, objs = plan.end, plan.end_objs
+    path = " -> ".join(dict.fromkeys(end.path))
+    if end.kind == le.TRIGGER:
+        return f"enter the trigger {_name(objs, end.trigger)} ({_ref(objs, end.trigger) or 'no ref'}); its chain: {path}"
+    if end.kind == le.FIGHT:
+        area = fight_area(end, objs)
+        return (f"the counted fight of {_name(objs, end.counter) if end.counter else 'one enemy'} ({end.count} deaths of "
+                f"{', '.join(_name(objs, k) for k in end.counted)}), started by "
+                f"{', '.join(_name(objs, k) + ' (' + (_ref(objs, k) or 'no ref') + ')' for k in end.starters) or 'nothing'},"
+                f" fought around {_name(objs, end.anchor)} ({_ref(objs, end.anchor) or 'no ref'})"
+                f"{' radius ' + str(int(area[1])) if area else ''}, waves at {end.waves or 'none'}; its chain: {path}")
+    return f"the level ends on its own ({end.why})"
+
+
+def end_lines(plan: Plan) -> list[str]:
+    """The derived end's steps: by live reference only (no position, no name list)."""
+    end, objs = plan.end, plan.end_objs
+    out = [f"log LEVELPASS end {end.kind}: {_safe(derived_words(plan))}"]
+    if plan.end_missing:
+        # Nothing to act on: said and failed at once (H's forbid), never a wait for an end that cannot come.
+        return out + [f"log {END_IMPOSSIBLE}: {_safe(plan.end_missing)}"]
+    if end.kind == le.TRIGGER:
+        return out + [f"enter_trigger {_ref(objs, end.trigger)}"]
+    area = fight_area(end, objs)
+    anchor = _ref(objs, end.anchor)
+    out += [f"goto_entity {anchor}", "wait_free 60"]
+    for k in end.starters:
+        ref = _ref(objs, k)
+        if not ref:
+            out.append(f"log LEVELPASS end starter {_safe(_name(objs, k))}: no live reference, not entered")
+        elif k in objs and area is not None and dist(objs[k].pos, area[0]) > 2 * area[1]:
+            out.append(f"log LEVELPASS end starter {_safe(_name(objs, k))}: outside the fight's area, not entered")
+        else:
+            out.append(f"enter_trigger {ref}")
+    radius = int(area[1]) if area else FIGHT_RADIUS_MIN
+    out.append(f"fight_near {anchor} {radius} {FIRST_ROUND_S}")
+    out += [f"fight_near {anchor} {radius} {ROUND_S}"] * (fight_rounds(end) - 1)
+    return out
+
+
 def exit_seconds(plan: Plan) -> float:
     """The exit phase's share: its actions' own timeouts and the level end's waits."""
     if plan.no_end:
         return 0.0
+    if plan.end is not None:
+        return end_seconds(plan.end) if plan.end.kind != le.TIMED else EXIT_WAIT_S
     if plan.exit_stop is None:
         return EXIT_WAIT_S if plan.timed else 0.0
     t = EXIT_WAIT_S
