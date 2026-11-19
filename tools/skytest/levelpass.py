@@ -660,6 +660,7 @@ class Plan:
     timed: bool = False             # the level ends on its own (no chain member a player acts on)
     probe: bool = True              # the authored probe on (--no-probe: names only, no auth: ids)
     game_args: list[str] = field(default_factory=list)  # --game-arg: extra settings for H and D (Host forwards S's)
+    no_end: bool = False            # --no-end: the pass ends after its last mid-level step (no exit, no level end)
 
 
 # Seconds the boot and the level load take, measured (the report prints the real ones); used for the
@@ -673,8 +674,8 @@ LATE_JOIN_S = 60.0     # D's own visit after it is in (its boot runs beside H's 
 EXIT_S = 90.0
 
 
-def estimate_seconds(stops: list[Stop], late_join: bool) -> float:
-    t = BOOT_S + LEVEL_LOAD_S + EXIT_S
+def estimate_seconds(stops: list[Stop], late_join: bool, end: bool = True) -> float:
+    t = BOOT_S + LEVEL_LOAD_S + (EXIT_S if end else 0.0)
     for s in stops:
         t += VISIT_S
         for a in s.actions:
@@ -687,21 +688,22 @@ def estimate_seconds(stops: list[Stop], late_join: bool) -> float:
 
 
 def make_plan(content: Content, full: bool = False, late_join: bool = True, budget_s: float = BUDGET_S,
-              sample: int = SAMPLE, provoke: str = "") -> Plan:
+              sample: int = SAMPLE, provoke: str = "", no_end: bool = False) -> Plan:
     """The plan; without --full, over the budget, the sample per family goes down to 2, then 1 (the
-    plan says so), after the quiet visits were dropped."""
-    plan = _make_plan(content, full, late_join, budget_s, sample, provoke)
+    plan says so), after the quiet visits were dropped. `no_end` (--no-end): the level's end is found
+    (the plan names it) but not attempted, and its time is not in the estimate."""
+    plan = _make_plan(content, full, late_join, budget_s, sample, provoke, no_end=no_end)
     n = sample
     while not full and plan.estimate_s > budget_s and n > 1:
         n -= 1
-        plan = _make_plan(content, full, late_join, budget_s, n, provoke)
+        plan = _make_plan(content, full, late_join, budget_s, n, provoke, no_end=no_end)
         plan.left_out.append(f"each action family sampled {n} time(s), not {sample}, to fit the budget")
     # Still over at one per family (a level with many archetypes): at most `cap` actions of each kind
     # (fight, attack, interact, pickup, enter, talk), the first ones along the path, the cap going down
     # until the plan fits; --full acts on the rest.
     cap = KIND_CAP_START
     while not full and plan.estimate_s > budget_s and cap >= 1:
-        plan = _make_plan(content, full, late_join, budget_s, n, provoke, kind_cap=cap)
+        plan = _make_plan(content, full, late_join, budget_s, n, provoke, kind_cap=cap, no_end=no_end)
         plan.left_out.append(f"each action family sampled {n} time(s), not {sample}, to fit the budget")
         plan.left_out.append(f"each kind of action at most {cap} times, to fit the budget (--full acts on all)")
         cap -= 1
@@ -713,7 +715,7 @@ KIND_CAP_START = 8   # the first per-kind cap tried when one action per family i
 
 
 def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, sample: int,
-               provoke: str, kind_cap: int = 0) -> Plan:
+               provoke: str, kind_cap: int = 0, no_end: bool = False) -> Plan:
     visited = [o for o in content.objects if o.group in GROUPS_VISITED]
     # A sub-zone (a swap zone, a staging map) is its own map that a player reaches only through its own
     # entry: its objects are never visited, even when the probe walked its package at the level's load
@@ -858,7 +860,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
         zones = sorted({o.zone for o in other_zone})
         left_out.append(f"{len(other_zone)} object(s) of sub-zones not loaded with the level ({', '.join(zones)})")
     # Over the budget: drop visits of stops with no action, farthest from the start first; then say so.
-    est = estimate_seconds(stops, late_join)
+    est = estimate_seconds([s for s in stops if not (no_end and s is exit_stop)], late_join, end=not no_end)
     if est > budget_s:
         quiet = [s for s in stops if not s.actions]
         quiet.sort(key=lambda s: -(dist(start, s.cluster.center) if start else s.cluster.index))
@@ -873,7 +875,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
             left_out.append(f"{dropped} visit(s) of clusters with no sampled action (over the budget)")
     return Plan(level=content.level, source=content.source, stops=stops, left_out=left_out, no_action=no_action,
                 unplaced=unplaced, estimate_s=round(est, 1), full=full, late_join=late_join, exit_stop=exit_stop,
-                provoke=provoke, timed=bool(content.level_end) and exit_stop is None)
+                provoke=provoke, timed=bool(content.level_end) and exit_stop is None, no_end=no_end)
 
 
 # --- the scripts -------------------------------------------------------------------------------------------
@@ -1012,6 +1014,11 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
         # D ends its session once its audits are done: H waits for D in, then for D gone.
         lines += ["log LEVELPASS phase late-join", "waitfor online_peer_was_in 300", "waitfor online_alone 300",
                   "online_audit late"]
+    if plan.no_end:
+        # --no-end: the middle of the level is the evidence; its end is neither acted on nor waited for.
+        lines += [f"log LEVELPASS exit not attempted (--no-end), the end would be: {_safe(end_words(plan))}",
+                  "log LEVELPASS done", "online_end", "quit"]
+        return "\n".join(lines) + "\n"
     lines.append("log LEVELPASS phase exit")
     if plan.exit_stop is not None:
         lines += stop_lines(plan.exit_stop)
@@ -1028,8 +1035,20 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def end_words(plan: Plan) -> str:
+    """The level end the plan found, in words (the report's and --no-end's line)."""
+    if plan.exit_stop is not None:
+        acts = ", ".join(f"{a.action} {exit_kind(a.obj)} {a.obj.name or '-'} {a.obj.ref}" for a in plan.exit_stop.actions)
+        return f"the exit's actions: {acts}"
+    if plan.timed:
+        return "the level ends on its own (a timed level)"
+    return "none found in the content"
+
+
 def exit_seconds(plan: Plan) -> float:
     """The exit phase's share: its actions' own timeouts and the level end's waits."""
+    if plan.no_end:
+        return 0.0
     if plan.exit_stop is None:
         return EXIT_WAIT_S if plan.timed else 0.0
     t = EXIT_WAIT_S
@@ -1528,7 +1547,9 @@ def report_text(level: str, plan: Plan, wall_s: float, phases: list[tuple[str, f
              f"estimate was {plan.estimate_s:.0f} s",
              f"pass: {'full' if plan.full else 'sampled (each action family at most ' + str(plan.sample) + ' times)'}, "
              f"{len(plan.stops)} stops, {sum(len(s.actions) for s in plan.stops)} actions, "
-             f"late join {'on' if plan.late_join else 'off'}"]
+             f"late join {'on' if plan.late_join else 'off'}",
+             (f"level end: NOT ATTEMPTED (--no-end): judged on the mid-level steps only; the end would be "
+              f"{end_words(plan)}") if plan.no_end else f"level end: attempted ({end_words(plan)})"]
     lines.append("")
     lines.append("time per phase:")
     for name, s in phases:
@@ -1612,8 +1633,9 @@ def _toml_list(items: list[str]) -> str:
     return "[" + ", ".join("'" + i.replace("'", "") + "'" for i in items) + "]"
 
 
-def case_name(level: str) -> str:
-    return f"levelpass-{level}"
+def case_name(level: str, no_end: bool = False) -> str:
+    """The generated case's name: a --no-end pass is its own case (its runs and results apart)."""
+    return f"levelpass-{level}" + ("-no-end" if no_end else "")
 
 
 def spec_from_scripts(level: str, h: str, d: str | None, d_args: list[str] | None = None,
@@ -1637,11 +1659,12 @@ def spec_toml(plan: Plan) -> str:
     pass: every step's failure is a finding of the report, not a failed expectation."""
     late = plan.late_join
     h = script_h(plan, LATE_JOIN_MARK if late else None)
-    out = [f'name = "{case_name(plan.level)}"',
+    out = [f'name = "{case_name(plan.level, plan.no_end)}"',
            f'layout = "{"server+2" if late else "server+1"}"',
            'stage = "8"',
            'server = "host"',
-           f'description = "The automatic level pass of {plan.level} (skytest levelpass; generated, not committed)"',
+           f'description = "The automatic level pass of {plan.level}{" without its end (--no-end)" if plan.no_end else ""}'
+           ' (skytest levelpass; generated, not committed)"',
            f"timeout = {CASE_TIMEOUT_S}",
            'scenes = "skip"',
            "show_server_window = false",

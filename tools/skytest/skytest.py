@@ -8982,7 +8982,10 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         content = lp.load_content(folder, a.level, probe_ids=not a.no_probe)
     except ValueError as e:
         raise SystemExit(f"levelpass: {e}") from None
-    plan = lp.make_plan(content, full=a.full, late_join=not a.no_late_join, provoke=a.provoke or "")
+    if a.no_end and a.predictions:
+        raise SystemExit("levelpass: --no-end is for the generated pass, not --predictions")
+    plan = lp.make_plan(content, full=a.full, late_join=not a.no_late_join, provoke=a.provoke or "",
+                        no_end=a.no_end)
     plan.probe = not a.no_probe
     try:
         plan.game_args = [lp.check_game_arg(g) for g in (a.game_arg or [])]
@@ -8993,7 +8996,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     cases = folder / "cases" / stamp
     cases.mkdir(parents=True, exist_ok=False)
-    spec_path = cases / f"{lp.case_name(a.level)}.toml"
+    case = lp.case_name(a.level, plan.no_end)
+    spec_path = cases / f"{case}.toml"
     bugs: list = []
     if a.predictions:
         import levelpass_predictions as lpp
@@ -9025,7 +9029,7 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         return 0
     t0 = time.monotonic()
     started = time.strftime("%Y%m%d-%H%M%S")
-    ns = argparse.Namespace(cases=[lp.case_name(a.level)], stage=None, max_games=0, gate=False, per_build=False,
+    ns = argparse.Namespace(cases=[case], stage=None, max_games=0, gate=False, per_build=False,
                             allow_restricted=False, jobs=1, run_not_ready=False, no_breaker=False, queue=None,
                             remote=None, remote_manifest=None, remote_token_file=None,
                             rerun_known_failure=a.rerun_known_failure, ignore_build=a.ignore_build,
@@ -9035,7 +9039,7 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         print(f"levelpass {a.level}: not started ({'a known failure' if code == EXIT_KNOWN_FAILURE else 'a build held its slot'}, above); no report", flush=True)
         return code
     wall = time.monotonic() - t0
-    runs = sorted(p for p in (cfg.store / "runs").glob(f"*-{lp.case_name(a.level)}")
+    runs = sorted(p for p in (cfg.store / "runs").glob(f"*-{case}")
                   if p.is_dir() and p.name[:15] >= started)
     if not runs:
         print(f"levelpass {a.level}: no run folder (the case did not start; exit {code})", flush=True)
@@ -9184,6 +9188,10 @@ def main(argv: list[str] | None = None) -> int:
     lp_.add_argument("--full", action="store_true", help="act on every object (default: each action family at"
                      " most 3 times, every cluster still visited)")
     lp_.add_argument("--no-late-join", action="store_true", help="no second client D near the end")
+    lp_.add_argument("--no-end", action="store_true", help="stop after the last mid-level step: the level's end is"
+                     " neither acted on nor waited for, the pass is judged on the mid-level steps, the report says"
+                     " the end was not attempted (its own case, levelpass-<level>-no-end): for evidence from the"
+                     " middle of a level")
     lp_.add_argument("--folder", default=None, help="the levelpass folder (default: tests/skytest.toml's"
                      " [levelpass] folder)")
     lp_.add_argument("--provoke", default=None, metavar="KIND", help="the audit's proof: after the first visit H"

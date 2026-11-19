@@ -367,6 +367,42 @@ class Scripts(unittest.TestCase):
         self.assertIn("LEVELPASS exit none", h)
         self.assertNotIn("online_wait_peers", h)
 
+    def test_no_end_stops_after_the_last_mid_level_step(self):
+        """--no-end: the exit is found and named but neither acted on nor waited for; its own case; the
+        estimate and the sweep's share have no exit time; the report says the end was not attempted."""
+        full, p = lp.make_plan(content()), lp.make_plan(content(), no_end=True)
+        self.assertTrue(p.no_end)
+        self.assertIsNotNone(p.exit_stop)  # found, named in the line below
+        h = lp.script_h(p, lp.LATE_JOIN_MARK)
+        self.check_script(h)
+        for words in ("online_level_end", "online_past_level_end", "online_audit next", "LEVELPASS phase exit",
+                      "enter_trigger auth:madeup:2"):
+            self.assertNotIn(words, h)
+        self.assertIn("LEVELPASS exit not attempted (--no-end)", h)
+        self.assertIn("Level_Exit", h.split("exit not attempted", 1)[1].splitlines()[0])
+        # The sweep, its final audit and the late join's audit all still run, in order, before the end line.
+        for words in ("LEVELPASS phase audit", "online_audit end", "waitfor online_alone 300", "online_audit late"):
+            self.assertLess(h.index(words), h.index("exit not attempted"))
+        self.assertTrue(h.rstrip().endswith("LEVELPASS done\nonline_end\nquit"))
+        self.assertEqual(lp.exit_seconds(p), 0.0)
+        self.assertGreater(lp.sweep_share(p), lp.sweep_share(full))
+        self.assertLess(p.estimate_s, full.estimate_s)
+        self.assertEqual(lp.case_name("madeup", True), "levelpass-madeup-no-end")
+        self.assertIn('name = "levelpass-madeup-no-end"', lp.spec_toml(p))
+        self.assertIn('name = "levelpass-madeup"', lp.spec_toml(full))
+        report = lp.report_text("madeup", p, 100.0, [], [], "", {}, "run", [])
+        self.assertIn("level end: NOT ATTEMPTED (--no-end)", report)
+        self.assertIn("level end: attempted", lp.report_text("madeup", full, 100.0, [], [], "", {}, "run", []))
+        # A timed level does not wait for its own end either.
+        c = content()
+        c.objects = [o for o in c.objects if o.name != "Level_Exit"]
+        c.level_end = ["Event_StartFight"]
+        t = lp.make_plan(c, no_end=True)
+        self.assertTrue(t.timed)
+        ht = lp.script_h(t, lp.LATE_JOIN_MARK)
+        self.assertNotIn("online_level_end", ht)
+        self.assertIn("the level ends on its own", ht)
+
     def test_no_probe(self):
         """--no-probe: no auth: ids in the steps and no probe setting on any game."""
         c = lp.parse_probe_manifest(PROBE, "madeup")
