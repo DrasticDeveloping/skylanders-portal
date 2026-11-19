@@ -196,6 +196,15 @@ class EnemyKinds(unittest.TestCase):
         self.assertIn("died with no attacker at -442,-58676,64", v.findings[0].lines[1])
         self.assertEqual(len(v.findings), 1)  # not named twice as `existed on no client`
 
+    def test_a_death_by_another_entity_is_counted(self) -> None:
+        # ww1 20261119-051557: `dead by none (S, placed; attacker (null)#3457)`, the seventh death the counts missed.
+        v = self.grade([(30, f"Online: enemy run-time spawn {K3} as Sawmouth_Spawned1#3 hp 45 pose 3 source 1 (S)"),
+                        (60, f"Online: enemy {K3} dead by none (S, placed; attacker (null)#3457)")],
+                       [(31, f"Online: enemy spawn {K3} as Sawmouth_Spawned1#b8 (spawn other)"),
+                        (61, f"Online: enemy life {K3} alive -> dead")])
+        self.assertIn("1 died on S (by a player: H 0; by another entity 1 ((null)#3457); no attacker 0; attacker not "
+                      "recorded 0)", v.counts)
+
     def test_an_encounter_spawn_counts_and_its_unnamed_attacker_is_no_finding(self) -> None:
         # tutorial_a's encounter actors: `enemy spawn <key> ... (S)`, dead `by none (S)` with no attacker field
         # (a player's kill may read so: one died 4 ms after H's press started on S).
@@ -206,7 +215,7 @@ class EnemyKinds(unittest.TestCase):
                         (30.1, f"Online: enemy bind {enc} (resolved)"),
                         (34.8, f"Online: enemy life {enc} alive -> dead")])
         self.assertEqual(v.status, lc.PASS, v.findings)
-        self.assertIn("S 1 (0 placed, 1 encounter, 0 run-time), 1 died on S (by a player: H 0; no attacker 0; "
+        self.assertIn("S 1 (0 placed, 1 encounter, 0 run-time), 1 died on S (by a player: H 0; by another entity 0; no attacker 0; "
                       "attacker not recorded 1)", v.counts)
 
 
@@ -220,18 +229,63 @@ class RequiredSteps(unittest.TestCase):
                                            lh.Gate("Finale_DemonGate", "enc8", lh.BATTLE_GATE, True, "win its fight"),
                                            lh.Gate("ElementalGate", "ez1", "an elemental gate", False, "")])
 
-    def test_a_gate_no_line_shows_opened_is_not_performed(self) -> None:
+    PASSED = {"levelpass": {"verdict": "PASS", "not_covered": []}}
+
+    def test_not_performed_names_the_first_step_and_a_battle_gate_opened_everywhere(self) -> None:
+        h = [(60, "Input script: LEVELPASS required r1 Spark_Lock Intro_LockpickGate not performed: needs a lock opened: "
+                  "this build has no lock_solve / lock_ready (online/6-spark-lock is not in it)"),
+             (70, "Input script: LEVELPASS required r2 battle_gate Finale_DemonGate (win its fight: Wave1)"),
+             (91, "Online: world gate Finale_DemonGate#2365 open apply: 1 lock(s) set UnLocked first (x)")]
+        d = [(92, "Online: world gate Finale_DemonGate#2370 open apply: 1 lock(s) set UnLocked first (x)")]
         run = RunFolder([(90, "Online: world gate Finale_DemonGate#2365 tombstoned (removed for good, written)")],
-                        H_JOIN + H_NEXT, D_JOIN + D_NEXT, result={"levelpass": {"verdict": "PASS", "not_covered": []}}).run()
+                        H_JOIN + h + H_NEXT, D_JOIN + d + D_NEXT, result=self.PASSED).run()
         v = lc.grade_completable(run, self.data())
         self.assertEqual(v.status, lc.BY_TELEPORT)
-        self.assertTrue(v.counts.startswith("completable by teleport; required steps not performed: 1; level pass PASS"))
-        self.assertIn("required, not performed: Intro_LockpickGate (Spark Lock: solve its lock puzzle; no line of S, H or "
-                      "D shows it opened)", v.notes)
-        self.assertTrue(any(n.startswith("required, performed: Finale_DemonGate (battle gate): H/data/Online/session/"
-                                         "game.log:1:") for n in v.notes), v.notes)
+        self.assertTrue(v.counts.startswith("completable by teleport; first step not done: Intro_LockpickGate (Spark Lock): "
+                                            "not performed: needs a lock opened"), v.counts)
+        self.assertIn("required steps not done: 1 of 2", v.counts)
+        self.assertTrue(any(n.startswith("required, done: Finale_DemonGate (battle gate): opened on S, H, D: S ")
+                            for n in v.notes), v.notes)
         self.assertEqual(lc.overall([v, lc.Verdict("lobby", lc.PASS, "")]), "BY TELEPORT: completable")
         self.assertEqual(lc.overall([v, lc.Verdict("loot", lc.NOT_TESTED, "")]), "NOT ALL TESTED: loot; BY TELEPORT: completable")
+
+    def test_by_play_when_every_gate_opened_on_all_three(self) -> None:
+        import levelpass_holds as lh
+        data = lc.LevelData("madeup", {}, [lh.Gate("Finale_DemonGate", "enc8", lh.BATTLE_GATE, True, "win its fight")])
+        h = [(70, "Input script: LEVELPASS required r1 battle_gate Finale_DemonGate (win its fight: Wave1)"),
+             (91, "Dev: wait_moved Finale_DemonGate#2365 done (gone after moving 300 from 1,2,3)")]
+        d = [(92, "Online: world gate Finale_DemonGate#2370 open apply: 1 lock(s) set UnLocked first (x)")]
+        run = RunFolder([(90, "Online: availability Finale_DemonGate#2365 removed (script) bd35d565.1.6496")],
+                        H_JOIN + h + H_NEXT, D_JOIN + d + D_NEXT, result=self.PASSED).run()
+        v = lc.grade_completable(run, data)
+        self.assertEqual(v.status, lc.PASS, v.counts)
+        self.assertTrue(v.counts.startswith("completable by play: 1 required step(s) performed, every gate opened on S, H, D"))
+
+    def test_no_gates_says_the_gates_were_not_attempted(self) -> None:
+        h = [(60, "Input script: LEVELPASS gates not attempted (--no-gates)")]
+        run = RunFolder([], H_JOIN + h + H_NEXT, D_JOIN + D_NEXT, result=self.PASSED).run()
+        v = lc.grade_completable(run, self.data())
+        self.assertEqual(v.status, lc.BY_TELEPORT)
+        self.assertTrue(v.counts.startswith("completable by teleport; gates not attempted (--no-gates); required steps "
+                                            "not performed: 2;"), v.counts)
+
+    def test_a_carried_key_says_where_it_broke(self) -> None:
+        import levelpass_holds as lh
+        data = lc.LevelData("madeup", {}, [lh.Gate("TutorialLockedGate", "a2", lh.KEY_GATE, True, "fetch its key K",
+                                                   key_data="LockedDoorKey_Intro")])
+        h = [(60, "Input script: LEVELPASS required r1 key_gate TutorialLockedGate (fetch its key LockedDoorKey_Intro)"),
+             (70, "Dev: pickup TutorialLockedGate_key#2609 done (carried by the hero (Hero#1 12 from it))"),
+             (80, "Dev: interact TutorialLockedGate_keylock#2608 done (fired by a tap of rt; state 5 (interacted), player 0)"),
+             (85, "Dev: wait_moved TutorialLockedGate#2607 done (settled at 1,2,3, 120 from 1,2,3 (most 120), z +0)")]
+        s = [(20, "Online: world unsupported carried_item TutorialLockedGate_key#2609 (spawned without a stable key)")]
+        run = RunFolder(s, H_JOIN + h + H_NEXT, D_JOIN + D_NEXT, result=self.PASSED).run()
+        v = lc.grade_completable(run, data)
+        self.assertEqual(v.status, lc.BY_TELEPORT)
+        first = v.counts.split("first step not done: ")[1]
+        self.assertTrue(first.startswith("TutorialLockedGate (key gate): performed ("), first)
+        self.assertIn("opened on H, not on S, D; picked up on H: H/game.log:", first)
+        self.assertIn("; no carried key row on S: H/data/Online/session/game.log:1:", first)
+        self.assertIn("; pressed at the lock on H: H/game.log:", first)
 
     def test_no_level_data_is_said(self) -> None:
         run = RunFolder([], H_JOIN + H_NEXT, D_JOIN + D_NEXT, result={"levelpass": {"verdict": "PASS", "not_covered": []}}).run()
@@ -251,6 +305,32 @@ class RequiredSteps(unittest.TestCase):
         self.assertIn("GreebleMelee: held (job state Idle); released by Scene_Manager (IntroArea_LockpickGate -> "
                       "Scene_Manager; a player: open the lock IntroArea_LockpickGate)", lines)
         self.assertIn("    IntroArea_LockpickGate: no line shows it opened: not fired in this run", lines)
+
+
+class Together(unittest.TestCase):
+    """With the follow on, each stop where H acted says whether D stood within the follow distance of H on S's
+    poses (the puppet of each peer from `puppet <n> for peer <p> spawned`, swapped at a level change)."""
+    S = [(20, "Online: puppet 2 for peer 1 spawned at 0,0,0 (generation 2)"),
+         (20, "Online: puppet 1 for peer 2 spawned at 0,0,0 (generation 2)"),
+         (61, "Online: puppet 2 pose 10 at 1000.00,0.00,0.00 client at 1000.00,0.00,0.00 off 0.00 age 30 ms"),
+         (61.5, "Online: puppet 1 pose 11 at 1100.00,50.00,0.00 client at 1100.00,50.00,0.00 off 0.00 age 30 ms"),
+         (91, "Online: puppet 2 pose 20 at 9000.00,0.00,0.00 client at 9000.00,0.00,0.00 off 0.00 age 30 ms"),
+         (91.5, "Online: puppet 1 pose 21 at 1100.00,50.00,0.00 client at 1100.00,50.00,0.00 off 0.00 age 30 ms")]
+    H = [(60, "Input script: LEVELPASS act v3_1 fight Greeble CActor ref auth:x:1"),
+         (90, "Input script: LEVELPASS act v4_1 attack Crate CPhysicalEntity ref auth:x:2")]
+
+    def test_near_and_apart_per_stop(self) -> None:
+        d = [(45, "Online: auto follow the host (peer 1) (script)")]
+        v = lc.grade_together(RunFolder(self.S, H_JOIN + self.H + LEVEL_END, D_JOIN + d + LEVEL_END).run())
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.counts, "D near H (within 400 on S's poses) at 1 of 2 stop(s) where H acted; apart at 1")
+        self.assertEqual(v.notes, ["near: v3 (112)"])
+        self.assertTrue(v.findings[0].what.startswith("v4: D was 7900 from H while H acted"))
+
+    def test_no_follow_is_not_tested_and_the_rows_say_where_they_were_read(self) -> None:
+        v = lc.grade_together(RunFolder(self.S, H_JOIN + self.H + LEVEL_END, D_JOIN + LEVEL_END).run())
+        self.assertEqual(v.status, lc.NOT_TESTED)
+        self.assertIn("D stayed where it entered", v.counts)
 
 
 class Coins(unittest.TestCase):
@@ -300,7 +380,7 @@ class EnemiesCalibration(unittest.TestCase):
     def test_tutorial_a_counts_every_enemy_s_had(self) -> None:
         v = lc.grade_enemies(lc.load_run(TUTORIAL_A))
         self.assertTrue(v.counts.startswith("S 32 (0 placed, 28 encounter, 4 run-time), 32 died on S (by a player: "
-                                            "H 0, D 0; no attacker 4; attacker not recorded 28)"), v.counts)
+                                            "H 0, D 0; by another entity 0; no attacker 4; attacker not recorded 28)"), v.counts)
         for who in "HD":
             self.assertIn(f"{who}: bound 30 of 32, waiting asleep 0 (its copy asleep, far from this player: not a "
                           "fault by itself), never existed here 2; deaths 32: 30 seen on a bound copy, 2 dead before "
@@ -360,6 +440,99 @@ class LootAndCoinsCalibration(unittest.TestCase):
         # A night run with coins off says so: not tested, never a pass.
         self.assertEqual(lc.grade_coins(lc.load_run(TUTORIAL_B)).status, lc.NOT_TESTED)
 
+
+
+LEVELPASS_DATA = Path.home() / "Documents" / "T3Code" / "SwapForceOnline-work" / "levelpass"
+TB_AIM = CALIBRATION_RUNS / "20261119-043508-levelpass-tutorial_b"
+
+
+@unittest.skipUnless(TB_AIM.is_dir() and TUTORIAL_B.is_dir() and (LEVELPASS_DATA / "tutorial_b" / "logic.json").is_file(),
+                     "the batch 8/9 run folders or the level data are not on this machine")
+class HeldEnemiesCalibration(unittest.TestCase):
+    """The enemies row reads the level's holds (levelpass_holds, the generator's data): scenery is not counted,
+    a hold this run did not release is listed, not graded (043508 failed on the Ambi_Chompy scenery)."""
+
+    def grade(self, folder: Path) -> lc.Verdict:
+        run = lc.load_run(folder)
+        return lc.grade_enemies(run, lc.level_data(LEVELPASS_DATA, lc.run_level(run)))
+
+    def test_the_aim_run_passes_with_its_scenery_and_holds_listed(self) -> None:
+        v = self.grade(TB_AIM)
+        self.assertEqual(v.status, lc.PASS, [x.what for x in v.findings])
+        self.assertTrue(v.notes[0].startswith("scenery, not counted (the level never releases them): Ambi_Chompy_01,"))
+        held = [n for n in v.notes if n.startswith("held, not released in this run: ")]
+        self.assertEqual([n.split(": ", 1)[1].split(" (")[0] for n in held], ["Chompy", "Chompy001", "Chompy002", "Chompy003"])
+        self.assertIn("SwapPartsHint_RemoveTrigger", held[0])
+        self.assertIn("hit only held enemies (Ambi_Chompy_03 scenery)", v.counts)
+        self.assertIn("set apart: 9 scenery, 4 held and not released in this run", v.counts)
+
+    def test_033620_fails_only_on_the_bomber_no_client_had(self) -> None:
+        v = self.grade(TUTORIAL_B)
+        self.assertEqual([x.what for x in v.findings],
+                         ["existed on no client: sb7fe49cd.52540001#3/0@2 (BomberSpawner_02_Spawned3#3951)"])
+
+
+PROBE = CALIBRATION_RUNS / "20261119-042921-islands-probe-ww1"
+
+
+class Pieces(unittest.TestCase):
+    S = [(10, "Online: world tracked spawner_fires EZ3_IslandSpawner0#2460 (Scripts.SpawnerComponent; its first island)"),
+         (50, "Online: world island spawner EZ3_IslandSpawner0#2460 fired 1 (tick 5142): EZ3_IslandSpawner0_SpawnedInstance1#3576"),
+         (57, "Online: world island spawner EZ3_IslandSpawner0#2460 fired 2 (tick 5352): EZ3_IslandSpawner0_SpawnedInstance2#3580"),
+         (51, "Online: world island EZ3_IslandSpawner0#2460 #1 at -5071.8,-3012.2,-38.7"),
+         (58, "Online: world island EZ3_IslandSpawner0#2460 #2 at -5071.8,-3012.2,-38.7"),
+         (70, "Online: world island EZ3_IslandSpawner0#2460 #1 gone (lived 20000 ms)")]
+
+    def test_made_placed_and_gone_with_s(self) -> None:
+        h = [(11, "Online: world tracked spawner_fires EZ3_IslandSpawner0#2460 (Scripts.SpawnerComponent; its first island)"),
+             (50.1, "Online: world island spawner EZ3_IslandSpawner0#2460 made 1 here (S's 0, 0 ticks after S): x#1"),
+             (57.2, "Online: world island spawner EZ3_IslandSpawner0#2460 made 2 here (S's 2, 5 ticks after S): x#2"),
+             (51.1, "Online: world island EZ3_IslandSpawner0#2460 #1 at -5071.0,-3012.0,-38.0"),
+             (58.1, "Online: world island EZ3_IslandSpawner0#2460 #2 at -5071.0,-3012.0,-38.0"),
+             (70.3, "Online: world island EZ3_IslandSpawner0#2460 #1 gone (lived 20000 ms)")]
+        v = lc.grade_pieces(RunFolder(self.S, H_JOIN + h + LEVEL_END).run())
+        self.assertEqual(v.status, lc.PASS, v.findings)
+        self.assertIn("H: tracked 1 spawner(s); made 2 of 2 within 1 s; places 2 pair(s), 0 over 64", v.counts)
+        self.assertIn("gone 1 of S's 1", v.counts)
+
+    def test_late_far_missing_and_not_gone(self) -> None:
+        h = [(11, "Online: world tracked spawner_fires EZ3_IslandSpawner0#2460 (Scripts.SpawnerComponent; its first island)"),
+             (52, "Online: world island spawner EZ3_IslandSpawner0#2460 made 1 here (S's 1, 120 ticks after S): x#1"),
+             (51.1, "Online: world island EZ3_IslandSpawner0#2460 #1 at -4900.0,-3012.0,-38.0")]
+        v = lc.grade_pieces(RunFolder(self.S, H_JOIN + h + LEVEL_END).run())
+        whats = [x.what for x in v.findings]
+        self.assertEqual(whats, ["H: 1 of S's island fires never made here", "H: 1 island(s) made more than 1 s from S's fire",
+                                 "H: 1 island place(s) more than 64 from S's", "H: 1 island end(s) of S not followed here "
+                                 "within 1 s"])
+
+    def test_off_is_not_tested_each_game_its_own(self) -> None:
+        import levelpass_holds as lh  # noqa: F401
+        data = lc.LevelData("ww1", {}, [], {}, ["EZ3_IslandSpawner0"])
+        v = lc.grade_pieces(RunFolder([], H_JOIN + LEVEL_END).run(), data)
+        self.assertEqual(v.status, lc.NOT_TESTED)
+        self.assertTrue(v.counts.startswith("not tested: each game runs its own islands"))
+
+    @unittest.skipUnless(PROBE.is_dir(), "the islands probe's run folder is not on this machine")
+    def test_the_probe_run(self) -> None:
+        v = lc.grade_pieces(lc.load_run(PROBE))
+        self.assertEqual(v.status, lc.PASS, v.findings)
+        self.assertTrue(v.counts.startswith("S fired 18 island(s) of 5 spawner(s); H: tracked 5 spawner(s); made 18 of 18 "
+                                            "within 1 s; places 210 pair(s), 0 over 64 (median 1.6"), v.counts)
+
+
+
+B10_TB = CALIBRATION_RUNS / "20261119-050629-levelpass-tutorial_b"
+
+
+@unittest.skipUnless(B10_TB.is_dir() and (GAME_REPO / "tools" / "scene_sync_check.py").is_file(),
+                     "batch 10's run folder or the game repository's scene checker is not here")
+class ScenesWhereCalibration(unittest.TestCase):
+    def test_the_missing_scenes_say_d_was_not_there(self) -> None:
+        v = lc.grade_scenes(lc.load_run(B10_TB), GAME_REPO)
+        self.assertIn("missing on one client: 0 with both players there (game), 3 with the other player farther than "
+                      "1500 (test)", v.counts)
+        self.assertTrue(all(x.what.startswith("D was not there (test): 4287") for x in v.findings), v.findings)
+        self.assertTrue(v.findings[0].lines[-1].startswith("H/data/Online/session/game.log:"))
 
 FIGHT = "-535,-2875,303"
 PLACED = [(30, f"Online: enemy placed {K1} as GreebleMelee#3531 hp 96 pose 26 (S)")]

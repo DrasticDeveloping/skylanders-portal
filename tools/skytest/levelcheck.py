@@ -20,6 +20,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -376,15 +377,39 @@ def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
                        "(S)` line")
     peers = peer_numbers(run)
     order = sorted(run.clients, key=lambda w: (w != "H", w))  # H first, as the page names the players
+    # The level's holds (levelpass_holds, the generator's data): scenery and holds not released here are set
+    # apart, listed, never graded.
+    scenery: list[str] = []
+    unreleased: list[str] = []
+    for key, k in list(keys.items()):
+        hold = hold_of(data, key, k.name) if k.kind == "placed" else None
+        if hold is None:
+            continue
+        if hold.ambient:
+            scenery.append(k.name.split("#")[0])
+            del keys[key]
+        elif released_here(run, hold, bool(k.dead and k.by.isdigit())) is None:
+            unreleased.append(f"{k.name.split('#')[0]} ({hold.how}; " + "; or ".join(r.words() for r in hold.releases)
+                              + ")")
+            del keys[key]
+    held_notes = ([f"scenery, not counted (the level never releases them): {', '.join(sorted(set(scenery)))}"]
+                  if scenery else []) + [f"held, not released in this run: {u}" for u in unreleased]
+    if not keys:
+        return Verdict("enemies", NOT_TESTED, "every enemy S had is scenery or held and not released in this run",
+                       notes=held_notes)
     kinds = {kd: sum(1 for k in keys.values() if k.kind == kd) for kd in ("placed", "encounter", "run-time")}
     dead = [k for k in keys.values() if k.dead]
     by_player = {who: sum(1 for k in dead if k.by.isdigit() and peers.get(int(k.by)) == who)
                  for who in order}
     no_attacker = [k for k in dead if k.attacker == "-"]
     unrecorded = [k for k in dead if k.attacker is None and not k.by.isdigit()]
+    # Killed by an entity that is no player (`dead by none (S, placed; attacker (null)#3457)`: ww1 20261119-051557,
+    # the seventh death the counts missed): named, so the totals add up.
+    by_other = [k for k in dead if k.attacker not in (None, "-") and not k.by.isdigit()]
     counts = [f"S {len(keys)} ({', '.join(f'{n} {kd}' for kd, n in kinds.items())}), {len(dead)} died on S (by a "
-              f"player: {', '.join(f'{w} {n}' for w, n in by_player.items()) or '-'}; no attacker {len(no_attacker)}; "
-              f"attacker not recorded {len(unrecorded)})"]
+              f"player: {', '.join(f'{w} {n}' for w, n in by_player.items()) or '-'}; by another entity "
+              f"{len(by_other)}{' (' + ', '.join(sorted({k.attacker for k in by_other})[:4]) + ')' if by_other else ''}; "
+              f"no attacker {len(no_attacker)}; attacker not recorded {len(unrecorded)})"]
     findings: list[Finding] = []
     expected: dict[str, list[str]] = {}       # key -> the clients that should have had it
     there: dict[str, dict[str, ClientEnemy | None]] = {}
@@ -475,8 +500,10 @@ def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
     first = next(iter(keys.values())).placed.cite()
     fights, fight_findings = fight_findings_of(run, by_player, len(unrecorded), data)
     counts.append(fights)
+    if scenery or unreleased:
+        counts.append(f"set apart: {len(scenery)} scenery, {len(unreleased)} held and not released in this run")
     findings = fight_findings + findings  # the fights first: the most telling
-    return Verdict("enemies", FAIL if findings else PASS, "; ".join(counts), first, findings)
+    return Verdict("enemies", FAIL if findings else PASS, "; ".join(counts), first, findings, held_notes)
 
 
 # The fights a run's steps made (H's route helpers, route_actions.cpp fight_area: `start`, one `try <k>: x at
@@ -523,9 +550,12 @@ def fight_findings_of(run: Run, by_player: dict[str, int] | None = None,
     tally = ", ".join(f"{w} {n}" for w, n in by_player.items())
     refused = run.server.find(DAMAGE_REFUSED) if run.server is not None else []
     findings: list[Finding] = []
+    on_held = [fg for fg in fights if fg["tries"] and not fg["hit"] and held_victims(run, fg, data)]
     for fg in fights:
         if fg["end"] is None or fg["end"][1] != "failed" or fg["hit"] or not fg["tries"]:
             continue  # a fight that failed before any burst is the tool's (a hold, out of reach): counted below
+        if fg in on_held:
+            continue  # every victim held: the level's script, not the game (counted below)
         lines = [fg["end"][0].cite()] + ([fg["tries"][0].cite()] if fg["tries"] else [])
         lines.append(refused[0][0].cite() + f" (and {len(refused) - 1} more)" if refused else
                      "S logged no damage check line (its damage trace is off in this run): the hits are not "
@@ -535,7 +565,7 @@ def fight_findings_of(run: Run, by_player: dict[str, int] | None = None,
         lines += held_lines(run, fg, data)
         findings.append(Finding(f"a fight step failed with no damage done: {len(fg['tries'])} burst(s) at "
                                 f"{fg['area']}, no hit took a hit point", lines))
-    with_bursts = [fg for fg in fights if fg["tries"]]
+    with_bursts = [fg for fg in fights if fg["tries"] and fg not in on_held]
     others = {w: n for w, n in by_player.items() if w != "H" and n}
     if with_bursts and not any(fg["hit"] for fg in with_bursts) and not by_player.get("H") and others:
         # One player's hits take nothing while the other's kill (the player S credits: `dead by <peer>`).
@@ -554,8 +584,34 @@ def fight_findings_of(run: Run, by_player: dict[str, int] | None = None,
     text = (f"fights: {len(fights)} step(s), {len(with_bursts)} with bursts, "
             f"{sum(1 for fg in fights if fg['hit'])} took hit points"
             + (f", {len(no_burst)} failed before any burst ({no_burst[0]['end'][2][:60]})" if no_burst else "")
-            + f"; {len(kills)} enemy death(s) by a player on S")
+            + f"; {len(kills)} enemy death(s) by a player on S"
+            + "".join(f"; the fight at {fg['area']} hit only held enemies ({held_victims(run, fg, data)}): the level's "
+                      "script, not a finding" for fg in on_held))
     return text, findings
+
+
+def held_victims(run: Run, fg: dict, data: LevelData | None) -> str:
+    """When every victim of the fight's bursts is scenery or held and not released in this run: their names and
+    holds in words; else "" (the fight is graded)."""
+    if data is None or not fg["tries"]:
+        return ""
+    try:
+        at = tuple(float(v) for v in fg["area"].split(","))
+    except ValueError:
+        return ""
+    out = []
+    for name in dict.fromkeys(m.group(1) for line in fg["tries"] for m in [VICTIM.search(line.text)] if m):
+        cands = [x for x in data.holds.values() if x.name == name and x.pos is not None]
+        if not cands:
+            return ""
+        hold = min(cands, key=lambda x: math.dist(x.pos, at))
+        if hold.ambient:
+            out.append(f"{name} scenery")
+        elif released_here(run, hold, False) is None:
+            out.append(f"{name} held, not released in this run")
+        else:
+            return ""
+    return ", ".join(out)
 
 
 VICTIM = re.compile(r" try \d+: x at ([^#\s]+)#")
@@ -724,6 +780,187 @@ def grade_coins(run: Run) -> Verdict:
         return Verdict("coins", FAIL if findings else NOT_TESTED, counts + " (no coin was taken in this run)",
                        sw[0][0].cite(), findings)
     return Verdict("coins", FAIL if findings else PASS, counts, taken[0][1].cite(), findings)
+
+
+# --- together: D near H where H acted (the second player follows the first) ------------------------------
+#
+# With the follow on (D's `Online: auto follow the host (peer 1) (script)`: `online_auto_follow on` after the
+# party is in), the game moves D's hero next to H's whenever it is farther than FOLLOW_NEAR. Per stop where H
+# acted (H's first `LEVELPASS act v<n>_<k>` line), S's puppet poses (`puppet <n> pose <seq> at <x,y,z>`, every
+# 2 s; the puppet of each peer from `puppet <n> for peer <p> spawned ... (generation <g>)`: the slots swap at a
+# level change) say whether D stood within FOLLOW_NEAR of H within FOLLOW_WINDOW after it, so the enemies and
+# the loot rows are read where both players stand. Without the follow: not tested (D stayed where it entered).
+FOLLOW_NEAR = 400.0           # the follow moves the hero when it is farther than this (client/auto_follow.h)
+FOLLOW_WINDOW = timedelta(seconds=5)   # a move a second at most, poses every 2 s
+POSE_PAIR = timedelta(seconds=1.5)     # two puppets' poses this close in time are compared
+FOLLOW_ON = re.compile(r"Online: auto follow the host \(peer (\d+)\) \(script\)")
+PUPPET_FOR = re.compile(r"Online: puppet (\d+) for peer (\d+) spawned at .*\(generation (\d+)\)")
+PUPPET_POSE = re.compile(r"Online: puppet (\d+) pose \d+ at (-?[\d.]+),(-?[\d.]+),(-?[\d.]+) ")
+H_ACT = re.compile(r"Input script: LEVELPASS act (v\d+)_\d+ ")
+
+
+def peer_poses(server: Log) -> dict[int, list[tuple[datetime, tuple[float, float, float], Line]]]:
+    """Each peer's poses on S, by the puppet each pose names and that puppet's peer at the time."""
+    owner: dict[int, int] = {}
+    out: dict[int, list] = {}
+    for i, raw in enumerate(server.lines):
+        m = PUPPET_FOR.search(raw)
+        if m:
+            owner[int(m.group(1))] = int(m.group(2))
+            continue
+        m = PUPPET_POSE.search(raw)
+        if m and int(m.group(1)) in owner:
+            line = server.line(i)
+            if line.t is not None:
+                out.setdefault(owner[int(m.group(1))], []).append(
+                    (line.t, (float(m.group(2)), float(m.group(3)), float(m.group(4))), line))
+    return out
+
+
+def grade_together(run: Run) -> Verdict:
+    """Per stop where H acted: was D within FOLLOW_NEAR of H (S's poses) in the seconds after?"""
+    d, h = run.clients.get("D"), run.clients.get("H")
+    if d is None or h is None:
+        return Verdict("together", NOT_TESTED, "one client in this run (no second player to follow)")
+    on = d.find(FOLLOW_ON)
+    if not on:
+        return Verdict("together", NOT_TESTED, "D did not follow H (no `auto follow the host ... (script)` on D: "
+                       "--d-stays, or a build without online_auto_follow): D stayed where it entered")
+    if run.server is None:
+        return Verdict("together", NOT_TESTED, "no server log: no poses", on[0][0].cite())
+    peers = {w: p for p, w in peer_numbers(run).items()}
+    poses = peer_poses(run.server)
+    hp, dp = poses.get(peers.get("H", -1), []), poses.get(peers.get("D", -1), [])
+    stops: dict[str, Line] = {}
+    for line, m in h.find(H_ACT):
+        if line.t is not None and (on[0][0].t is None or line.t >= on[0][0].t):
+            stops.setdefault(m.group(1), line)
+    if not stops:
+        return Verdict("together", NOT_TESTED, "H acted at no stop after D's follow began", on[0][0].cite())
+    near, apart, unknown = [], [], []
+    findings: list[Finding] = []
+    for label, act in stops.items():
+        win_h = [p for p in hp if act.t <= p[0] <= act.t + FOLLOW_WINDOW]
+        win_d = [p for p in dp if act.t <= p[0] <= act.t + FOLLOW_WINDOW]
+        pairs = [(math.dist(a[1][:2], b[1][:2]), a, b) for a in win_h for b in win_d if abs(a[0] - b[0]) <= POSE_PAIR]
+        if not pairs:
+            unknown.append(label)
+            continue
+        dist, a, b = min(pairs, key=lambda x: x[0])
+        if dist <= FOLLOW_NEAR:
+            near.append(f"{label} ({dist:.0f})")
+        else:
+            apart.append(f"{label} ({dist:.0f})")
+            findings.append(Finding(f"{label}: D was {dist:.0f} from H while H acted (the follow keeps it within "
+                                    f"{FOLLOW_NEAR:.0f})", [act.cite(), a[2].cite(), b[2].cite()]))
+    counts = (f"D near H (within {FOLLOW_NEAR:.0f} on S's poses) at {len(near)} of {len(stops)} stop(s) where H acted"
+              + (f"; apart at {len(apart)}" if apart else "") + (f"; no poses at {len(unknown)}" if unknown else ""))
+    notes = [f"near: {', '.join(near)}"] if near else []
+    notes += [f"no pose pair within {POSE_PAIR.seconds + 0.5:.1f} s: {', '.join(unknown)}"] if unknown else []
+    status = FAIL if findings else (PASS if near else NOT_TESTED)
+    return Verdict("together", status, counts, on[0][0].cite(), findings, notes)
+
+
+# --- level pieces: run-time movers (ww1's travelling islands; docs/online-6.md "Spawned movers") ---------------
+#
+# With online_island_spawns on, S tracks each island spawner (`world tracked spawner_fires <Name#id> (...)`) and
+# fires its islands (`world island spawner <Name#id> fired <n> (tick <t>): <island>`); each client with the area
+# loaded (its own `world tracked spawner_fires` of that spawner) makes S's n-th island (`made <n> here (S's <m>,
+# <a> ticks after S)`) or adopts it (`adopted <k> of S's <m>`). Each island's place once a second
+# (`world island <spawner> #<n> at <x,y,z>`) and its end (`... #<n> gone (lived <ms> ms)`) on S and the client.
+# Graded (the movers agent's rule, logs/pieces-notes.txt; calibrated on islands-probe-ww1 20261119-042921: S fired
+# 18, H made the same 18, places 1.6 apart typically): every fire has its island on each such client within
+# PIECE_MADE_S, matched places (within PIECE_PAIR_S of each other) within PIECE_NEAR, each S `gone` followed on the
+# client within PIECE_MADE_S, none of the client's warnings. Off (S tracked no island spawner on a level whose
+# data has them): not tested, each game runs its own islands.
+PIECE_MADE_S = timedelta(seconds=1)
+PIECE_PAIR_S = timedelta(seconds=0.5)
+PIECE_NEAR = 64.0
+PIECE_TRACKED = re.compile(r"Online: world tracked spawner_fires ([^#\s]+)#")
+PIECE_FIRED = re.compile(r"Online: world island spawner ([^#\s]+)#\S* fired (\d+) \(tick")
+PIECE_MADE = re.compile(r"Online: world island spawner ([^#\s]+)#\S* made (\d+) here")
+PIECE_ADOPTED = re.compile(r"Online: world island spawner ([^#\s]+)#\S* adopted (\d+) of S's (\d+)")
+PIECE_AT = re.compile(r"Online: world island ([^#\s]+)#\S* #(\d+) at (-?[\d.]+),(-?[\d.]+),(-?[\d.]+)")
+PIECE_GONE = re.compile(r"Online: world island ([^#\s]+)#\S* #(\d+) gone")
+PIECE_BAD = re.compile(r"Online: world island spawner \S+ (?:fire made no island here|has no spawn message of its own|"
+                       r"spawn for S's \d+ not delivered inside the send).*")
+
+
+def grade_pieces(run: Run, data: "LevelData | None" = None) -> Verdict:
+    """S's island fires against each client's islands: made in time, in the same place, gone together."""
+    if run.server is None:
+        return Verdict("level pieces", NOT_TESTED, "no server log in this run folder")
+    tracked = {m.group(1) for _l, m in run.server.find(PIECE_TRACKED)}
+    if not tracked:
+        movers = data.movers if data is not None else []
+        if movers:
+            return Verdict("level pieces", NOT_TESTED, f"not tested: each game runs its own islands (S tracked no island "
+                           f"spawner, online_island_spawns off; the level's data has {len(movers)}: "
+                           f"{', '.join(movers[:5])})")
+        return Verdict("level pieces", NOT_TESTED, "S tracked no island spawner (the level has no run-time movers, or "
+                       "online_island_spawns is off)")
+    fires = [(line, m.group(1), int(m.group(2))) for line, m in run.server.find(PIECE_FIRED)]
+    if not fires:
+        return Verdict("level pieces", NOT_TESTED, f"S tracked {len(tracked)} island spawner(s) and fired none in this "
+                       "run (their start trigger was not entered)", run.server.find(PIECE_TRACKED)[0][0].cite())
+    s_at = [(line, m) for line, m in run.server.find(PIECE_AT)]
+    s_gone = [(line, m) for line, m in run.server.find(PIECE_GONE)]
+    counts = [f"S fired {len(fires)} island(s) of {len({sp for _l, sp, _n in fires})} spawner(s)"]
+    findings: list[Finding] = []
+    for who in sorted(run.clients, key=lambda w: (w != "H", w)):
+        log = run.clients[who]
+        here = {m.group(1) for _l, m in log.find(PIECE_TRACKED)}
+        made = {(m.group(1), int(m.group(2))): line for line, m in log.find(PIECE_MADE)}
+        adopted = [(m.group(1), int(m.group(3)), line) for line, m in log.find(PIECE_ADOPTED)]
+        mine = [(line, sp, n) for line, sp, n in fires if sp in here]
+        late, missing, ok = [], [], 0
+        for line, sp, n in mine:
+            got = made.get((sp, n))
+            if got is None:
+                cover = next((a for a in adopted if a[0] == sp and a[1] >= n), None)
+                if cover is None:
+                    missing.append(f"{line.cite()}; {absent(log, f'`{sp} made {n} here` or an adoption')}")
+                else:
+                    ok += 1
+            elif got.t and line.t and abs(got.t - line.t) > PIECE_MADE_S:
+                late.append(f"{line.cite()}; {got.cite()} ({abs((got.t - line.t).total_seconds()):.2f} s)")
+            else:
+                ok += 1
+        c_at = log.find(PIECE_AT)
+        dists, far = [], []
+        for sl, sm in s_at:
+            pair = [(cl, cm) for cl, cm in c_at if cm.group(1) == sm.group(1) and cm.group(2) == sm.group(2) and
+                    cl.t and sl.t and abs(cl.t - sl.t) <= PIECE_PAIR_S]
+            if not pair:
+                continue
+            cl, cm = min(pair, key=lambda p: abs(p[0].t - sl.t))
+            d = math.dist(tuple(float(sm.group(i)) for i in (3, 4, 5)), tuple(float(cm.group(i)) for i in (3, 4, 5)))
+            dists.append(d)
+            if d > PIECE_NEAR:
+                far.append(f"{sl.cite()}; {cl.cite()} ({d:.1f} apart)")
+        c_gone = log.find(PIECE_GONE)
+        gone_missing = []
+        for sl, sm in s_gone:
+            if sm.group(1) not in here:
+                continue
+            if not any(cm.group(1) == sm.group(1) and cm.group(2) == sm.group(2) and cl.t and sl.t and
+                       abs(cl.t - sl.t) <= PIECE_MADE_S for cl, cm in c_gone):
+                gone_missing.append(f"{sl.cite()}; {absent(log, f'`{sm.group(1)} #{sm.group(2)} gone` within 1 s')}")
+        bad = [l.cite() for l, _m in log.find(PIECE_BAD)]
+        med = sorted(dists)[len(dists) // 2] if dists else None
+        counts.append(f"{who}: tracked {len(here)} spawner(s); made {ok} of {len(mine)} within 1 s; places "
+                      f"{len(dists)} pair(s), {len(far)} over {PIECE_NEAR:.0f}"
+                      + (f" (median {med:.1f}, max {max(dists):.1f})" if dists else "")
+                      + f"; gone {len(s_gone) - len(gone_missing)} of S's {len([1 for _l, m in s_gone if m.group(1) in here])}")
+        for what, lines in ((f"{who}: {len(missing)} of S's island fires never made here", missing),
+                            (f"{who}: {len(late)} island(s) made more than 1 s from S's fire", late),
+                            (f"{who}: {len(far)} island place(s) more than {PIECE_NEAR:.0f} from S's", far),
+                            (f"{who}: {len(gone_missing)} island end(s) of S not followed here within 1 s", gone_missing),
+                            (f"{who}: {len(bad)} island warning(s)", bad)):
+            if lines:
+                findings.append(Finding(what, lines[:8]))
+    status = FAIL if findings else PASS
+    return Verdict("level pieces", status, "; ".join(counts), fires[0][0].cite(), findings)
 
 
 # --- loot (chests and enemy drops: the spill) -----------------------------------------------------------
@@ -928,14 +1165,39 @@ def grade_scenes(run: Run, repo: Path | None, start_tol: float = 1.0, end_tol: f
         both.append(r)
     out, ok = tool.judge(both, start_tol, end_tol, None)
     findings = []
+    poses = peer_poses(run.server) if run.server is not None else {}
+    peers = {w: p for p, w in peer_numbers(run).items()}
+    away = there = 0
     for r, text in zip(both, out):
         if text.startswith("FAIL"):
             g, name, n = r.key
-            findings.append(Finding(text[5:], [scene_line(h, name, r.h.start if r.h else None),
-                                               scene_line(d, name, r.d.start if r.d else None)]))
+            lines = [scene_line(h, name, r.h.start if r.h else None), scene_line(d, name, r.d.start if r.d else None)]
+            what = text[5:]
+            if (r.h is None) != (r.d is None):
+                # Missing on one client: how far it stood from the other when the scene started there decides
+                # whose the finding is (the test's placement or the game's sharing).
+                missing = "D" if r.d is None else "H"
+                start = (r.h or r.d).start
+                where = players_apart(poses, peers, start)
+                if where is None:
+                    what += f"; where {missing} stood is not known (no pose of both on S within {POSE_AT_S.seconds} s)"
+                else:
+                    dist_, la, lb = where
+                    if dist_ > SCENE_THERE:
+                        away += 1
+                        what = (f"{missing} was not there (test): {dist_:.0f} from the other player when the scene "
+                                f"started ({name}); {what}")
+                    else:
+                        there += 1
+                        what = (f"{missing} was there and did not get the scene (game): {dist_:.0f} from the other "
+                                f"player when it started ({name}); {what}")
+                    lines += [la.cite(), lb.cite()]
+            findings.append(Finding(what, lines))
     counts = (f"{len(both) - len(findings)} of {len(both)} scene(s) both clients were in played together "
               f"(start within {start_tol} s, end within {end_tol} s); {len(rows) - len(both)} outside the time both "
-              "were in the level")
+              "were in the level"
+              + (f"; missing on one client: {there} with both players there (game), {away} with the other player "
+                 f"farther than {SCENE_THERE:.0f} (test)" if there or away else ""))
     notes = expected_scene_notes(h, rows)
     skipped = [p for p in run.result.get("peers", []) if isinstance(p, dict) and SKIP_SCENES.search(str(p.get("command", "")))]
     example = scene_line(h, both[0].key[1], (both[0].h or both[0].d).start) if both else ""
@@ -945,6 +1207,26 @@ def grade_scenes(run: Run, repo: Path | None, start_tol: float = 1.0, end_tol: f
     if not both:
         return Verdict("cutscenes", NOT_TESTED, counts, notes=notes)
     return Verdict("cutscenes", FAIL if findings else PASS, counts, example, findings, notes)
+
+
+# A scene played on one client only: the other stood within SCENE_THERE of it on S's poses when the scene started
+# (it was there: the game's sharing), or farther (it was not there: the test's placement; batch 10's tutorial_b,
+# D at the level start 35 km from the end arena, failed every scene that only starts where a player stands).
+SCENE_THERE = 1500.0
+POSE_AT_S = timedelta(seconds=3)
+
+
+def players_apart(poses: dict, peers: dict, at) -> tuple[float, Line, Line] | None:
+    """H's and D's distance on S's poses nearest `at` (each within POSE_AT_S), with the two pose lines."""
+    if at is None:
+        return None
+    near = []
+    for who in ("H", "D"):
+        ps = [p for p in poses.get(peers.get(who, -1), []) if abs(p[0] - at) <= POSE_AT_S]
+        if not ps:
+            return None
+        near.append(min(ps, key=lambda p: abs(p[0] - at)))
+    return math.dist(near[0][1], near[1][1]), near[0][2], near[1][2]
 
 
 EXPECTED_SCENES = re.compile(r"Input script: LEVELPASS scenes expected: (.*)$")
@@ -1115,6 +1397,8 @@ class LevelData:
     level: str
     holds: dict
     gates: list
+    authored: dict = field(default_factory=dict)   # authored index -> (name, position): <level>-manifest.txt
+    movers: list = field(default_factory=list)     # the level's re-arming mover spawners' names (levelpass_pieces)
 
 
 def run_level(run: Run) -> str:
@@ -1140,7 +1424,67 @@ def level_data(levelpass: Path | None, level: str) -> LevelData | None:
                  tuple(e["position"]) if isinstance(e.get("position"), list) and len(e["position"]) == 3 else None)
                 for e in manifest.get("entities", []) or [] if isinstance(e, dict) and e.get("group") == "enemy"
                 and str((e.get("details") or {}).get("_isEnabled", "")).startswith("false")]
-    return LevelData(level, lh.holds_of(logic, disabled), lh.required_gates(manifest, logic, level))
+    authored: dict = {}
+    probe = levelpass / f"{level}-manifest.txt"
+    if probe.is_file():
+        import levelpass as lp
+        try:
+            for o in lp.parse_probe_manifest(probe.read_text(encoding="utf-8", errors="replace"), level).objects:
+                zone, _, idx = o.ident.partition("#")
+                if zone.lower() == level.lower() and idx.isdigit() and o.name:
+                    authored[int(idx)] = (o.name, o.pos)
+        except (OSError, ValueError):
+            authored = {}
+    import levelpass_pieces as lpc
+    movers = sorted(k.split(".")[-1] for k, period in lpc.mover_spawners(logic, level).items() if period > 0)
+    return LevelData(level, lh.holds_of(logic, disabled), lh.required_gates(manifest, logic, level), authored, movers)
+
+
+# --- held enemies in a run (levelpass_holds: what the generator reads) -------------------------------------
+#
+# A placed key on S (`a<..>.<zone hash>.<0001xxxx>@<g>`) names its authored index in its low 16 bits (tutorial_b:
+# a00000000.0629f659.00013057@2 is [tutorial_b#12375] Chompy in the probe's manifest); its name and place tie it
+# to the level's node and so to its hold. An ambient hold (nothing in the logic releases it) is scenery: not
+# counted. A hold whose release this run did not fire is listed, not graded. A held enemy whose release fired
+# is graded as any other.
+AUTHORED_KEY = re.compile(r"^a[0-9a-f]+\.[0-9a-f]{8}\.([0-9a-f]+)@\d+$")
+NEAR_NODE = 300.0   # the probe's live place and the static reader's within this: the same object
+
+
+def hold_of(data: LevelData | None, key: str, name: str):
+    """The level's hold of S's enemy `key` (named `name` on S), or None."""
+    if data is None or not data.holds:
+        return None
+    base = name.split("#")[0]
+    m = AUTHORED_KEY.match(key)
+    row = data.authored.get(int(m.group(1), 16) & 0xFFFF) if m else None
+    cands = [h for h in data.holds.values() if h.name == (row[0] if row else base)]
+    if row and cands:
+        near = [h for h in cands if h.pos is not None and math.dist(h.pos, row[1]) <= NEAR_NODE]
+        return min(near, key=lambda h: math.dist(h.pos, row[1])) if near else None
+    return cands[0] if len(cands) == 1 else None
+
+
+def released_here(run: Run, hold, dead_by_player: bool) -> Line | str | None:
+    """Whether this run fired the hold's release: the pass acted on its root (any LEVELPASS line of H naming it),
+    a lock's opening line, or the enemy died by a player (it took damage: released). A cited line, a reason, or
+    None."""
+    if dead_by_player:
+        return "it died by a player on S"
+    h = run.clients.get("H")
+    for r in hold.releases:
+        if not r.path:
+            continue
+        root = r.path[0]
+        if r.act == "lock":
+            line = gate_opened(run, root)
+            if line:
+                return line
+        elif h is not None:
+            hit = h.find(re.compile(r"Input script: LEVELPASS .*\b" + re.escape(root) + r"\b"))
+            if hit:
+                return hit[0][0]
+    return None
 
 
 def gate_opened(run: Run, name: str) -> Line | None:
@@ -1155,20 +1499,121 @@ def gate_opened(run: Run, name: str) -> Line | None:
     return None
 
 
+# The pass's required phase (levelpass.plan_required): H's `LEVELPASS required r<k> <kind> <gate> (...)` before
+# the step, or `... not performed: <why>`. Each gate's opening is read on each game apart: a client's `world gate
+# <Name#id> open apply` (S's open applied there) or `backend key gate <Name#id> ... unlocked`, S's `world gate
+# <Name#id> tombstoned` or `availability <Name#id> removed`, and on H the step's own `wait_moved <Name#id> done`.
+# Gates of the same name (tutorial_b's two TutorialLockedGate) are told apart by their order along the level and
+# the distinct ids each game opened.
+REQ_LINE = re.compile(r"Input script: LEVELPASS required (r\d+) (\S+) (\S+)(?: not performed: (.*))?")
+GATES_SKIPPED = re.compile(r"Input script: LEVELPASS gates not attempted \(--no-gates\)")
+
+
+def gate_open_ids(log: Log, name: str, mover: bool = False) -> list[Line]:
+    """One line per distinct `<name>#<id>` this game shows opened, in order."""
+    n = re.escape(name)
+    rx = re.compile(r"(?:Online: (?:world gate (" + n + r"#\d+) (?:open apply|tombstoned)|availability (" + n +
+                    r"#\d+) removed|backend key gate (" + n + r"#\d+)\S* unlocked)" +
+                    (r"|Dev: wait_moved (" + n + r"#\d+) done \()" if mover else ")"))
+    seen: dict[str, Line] = {}
+    for line, m in log.find(rx):
+        ident = next(g for g in m.groups() if g)
+        seen.setdefault(ident, line)
+    return list(seen.values())
+
+
+def gate_opened(run: Run, name: str) -> Line | None:
+    """A line of any game that shows the gate opened (the first)."""
+    for log in ([run.server] if run.server else []) + list(run.clients.values()):
+        ids = gate_open_ids(log, name, mover=log.who == "H")
+        if ids:
+            return ids[0]
+    return None
+
+
+def key_gate_trail(run: Run, name: str, k: int) -> list[str]:
+    """Where a carried key's way broke, in order: picked up on H, its row on S, pressed at the lock."""
+    h = run.clients.get("H")
+    out = []
+    picked = h.find(re.compile(r"Dev: pickup " + re.escape(name) + r"_key#\S+ (done|failed)")) if h else []
+    if len(picked) <= k or picked[k][1].group(1) != "done":
+        out.append("not picked up on H: " + (picked[k][0].cite() if len(picked) > k else
+                                              absent(h, f"`pickup {name}_key ... done`") if h else "no H log"))
+        return out
+    out.append(f"picked up on H: {picked[k][0].cite()}")
+    if run.server is not None:
+        row = run.server.find(re.compile(r"Online: world (?:unsupported carried_item|tracked carried_item) "
+                                         + re.escape(name) + r"_key#\S+ .*"))
+        if row and "unsupported" in row[0][0].text:
+            out.append(f"no carried key row on S: {row[0][0].cite()}")
+    pressed = h.find(re.compile(r"Dev: interact " + re.escape(name) + r"_keylock#\S+ (done|failed)"))
+    if len(pressed) <= k or pressed[k][1].group(1) != "done":
+        out.append("not pressed at the lock on H: " + (pressed[k][0].cite() if len(pressed) > k else
+                                                         absent(h, f"`interact {name}_keylock ... done`")))
+    else:
+        out.append(f"pressed at the lock on H: {pressed[k][0].cite()}")
+    return out
+
+
+def battle_gate_left(run: Run, data: "LevelData", gate) -> str:
+    """For a battle gate S did not open: its fight's enemies still alive on S (by name: the openers and the
+    encounters' actors) and whether H had them bound."""
+    if run.server is None:
+        return "no S log"
+    names = [k.split(".")[-1] for k in gate.openers]
+    keys = server_enemies(run.server)
+    seen = client_enemies(run.clients["H"]) if "H" in run.clients else {}
+    alive = []
+    for key, k in keys.items():
+        base = k.name.split("#")[0]
+        if any(base == n or base.startswith(n + "_actor_") for n in names) and k.dead is None:
+            c = seen.get(key)
+            alive.append(f"{k.name} ({'bound on H' if c is not None and c.bound else 'not bound on H'})")
+    return ("still alive on S: " + ", ".join(alive[:8])) if alive else \
+        f"none of its fight's enemies ({', '.join(names[:4])}) alive on S: it never started, or its count is elsewhere"
+
+
 def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[str]]:
-    """The gates a player must open on the level's way (levelpass_holds.required_gates): the ones no line shows
-    opened, and the ones a line does, each in words."""
+    """Each required gate (levelpass_holds.required_gates), in the pass's order: the ones not done (not performed,
+    or not opened on S, H and D, with where it broke) and the ones done, in words; the first of the first list is
+    the step the completable row names."""
     if data is None:
         return [], []
+    h = run.clients.get("H")
+    reqs = h.find(REQ_LINE) if h is not None else []
+    games = [("S", run.server)] + sorted(run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    games = [(w, lg) for w, lg in games if lg is not None]
+    opened = {}
     shut, done = [], []
-    for g in data.gates:
-        if not g.required:
+    nth: dict[str, int] = {}
+    for g in [g for g in data.gates if g.required]:
+        k = nth.get(g.name, 0)
+        nth[g.name] = k + 1
+        mine = [(line, m) for line, m in reqs if m.group(3) == g.name]
+        req = mine[k] if len(mine) > k else None
+        if req is None:
+            shut.append(f"{g.name} ({g.kind}: {g.opener}): not performed by this pass (no `LEVELPASS required ... "
+                        f"{g.name}` on H)")
             continue
-        line = gate_opened(run, g.name)
-        if line is None:
-            shut.append(f"{g.name} ({g.kind}: {g.opener}; no line of S, H or D shows it opened)")
+        if req[1].group(4):
+            shut.append(f"{g.name} ({g.kind}): not performed: {req[1].group(4)} ({req[0].cite()})")
+            continue
+        where = {}
+        for who, lg in games:
+            ids = opened.setdefault((who, g.name), gate_open_ids(lg, g.name, mover=who == "H"))
+            where[who] = ids[k] if len(ids) > k else None
+        missing = [w for w, line in where.items() if line is None]
+        trail = key_gate_trail(run, g.name, k) if g.kind == "key gate" else []
+        if g.kind == "battle gate" and where.get("S") is None:
+            trail.append(battle_gate_left(run, data, g))
+        if missing:
+            opened_on = [w for w in where if where[w] is not None]
+            shut.append(f"{g.name} ({g.kind}): performed ({req[0].cite()}); opened on "
+                        f"{', '.join(opened_on) or 'no game'}, not on {', '.join(missing)}"
+                        + ("; " + "; ".join(trail) if trail else ""))
         else:
-            done.append(f"{g.name} ({g.kind}): {line.cite()}")
+            done.append(f"{g.name} ({g.kind}): opened on {', '.join(where)}: "
+                        + "; ".join(f"{w} {line.cite()}" for w, line in where.items()))
     return shut, done
 
 
@@ -1193,7 +1638,7 @@ def grade_completable(run: Run, data: LevelData | None = None) -> Verdict:
     shut, done = required_steps(run, data)
     if data is None:
         counts += "; required steps on the way not checked (no level data for this run)"
-    notes += [f"required, not performed: {s}" for s in shut] + [f"required, performed: {s}" for s in done]
+    notes += [f"required, not done: {s}" for s in shut] + [f"required, done: {s}" for s in done]
     if verdict == "FAIL":
         return Verdict("completable", FAIL, counts, example, notes=notes)
     if verdict == "INCOMPLETE":
@@ -1201,10 +1646,19 @@ def grade_completable(run: Run, data: LevelData | None = None) -> Verdict:
     if "D" not in run.clients:
         return Verdict("completable", NOT_TESTED, counts + " (one client in this run: two players not shown)", example,
                        notes=notes)
+    gates_skipped = bool(run.clients.get("H") and run.clients["H"].find(GATES_SKIPPED))
     if verdict == "PASS" and all(reached.values()):
+        if shut and gates_skipped:
+            return Verdict("completable", BY_TELEPORT, f"completable by teleport; gates not attempted (--no-gates); "
+                           f"required steps not performed: {len(shut)}; {counts}", example, notes=notes)
         if shut:
-            return Verdict("completable", BY_TELEPORT, f"completable by teleport; required steps not performed: "
-                           f"{len(shut)}; {counts}", example, notes=notes)
+            return Verdict("completable", BY_TELEPORT, f"completable by teleport; first step not done: {shut[0]}; "
+                           f"required steps not done: {len(shut)} of {len(shut) + len(done)}; {counts}", example,
+                           notes=notes)
+        if data is not None and done:
+            return Verdict("completable", PASS, f"completable by play: {len(done)} required step(s) performed, every "
+                           f"gate opened on {', '.join(['S'] + sorted(run.clients, key=lambda w: (w != 'H', w)))}; "
+                           f"{counts}", example, notes=notes)
         return Verdict("completable", PASS, counts, example, notes=notes)
     missing = [w for w, line in reached.items() if line is None]
     return Verdict("completable", FAIL, counts, example, [Finding(f"{', '.join(missing)} logged no next-level mark", [
@@ -1220,8 +1674,18 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     gates (completable) and its held enemies (a fight that lands nothing)."""
     run = load_run(folder)
     data = level_data(levelpass, run_level(run))
-    return [grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), grade_scenes(run, repo),
-            grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run)]
+    together = grade_together(run)
+    rows = [grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
+            grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run),
+            grade_pieces(run, data)]
+    # The enemies and the loot are read where both players stand only when D followed H: each says which.
+    where = (f"read with D following H: {together.counts}" if together.status in (PASS, FAIL) else
+             "read with D where it entered the level (no follow in this run): D's enemies and loot far from H are "
+             "asleep there")
+    for v in rows:
+        if v.name in ("enemies", "loot"):
+            v.notes.append(where)
+    return rows
 
 
 def run_head(folder: Path) -> list[str]:

@@ -172,6 +172,18 @@ class Gate:
     required: bool
     opener: str                 # what opens it, in words
     pos: tuple[float, float, float] | None = None
+    openers: list[str] = field(default_factory=list)   # the node keys whose telegrams open it (not itself)
+    key_data: str = ""                                 # a key gate's KeyData
+
+
+FIGHT_GROUPS = ("enemy", "encounter")
+
+
+def fighters_into(gate_key: str, nodes: dict[str, le.Node], tels: list[le.Telegram]) -> list[str]:
+    """The enemies and encounter managers whose telegrams reach the gate itself (its own node, not a namesake):
+    the fight that opens it."""
+    return sorted({t.sender for t in tels if t.receiver == gate_key and t.sender != gate_key and t.sender in nodes
+                   and nodes[t.sender].group in FIGHT_GROUPS})
 
 
 def required_gates(manifest: dict, logic: dict | None, level: str) -> list[Gate]:
@@ -204,13 +216,15 @@ def required_gates(manifest: dict, logic: dict | None, level: str) -> list[Gate]
             out.append(Gate(name, unit, "an arena gate that starts open (a fight closes it)", False, "", pos))
         elif "KeyLockData" in lock:
             k = KEY_DATA.search(lock)
-            out.append(Gate(name, unit, KEY_GATE, True, f"fetch its key {k.group(1) if k else '?'}", pos))
+            out.append(Gate(name, unit, KEY_GATE, True, f"fetch its key {k.group(1) if k else '?'}", pos,
+                            key_data=k.group(1) if k else ""))
         elif SPARK.search(lock):
             out.append(Gate(name, unit, SPARK_LOCK, True, "solve its lock puzzle", pos))
         elif "DemonGateSeal" in lock:
             senders = sorted({nodes[t.sender].name for t in by_name.get(name, []) if t.sender in nodes} - {name})
             out.append(Gate(name, unit, BATTLE_GATE, True, "win its fight" + (f" ({', '.join(senders[:4])})" if senders
-                                                                                else ""), pos))
+                                                                                else ""), pos,
+                            openers=fighters_into(f"{unit}.{name}", nodes, tels)))
         else:
             senders = sorted({nodes[t.sender].name for t in by_name.get(name, []) if t.sender in nodes} - {name})
             out.append(Gate(name, unit, PUZZLE_GATE, True, "its opener" + (f" ({', '.join(senders[:4])})" if senders

@@ -9454,6 +9454,30 @@ def add_live_parser(sub) -> None:
 LEVELPASS_DEFAULT = "~/Documents/T3Code/SwapForceOnline-work/levelpass"
 
 
+def lock_commands_known(cfg: Config) -> bool:
+    """The game registers the Spark Lock's test commands (lock_solve, lock_move) and its condition lock_ready
+    (the checkout's tests/script_commands.toml, which the launch builder checks every script against)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        table = la.CommandTable.load(path)
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+    return {"lock_solve", "lock_move"} <= set(table.registered) and table.conditions is not None and \
+        "lock_ready" in table.conditions
+
+
+def auto_follow_known(cfg: Config) -> bool:
+    """The game registers `online_auto_follow` (the checkout's tests/script_commands.toml: the launch builder
+    refuses a script with a command the table does not have)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        return "online_auto_follow" in la.CommandTable.load(path).registered
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+
+
 def levelpass_folder(cfg: Config, given: str | None) -> Path:
     if given:
         folder = expand(given)
@@ -9479,8 +9503,12 @@ def measured_scene_lengths(cfg: Config, level: str, runs: int = 5) -> dict[str, 
         log = d / "H" / "game.log"
         if not log.is_file():
             continue
-        for name, s in lp.scene_lengths_from_log(log.read_text(encoding="utf-8", errors="replace")).items():
+        text = log.read_text(encoding="utf-8", errors="replace")
+        for name, s in lp.scene_lengths_from_log(text).items():
             out[name] = max(out.get(name, 0.0), s)
+        held = lp.sweep_scene_seconds_from_log(text)  # what the scenes took inside that run's sweep
+        if held is not None:
+            out[lp.SWEEP_SCENES_KEY] = max(out.get(lp.SWEEP_SCENES_KEY, 0.0), held)
         seen += 1
         if seen >= runs:
             break
@@ -9503,9 +9531,22 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                         d_lobby=not getattr(a, "d_joins_late", False), new_slot=getattr(a, "new_slot", False),
                         scenes=getattr(a, "scenes", "skip") == "play",
                         scene_lengths=measured_scene_lengths(cfg, a.level) if getattr(a, "scenes", "skip") == "play"
-                        else None)
+                        else None, lock_commands=lock_commands_known(cfg), no_gates=getattr(a, "no_gates", False))
     plan.probe = not a.no_probe
     plan.server_hidden = bool(getattr(a, "server_hidden", False))
+    plan.long_pause_s = int(getattr(a, "long_pause", 0) or 0)
+    plan.long_pause_at = getattr(a, "long_pause_at", "") or ""
+    if plan.long_pause_s and lp.long_pause_label(plan) is None:
+        raise SystemExit(f"levelpass: --long-pause: the plan has no pickup of "
+                         f"{plan.long_pause_at or 'a collectible'} to leave its screen up at")
+    # D follows H by default once the game registers online_auto_follow (the checkout's command table, which
+    # the launch builder checks every script against: before that build nothing changes); --d-stays keeps D
+    # where it entered.
+    follow_known = auto_follow_known(cfg)
+    plan.d_follow = plan.d_lobby and not getattr(a, "d_stays", False) and follow_known
+    notices = []
+    if plan.d_lobby and not getattr(a, "d_stays", False) and not follow_known:
+        notices.append("D stays where it entered: this game does not register online_auto_follow yet")
     try:
         plan.game_args = [lp.check_game_arg(g) for g in (a.game_arg or [])]
     except ValueError as e:
@@ -9542,11 +9583,16 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     if literals:  # the owner's rule: a level pass names objects; the game reads where they are
         raise SystemExit(f"levelpass: the generated scripts carry positions: {literals[:3]}")
     spec_path.write_text(text, encoding="utf-8")
-    print(f"levelpass {a.level}: content {plan.source}; {len(plan.stops)} stops, "
-          f"{sum(len(st.actions) for st in plan.stops)} actions, estimate {plan.estimate_s:.0f} s; case {spec_path}",
-          flush=True)
+    # The plan's first line: its estimate and which budget it is in (the gates phase, or --no-gates).
+    print(f"levelpass {a.level}: estimate {plan.estimate_s:.0f} s ({lp.budget_words(plan)}); content {plan.source}; "
+          f"{len(plan.stops)} stops, {sum(len(st.actions) for st in plan.stops)} actions; case {spec_path}", flush=True)
+    for n in notices:
+        print(f"levelpass {a.level}: {n}", flush=True)
     for h in plan.held:  # the fights the level's script holds (levelpass_holds), in words
         print(f"levelpass {a.level}: held: {h}", flush=True)
+    for r in plan.required:  # the gates a player opens on the way, performed or why not
+        what = r.why_not and f"not performed: {r.why_not}" or "; ".join(r.h[1:-1])
+        print(f"levelpass {a.level}: required {r.label} {r.kind} {r.gate.name}: {what}", flush=True)
     gates = lp.gates_words(content)
     if gates and not a.predictions:
         print(f"levelpass {a.level}: gates on the way a teleporting pass does not open ({len(gates)}): "
@@ -9676,6 +9722,17 @@ def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
     lp_.add_argument("--d-joins-late", action="store_true", help="D joins late, into the level under test (the"
                      " parked path); by default both clients join in the lobby, the host picks the slot and the"
                      " party enters the level together (the owner's order)")
+    lp_.add_argument("--no-gates", action="store_true", help="no required phase: the gates a player opens on the way"
+                     " are not attempted (the page says completable by teleport); the full sweep and the ten-minute"
+                     " budget, for runs about something else")
+    lp_.add_argument("--long-pause", type=int, default=0, metavar="SECONDS", help="one pickup leaves the game's"
+                     " found screen up this long on purpose (the run a pause crash's fix needs); every other step"
+                     " dismisses a pause screen within seconds")
+    lp_.add_argument("--long-pause-at", default="", metavar="NAME", help="the object whose pickup takes the long"
+                     " pause (default: the plan's first pickup of a collectible)")
+    lp_.add_argument("--d-stays", action="store_true", help="D stays where it entered the level (the old"
+                     " behaviour); by default D's hero follows H's through the stops (the game's Auto follow,"
+                     " online_auto_follow on) once the game registers that command")
     lp_.add_argument("--scenes", choices=("skip", "play"), default="skip", help="play: the cutscenes in full,"
                      " each scene's trigger entered in the sweep, the expected scenes in H's script for the level"
                      " check's cutscenes row, their lengths (measured in earlier runs, else 60 s at the load and"
