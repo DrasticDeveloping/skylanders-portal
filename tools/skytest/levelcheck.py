@@ -2113,7 +2113,45 @@ def run_head(folder: Path) -> list[str]:
             f"{(secs / 60):.1f} min" if isinstance(secs, (int, float)) else f"case {r.get('case', '?')}",
             f"build snapshot {prov.get('build') or '?'}, runner {prov.get('runner') or '?'}",
             *figures_head(folder),
-            *skipped_head(read_log(folder, "H/game.log", "H"))]
+            *skipped_head(read_log(folder, "H/game.log", "H")),
+            *route_head(folder)]
+
+
+# W24: a sweep target with no floor a player can stand on near it (a trigger in the air: tutorial_b's rail-ride end
+# trigger, auth:tutorial_b:8394) is not visited: the route teleport says `failed (no floor: ...)`; and a hero held too
+# long at the same spot twice is taken out to the last ground it stood on. The page names both.
+NO_FLOOR = re.compile(r"Dev: route teleport \S+ failed \((no floor: .*)\) \(target (.+)\)$")
+TAKEN_OUT = re.compile(r"Dev: route held too long at the same spot twice \(([^)]*)\): (taken out to the last ground it "
+                       r"stood on \S+|no ground it stood on is known, left there)")
+VISIT_OR_ACT = re.compile(r"Input script: LEVELPASS (?:visit (v\d+)|act (v\d+_\d+) \S+) .*?(?:ref (\S+))?$")
+
+
+def route_head(folder: Path) -> list[str]:
+    """The page's lines for targets not visited (no floor) and heroes taken out of a stuck spot, per client."""
+    out = []
+    for who in ("H", "D"):
+        log = read_log(folder, f"{who}/game.log", who)
+        if log is None:
+            continue
+        label, missed, taken = "", [], []
+        for i, raw in enumerate(log.lines):
+            m = VISIT_OR_ACT.search(raw)
+            if m:
+                label = m.group(1) or m.group(2)
+                continue
+            m = NO_FLOOR.search(raw)
+            if m:
+                missed.append(f"{label + ' ' if label else ''}{m.group(2)} ({m.group(1)}; {log.line(i).cite()})")
+                continue
+            m = TAKEN_OUT.search(raw)
+            if m:
+                taken.append(f"at {m.group(1)}: {m.group(2)} ({log.line(i).cite()})")
+        if missed:
+            out.append(f"not visited on {who}: no floor (a trigger in the air): " + "; ".join(missed[:4])
+                       + (f"; and {len(missed) - 4} more" if len(missed) > 4 else ""))
+        if taken:
+            out.append(f"{who} held too long at the same spot twice, {len(taken)} time(s): " + "; ".join(taken[:3]))
+    return out
 
 
 PLACE_LINE = re.compile(r"^\s*place (\d+) .*?([^/\\]+)\.dump\s*$")
