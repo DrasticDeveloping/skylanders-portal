@@ -629,3 +629,111 @@ def page(folder: Path, verdicts: list[Verdict], head: list[str] | None = None) -
             out.append(f"  {v.name}: {f.what}")
             out += [f"      {x}" for x in f.lines]
     return "\n".join(out)
+
+
+# --- the static table: every level's end and mechanics from its data, no game ----------------------------
+
+LEVEL_TYPES = (  # by the level's name (the game's own naming)
+    (re.compile(r"^town_state"), "hub"),
+    (re.compile(r"^town_"), "hub side game"),
+    (re.compile(r"^(pvp|ringout)_"), "versus arena"),
+    (re.compile(r"^(survival|sv)_"), "survival arena"),
+    (re.compile(r"^hc_"), "heroic challenge"),
+    (re.compile(r"^lp_puzzle"), "lock puzzle"),
+    (re.compile(r"_speedster$"), "swap zone"),
+    (re.compile(r"^ap_"), "adventure pack"),
+)
+TYPE_ORDER = ["story", "adventure pack", "hub", "swap zone", "heroic challenge", "lock puzzle", "hub side game",
+              "survival arena", "versus arena"]
+STATIC_COLUMNS = [("switches/mini-games", "A"), ("fetch hand-ins", "B"), ("thrown objects", "C"),
+                  ("turrets/vehicles", "D"), ("bosses", "F"), ("rides", "G")]
+SPAWNERS = re.compile(r"SpawnerComponentData$|CEncounterManagerComponentData$")
+
+
+def level_type(level: str) -> str:
+    return next((name for rx, name in LEVEL_TYPES if rx.search(level)), "story")
+
+
+@dataclass
+class StaticRow:
+    level: str
+    kind: str
+    ends: str          # how the level ends, in words
+    needs: str         # what the pass cannot do at the end ('' when it can)
+    on_way: str        # families on the end's path
+    counts: dict[str, int]
+    spawners: int
+    probe: bool
+    detail: str        # the full reason for an end the pass cannot carry out
+
+
+def static_row(folder: Path, level: str) -> StaticRow:
+    import levelpass_end as le
+    logic = json.loads((folder / level / "logic.json").read_text(encoding="utf-8"))
+    nodes, _ = le.read_logic(logic)
+    counts = {fam: 0 for _, fam in STATIC_COLUMNS}
+    spawners = 0
+    for n in nodes.values():
+        fam = le.family_of(n.components)
+        if fam in counts:
+            counts[fam] += 1
+        spawners += any(SPAWNERS.search(c) for c in n.components)
+    chains = logic.get("level_end") or []
+    end = le.derive_end(chains, logic, level) if chains else None
+
+    def name(k: str) -> str:
+        return nodes[k].name if k in nodes else k.split(".")[-1]
+    needs = detail = ""
+    if end is None:
+        ends = "no level end in the data"
+    elif end.kind == le.TRIGGER:
+        ends = f"enter a trigger: {name(end.trigger)}"
+    elif end.kind == le.FIGHT:
+        ends = (f"win a fight: {name(end.counter)} ({end.count} deaths)" if end.counter else "kill one enemy: "
+                + ", ".join(name(k) for k in end.counted[:2]))
+    elif end.kind == le.TIMED:
+        ends = "on its own (no player act found)"
+    else:
+        fam, key, _when = end.blockers[0]
+        ends = "the pass cannot end it"
+        needs = (f"{le.FAMILIES[fam]}: {name(key)}" if fam in le.FAMILIES else f"unknown: {name(key)}")
+        others = sorted({f for f, _k, _w in end.blockers[1:] if f != fam})
+        if others:
+            needs += " (also " + ", ".join(le.FAMILIES.get(f, "unknown") for f in others) + ")"
+        detail = end.why
+    on_way = ", ".join(sorted({le.FAMILIES[f] for f, _k in end.on_path})) if end and end.on_path else ""
+    return StaticRow(level, level_type(level), ends, needs, on_way, counts, spawners,
+                     (folder / f"{level}-manifest.txt").is_file(), detail)
+
+
+def static_table(folder: Path) -> str:
+    levels = sorted(p.parent.name for p in folder.glob("*/logic.json"))
+    rows = [static_row(folder, lv) for lv in levels]
+    rows.sort(key=lambda r: (TYPE_ORDER.index(r.kind) if r.kind in TYPE_ORDER else 99, r.level))
+    heads = ["level", "type", "how the level ends", "what the pass cannot do at the end", "on the way to the end",
+             *(h for h, _ in STATIC_COLUMNS), "enemy spawners", "probe data"]
+    cells = [[r.level, r.kind, r.ends, r.needs or "-", r.on_way or "-", *(str(r.counts[f]) for _, f in STATIC_COLUMNS),
+              str(r.spawners), "yes" if r.probe else "no"] for r in rows]
+    width = [max(len(h), *(len(c[i]) for c in cells)) for i, h in enumerate(heads)]
+    line = lambda c: " | ".join(x.ljust(width[i]) for i, x in enumerate(c)).rstrip()  # noqa: E731
+    by_end = {}
+    for r in rows:
+        k = ("cannot end it" if r.needs else r.ends.split(":")[0])
+        by_end[k] = by_end.get(k, 0) + 1
+    out = [
+        f"Every level's end and mechanics, read from the level data in {folder} (no game). {len(rows)} levels.",
+        "How the level ends: what the level pass would do at the end (enter a trigger, win a fight, wait), found by",
+        "  walking the level's own telegrams back from its map load. 'The pass cannot end it': the end needs what the",
+        "  next column says (a mini-game's result, a turret, a boss, a ride, a menu choice), or 'unknown' at the node",
+        "  where the reader stopped. Counts: objects of that kind in the level. Probe data: the pass can run (yes/no).",
+        "",
+        line(heads),
+        line(["-" * w for w in width]),
+        *(line(c) for c in cells),
+        "",
+        "Totals by how the level ends: " + ", ".join(f"{k} {v}" for k, v in sorted(by_end.items(), key=lambda x: -x[1])),
+        "",
+        "Why the pass cannot end these levels (the node and the telegram the reader stopped at):",
+    ]
+    out += [f"  {r.level}: {r.detail}" for r in rows if r.detail]
+    return "\n".join(out)

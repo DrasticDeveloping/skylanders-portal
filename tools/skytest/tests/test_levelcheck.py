@@ -285,5 +285,38 @@ class Command(unittest.TestCase):
         self.assertEqual(code, 0)
 
 
+class StaticTable(unittest.TestCase):
+    def test_every_level_with_data_one_row(self) -> None:
+        import json
+        tmp = tempfile.TemporaryDirectory()
+        FOLDERS.append(tmp)
+        folder = Path(tmp.name)
+
+        def level(name: str, comps: list[str], when: str, chain: bool = True) -> None:
+            (folder / name).mkdir()
+            thing = {"key": "u.Thing", "name": "Thing", "unit": "u", "zone": name, "class": "CEntity", "group": "other",
+                     "kind": "", "position": [0, 0, 0], "components": [{"key": c, "class": c} for c in comps]}
+            spawner = dict(thing, key="u.Sp", name="Sp", components=[{"key": "s", "class": "Scripts.SpawnerComponentData"}])
+            logic = {"schema": 1, "nodes": [thing, spawner],
+                     "edges": [{"from": "u.Thing", "to": [], "message": "CLoadMapComponentMessage", "fields": {},
+                                "when": when, "roles": "4"}],
+                     "level_end": ["Thing -[CLoadMapComponentMessage {_fade: true}]-> roles 4"] if chain else []}
+            (folder / name / "logic.json").write_text(json.dumps(logic), encoding="utf-8")
+        level("verdant1", ["Scripts.EnterVehicleComponentData"], "Scripts.EnterVehicleComponentData.OnExit")
+        level("pvp_barrens", [], "", chain=False)
+        (folder / "verdant1-manifest.txt").write_text("probe", encoding="utf-8")
+        text = lc.static_table(folder)
+        lines = text.splitlines()
+        self.assertIn("2 levels", lines[0])
+        row = next(x for x in lines if x.startswith("verdant1 "))
+        self.assertIn("the pass cannot end it", row)
+        self.assertIn("a turret or vehicle: Thing", row)
+        self.assertTrue(row.rstrip().endswith("yes"))  # probe data
+        pvp = next(x for x in lines if x.startswith("pvp_barrens "))
+        self.assertIn("versus arena", pvp)
+        self.assertIn("no level end in the data", pvp)
+        self.assertIn("  verdant1: the end needs a turret or vehicle at Thing", text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7684,8 +7684,14 @@ def cmd_levelcheck(cfg: Config, a: argparse.Namespace) -> int:
     Exit 0 when nothing failed (NOT TESTED included: it is said, never counted as a pass), 1 when a grader
     found a difference."""
     import levelcheck as lc
+    if getattr(a, "static", False):
+        text = lc.static_table(levelpass_folder(cfg, getattr(a, "folder", None)))
+        if getattr(a, "out", None):
+            Path(a.out).write_text(text + "\n", encoding="utf-8")
+        print(text)
+        return 0
     if bool(a.grade) == bool(a.level):
-        raise SystemExit("levelcheck: give a level (a level pass, then its grade) or --grade <run folder>")
+        raise SystemExit("levelcheck: give a level (a level pass, then its grade), --grade <run folder> or --static")
     if a.grade:
         folder = Path(a.grade)
         if not folder.is_dir():
@@ -9754,6 +9760,9 @@ def main(argv: list[str] | None = None) -> int:
                          " definition of working on one page (levelcheck.py); or --grade an existing run")
     lc_.add_argument("level", nargs="?", default=None, help="the level's short name (runs `levelpass <level>` first)")
     lc_.add_argument("--grade", metavar="RUN", default=None, help="grade this run folder instead (no game)")
+    lc_.add_argument("--static", action="store_true", help="every level's end and mechanics from the levelpass"
+                     " folder's data, one table (no game)")
+    lc_.add_argument("--out", default=None, metavar="FILE", help="with --static: also write the table here")
     add_levelpass_options(lc_)
     lc_.set_defaults(fn=cmd_levelcheck)
     pr = sub.add_parser("prune", help="remove the store's run folders older than some hours (through the janitor)")

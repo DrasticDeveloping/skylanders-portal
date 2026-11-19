@@ -713,6 +713,12 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
     """The plan; without --full, over the budget, the sample per family goes down to 2, then 1 (the
     plan says so), after the quiet visits were dropped. `no_end` (--no-end): the level's end is found
     (the plan names it) but not attempted, and its time is not in the estimate."""
+    # An end that needs a mechanic the pass cannot carry out (levelpass_end.UNSUPPORTED: a mini-game's result,
+    # a turret, a boss, a ride, a cause the reader does not know): the sweep only, no end wait; the verdict
+    # says INCOMPLETE with the end's family and node (pass_verdict).
+    end0 = derive(content)
+    if end0 is not None and end0.kind == le.UNSUPPORTED:
+        no_end = True
     # drop_unreachable leaves steps out by clearing their objects' refs: each try starts from the refs as loaded.
     refs = [(o, o.ref) for o in content.objects]
 
@@ -1337,6 +1343,8 @@ def derived_words(plan: Plan) -> str:
                 f"{', '.join(_name(objs, k) + ' (' + (_ref(objs, k) or 'no ref') + ')' for k in end.starters) or 'nothing'},"
                 f" fought around {_name(objs, end.anchor)} ({_ref(objs, end.anchor) or 'no ref'})"
                 f"{' radius ' + str(int(area[1])) if area else ''}, waves at {end.waves or 'none'}; its chain: {path}")
+    if end.kind == le.UNSUPPORTED:
+        return f"not attempted: {end.why}"
     return f"the level ends on its own ({end.why})"
 
 
@@ -1999,7 +2007,9 @@ def report_text(level: str, plan: Plan, wall_s: float, phases: list[tuple[str, f
              f"pass: {'full' if plan.full else 'sampled (each action family at most ' + str(plan.sample) + ' times)'}, "
              f"{len(plan.stops)} stops, {sum(len(s.actions) for s in plan.stops)} actions, "
              f"late join {'on' if plan.late_join else 'off'}",
-             (f"level end: NOT ATTEMPTED (--no-end): judged on the mid-level steps only; the end would be "
+             (f"level end: NOT ATTEMPTED ({end_words(plan)}): judged on the mid-level steps only"
+              if plan.end is not None and plan.end.kind == le.UNSUPPORTED else
+              f"level end: NOT ATTEMPTED (--no-end): judged on the mid-level steps only; the end would be "
               f"{end_words(plan)}") if plan.no_end else f"level end: attempted ({end_words(plan)})"]
     lines.append("")
     lines.append("time per phase:")
@@ -2175,6 +2185,8 @@ def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan, d_tex
     deadline, or the exit it planned was not reached by every client that was to be in the session at the
     exit (H, and D unless --d-leaves-before-end); PASS otherwise: every such client reached the next level."""
     missed: list[str] = []
+    if plan.end is not None and plan.end.kind == le.UNSUPPORTED:
+        missed.append(f"the level's end, not attempted: {plan.end.why}")
     skipped = [f"{m.group(1)} {m.group(2)}" for m in SKIPPED.finditer(h_text)]
     if skipped:
         missed.append(f"{len(skipped)} step(s) skipped at the sweep's deadline: " + ", ".join(skipped[:8])
