@@ -196,6 +196,20 @@ class EnemyKinds(unittest.TestCase):
         self.assertIn("died with no attacker at -442,-58676,64", v.findings[0].lines[1])
         self.assertEqual(len(v.findings), 1)  # not named twice as `existed on no client`
 
+    def test_a_spawn_slept_on_s_before_any_copy_is_set_apart(self) -> None:
+        # Batch 11 tutorial_b 20261119-061110: CrashSP_04_Spawned1 slept on S 3.04 s after its spawn, far from both
+        # players; both clients only retired it. Not graded; a spawn a client had in its interest still is.
+        s = [(30, f"Online: enemy run-time spawn {K3} as CrashSP_04_Spawned1#3956 hp 45 pose 22 source e1 (CActorData) (S)"),
+             (33.04, f"Online: enemy {K3} streamed out on the server: no end published (its row retired)")]
+        retired = [(33.06, f"Online: enemy retired {K3} (streamed out on the server)")]
+        v = self.grade(s, retired, retired)
+        self.assertEqual(v.status, lc.NOT_TESTED, v.findings)  # nothing else to grade in this made-up run
+        self.assertIn("gone to sleep on the server before any player's game made it (not graded): "
+                      "CrashSP_04_Spawned1#3956", v.notes[-1])
+        seen = [(30.5, f"Online: enemy bind {K3} (pending past grace: missing)")] + retired
+        v = self.grade(s, seen, retired)
+        self.assertEqual([x.what.split(":")[0] for x in v.findings], [f"H never found {K3} (CrashSP_04_Spawned1#3956)"])
+
     def test_a_death_by_another_entity_is_counted(self) -> None:
         # ww1 20261119-051557: `dead by none (S, placed; attacker (null)#3457)`, the seventh death the counts missed.
         v = self.grade([(30, f"Online: enemy run-time spawn {K3} as Sawmouth_Spawned1#3 hp 45 pose 3 source 1 (S)"),
@@ -465,6 +479,13 @@ class HeldEnemiesCalibration(unittest.TestCase):
         self.assertIn("SwapPartsHint_RemoveTrigger", held[0])
         self.assertIn("hit only held enemies (Ambi_Chompy_03 scenery)", v.counts)
         self.assertIn("set apart: 9 scenery, 4 held and not released in this run", v.counts)
+
+    @unittest.skipUnless((CALIBRATION_RUNS / "20261119-061110-levelpass-tutorial_b").is_dir(), "batch 11's run is not here")
+    def test_batch_11_follow_run_passes_with_its_slept_spawn_apart(self) -> None:
+        v = self.grade(CALIBRATION_RUNS / "20261119-061110-levelpass-tutorial_b")
+        self.assertEqual(v.status, lc.PASS, [x.what for x in v.findings])
+        self.assertIn("D: bound 11 of 11", v.counts)
+        self.assertIn("gone to sleep on the server before any player's game made it: 1", v.counts)
 
     def test_033620_fails_only_on_the_bomber_no_client_had(self) -> None:
         v = self.grade(TUTORIAL_B)

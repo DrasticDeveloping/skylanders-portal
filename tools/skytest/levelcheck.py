@@ -330,6 +330,7 @@ class ClientEnemy:
     seen_dead: Line | None = None  # `life <key> alive -> dead` / `dead <key> by`: the death shown on its copy
     skipped: Line | None = None    # `skipped <key> (dead before bind)`: S's death came before any bind here
     retired_alive: Line | None = None
+    retired_streamed: Line | None = None  # `retired <key> (streamed out on the server)`: S slept it, its row went
     last: Line | None = None
 
     def status(self) -> str:
@@ -360,7 +361,18 @@ def client_enemies(log: Log) -> dict[str, ClientEnemy]:
             c.seen_dead = c.seen_dead or line
         elif kind == "retired alive":
             c.retired_alive = c.retired_alive or line
+        elif kind == "retired" and "streamed out on the server" in rest:
+            c.retired_streamed = c.retired_streamed or line
     return out
+
+
+def slept_before_made(k: "EnemyKey", c: "ClientEnemy | None") -> bool:
+    """A run-time spawn S put to sleep (streamed out, its row retired) before this client made a copy: it never
+    died, and the client's only line for it is that retirement (never bound, waited for, looked for or killed
+    here). Nobody could see it (batch 11 tutorial_b 20261119-061110: CrashSP_04_Spawned1 slept on S 3.04 s after
+    its spawn, far from both players, and both clients dropped it before their 3 s wait for a copy ran out)."""
+    return (k.kind == "run-time" and k.dead is None and k.streamed is not None and c is not None
+            and c.retired_streamed is not None and not (c.bound or c.waits or c.pending or c.skipped or c.seen_dead))
 
 
 def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
@@ -412,6 +424,7 @@ def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
               f"no attacker {len(no_attacker)}; attacker not recorded {len(unrecorded)})"]
     findings: list[Finding] = []
     expected: dict[str, list[str]] = {}       # key -> the clients that should have had it
+    slept: dict[str, list[str]] = {}          # key -> the clients it went to sleep on S before they made it
     there: dict[str, dict[str, ClientEnemy | None]] = {}
     for who in order:
         log = run.clients[who]
@@ -426,9 +439,12 @@ def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
             gone = k.dead or k.streamed
             if k.placed.t is None or k.placed.t > w.end - BIND_GRACE or (gone and gone.t and gone.t < w.start):
                 continue  # made too late for this client, or gone before it came
+            c = seen.get(k.key)
+            if slept_before_made(k, c):
+                slept.setdefault(k.key, []).append(who)
+                continue  # listed apart, never graded (slept_before_made)
             n_exp += 1
             expected.setdefault(k.key, []).append(who)
-            c = seen.get(k.key)
             there.setdefault(k.key, {})[who] = c
             died_here = bool(k.dead and k.dead.t and w.start <= k.dead.t <= w.end - DEATH_GRACE)
             n_deaths += died_here
@@ -502,7 +518,16 @@ def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
     counts.append(fights)
     if scenery or unreleased:
         counts.append(f"set apart: {len(scenery)} scenery, {len(unreleased)} held and not released in this run")
+    gone_early = [k for k in slept if k not in expected]
+    if gone_early:
+        counts.append(f"gone to sleep on the server before any player's game made it: {len(gone_early)}")
+        held_notes.append("gone to sleep on the server before any player's game made it (not graded): " + "; ".join(
+            f"{keys[k].name} ({k}): {keys[k].streamed.cite()}" for k in gone_early[:6]))
     findings = fight_findings + findings  # the fights first: the most telling
+    if not expected and not findings:
+        # Nothing a client should have had (every key set apart, made too late or gone before it came): not a pass.
+        return Verdict("enemies", NOT_TESTED, "; ".join(counts) + "; no enemy any client should have had", first,
+                       notes=held_notes)
     return Verdict("enemies", FAIL if findings else PASS, "; ".join(counts), first, findings, held_notes)
 
 
