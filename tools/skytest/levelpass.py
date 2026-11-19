@@ -865,6 +865,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
         actions: list[Action] = []
         visit_only: list[tuple[Obj, str]] = []
         fought = False
+        lost_fight: str | None = None
         had_visit = any(o.ref for o in c.objects)
         for o in sorted(c.objects, key=lambda o: (ACTION_ORDER[classify(o)[0]], o.name, o.ident)):
             act, why = classify(o)
@@ -902,9 +903,13 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
                 continue
             if unregistered:
                 # A step the script would have had: left out, and not its family's sample (the next of the
-                # family, here or further on, takes it; the next fighter of the cluster takes its fight).
+                # family, here or further on, takes it; the next fighter of the cluster takes its fight: the
+                # cluster's one fight is named once, and only when no fighter of the cluster is left).
                 o.ref = ""
-                not_registered.append((None, f"{act} {step_name(o)}"))
+                if act != FIGHT:
+                    not_registered.append((None, f"{act} {step_name(o)}"))
+                elif lost_fight is None:
+                    lost_fight = f"{act} {step_name(o)}"
                 visit_only.append((o, NOT_REGISTERED))
                 no_action_key = f"{stem(o.name) or o.cls}: {NOT_REGISTERED}"
                 no_action[no_action_key] = no_action.get(no_action_key, 0) + 1
@@ -915,6 +920,8 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
             taken[family] = taken.get(family, 0) + 1
             actions.append(Action(action=act, obj=o, why=why, expect=effects.get(o.name, [])))
         stop = Stop(label=f"v{n + 1}", cluster=c, actions=actions, visit_only=visit_only)
+        if lost_fight is not None and not fought:
+            not_registered.append((None, lost_fight))
         if had_visit and not any(o.ref for o in c.objects):
             not_registered.append((stop, f"visit {stop.label}"))
         if any(a.action == EXIT_A for a in actions):
