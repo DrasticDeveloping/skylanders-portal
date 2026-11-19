@@ -1033,8 +1033,16 @@ class RequiredStepsPlan(unittest.TestCase):
         k = h.index("log LEVELPASS phase required")
         self.assertLess(h.index("sweep_deadline 0"), k)
         self.assertIn(f"pickup TutorialLockedGate_key {lp.KEY_PICKUP_S}", h[k:])  # the exact name, never nearest:
-        self.assertIn(f"interact TutorialLockedGate_keylock {lp.KEY_PRESS_S}", h[k:])
-        self.assertFalse([l for l in h if "nearest:" in l])
+        # W10: back to the gate, then the lock nearest the hero there (a bounded nearest: of the lock's own name):
+        # the bare name from the pickup's end pressed gate 1's lock for gate 2 (tutorial_b 20261119-065111).
+        for r in p.required:
+            press = f"interact nearest:TutorialLockedGate_keylock:{lp.KEY_LOCK_NEAR} {lp.KEY_PRESS_S}"
+            i = h.index(f"log LEVELPASS required {r.label} key_gate TutorialLockedGate (fetch its key {r.gate.key_data})")
+            self.assertEqual(h[i + 1:i + 7], [f"goto_entity {r.gate_ref}", f"pickup TutorialLockedGate_key {lp.KEY_PICKUP_S}",
+                                              f"goto_entity {r.gate_ref}", press,
+                                              f"wait_moved {r.gate_ref} 50 {lp.GATE_OPEN_WAIT_S}", f"online_audit {r.label}"])
+        self.assertNotIn(f"interact TutorialLockedGate_keylock {lp.KEY_PRESS_S}", h)
+        self.assertEqual([l for l in h if "nearest:" in l and "_keylock:" not in l], [])  # the key: exact name only
         self.assertEqual(lp.position_literals("\n".join(h)), [])
         d = lp.script_d(p)
         self.assertIn(f"online_wait_peer_near_entity {p.required[0].gate_ref} {lp.D_NEAR} {lp.D_COME_WAIT_S}", d)
