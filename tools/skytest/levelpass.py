@@ -1225,11 +1225,54 @@ def gates_words(content: Content) -> list[str]:
 #   when the build's command table has lock_solve, lock_move and the condition lock_ready; otherwise not performed,
 #   said so.
 # D, not following H, comes to each gate (d_come_lines). The level check grades each gate's opening on S, H and D.
-REQ_KEY_S = 50.0          # pickup (a navto to its key), back to the gate, the press, the gate's move
-REQ_BATTLE_S = 80.0       # the release, the fight (GATE_FIGHT_S), the gate's move
-REQ_SPARK_S = 90.0        # the press, the board, its solve
-GATE_FIGHT_S = 60         # a gate's fight is bounded by this (encounter_clear exact, fight_near)
-GATE_OPEN_WAIT_S = 20     # wait_moved on the gate after its step
+REQ_KEY_S = 30.0          # pickup (a navto to its key), back to the gate, the press
+REQ_BATTLE_S = 20.0       # the releases and the approach; the fight's own seconds (gate_fight_seconds) are added
+REQ_SPARK_S = 70.0        # the press, the board, its solve
+GATE_FIGHT_S = 60         # a gate's fight is bounded by at least this (encounter_clear exact, fight_near)
+# A gate's fight gets its time from the level's data (W18: batch 12 case 7's r4, three waves of 14 enemies, ran out of
+# its fixed 60 s 5.7 s after the last kill, inside the 10 s quiet window fight_area's done rule needs): a base, a share
+# per enemy its openers bring (an encounter manager's _maxSpawnedLifetime, a placed enemy 1) and the quiet window.
+GATE_FIGHT_BASE_S = 30
+GATE_FIGHT_PER_ENEMY_S = 5
+GATE_FIGHT_QUIET_S = 10
+# A gate's opening is not waited for by wait_moved (W17): a Scripts.LockedObjectComponent gate opens in place (its lock
+# state, its open animation, DisableCollisionOnOpen), its origin never moves (batch 12 case 7: `wait_moved ... most 0`
+# 3 s after the demon gate opened; tutorial_b 20261119-065111's key gate the same). The level check reads the lock
+# state on each game (S's gate row written again, each client's `backend key gate <ref> ... (unlocked ...)`).
+ACTIVATION_RADIUS = re.compile(r"activationRadius (\d+)")
+
+
+def manifest_entity(manifest: dict | None, key: str) -> dict | None:
+    """The static manifest's entity `<unit>.<name>`, or None."""
+    unit, _, name = key.rpartition(".")
+    for e in (manifest or {}).get("entities", []) or []:
+        if isinstance(e, dict) and e.get("name") == name and (e.get("unit") or "") == unit:
+            return e
+    return None
+
+
+def encounter_radius(entity: dict | None) -> float | None:
+    """An encounter manager's activation radius from the data (`starts`: `activationRadius <r>`), or None."""
+    m = ACTIVATION_RADIUS.search(str(((entity or {}).get("details") or {}).get("starts", "")))
+    return float(m.group(1)) if m else None
+
+
+def opener_enemies(entity: dict | None) -> int:
+    """How many enemies an opener of a battle gate brings: an encounter manager its spawns over its life
+    (_maxSpawnedLifetime, else its payloads), anything else 1."""
+    details = (entity or {}).get("details") or {}
+    if (entity or {}).get("group") == "encounter":
+        life = str(details.get("_maxSpawnedLifetime", ""))
+        if life.isdigit():
+            return int(life)
+        return max(1, str(details.get("_spawnPayloads", "")).count("_actorDataToSpawnFrom"))
+    return 1
+
+
+def gate_fight_seconds(manifest: dict | None, openers: list[str]) -> int:
+    """A battle gate's fight budget from the level's data (W18), at least GATE_FIGHT_S."""
+    n = sum(opener_enemies(manifest_entity(manifest, k)) for k in openers)
+    return max(GATE_FIGHT_S, GATE_FIGHT_BASE_S + GATE_FIGHT_PER_ENEMY_S * n + GATE_FIGHT_QUIET_S)
 KEY_PICKUP_S = 40         # pickup: onto the key (tutorial_b's lies about 1400 from its gate) and its follow
 KEY_PRESS_S = 60          # interact: the walk back to the lock with the key and the press
 KEY_LOCK_NEAR = 1000      # the press takes a `<gate>_keylock` within this of the hero standing at the gate
@@ -1285,8 +1328,7 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
         elif g.kind == lh.KEY_GATE:
             step.h = [f"{head} (fetch its key {_safe(g.key_data)})", f"goto_entity {ref}",
                       f"pickup {g.name}_key {KEY_PICKUP_S}", f"goto_entity {ref}",
-                      f"interact nearest:{g.name}_keylock:{KEY_LOCK_NEAR} {KEY_PRESS_S}",
-                      f"wait_moved {ref} 50 {GATE_OPEN_WAIT_S}", f"online_audit {label}"]
+                      f"interact nearest:{g.name}_keylock:{KEY_LOCK_NEAR} {KEY_PRESS_S}", f"online_audit {label}"]
             step.est_s = REQ_KEY_S
         elif g.kind == lh.SPARK_LOCK:
             if not lock_commands:
@@ -1294,14 +1336,14 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                                 "is not in it)")
             else:
                 step.h = [f"{head} (solve its lock puzzle)", f"goto_entity {ref}", f"interact {ref} 20",
-                          "waitfor lock_ready 30", "lock_solve 120", f"wait_moved {ref} 50 {GATE_OPEN_WAIT_S}",
-                          f"online_audit {label}"]
+                          "waitfor lock_ready 30", "lock_solve 120", f"online_audit {label}"]
                 step.d = [f"interact {ref} 20", "waitfor lock_ready 30", "lock_solve 120"]
                 step.est_s = REQ_SPARK_S
         elif g.kind == lh.BATTLE_GATE:
             releases: list[str] = []
             blocked: list[str] = []
             fight = ""
+            fight_s = gate_fight_seconds(content.manifest, g.openers)
             for k in g.openers:
                 h = holds.get(k)
                 if h is not None and not h.ambient:
@@ -1325,8 +1367,18 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                                 break
                 ob = by_key.get(k)
                 if not fight and ob is not None and ob.ref:
-                    fight = (f"encounter_clear {ob.ref} 1500 {GATE_FIGHT_S} exact" if n is not None and
-                             n.group == "encounter" else f"fight_near {ob.ref} 1500 {GATE_FIGHT_S}")
+                    is_encounter = n is not None and n.group == "encounter"
+                    fight = (f"encounter_clear {ob.ref} 1500 {fight_s} exact" if is_encounter
+                             else f"fight_near {ob.ref} 1500 {fight_s}")
+                    # W16: an encounter nothing toggles starts when a player comes within its activation radius of
+                    # the manager (the data's `activationRadius`): the step goes to the manager first, so
+                    # encounter_clear waits there for it to run and fights its spawnees. Batch 12 case 7's r2
+                    # (EncounterManager001_002, radius 2000) fought a placed enemy 2990 away instead and the encounter
+                    # never started (`spawned 0/6` for 61 s).
+                    radius = encounter_radius(manifest_entity(content.manifest, k)) if is_encounter else None
+                    toggled = any(tg.receiver == k and tg.message == TOGGLE for tg in tels)
+                    if radius is not None and not toggled:
+                        releases.append(f"goto_entity {ob.ref}")
             if not fight:
                 step.why_not = "no live reference to any of its fight's enemies or encounters"
             elif blocked and len(blocked) == len([k for k in g.openers if k in holds]) and \
@@ -1334,9 +1386,8 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                 step.why_not = "its enemies are held: " + "; ".join(blocked[:2])
             else:
                 names = ", ".join(_safe(k.split(".")[-1]) for k in g.openers[:4])
-                step.h = [f"{head} (win its fight: {names})", *releases, fight, f"wait_moved {ref} 50 {GATE_OPEN_WAIT_S}",
-                          f"online_audit {label}"]
-                step.est_s = REQ_BATTLE_S
+                step.h = [f"{head} (win its fight: {names})", *releases, fight, f"online_audit {label}"]
+                step.est_s = REQ_BATTLE_S + fight_s
         else:
             step.why_not = f"no rule for a {g.kind} yet ({g.opener})"
     return out

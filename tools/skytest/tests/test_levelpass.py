@@ -1038,9 +1038,8 @@ class RequiredStepsPlan(unittest.TestCase):
         for r in p.required:
             press = f"interact nearest:TutorialLockedGate_keylock:{lp.KEY_LOCK_NEAR} {lp.KEY_PRESS_S}"
             i = h.index(f"log LEVELPASS required {r.label} key_gate TutorialLockedGate (fetch its key {r.gate.key_data})")
-            self.assertEqual(h[i + 1:i + 7], [f"goto_entity {r.gate_ref}", f"pickup TutorialLockedGate_key {lp.KEY_PICKUP_S}",
-                                              f"goto_entity {r.gate_ref}", press,
-                                              f"wait_moved {r.gate_ref} 50 {lp.GATE_OPEN_WAIT_S}", f"online_audit {r.label}"])
+            self.assertEqual(h[i + 1:i + 6], [f"goto_entity {r.gate_ref}", f"pickup TutorialLockedGate_key {lp.KEY_PICKUP_S}",
+                                              f"goto_entity {r.gate_ref}", press, f"online_audit {r.label}"])
         self.assertNotIn(f"interact TutorialLockedGate_keylock {lp.KEY_PRESS_S}", h)
         self.assertEqual([l for l in h if "nearest:" in l and "_keylock:" not in l], [])  # the key: exact name only
         self.assertEqual(lp.position_literals("\n".join(h)), [])
@@ -1069,7 +1068,8 @@ class RequiredStepsPlan(unittest.TestCase):
         self.assertLessEqual(free.estimate_s, lp.BUDGET_S)
         self.assertIn(f"log {lp.GATES_SKIPPED}", lp.script_h(free, None).splitlines())
         self.assertIn("; gates not attempted (--no-gates); total 600 s", lp.budget_words(free))
-        self.assertIn("gates phase 100 s of its own (2 of 2 required gate(s) performed)", lp.budget_words(gated))
+        self.assertIn(f"gates phase {2 * lp.REQ_KEY_S:.0f} s of its own (2 of 2 required gate(s) performed)",
+                      lp.budget_words(gated))
 
     def test_ww1_fights_its_battle_gates_and_waits_for_the_lock_commands(self) -> None:
         p = self.plan("ww1")
@@ -1078,9 +1078,19 @@ class RequiredStepsPlan(unittest.TestCase):
                                  ("Spark Lock", True), ("battle gate", False)])
         saw = next(r for r in p.required if r.gate.name == "PuzzleGateSawtooth001")
         self.assertTrue(saw.h[1].startswith("enter_trigger "))  # the caged Greebles' release first
-        self.assertTrue(saw.h[2].startswith("fight_near ") and saw.h[2].endswith(f" 1500 {lp.GATE_FIGHT_S}"))
+        self.assertTrue(saw.h[2].startswith("fight_near "))
+        # W16: EncounterManager001_002 starts within its activation radius (2000, nothing toggles it): the step goes
+        # to the manager first (batch 12 case 7 fought a placed enemy 2990 away; the encounter never started).
         ec = next(r for r in p.required if r.gate.name == "EC001_DemonGate")
-        self.assertTrue(ec.h[1].startswith("encounter_clear ") and ec.h[1].endswith(" exact"))
+        self.assertEqual(ec.h[1], "goto_entity auth:ww1:8291")
+        self.assertEqual(ec.h[2], "encounter_clear auth:ww1:8291 1500 70 exact")  # W18: 6 spawns: 30 + 5 * 6 + 10
+        # W18: the three-wave gate (3 placed, 6 and 5 spawns): 30 + 5 * 14 + 10.
+        fin = next(r for r in p.required if r.gate.name == "Finale_DemonGate008")
+        self.assertTrue(fin.h[-2].startswith("fight_near ") and fin.h[-2].endswith(" 1500 110"), fin.h)
+        self.assertEqual(fin.est_s, lp.REQ_BATTLE_S + 110)
+        # W17: no gate step waits for its gate to move (a LockedObjectComponent gate opens in place).
+        for r in p.required + self.plan("tutorial_b").required + self.plan("ww1", lock_commands=True).required:
+            self.assertFalse([l for l in r.h if l.startswith("wait_moved")], r.h)
         spark = self.plan("ww1", lock_commands=True).required[0]
         self.assertEqual(spark.h[2:5], [f"interact {spark.gate_ref} 20", "waitfor lock_ready 30", "lock_solve 120"])
         self.assertEqual(spark.d, [f"interact {spark.gate_ref} 20", "waitfor lock_ready 30", "lock_solve 120"])
