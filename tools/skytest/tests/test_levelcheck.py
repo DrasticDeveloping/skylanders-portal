@@ -86,10 +86,13 @@ class Enemies(unittest.TestCase):
                         (60, f"Online: enemy {K1} dead by 1 (S, placed; attacker PeerPuppet_1#3829)")],
                        [(31, f"Online: enemy spawn {K1} as Chompy#b848ac60 (bind placed)"),
                         (61, f"Online: enemy life {K1} alive -> dead")],
-                       [(45, f"Online: enemy replica {K1} at b8 asleep (mID 0x1): the binding waits for its wake"),
+                       [(45, f"Online: enemy spawn {K1} as Chompy#b884c740 (spawn other)"),
+                        (45, f"Online: enemy bind {K1} (resolved)"),
+                        (45, f"Online: enemy replica {K1} at b8 asleep (mID 0x1): the binding waits for its wake"),
                         (61, f"Online: enemy life {K1} alive -> dead (its copy made here was asleep: removed)")])
         self.assertEqual(v.status, lc.PASS, v)
-        self.assertIn("H: attached 1 of 1 it should have, deaths seen 1 of 1", v.counts)
+        self.assertIn("H: bound 1 of 1, waiting asleep 0", v.counts)
+        self.assertIn("deaths 1: 1 seen on a bound copy, 0 dead before bind", v.counts)
         self.assertIn("H/data/Online/session/game.log:1:", v.example)
 
     def test_never_attached_never_found_and_a_lost_death(self) -> None:
@@ -127,10 +130,122 @@ class Enemies(unittest.TestCase):
                        [(26, f"Online: enemy spawn {K2} as Ambi#b8 (bind placed)"),
                         (31, f"Online: enemy retired {K2} (streamed out on the server)")], [])
         self.assertEqual(v.status, lc.PASS, v.findings)
-        self.assertIn("D: attached 0 of 0", v.counts)
+        self.assertIn("D: bound 0 of 0", v.counts)
 
     def test_no_enemy_is_not_a_pass(self) -> None:
         self.assertEqual(self.grade([], []).status, lc.NOT_TESTED)
+
+
+class EnemyKinds(unittest.TestCase):
+    """Bound, waiting asleep, never existed here; deaths seen on a bound copy, dead before bind (the confirm
+    agent's tutorial_b by hand: 20261119-033620)."""
+
+    def grade(self, s, h, d=None) -> lc.Verdict:
+        return lc.grade_enemies(RunFolder(s, H_JOIN + h + LEVEL_END, None if d is None else D_JOIN + d + LEVEL_END).run())
+
+    def test_asleep_far_away_is_no_fault_and_dead_before_bind_is_no_death_seen(self) -> None:
+        v = self.grade([(30, f"Online: enemy placed {K1} as GreebleLobber#3887 hp 45 pose 12 (S)"),
+                        (30, f"Online: enemy placed {K2} as Chompy#3889 hp 1 pose 14 (S)"),
+                        (60, f"Online: enemy {K1} dead by 1 (S, placed; attacker PeerPuppet_2#3833)")],
+                       [(31, f"Online: enemy spawn {K1} as GreebleLobber#b8487e80 (bind placed)"),
+                        (31, f"Online: enemy bind {K1} (resolved)"),
+                        (31, f"Online: enemy spawn {K2} as Chompy#b848ac60 (bind placed)"),
+                        (31, f"Online: enemy bind {K2} (resolved)"),
+                        (61, f"Online: enemy life {K1} alive -> dead")],
+                       [(45, f"Online: enemy bind {K1} by authored id 0629f659.1.12338 waits (asleep here, its copy "
+                             "at b8487e80): never counted missing"),
+                        (45, f"Online: enemy bind {K2} by authored id 0629f659.1.12375 waits (asleep here, its copy "
+                             "at b848ac60): never counted missing"),
+                        (61, f"Online: enemy skipped {K1} (dead before bind)")])
+        self.assertEqual(v.status, lc.PASS, v.findings)
+        self.assertIn("D: bound 0 of 2, waiting asleep 2 (its copy asleep, far from this player: not a fault by itself), "
+                      "never existed here 0; deaths 1: 0 seen on a bound copy, 1 dead before bind", v.counts)
+        self.assertIn("H: bound 2 of 2, waiting asleep 0", v.counts)
+        # S's puppet name is no player number: the kill is the player of `dead by <peer>` (peer 1, H).
+        self.assertIn("by a player: H 1, D 0", v.counts)
+
+    def test_a_bound_copy_that_never_saw_the_death_fails(self) -> None:
+        v = self.grade([(30, f"Online: enemy placed {K1} as Chompy#1 hp 1 pose 1 (S)"),
+                        (60, f"Online: enemy {K1} dead by 1 (S, placed; attacker PeerPuppet_1#9)")],
+                       [(31, f"Online: enemy bind {K1} (resolved)")])
+        self.assertEqual([x.what.split(":")[0] for x in v.findings], [f"H never saw {K1} (Chompy#1) die"])
+
+    def test_an_enemy_on_no_client_is_named(self) -> None:
+        v = self.grade([(30, f"Online: enemy run-time spawn {K3} as BomberSpawner_02_Spawned3#3951 hp 78 pose 22 "
+                             "source e1d82dd6 (CActorData at depth 2, 11 nodes) (S)"),
+                        (42, f"Online: enemy {K3} dead by 1 (S, placed; attacker PeerPuppet_2#3833)")],
+                       [(42, f"Online: enemy skipped {K3} (dead before bind)")],
+                       [(42, f"Online: enemy skipped {K3} (dead before bind)")])
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.findings[0].what, f"existed on no client: {K3} (BomberSpawner_02_Spawned3#3951)")
+        self.assertIn("on the clients: H dead before bind (never existed here), D dead before bind (never existed "
+                      "here)", v.findings[0].lines[-1])
+
+    def test_a_death_with_no_attacker_right_after_its_spawn(self) -> None:
+        # The tutorial_a ship greebles (20261119-033102): made, fell, died with no attacker 2.5 s later.
+        v = self.grade([(30, f"Online: enemy run-time spawn {K3} as GreebleSpawner_03_SpawnedInstance1#2408 hp 78 pose "
+                             "29 source c927708a (a clone of  at depth 2, 6 nodes) (S)"),
+                        (32.5, f"Online: enemy {K3} dead by none (S, placed; attacker -)"),
+                        (32.5, f"Online: enemy {K3} died with no attacker at -442,-58676,64 (made at -112,-57191,1014; "
+                               "kill height -5000)")],
+                       [(32.6, f"Online: enemy skipped {K3} (dead before bind)")])
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.findings[0].what, "1 enemy died on S with no attacker within 10 s of its spawn (1 reached "
+                                             "no client)")
+        self.assertIn("(2.50 s after its spawn)", v.findings[0].lines[0])
+        self.assertIn("died with no attacker at -442,-58676,64", v.findings[0].lines[1])
+        self.assertEqual(len(v.findings), 1)  # not named twice as `existed on no client`
+
+    def test_an_encounter_spawn_counts_and_its_unnamed_attacker_is_no_finding(self) -> None:
+        # tutorial_a's encounter actors: `enemy spawn <key> ... (S)`, dead `by none (S)` with no attacker field
+        # (a player's kill may read so: one died 4 ms after H's press started on S).
+        enc = "scbde1a85.00000001#1/0@2"
+        v = self.grade([(30, f"Online: enemy spawn {enc} as ECI_Manager_actor_0 payload 0 point 0 pose 1 (S)"),
+                        (34.7, f"Online: enemy {enc} dead by none (S)")],
+                       [(30.1, f"Online: enemy spawn {enc} as ECI_Manager_actor_0#b78d1070 (live)"),
+                        (30.1, f"Online: enemy bind {enc} (resolved)"),
+                        (34.8, f"Online: enemy life {enc} alive -> dead")])
+        self.assertEqual(v.status, lc.PASS, v.findings)
+        self.assertIn("S 1 (0 placed, 1 encounter, 0 run-time), 1 died on S (by a player: H 0; no attacker 0; "
+                      "attacker not recorded 1)", v.counts)
+
+
+# The two pages the confirm agent checked row by row (logs/confirm/TRIAGE.txt, batch 8, runs 4 and 5): the
+# enemies row was wrong on both. Run folders on the test store (outside git: they name the disc's objects).
+CALIBRATION_RUNS = Path(r"D:/SwapForceOnline-data/tests/int2/runs")
+TUTORIAL_A = CALIBRATION_RUNS / "20261119-033102-levelpass-tutorial_a"
+TUTORIAL_B = CALIBRATION_RUNS / "20261119-033620-levelpass-tutorial_b"
+
+
+@unittest.skipUnless(TUTORIAL_A.is_dir() and TUTORIAL_B.is_dir(), "the batch 8 run folders are not on this machine")
+class EnemiesCalibration(unittest.TestCase):
+    def test_tutorial_a_counts_every_enemy_s_had(self) -> None:
+        v = lc.grade_enemies(lc.load_run(TUTORIAL_A))
+        self.assertTrue(v.counts.startswith("S 32 (0 placed, 28 encounter, 4 run-time), 32 died on S (by a player: "
+                                            "H 0, D 0; no attacker 4; attacker not recorded 28)"), v.counts)
+        for who in "HD":
+            self.assertIn(f"{who}: bound 30 of 32, waiting asleep 0 (its copy asleep, far from this player: not a "
+                          "fault by itself), never existed here 2; deaths 32: 30 seen on a bound copy, 2 dead before "
+                          "bind", v.counts)
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.findings[0].what, "4 enemies died on S with no attacker within 10 s of their spawn (2 "
+                                             "reached no client)")
+
+    def test_tutorial_b_bound_asleep_and_dead_before_bind_apart(self) -> None:
+        v = lc.grade_enemies(lc.load_run(TUTORIAL_B))
+        self.assertIn("S 25 (17 placed, 0 encounter, 8 run-time), 11 died on S (by a player: H 11, D 0;", v.counts)
+        self.assertIn("H: bound 22 of 25, waiting asleep 2 (its copy asleep, far from this player: not a fault by "
+                      "itself), never existed here 1; deaths 11: 10 seen on a bound copy, 1 dead before bind", v.counts)
+        # D stands at the start: 17 copies only waited asleep; its 5 dead-before-bind are 4 asleep copies and the
+        # bomber no client had.
+        self.assertIn("D: bound 7 of 25, waiting asleep 17 (its copy asleep, far from this player: not a fault by "
+                      "itself), never existed here 1; deaths 11: 6 seen on a bound copy, 5 dead before bind", v.counts)
+        whats = [x.what for x in v.findings]
+        self.assertEqual(whats[0], "a fight step failed with no damage done: 17 burst(s) at 3085,-534,3746, no hit "
+                                   "took a hit point")
+        self.assertIn("S's kills by player (`dead by <peer>`): H 11, D 0", v.findings[0].lines)
+        self.assertIn("existed on no client: sb7fe49cd.52540001#3/0@2 (BomberSpawner_02_Spawned3#3951)", whats)
+        self.assertEqual(v.status, lc.FAIL)
 
 
 FIGHT = "-535,-2875,303"
@@ -178,6 +293,16 @@ class Fights(unittest.TestCase):
                        + [(54, f"Online: enemy life {K1} alive -> dead")])
         self.assertEqual(v.status, lc.PASS, v.findings)
         self.assertIn("1 took hit points; 1 enemy death(s) by a player on S", v.counts)
+
+    def test_one_players_hits_take_nothing_while_the_others_kill(self) -> None:
+        v = lc.grade_enemies(RunFolder(PLACED + [(60, f"Online: enemy {K1} dead by 2 (S, placed; attacker PeerPuppet_1#9)")],
+                                       H_JOIN + SEEN + fight("96") + LEVEL_END,
+                                       D_JOIN + [(41, f"Online: enemy bind {K1} (resolved)"),
+                                                 (61, f"Online: enemy life {K1} alive -> dead")] + LEVEL_END).run())
+        whats = [x.what for x in v.findings]
+        self.assertIn("H's hits took no hit point in 1 fight(s) (2 burst(s)) while D killed 1 on S: one player cannot "
+                      "hurt enemies the other can", whats)
+        self.assertNotIn("the route fought", " ".join(whats))  # a player's kill came
 
     def test_a_fight_that_never_burst_is_counted_not_a_finding_of_its_own(self) -> None:
         held = [(50, f"Dev: fight_area {FIGHT} start: radius 1500, 0 enemies within it"),

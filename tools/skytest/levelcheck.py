@@ -260,10 +260,23 @@ def grade_lobby(run: Run) -> Verdict:
 
 # --- enemies shared ------------------------------------------------------------------------------------
 
-S_PLACED = re.compile(r"Online: enemy (placed|run-time spawn) " + KEY + r" as (\S+)")
-S_DEAD = re.compile(r"Online: enemy " + KEY + r" dead by ")
+# S's enemies, every kind it logs (`enemy placed`, `enemy run-time spawn`, and the encounter path's `enemy spawn
+# <key> as <Name> ... (S)`: tutorial_a's 28 ECI_Manager actors and its Feeder were missing from this row before,
+# 20261119-033102), and each one's death: `dead by <peer|none> (S[, placed; attacker <Name#id|->])`. The attacker is
+# S's actor name: `-` is no attacker at all; no field (the encounter path) is an attacker not recorded, and a
+# player's kill there reads `dead by none (S)` too (tutorial_a: a death 4 ms after H's press started on S). The
+# puppet name is no player number (S's puppet slots swap at a level change: tutorial_b 20261119-033620, `puppet 2
+# for peer 1` in generation 2), so a kill is the player of `dead by <peer>`.
+S_PLACED = re.compile(r"Online: enemy (placed|run-time spawn|spawn) " + KEY + r" as (\S+)")
+S_DEAD = re.compile(r"Online: enemy " + KEY + r" dead by (\S+) \((.*)\)")
+S_NO_ATTACKER = re.compile(r"Online: enemy " + KEY + r" died with no attacker at ")
 S_STREAMED = re.compile(r"Online: enemy " + KEY + r" streamed out on the server")
+S_ATTACKER = re.compile(r"attacker (\S+)")
 C_ENEMY = re.compile(r"Online: enemy (spawn|replica|skipped|life|dead|retired alive|retired|bind) " + KEY + r"(.*)")
+# An enemy that dies on S with no attacker this soon after S made it never got to the players: the tutorial_a
+# ship greebles fell and died 0.87 to 2.8 s after their spawn, two of them before either client bound them.
+DIED_SOON = timedelta(seconds=10)
+KINDS = {"placed": "placed", "run-time spawn": "run-time", "spawn": "encounter"}
 
 
 @dataclass
@@ -272,19 +285,31 @@ class EnemyKey:
     gen: int
     name: str
     placed: Line
+    kind: str = "placed"
     dead: Line | None = None
+    by: str = ""                   # dead by <peer|none>
+    attacker: str | None = None    # S's attacker field: a name, "-" (none), None (not recorded)
+    no_attacker: Line | None = None
     streamed: Line | None = None
 
 
 def server_enemies(log: Log) -> dict[str, EnemyKey]:
     keys: dict[str, EnemyKey] = {}
     for line, m in log.find(S_PLACED):
+        if m.group(1) == "spawn" and not line.text.endswith("(S)"):
+            continue  # the encounter path's line is S's own only with its (S)
         if m.group(2) not in keys:
-            keys[m.group(2)] = EnemyKey(m.group(2), int(m.group(3)), m.group(4), line)
+            keys[m.group(2)] = EnemyKey(m.group(2), int(m.group(3)), m.group(4), line, KINDS[m.group(1)])
     for line, m in log.find(S_DEAD):
         k = keys.get(m.group(1))
         if k and k.dead is None:
-            k.dead = line
+            k.dead, k.by = line, m.group(3)
+            a = S_ATTACKER.search(m.group(4))
+            k.attacker = a.group(1) if a else None
+    for line, m in log.find(S_NO_ATTACKER):
+        k = keys.get(m.group(1))
+        if k and k.no_attacker is None:
+            k.no_attacker = line
     for line, m in log.find(S_STREAMED):
         k = keys.get(m.group(1))
         if k and k.streamed is None:
@@ -294,11 +319,22 @@ def server_enemies(log: Log) -> dict[str, EnemyKey]:
 
 @dataclass
 class ClientEnemy:
-    attach: Line | None = None    # spawn, bind (resolved), replica, skipped, life, dead, retired
-    pending: Line | None = None   # bind (pending past grace: missing)
-    death: Line | None = None     # life alive -> dead, skipped (dead before bind), dead by
+    bound: Line | None = None      # `spawn <key>` or `bind <key> (resolved)`: a copy here tied to S's row
+    waits: Line | None = None      # `bind <key> by authored id ... waits (asleep here ...)`
+    pending: Line | None = None    # `bind <key> (pending past grace: missing)`
+    seen_dead: Line | None = None  # `life <key> alive -> dead` / `dead <key> by`: the death shown on its copy
+    skipped: Line | None = None    # `skipped <key> (dead before bind)`: S's death came before any bind here
     retired_alive: Line | None = None
     last: Line | None = None
+
+    def status(self) -> str:
+        if self.bound:
+            return "bound" + (", saw it die" if self.seen_dead else "")
+        if self.waits:
+            return "waiting asleep" + (", then dead before bind" if self.skipped else "")
+        if self.pending:
+            return "looked for, never found"
+        return "dead before bind (never existed here)" if self.skipped else "no line"
 
 
 def client_enemies(log: Log) -> dict[str, ClientEnemy]:
@@ -307,66 +343,133 @@ def client_enemies(log: Log) -> dict[str, ClientEnemy]:
         kind, key, rest = m.group(1), m.group(2), m.group(4)
         c = out.setdefault(key, ClientEnemy())
         c.last = line
-        if kind == "bind" and "pending past grace" in rest:
+        if kind == "spawn" or (kind == "bind" and "(resolved)" in rest):
+            c.bound = c.bound or line
+        elif kind == "bind" and "pending past grace" in rest:
             c.pending = c.pending or line
-            continue
-        c.attach = c.attach or line
-        if (kind == "life" and "-> dead" in rest) or (kind == "skipped" and "dead before bind" in rest) or kind == "dead":
-            c.death = c.death or line
-        if kind == "retired alive":
+        elif kind == "bind" and " waits (asleep here" in rest:
+            c.waits = c.waits or line
+        elif kind == "skipped" and "dead before bind" in rest:
+            c.skipped = c.skipped or line
+        elif (kind == "life" and "-> dead" in rest) or kind == "dead":
+            c.seen_dead = c.seen_dead or line
+        elif kind == "retired alive":
             c.retired_alive = c.retired_alive or line
     return out
 
 
 def grade_enemies(run: Run) -> Verdict:
+    """Every enemy S had, per client: bound there, waiting asleep (its copy asleep far from that player: no
+    fault by itself), or never there; and each death S logged: seen on a bound copy, or dead before bind. PASS
+    only when every enemy a client was near enough to see (not asleep there) was bound there, every death of a
+    bound enemy arrived, no enemy existed on no client, and none died on S with no attacker right after its
+    spawn."""
     if run.server is None:
         return Verdict("enemies", NOT_TESTED, "no server log in this run folder")
     keys = server_enemies(run.server)
     if not keys:
-        return Verdict("enemies", NOT_TESTED, "S logged no `enemy placed` or `enemy run-time spawn` line")
-    placed = sum(1 for k in keys.values() if "placed" in k.placed.text)
-    counts = [f"S {len(keys)} ({placed} placed, {len(keys) - placed} run-time), "
-              f"{sum(1 for k in keys.values() if k.dead)} died on S"]
+        return Verdict("enemies", NOT_TESTED, "S logged no `enemy placed`, `enemy run-time spawn` or `enemy spawn ... "
+                       "(S)` line")
+    peers = peer_numbers(run)
+    order = sorted(run.clients, key=lambda w: (w != "H", w))  # H first, as the page names the players
+    kinds = {kd: sum(1 for k in keys.values() if k.kind == kd) for kd in ("placed", "encounter", "run-time")}
+    dead = [k for k in keys.values() if k.dead]
+    by_player = {who: sum(1 for k in dead if k.by.isdigit() and peers.get(int(k.by)) == who)
+                 for who in order}
+    no_attacker = [k for k in dead if k.attacker == "-"]
+    unrecorded = [k for k in dead if k.attacker is None and not k.by.isdigit()]
+    counts = [f"S {len(keys)} ({', '.join(f'{n} {kd}' for kd, n in kinds.items())}), {len(dead)} died on S (by a "
+              f"player: {', '.join(f'{w} {n}' for w, n in by_player.items()) or '-'}; no attacker {len(no_attacker)}; "
+              f"attacker not recorded {len(unrecorded)})"]
     findings: list[Finding] = []
-    for who, log in run.clients.items():
+    expected: dict[str, list[str]] = {}       # key -> the clients that should have had it
+    there: dict[str, dict[str, ClientEnemy | None]] = {}
+    for who in order:
+        log = run.clients[who]
         wins = client_windows(log)
         seen = client_enemies(log)
-        n_exp = n_att = n_deaths = n_deaths_ok = 0
+        n_exp = n_bound = n_wait = n_none = 0
+        n_deaths = n_seen = n_before = n_asleep_quiet = 0
         for k in keys.values():
             w = wins.get(k.gen)
             if w is None:
                 continue
             gone = k.dead or k.streamed
             if k.placed.t is None or k.placed.t > w.end - BIND_GRACE or (gone and gone.t and gone.t < w.start):
-                continue  # placed too late for this client, or gone before it came
+                continue  # made too late for this client, or gone before it came
             n_exp += 1
+            expected.setdefault(k.key, []).append(who)
             c = seen.get(k.key)
-            if c is None or (c.attach is None and c.pending is None):
-                findings.append(Finding(f"{who} never attached {k.key} ({k.name})", [
-                    k.placed.cite(), absent(log, f"for {k.key}")]))
+            there.setdefault(k.key, {})[who] = c
+            died_here = bool(k.dead and k.dead.t and w.start <= k.dead.t <= w.end - DEATH_GRACE)
+            n_deaths += died_here
+            if c is not None and c.bound:
+                n_bound += 1
+                if died_here:
+                    if c.seen_dead:
+                        n_seen += 1
+                    else:
+                        findings.append(Finding(f"{who} never saw {k.key} ({k.name}) die: dead on S, alive on its "
+                                                f"bound copy here", [k.dead.cite(), (c.retired_alive or c.last).cite()]))
+                elif c.seen_dead and k.dead is None and k.streamed is None:
+                    findings.append(Finding(f"{who}: {k.key} ({k.name}) dead here only, S never logged its death", [
+                        c.seen_dead.cite(), absent(run.server, f"`enemy {k.key} dead by`")]))
                 continue
-            if c.attach is None:
+            if c is not None and c.waits:
+                n_wait += 1
+                if died_here:
+                    if c.skipped:
+                        n_before += 1
+                    else:
+                        n_asleep_quiet += 1
+                continue
+            if c is not None and c.pending:
                 findings.append(Finding(f"{who} never found {k.key} ({k.name}): S had it, {who} looked for it "
                                         f"and never bound it", [k.placed.cite(), c.pending.cite()]))
                 continue
-            n_att += 1
-            if k.dead and k.dead.t and w.start <= k.dead.t <= w.end - DEATH_GRACE:
-                n_deaths += 1
-                if c.death is not None:
-                    n_deaths_ok += 1
-                else:
-                    findings.append(Finding(f"{who} never saw {k.key} ({k.name}) die: dead on S, alive here", [
-                        k.dead.cite(), (c.retired_alive or c.last).cite()]))
-            elif c.death is not None and k.dead is None and k.streamed is None:
-                findings.append(Finding(f"{who}: {k.key} ({k.name}) dead here only, S never logged its death", [
-                    c.death.cite(), absent(run.server, f"`enemy {k.key} dead by`")]))
+            if c is not None and c.skipped:
+                n_none += 1
+                n_before += died_here
+                continue
+            findings.append(Finding(f"{who} never attached {k.key} ({k.name})", [
+                k.placed.cite(), absent(log, f"for {k.key}")]))
         if wins:
-            counts.append(f"{who}: attached {n_att} of {n_exp} it should have, deaths seen {n_deaths_ok} of "
-                          f"{n_deaths}")
+            counts.append(f"{who}: bound {n_bound} of {n_exp}, waiting asleep {n_wait} (its copy asleep, far from "
+                          f"this player: not a fault by itself), never existed here {n_none}; deaths {n_deaths}: "
+                          f"{n_seen} seen on a bound copy, {n_before} dead before bind"
+                          + (f", {n_asleep_quiet} with no word on its asleep copy" if n_asleep_quiet else ""))
         else:
             counts.append(f"{who}: in no level")
+
+    def where(key: str) -> str:
+        return ", ".join(f"{w} {c.status() if c else 'no line'}" for w, c in there.get(key, {}).items()) or \
+            "no client was in its level"
+
+    soon = [k for k in no_attacker if k.placed.t and k.dead.t and k.dead.t - k.placed.t <= DIED_SOON]
+    if soon:
+        lines = []
+        for k in soon:
+            lines += [k.dead.cite() + f" ({(k.dead.t - k.placed.t).total_seconds():.2f} s after its spawn)",
+                      *([k.no_attacker.cite()] if k.no_attacker else []), f"    on the clients: {where(k.key)}"]
+        nowhere = sum(1 for k in soon if all(c is None or not (c.bound or c.waits) for c in there.get(k.key, {}).values()))
+        findings.insert(0, Finding(f"{len(soon)} enem{'y' if len(soon) == 1 else 'ies'} died on S with no attacker "
+                                   f"within {DIED_SOON.seconds} s of {'its' if len(soon) == 1 else 'their'} spawn "
+                                   f"({nowhere} reached no client)", lines))
+    soon_keys = {k.key for k in soon}
+    # Every client that should have had it logged it and none had a copy (a key with no line on a client is that
+    # client's `never attached` above).
+    nowhere_keys = [key for key, ws in expected.items() if key not in soon_keys and
+                    all(there[key].get(w) is not None and not (there[key][w].bound or there[key][w].waits or
+                                                               there[key][w].pending) for w in ws)]
+    if nowhere_keys:
+        lines = []
+        for key in nowhere_keys:
+            k = keys[key]
+            lines += [k.placed.cite(), *([k.dead.cite()] if k.dead else []), f"    on the clients: {where(key)}"]
+        findings.insert(0, Finding(f"existed on no client: {', '.join(f'{key} ({keys[key].name})' for key in nowhere_keys)}",
+                                   lines))
     first = next(iter(keys.values())).placed.cite()
-    fights, fight_findings = fight_findings_of(run)
+    fights, fight_findings = fight_findings_of(run, by_player, len(unrecorded))
     counts.append(fights)
     findings = fight_findings + findings  # the fights first: the most telling
     return Verdict("enemies", FAIL if findings else PASS, "; ".join(counts), first, findings)
@@ -385,7 +488,11 @@ PLAYER_KILL = re.compile(r"Online: enemy " + KEY + r" dead by (\d+) ")
 DAMAGE_REFUSED = re.compile(r"Online: puppet \d+ damage check on .*result 0 reason .*")
 
 
-def fight_findings_of(run: Run) -> tuple[str, list[Finding]]:
+def fight_findings_of(run: Run, by_player: dict[str, int] | None = None,
+                      unrecorded: int = 0) -> tuple[str, list[Finding]]:
+    """H's fights against S's deaths: `by_player` the kills S credits to each client (`dead by <peer>`),
+    `unrecorded` the deaths whose attacker S does not name (the encounter path: a player's kill may hide there)."""
+    by_player = by_player or {}
     h = run.clients.get("H")
     if h is None:
         return "fights: no H log", []
@@ -409,6 +516,7 @@ def fight_findings_of(run: Run) -> tuple[str, list[Finding]]:
             cur["end"] = (h.line(i), m.group(2), m.group(3))
             cur = None
     kills = run.server.find(PLAYER_KILL) if run.server is not None else []
+    tally = ", ".join(f"{w} {n}" for w, n in by_player.items())
     refused = run.server.find(DAMAGE_REFUSED) if run.server is not None else []
     findings: list[Finding] = []
     for fg in fights:
@@ -418,10 +526,20 @@ def fight_findings_of(run: Run) -> tuple[str, list[Finding]]:
         lines.append(refused[0][0].cite() + f" (and {len(refused) - 1} more)" if refused else
                      "S logged no damage check line (its damage trace is off in this run): the hits are not "
                      "explained, only that none took a hit point")
+        if tally:
+            lines.append(f"S's kills by player (`dead by <peer>`): {tally}")
         findings.append(Finding(f"a fight step failed with no damage done: {len(fg['tries'])} burst(s) at "
                                 f"{fg['area']}, no hit took a hit point", lines))
     with_bursts = [fg for fg in fights if fg["tries"]]
-    if fights and not kills:
+    others = {w: n for w, n in by_player.items() if w != "H" and n}
+    if with_bursts and not any(fg["hit"] for fg in with_bursts) and not by_player.get("H") and others:
+        # One player's hits take nothing while the other's kill (the player S credits: `dead by <peer>`).
+        findings.append(Finding(
+            f"H's hits took no hit point in {len(with_bursts)} fight(s) ({sum(len(fg['tries']) for fg in with_bursts)} "
+            f"burst(s)) while {', '.join(f'{w} killed {n}' for w, n in others.items())} on S: one player cannot "
+            "hurt enemies the other can",
+            [with_bursts[0]["tries"][0].cite(), next(l.cite() for l, m in kills if peer_of(run, m) in others)]))
+    if with_bursts and not kills and not unrecorded:
         findings.append(Finding(
             f"the route fought {len(fights)} time(s) ({sum(len(fg['tries']) for fg in fights)} burst(s)) and no "
             "enemy died by a player on S",
@@ -433,6 +551,11 @@ def fight_findings_of(run: Run) -> tuple[str, list[Finding]]:
             + (f", {len(no_burst)} failed before any burst ({no_burst[0]['end'][2][:60]})" if no_burst else "")
             + f"; {len(kills)} enemy death(s) by a player on S")
     return text, findings
+
+
+def peer_of(run: Run, m: re.Match) -> str:
+    """The client a `dead by <peer>` match names (PLAYER_KILL's peer group), or ''."""
+    return peer_numbers(run).get(int(m.group(3)), "")
 
 
 # --- pickups (and the coins slot) ----------------------------------------------------------------------
