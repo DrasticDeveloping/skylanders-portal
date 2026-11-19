@@ -804,6 +804,13 @@ bool ServerSession::SendSceneBarrier(const SceneBarrier& scene, TimePoint now) {
   return true;
 }
 
+bool ServerSession::SendSceneBarrierTo(uint16_t peer, const SceneBarrier& scene, TimePoint now) {
+  if (scene.phase == ScenePhase::kAck) return false;
+  Peer* p = FindById(peer);
+  if (p == nullptr || p->state != PeerState::kWelcomed) return false;
+  return Post(*p, Lane::kGameplay, scene, now);
+}
+
 void ServerSession::EndSession(TimePoint now) {
   if (!transport_ || requests_.Closing()) return;
   std::vector<uint16_t> ids;
