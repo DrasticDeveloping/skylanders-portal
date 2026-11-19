@@ -502,7 +502,7 @@ def scene_line(log: Log, name: str, t: datetime | None) -> str:
     elif name.startswith("conversation@"):
         want, kind = "recipient " + name[len("conversation@"):], "scene local"
     else:
-        want, kind = name, "scene"
+        want, kind = name, "Online: scene"
     for i, raw in enumerate(log.lines):
         if want in raw and kind in raw and (t is None or stamp(raw) == t):
             return log.line(i).cite()
@@ -585,6 +585,127 @@ def expected_scene_notes(h: Log, rows) -> list[str]:
     return out
 
 
+# --- the other player is the right skylander ---------------------------------------------------------------
+#
+# What a player sees of the other player: each client's puppet of each remote player, from the lines the
+# games write: `Online: puppet <n> spawned <character> at ... (epoch e gen g, stand-in from Hero_<own>)` and
+# `Online: puppet <n> epoch e gen g body <character> (stand-in) swap k tick t`, until `puppet <n> despawned`.
+# A body is right when it is a real body (online/4-remote-bodies, setting online_remote_bodies: its line reads
+# `body <character> (real)`; BODY takes it as soon as it is written so) of the character that player plays at
+# that moment (its own `Online: own player row <Character> figure ...` line, the newest before the moment): a
+# figure change or a swap is followed. A stand-in shown longer than STANDIN_MAX_S is a failure, as is a body of
+# another character. Puppet <n> is peer <n>'s (each client's `connected as peer <n>`).
+STANDIN_MAX_S = 5.0
+PUPPET_SPAWNED = re.compile(r"Online: puppet (\d+) spawned (\S+) at .*\((?:epoch \d+ gen \d+, )?(stand-in|real)\b")
+PUPPET_BODY = re.compile(r"Online: puppet (\d+) epoch \d+ gen \d+ body (\S+) \((stand-in|real)\b")
+PUPPET_GONE = re.compile(r"Online: puppet (\d+) despawned")
+OWN_ROW = re.compile(r"Online: own player row (\S+) figure ")
+
+
+@dataclass
+class BodySpan:
+    character: str
+    kind: str              # stand-in or real
+    start: datetime
+    end: datetime
+    line: Line
+
+
+def body_spans(log: Log) -> dict[int, list[BodySpan]]:
+    """Each puppet's bodies on this client, one span per body line (the newest body until the next line,
+    its despawn or the log's end)."""
+    events: list[tuple[datetime, int, str, str, Line]] = []
+    for rx, kind in ((PUPPET_SPAWNED, "body"), (PUPPET_BODY, "body"), (PUPPET_GONE, "gone")):
+        for line, m in log.find(rx):
+            if line.t is None:
+                continue
+            if kind == "gone":
+                events.append((line.t, int(m.group(1)), "", "gone", line))
+            else:
+                events.append((line.t, int(m.group(1)), m.group(2), m.group(3), line))
+    events.sort(key=lambda e: (e[0], e[4].no))
+    last = log.last_time()
+    out: dict[int, list[BodySpan]] = {}
+    for t_, puppet, character, kind, line in events:
+        spans = out.setdefault(puppet, [])
+        if spans and spans[-1].end == datetime.max:
+            spans[-1].end = t_
+        if kind != "gone":
+            spans.append(BodySpan(character, kind, t_, datetime.max, line))
+    for spans in out.values():
+        if spans and spans[-1].end == datetime.max:
+            spans[-1].end = last or spans[-1].start
+    return out
+
+
+def own_characters(log: Log) -> list[tuple[datetime, str, Line]]:
+    return [(line.t, m.group(1).lower(), line) for line, m in log.find(OWN_ROW) if line.t is not None]
+
+
+def grade_bodies(run: Run) -> Verdict:
+    peers = peer_numbers(run)
+    findings: list[Finding] = []
+    counts: list[str] = []
+    example = ""
+    standins = total = 0
+    for who, log in run.clients.items():
+        for puppet, spans in sorted(body_spans(log).items()):
+            other = peers.get(puppet)
+            plays = own_characters(run.clients[other]) if other in run.clients else []
+            shown = standin = 0.0
+            for sp in spans:
+                secs = max(0.0, (sp.end - sp.start).total_seconds())
+                shown += secs
+                total += 1
+                example = example or sp.line.cite()
+                playing = next((c for t_, c, _l in reversed(plays) if t_ <= sp.start), plays[0][1] if plays else "")
+                if sp.kind == "stand-in":
+                    standin += secs
+                    if secs > STANDIN_MAX_S:
+                        standins += 1
+                        findings.append(Finding(
+                            f"{who} shows {other or 'peer ' + str(puppet)} as a stand-in {sp.character} for {secs:.0f} s "
+                            f"(more than {STANDIN_MAX_S:.0f} s): a copy of {who}'s own skylander",
+                            [sp.line.cite()]))
+                if playing and sp.character.lower() != playing:
+                    findings.append(Finding(
+                        f"{who} shows {other or 'peer ' + str(puppet)} as {sp.character}, but that player plays {playing}",
+                        [sp.line.cite(), next(l.cite() for t_, c, l in reversed(plays) if c == playing)]))
+            counts.append(f"{who} sees {other or 'peer ' + str(puppet)}: {len(spans)} body line(s), "
+                          f"{shown:.0f} s shown, {standin:.0f} s of it a stand-in")
+    if total == 0:
+        return Verdict("other player", NOT_TESTED, "no client showed another player (no `puppet <n> spawned` line)")
+    return Verdict("other player", FAIL if findings else PASS,
+                   "; ".join(counts) + f"; stand-ins over {STANDIN_MAX_S:.0f} s: {standins}", example, findings)
+
+
+# --- what no grader covers yet -------------------------------------------------------------------------------
+#
+# Said at the bottom of every page so the gaps are seen without asking. From the placeholder audit's CLASS 1
+# (logs/placeholder-audit.txt, two players in tutorial_a, tutorial_b and ww1 with the session's defaults) and the
+# owner's own list; a line goes when a grader covers it.
+NOT_COVERED = (
+    "the other player's animations, attacks, specials, projectiles, sounds and effects (only its body is read)",
+    "which skylander's attack lands on the server (it replays the presses on its own hero: reach and damage may "
+    "differ), player hits and damage numbers as the other player sees them",
+    "the HUD and party panel: portraits (a number today), health bars, names, level, hat, lives",
+    "coins lying in the level, food and the wallet (until their log lines exist)",
+    "the other player's knock-out, death and revive, jumps and falls as seen on the screen",
+    "enemy movement, animation and attack timing, enemies aiming at the partner, enemy missiles, freezes and "
+    "other victim states",
+    "the save: whether the session's progress reaches the host's real slot",
+    "Spark Lock boards, Swap Zones, shops, turrets, containers and conversations left open, push blocks and "
+    "moving platforms seen in different places, sub-map scenery",
+    "a cutscene one screen keeps playing after the server stopped it, conversation lines skipped on one screen",
+    "co-op difficulty scaling for two players",
+    "levels, modes and paths the pass does not take (swap zones, later levels, rejoining)",
+)
+
+
+def not_covered_lines() -> list[str]:
+    return ["", "what this check does NOT look at (no grader covers it yet):"] + [f"  - {x}" for x in NOT_COVERED]
+
+
 # --- completable (the level pass's own verdict) --------------------------------------------------------
 
 H_NEXT = re.compile(r"Input script: LEVELPASS phase next-level")
@@ -628,8 +749,8 @@ def grade_completable(run: Run) -> Verdict:
 
 def grade(folder: Path, repo: Path | None) -> list[Verdict]:
     run = load_run(folder)
-    return [grade_completable(run), grade_lobby(run), grade_slot(run), grade_scenes(run, repo), grade_enemies(run),
-            grade_pickups(run), grade_loot(run)]
+    return [grade_completable(run), grade_lobby(run), grade_slot(run), grade_bodies(run), grade_scenes(run, repo),
+            grade_enemies(run), grade_pickups(run), grade_loot(run)]
 
 
 def run_head(folder: Path) -> list[str]:
@@ -666,6 +787,7 @@ def page(folder: Path, verdicts: list[Verdict], head: list[str] | None = None) -
         for v, f in more:
             out.append(f"  {v.name}: {f.what}")
             out += [f"      {x}" for x in f.lines]
+    out += not_covered_lines()
     return "\n".join(out)
 
 

@@ -285,6 +285,48 @@ class Command(unittest.TestCase):
         self.assertEqual(code, 0)
 
 
+
+class OtherPlayer(unittest.TestCase):
+    """What a player sees of the other: a stand-in over STANDIN_MAX_S fails, a real body of the character that
+    player plays at that moment passes, a swap is followed (the newest own row before each body line)."""
+    H_ROW = [(10, "Online: own player row TopsyDerby figure 3012 state 0 swap 2 (epoch 1)")]
+    D_ROW = [(41, "Online: own player row Scorpion figure 3003 state 0 swap 0 (epoch 1)")]
+
+    def grade(self, h_extra, d_extra=()) -> lc.Verdict:
+        return lc.grade_bodies(RunFolder([], H_JOIN + self.H_ROW + list(h_extra) + LEVEL_END,
+                                         D_JOIN + self.D_ROW + list(d_extra) + LEVEL_END).run())
+
+    def test_tonights_stand_in_fails(self) -> None:
+        v = self.grade([(50, "Online: puppet 2 spawned scorpion at 1,2,3 (epoch 1 gen 2, stand-in from Hero_topsyderby)"),
+                        (50, "Online: puppet 2 epoch 1 gen 2 body scorpion (stand-in) swap 1 tick 19268"),
+                        (180, "Online: puppet 2 despawned (generation)")])
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertIn("H sees D: 2 body line(s), 130 s shown, 130 s of it a stand-in", v.counts)
+        self.assertIn("stand-in scorpion for 130 s", v.findings[0].what)
+        self.assertTrue(v.findings[0].lines[0].startswith("H/game.log:"), v.findings[0].lines)
+
+    def test_a_short_stand_in_then_the_real_body_passes(self) -> None:
+        v = self.grade([(50, "Online: puppet 2 spawned scorpion at 1,2,3 (epoch 1 gen 2, stand-in from Hero_topsyderby)"),
+                        (53, "Online: puppet 2 epoch 1 gen 2 body scorpion (real) swap 1 tick 19300")],
+                       [(60, "Online: puppet 1 spawned topsyderby at 1,2,3 (epoch 1 gen 2, real)")])
+        self.assertEqual(v.status, lc.PASS, v.findings)
+
+    def test_a_swap_is_followed(self) -> None:
+        # D swaps to Wash Buckler at 90 s; H's puppet keeps showing scorpion: wrong from then on.
+        v = self.grade([(50, "Online: puppet 2 epoch 1 gen 2 body scorpion (real) swap 1 tick 1"),
+                        (95, "Online: puppet 2 epoch 1 gen 2 body scorpion (real) swap 2 tick 2")],
+                       [(90, "Online: own player row WashBuckler figure 3050 state 0 swap 1 (epoch 1)")])
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.findings[0].what, "H shows D as scorpion, but that player plays washbuckler")
+
+    def test_no_other_player_is_not_tested(self) -> None:
+        self.assertEqual(self.grade([]).status, lc.NOT_TESTED)
+
+    def test_every_page_says_what_it_does_not_look_at(self) -> None:
+        text = lc.page(Path("run"), [lc.Verdict("x", lc.PASS, "c")])
+        self.assertIn("what this check does NOT look at", text)
+        self.assertIn("coins lying in the level", text)
+
 class StaticTable(unittest.TestCase):
     def test_every_level_with_data_one_row(self) -> None:
         import json
