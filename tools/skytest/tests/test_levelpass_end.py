@@ -340,9 +340,11 @@ class Pause(unittest.TestCase):
                      components=["Scripts.CollectibleComponentData"])
         lines = lp.action_lines(lp.Action(lp.PICKUP, gem, "x"), "v19_1")
         seq = list(lp.DISMISS_LINES)
-        # The selection to No first, then A (A first answers Yes and plays the preview movie).
-        self.assertEqual(seq, [f"tap {lp.FOUND_SCREEN_TO_NO}", "waitfor hero_free 2", "tap a", "waitfor hero_free 6"])
-        self.assertIn(lp.FOUND_SCREEN_TO_NO, ("up", "down", "left", "right"))
+        # A (on to the Yes/No prompt), then B (No) twice; one A only (a second A would answer Yes), no d-pad.
+        self.assertEqual(seq, ["tap a", "waitfor hero_free 3", "tap b", "waitfor hero_free 4", "tap b",
+                               "waitfor hero_free 4"])
+        self.assertEqual(seq.count("tap a"), 1)
+        self.assertFalse(any(p in seq for p in ("tap up", "tap down", "tap left", "tap right")))
         self.assertEqual(lines[1:], ["goto_entity auth:ww1:12086", *seq,
                                      f"pickup auth:ww1:12086 {lp.ACTION_TIMEOUT[lp.PICKUP]}", *seq])
         # The visit's teleport to it: B before anything else runs (the pickup's pause line would end the pass).
@@ -350,7 +352,7 @@ class Pause(unittest.TestCase):
                        visit_only=[])
         s = lp.stop_lines(stop)
         self.assertEqual(s[1:2 + len(seq)], ["goto_entity auth:ww1:12086", *seq])
-        self.assertLess(s.index(f"tap {lp.FOUND_SCREEN_TO_NO}"), s.index("tap a"))
+        self.assertLess(s.index("tap a"), s.index("tap b"))
         self.assertLess(s.index("tap a"), next(i for i, l in enumerate(s) if l.startswith("pickup ")))
         # Keyed on the component (or the probe's collectible class), never the name; no A, back or start.
         box = lp.Obj("Gem_Box", "CPhysicalEntity", (1.0, 2.0, 3.0), lp.GROUP_INTERACT, ref="auth:ww1:5",
