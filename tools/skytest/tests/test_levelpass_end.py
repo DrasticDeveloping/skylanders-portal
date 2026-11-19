@@ -487,5 +487,19 @@ class HeldLevelEnd(unittest.TestCase):
         self.assertIn("online_level_after_mark", lp.D_WAIT_NEEDS)
 
 
+class LevelChangedFight(unittest.TestCase):
+    """fight_area's end when the level changes under it is normal: no finding, no forbidden line, no tool kind."""
+    LINE = ("[2026-11-18 23:03:49.100] [info] [core] [t42892] Dev: fight_area 36764,17631,-2184 done (ended: the level "
+            "changed (zone 0xB52D7D38 -> 0x1234ABCD): 14 bursts, 19 enemies seen, 0 lowered) after 7.4 s")
+
+    def test_the_line_is_normal(self):
+        self.assertEqual(lp.findings_from_log("H", self.LINE, {}), [])
+        self.assertEqual(lp.tool_kind(self.LINE), "")
+        h = ("log LEVELPASS phase exit\ngoto_entity auth:tutorial_b:12036\n"
+             "fight_near auth:tutorial_b:12036 1800 60\nlog LEVELPASS done\n")
+        for rx in lp.exit_forbid(h) + [lp.PAUSE_FATAL]:
+            self.assertIsNone(re.search(rx, self.LINE), rx)
+
+
 if __name__ == "__main__":
     unittest.main()
