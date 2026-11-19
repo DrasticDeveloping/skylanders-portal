@@ -722,6 +722,8 @@ def load_config(repo: Path) -> Config:
         bulk_settings=BulkSettings(games=bulk_games, wait_factor=float(factor), gb_per_game=float(gb)),
     )
     cfg.snapshots = snapshots_setting(cfg)
+    global SCRIPT_CONDITIONS
+    SCRIPT_CONDITIONS = table_conditions(cfg.script_commands)
     return cfg
 
 
@@ -1261,11 +1263,56 @@ def fill_save_slots(data: Path, title: str, name_pattern: str, slots: dict[int, 
     return done
 
 
+# A spec script line that depends on the build: `when <condition> <line>` keeps <line> when the checkout's command
+# table (Config.script_commands, tests/script_commands.toml: the conditions the game's source registers, checked
+# against it by tools/tests/test_launch_tables.py) lists <condition>, `unless <condition> <line>` when it does not.
+# Expanded when a spec is read (load_spec, the preflight), so the runner, the preflight's checks and the game see
+# plain lines; the game has no `when` command, so a line left unexpanded is refused there (fail closed). Without a
+# table (SCRIPT_CONDITIONS None: no config read) a condition counts as not listed. First use: scene-skip-press-tb
+# waits for the cutscene skip prompt (`scene_skip_prompt_up`, online/8-test-conditions) where the build has it.
+SCRIPT_CONDITIONS: set[str] | None = None
+WHEN_LINE = re.compile(r"^(\s*)(when|unless)\s+(\S+)\s+(\S.*)$")
+
+
+def table_conditions(path: Path) -> set[str] | None:
+    """The conditions a command table lists, or None when it cannot be read."""
+    try:
+        return set(tomllib.loads(path.read_text(encoding="utf-8")).get("conditions", []))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+
+
+def expand_when_lines(script: str, conditions: set[str] | None) -> str:
+    """A script with its `when` / `unless` lines decided (WHEN_LINE): the kept ones without their prefix."""
+    out = []
+    for line in script.split("\n"):
+        m = WHEN_LINE.match(line)
+        if not m:
+            out.append(line)
+            continue
+        listed = conditions is not None and m.group(3) in conditions
+        if listed == (m.group(2) == "when"):
+            out.append(m.group(1) + m.group(4))
+    return "\n".join(out)
+
+
+def expand_spec_dict(d: dict, conditions: set[str] | None = None) -> dict:
+    """A spec table with every peer's script (and the common one) expanded (expand_when_lines); the table's own
+    SCRIPT_CONDITIONS unless `conditions` is given."""
+    conds = SCRIPT_CONDITIONS if conditions is None else conditions
+    if isinstance(d.get("script"), str):
+        d["script"] = expand_when_lines(d["script"], conds)
+    for peer in (d.get("peer") or {}).values():
+        if isinstance(peer, dict) and isinstance(peer.get("script"), str):
+            peer["script"] = expand_when_lines(peer["script"], conds)
+    return d
+
+
 def load_spec(path: Path, default_timeout: float) -> Spec:
     try:
         data = path.read_bytes()
         text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")  # as read_text reads it
-        d = tomllib.loads(text)
+        d = expand_spec_dict(tomllib.loads(text))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
         raise SpecError(f"{path.name}: {e}") from e
     for key in ("name", "layout", "stage"):
@@ -8396,7 +8443,7 @@ def preflight_check(cfg: Config, spec: Spec, cache: dict) -> list:
     if "ctx" not in cache:
         cache["ctx"], cache["runs"], *_ = preflight_context(cfg)
     try:
-        d = tomllib.loads(spec.path.read_text(encoding="utf-8"))
+        d = expand_spec_dict(tomllib.loads(spec.path.read_text(encoding="utf-8")))
     except (OSError, tomllib.TOMLDecodeError):
         return []  # load_spec read it: a file changed since is said by run_one
     return preflight_case(cache["ctx"], cache["runs"], spec.name, d, True)
@@ -8410,7 +8457,7 @@ def cmd_preflight(cfg: Config, a: argparse.Namespace) -> int:
     for path in paths:
         text = path.read_text(encoding="utf-8")
         try:
-            d = tomllib.loads(text)
+            d = expand_spec_dict(tomllib.loads(text))
         except tomllib.TOMLDecodeError as e:
             print(f"{path.stem}: error spec -: not TOML ({e})")
             continue
@@ -8426,7 +8473,8 @@ def cmd_preflight(cfg: Config, a: argparse.Namespace) -> int:
     for f in a.file or []:
         fp = expand(f)
         try:
-            chosen.append((fp.stem.split("@")[0], tomllib.loads(fp.read_text(encoding="utf-8")), False))
+            chosen.append((fp.stem.split("@")[0], expand_spec_dict(tomllib.loads(fp.read_text(encoding="utf-8"))),
+                           False))
         except (OSError, tomllib.TOMLDecodeError) as e:
             print(f"{fp.name}: error spec -: {e}")
     if not chosen:
