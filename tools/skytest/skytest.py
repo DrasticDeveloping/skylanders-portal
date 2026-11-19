@@ -802,13 +802,13 @@ def snapshots_setting(cfg: Config) -> Path | None:
     return folder
 
 
-def remove_temporary(cfg: Config, tmp: Path) -> None:
-    """A partial snapshot folder of this process removed: only while its real path is inside the snapshots
-    root (the store's snapshots/ or the outside folder) and it is no link; else the run stops."""
+def remove_temporary(tmp: Path, root: str) -> None:
+    """A partial snapshot folder of this process removed: only while its real path is inside `root` (the
+    snapshots root's real path, resolved once by the caller: the store's snapshots/ or the outside folder) and
+    it is no link; else the run stops."""
     if not os.path.lexists(tmp):
         return
-    root = snapshots_root(cfg)
-    why = store_paths.check_victim(tmp, store_paths.real(root))
+    why = store_paths.check_victim(tmp, root)
     if why:
         raise SystemExit(f"refusing to remove {tmp}: {why}")
     shutil.rmtree(tmp, ignore_errors=True)
@@ -2681,7 +2681,8 @@ def snapshot_build(cfg: Config) -> Path:
     files = build_files(cfg)
     if not files:
         raise SystemExit(f"no build at {cfg.build / cfg.exe}: build the release first (`just build-release`)")
-    snap = snapshots_root(cfg) / build_hash(cfg, files)
+    root = snapshots_root(cfg)
+    snap = root / build_hash(cfg, files)
     check_output_path(cfg, snap)
     if snapshot_complete(snap, files, cfg):
         return snap
@@ -2690,8 +2691,10 @@ def snapshot_build(cfg: Config) -> Path:
     # with FileExistsError), then renames it into place; when the rename fails because another runner
     # put the same snapshot there first, that one is used.
     tmp = snap.with_name(f"{snap.name}.partial-{os.getpid()}-{threading.get_ident()}")
+    root.mkdir(parents=True, exist_ok=True)
+    pinned = store_paths.real(root)  # resolved once; every cleanup of tmp below uses it
     check_output_path(cfg, tmp)
-    remove_temporary(cfg, tmp)
+    remove_temporary(tmp, pinned)
     try:
         tmp.mkdir(parents=True)
         for f in files:
@@ -2704,7 +2707,7 @@ def snapshot_build(cfg: Config) -> Path:
                 raise SystemExit(f"could not put the snapshot in place at {snap} ({e}), and no complete one is"
                                  " there") from e
     finally:
-        remove_temporary(cfg, tmp)
+        remove_temporary(tmp, pinned)
     return snap
 
 
@@ -2750,15 +2753,18 @@ def snapshot_unit(cfg: Config, binary: str) -> Path:
     for f in files:
         st = f.stat()
         h.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns}\n".encode())
-    snap = snapshots_root(cfg) / f"unit-{h.hexdigest()[:12]}"
+    root = snapshots_root(cfg)
+    snap = root / f"unit-{h.hexdigest()[:12]}"
     check_output_path(cfg, snap)
     if snapshot_complete(snap, files):
         return snap / src.name
     # As snapshot_build (PS11): each runner and each case thread copies into its own partial folder and
     # renames it into place; a rename that loses to another one's complete snapshot uses that one.
     tmp = snap.with_name(f"{snap.name}.partial-{os.getpid()}-{threading.get_ident()}")
+    root.mkdir(parents=True, exist_ok=True)
+    pinned = store_paths.real(root)  # resolved once; every cleanup of tmp below uses it
     check_output_path(cfg, tmp)
-    remove_temporary(cfg, tmp)
+    remove_temporary(tmp, pinned)
     try:
         tmp.mkdir(parents=True)
         for f in files:
@@ -2770,7 +2776,7 @@ def snapshot_unit(cfg: Config, binary: str) -> Path:
                 raise SpecError(f"could not put the unit snapshot in place at {snap} ({e}), and no complete one"
                                 " is there") from e
     finally:
-        remove_temporary(cfg, tmp)
+        remove_temporary(tmp, pinned)
     return snap / src.name
 
 
@@ -7565,6 +7571,15 @@ SESSION_RECENT_S = 24 * 3600.0   # a session this young with no results.json yet
 SESSION_NAME = re.compile(r"-session(?:-\d+)?$")  # fresh_dir names a same-second second session -session-2
 
 
+def publish_live_session(cfg: Config, name: str, snap: Path) -> Path:
+    """A live session's own session folder (runs/<stamp>-live-<name>-session) naming its snapshot, written
+    while the caller holds the machine lock; it stays `in_progress` (active while a game runs in this store)."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:40] or "live"
+    out = make_run_dir(cfg, cfg.store / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-live-{safe}-session")
+    publish_session(out, snap)
+    return out
+
+
 def publish_session(out: Path, snap: Path | None) -> None:
     """A session's results.json from its first moment (in progress, naming its snapshot), so every runner's
     after-run cleanup keeps the snapshot it uses; write_progress replaces it as cases end."""
@@ -7594,6 +7609,16 @@ def snapshots_in_use(cfg: Config, current: str) -> list[str] | None:
     keep = [current]
     previous = ""
     runs = cfg.store / "runs"
+    games: list[bool] = []  # once: does a running game have its data folder in this store (None: cannot tell)
+
+    def games_here() -> bool:
+        """A session without a finished results file counts as active, whatever its age, while a running game
+        has its data folder in this store, or when that cannot be told."""
+        if not games:
+            roots = store_paths.data_roots_in_use()
+            store_real = store_paths.real(cfg.store)
+            games.append(roots is None or any(store_paths.within(r, store_real) for r in roots))
+        return games[0]
     try:
         sessions = sorted((d for d in runs.iterdir() if SESSION_NAME.search(d.name)), key=lambda d: d.name,
                           reverse=True)
@@ -7610,19 +7635,19 @@ def snapshots_in_use(cfg: Config, current: str) -> list[str] | None:
                 young = False
         try:
             res = json.loads((d / "results.json").read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            if young:
-                return None
-            continue
         except (OSError, ValueError):
-            continue
+            res = None
         if not isinstance(res, dict):
+            # No results file yet, or one that does not read: its snapshot is unknown; while it may be running
+            # (young, or a game runs in this store) nothing is removed this time.
+            if young or games_here():
+                return None
             continue
         name = Path(str(res.get("snapshot") or "")).name
         if not name:
             continue
         if res.get("in_progress"):
-            if young and name not in keep:
+            if (young or games_here()) and name not in keep:
                 keep.append(name)
         elif not previous and name != current:
             previous = name
@@ -7645,7 +7670,8 @@ def prune_snapshots(cfg: Config, current: str) -> str:
     try:
         r = subprocess.run([sys.executable, "-I", str(script), "--store", str(cfg.store), "--apply", "--line",
                             "--only", "snapshots", "--keep-snapshot-names", ",".join(keep)]
-                           + (["--snapshots-folder", str(cfg.snapshots)] if cfg.snapshots is not None else []),
+                           + (["--snapshots-folder", str(cfg.snapshots)] if cfg.snapshots is not None
+                              else ["--no-snapshots-folder"]),
                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"snapshots: not cleaned ({e})"
@@ -8968,9 +8994,12 @@ def live_serve(cfg: Config, a: argparse.Namespace) -> int:
             if lease.capacity:
                 say("failed", lease.capacity)
                 return 1
-        # The snapshot only once the slots are held (store cleanup review, item 5b).
+        # The snapshot only once the slots are held (store cleanup review, item 5b), and named in a session
+        # folder of its own before the machine lock goes (re-check 3): every runner's after-run cleanup keeps
+        # what a session names.
         with (budget.mutex() if budget is not None else contextlib.nullcontext()):
             snap = snapshot_build(cfg)
+            publish_live_session(cfg, info.name, snap)
         hooks = LiveHooks(folder, info, spec, st)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         res = run_case(cfg, spec, snap, len(spec.peers), stamp, {}, {}, (),

@@ -145,6 +145,40 @@ class SnapshotsFolderTest(unittest.TestCase):
         self.session(stamp(0.5), None)
         self.assertIsNone(skytest.snapshots_in_use(self.cfg, "cur"))
 
+    def test_an_old_session_without_a_finished_results_file_is_active_while_a_game_runs_here(self) -> None:
+        """Re-check 3: whatever its age, while a running game has its data folder in this store (or that cannot
+        be told), a session's snapshot is kept, and one with no results file stops the cleanup."""
+        self.addCleanup(setattr, skytest.store_paths, "data_roots_in_use", skytest.store_paths.data_roots_in_use)
+        stamp = lambda hours: time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() - hours * 3600))  # noqa: E731
+        self.session(stamp(80), "prev")
+        self.session(stamp(50), "lane", in_progress=True)
+        game = skytest.store_paths.real(self.cfg.store / "runs" / "x-case" / "H" / "data")
+        for roots, want in (([], ["cur", "prev"]), ([game], ["cur", "prev", "lane"]), (None, ["cur", "prev", "lane"])):
+            skytest.store_paths.data_roots_in_use = lambda exe=None, r=roots: r
+            self.assertEqual(skytest.snapshots_in_use(self.cfg, "cur"), want, roots)
+        self.session(stamp(60), None)  # no results file at all
+        skytest.store_paths.data_roots_in_use = lambda exe=None: None
+        self.assertIsNone(skytest.snapshots_in_use(self.cfg, "cur"))
+        skytest.store_paths.data_roots_in_use = lambda exe=None: []
+        self.assertEqual(skytest.snapshots_in_use(self.cfg, "cur"), ["cur", "prev"])
+
+    def test_the_live_session_names_its_snapshot(self) -> None:
+        out = skytest.publish_live_session(self.cfg, "my live/one", self.cfg.store / "snapshots" / "dddddddddddd")
+        self.assertTrue(skytest.SESSION_NAME.search(out.name), out.name)
+        self.assertIn("dddddddddddd", skytest.snapshots_in_use(self.cfg, "cur"))
+
+    def test_a_temporary_folder_is_removed_only_inside_the_root_it_was_given(self) -> None:
+        root = self.cfg.store / "snapshots"
+        tmp = root / "x.partial-1-2"
+        tmp.mkdir(parents=True)
+        elsewhere = Path(self.tmp.name) / "elsewhere"
+        elsewhere.mkdir()
+        with self.assertRaises(SystemExit):
+            skytest.remove_temporary(tmp, skytest.store_paths.real(elsewhere))
+        self.assertTrue(tmp.is_dir())
+        skytest.remove_temporary(tmp, skytest.store_paths.real(root))
+        self.assertFalse(tmp.exists())
+
     def test_prune_hours_must_be_finite_and_above_zero(self) -> None:
         for bad in (0.0, -1.0, float("nan"), float("inf")):
             with self.assertRaises(SystemExit, msg=str(bad)):

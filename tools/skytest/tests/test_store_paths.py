@@ -127,6 +127,43 @@ class Victim(unittest.TestCase):
             os.rmdir(root / "b")
 
 
+class CannotTell(unittest.TestCase):
+    """Re-check 5: a process list or a command line that cannot be read is "cannot tell" (None), never a
+    shorter list."""
+
+    def test_unreadable_is_none(self) -> None:
+        real_lines, real_split = sp.command_lines, sp.split_command_line
+        try:
+            sp.command_lines = lambda exe: None
+            self.assertIsNone(sp.data_roots_in_use("x.exe"))
+            sp.command_lines = lambda exe: ['x.exe "--user_data_root=C:/a b"']
+            sp.split_command_line = lambda line: None
+            self.assertIsNone(sp.data_roots_in_use("x.exe"))
+        finally:
+            sp.command_lines, sp.split_command_line = real_lines, real_split
+        self.assertEqual(sp.split_command_line('x.exe "--user_data_root=C:/a b" -y'),
+                         ["x.exe", "--user_data_root=C:/a b", "-y"])
+
+
+class DangerInside(unittest.TestCase):
+    def test_a_disc_a_rom_folder_or_a_checkout_at_any_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for rel, made in (("a/b/default.xex", "file"), ("a/b/rom", "dir"), ("a/b/.git", "file"),
+                              ("a/b/.git", "dir")):
+                victim = root / f"v{len(rel)}{made}"
+                p = victim / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.mkdir() if made == "dir" else p.write_text("x", encoding="utf-8")
+                with self.subTest(rel=rel, made=made):
+                    self.assertNotEqual(sp.danger_inside(victim), "")
+                import shutil as _sh
+                _sh.rmtree(victim)
+            plain = root / "plain"
+            (plain / "x").mkdir(parents=True)
+            self.assertEqual(sp.danger_inside(plain), "")
+
+
 @unittest.skipUnless(os.name == "nt", "Windows process command lines")
 class LiveGames(unittest.TestCase):
     def test_a_running_programs_data_folder(self) -> None:

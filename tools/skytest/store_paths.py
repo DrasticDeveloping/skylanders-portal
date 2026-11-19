@@ -111,9 +111,18 @@ def disc_near(path: str) -> str:
     return ""
 
 
+def is_bare_repository(folder: str) -> bool:
+    """A bare repository: HEAD, objects and refs at its root."""
+    return (os.path.isfile(os.path.join(folder, "HEAD")) and os.path.isdir(os.path.join(folder, "objects"))
+            and os.path.isdir(os.path.join(folder, "refs")))
+
+
 def is_checkout(folder: str) -> bool:
-    """A git checkout: its `.git` is a git directory (it has HEAD) or a worktree's `gitdir:` file. An empty
-    `.git` folder is none (this machine's profile has one: git itself says "not a git repository")."""
+    """A git checkout: its `.git` is a git directory (it has HEAD) or a worktree's `gitdir:` file, or the
+    folder is a bare repository. An empty `.git` folder is none (this machine's profile has one: git itself
+    says "not a git repository")."""
+    if is_bare_repository(folder):
+        return True
     g = os.path.join(folder, ".git")
     if os.path.isdir(g):
         return os.path.isfile(os.path.join(g, "HEAD"))
@@ -127,16 +136,47 @@ def is_checkout(folder: str) -> bool:
 
 
 def checkout_near(path: str) -> str:
-    """A git checkout at or above `path`, or one directly inside it."""
+    """A git checkout at or above `path`, or one at any depth inside it (links not followed)."""
     for p in _parents(path):
         if is_checkout(p):
             return f"{p} is a git checkout"
-    try:
-        for e in os.scandir(path):
-            if e.is_dir(follow_symlinks=False) and is_checkout(e.path):
-                return f"{e.path} inside it is a git checkout"
-    except OSError:
-        pass
+    for root, dirs, _files in os.walk(path, followlinks=False):
+        dirs[:] = [d for d in dirs if not is_link(os.path.join(root, d))]
+        for d in dirs:
+            if is_checkout(os.path.join(root, d)):
+                return f"{os.path.join(root, d)} inside it is a git checkout"
+    return ""
+
+
+def danger_inside(path: str | Path) -> str:
+    """What makes a folder no victim ('' when nothing does): a `default.xex`, a folder named `rom`, a `.git`
+    (folder or file) or a bare repository at any depth below it (links not followed; an unreadable part
+    counts: fail closed). The cleanup then stops whole."""
+    p = str(path)
+    if os.path.isfile(p):
+        return f"{p} is a disc file" if os.path.basename(p).lower() == DISC_FILE else ""
+    if is_bare_repository(p):
+        return f"{p} is a bare git repository"
+    errors: list[str] = []
+    for root, dirs, files in os.walk(p, followlinks=False, onerror=lambda e: errors.append(str(e))):
+        dirs[:] = [d for d in dirs if not is_link(os.path.join(root, d))]
+        for name in files:
+            low = name.lower()
+            if low == DISC_FILE:
+                return f"{os.path.join(root, name)} is a disc file"
+            if low == ".git":
+                return f"{os.path.join(root, name)} is a git checkout's .git"
+        for d in dirs:
+            low = d.lower()
+            full = os.path.join(root, d)
+            if low == "rom":
+                return f"{full} is a folder named rom"
+            if low == ".git":
+                return f"{full} is a git checkout's .git"
+            if is_bare_repository(full):
+                return f"{full} is a bare git repository"
+    if errors:
+        return f"a part of {p} could not be read ({errors[0]})"
     return ""
 
 
@@ -312,6 +352,9 @@ def command_lines(exe: str) -> list[str] | None:
             if e.szExeFile.lower() == exe.lower():
                 pids.append(e.th32ProcessID)
             ok = k32.Process32NextW(snap, ctypes.byref(e))
+        # The list ends only with ERROR_NO_MORE_FILES (18); any other error leaves it partial: cannot tell.
+        if ctypes.get_last_error() != 18:
+            return None
     finally:
         k32.CloseHandle(snap)
     out = []
@@ -336,11 +379,11 @@ def command_lines(exe: str) -> list[str] | None:
     return out
 
 
-def split_command_line(line: str) -> list[str]:
+def split_command_line(line: str) -> list[str] | None:
     """A command line's arguments as the program sees them (Windows' CommandLineToArgvW: a token quoted as a
     whole, `"--user_data_root=C:/a b"`, is one argument)."""
     if os.name != "nt":
-        return line.split()
+        return None  # no Windows splitting: cannot tell (the reader is Windows-only anyway)
     import ctypes
     from ctypes import wintypes
     shell32 = ctypes.WinDLL("shell32")
@@ -351,7 +394,7 @@ def split_command_line(line: str) -> list[str]:
     n = ctypes.c_int(0)
     argv = shell32.CommandLineToArgvW(line, ctypes.byref(n))
     if not argv:
-        return line.split()
+        return None  # it could not be split: cannot tell (a quoted data folder would be lost)
     try:
         return [argv[i] for i in range(n.value)]
     finally:
@@ -366,6 +409,8 @@ def data_roots_in_use(exe: str = GAME_EXE) -> list[str] | None:
     out = []
     for line in lines:
         args = split_command_line(line)
+        if args is None:
+            return None
         for k, arg in enumerate(args):
             if arg.startswith("--user_data_root="):
                 out.append(real(arg.split("=", 1)[1]))
