@@ -454,3 +454,36 @@ BACKEND_TEST("ID10", IdSpawnedParentForms) {
   CHECK(!Valid(Spawned(5, &authored, HashName("minion"), 0, 0)));
   CHECK(Valid(Spawned(5, &authored, HashName("minion"), 1, 0)));
 }
+
+BACKEND_TEST("ID11", IdAuthoredMidIndex) {
+  // An authored id with a mID: one never reported whose hashes differ from the id under the same mID
+  // names nothing here (unresolved), before and after it would have been reported.
+  IdentityMap map;
+  map.OnEpoch(2);
+  const EntityId jump = Authored(2, 0x500, HashName("JumpHint_Trigger"), HashName("CTriggerVolume"));
+  const EntityId other = Authored(2, 0x500, HashName("Chompy"), HashName("CActor"));
+  map.OnSpawn(jump, 10, kT0);
+  CHECK(map.Resolve(jump).resolution == Resolution::kResolved);
+  CHECK(map.Resolve(other).resolution == Resolution::kUnresolved);
+  // mID word 0 (a game's placed-enemy key, its identity in the other words): never indexed, never
+  // probed. With one registered, another one never reported is pending (its row waits), and resolves
+  // once reported; the first keeps its handle.
+  const EntityId placed_a = Authored(2, 0, 0x0629f659, (1u << 16) | 6733);
+  const EntityId placed_b = Authored(2, 0, 0x0629f659, (1u << 16) | 12375);
+  CHECK(Valid(placed_a) && Valid(placed_b));
+  map.OnSpawn(placed_a, 20, kT0 + 1s);
+  IdentityMap::Lookup l = map.Resolve(placed_b);
+  CHECK(l.resolution == Resolution::kPending && l.handle == kNoHandle);
+  map.OnSpawn(placed_b, 21, kT0 + 2s);
+  l = map.Resolve(placed_b);
+  CHECK(l.resolution == Resolution::kResolved && l.handle == 21);
+  l = map.Resolve(placed_a);
+  CHECK(l.resolution == Resolution::kResolved && l.handle == 20);
+  // A placed key next to a world ref of a nonzero mID changes nothing of the index's rule.
+  CHECK(map.Resolve(other).resolution == Resolution::kUnresolved);
+  // Another epoch's id stays unresolved whatever its mID word.
+  CHECK(map.Resolve(Authored(3, 0, 0x0629f659, (1u << 16) | 1)).resolution == Resolution::kUnresolved);
+  // A new epoch forgets them all.
+  map.OnEpoch(3);
+  CHECK(map.Resolve(Authored(3, 0, 0x0629f659, (1u << 16) | 6733)).resolution == Resolution::kPending);
+}

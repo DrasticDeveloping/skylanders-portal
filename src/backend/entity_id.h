@@ -154,7 +154,9 @@ class IdentityMap {
   std::map<Handle, EntityId> handles_;     // each live handle's own id
   std::map<Handle, EntityId> bound_;       // each bound handle's server-issued id
   // Authored ids by (epoch, mID): an id whose hashes differ from the one under its mID resolves
-  // kUnresolved.
+  // kUnresolved. An authored id with mID word 0 names no mID (a game's placed-enemy key keeps its
+  // own identity in the other words; mirrored marker rows never reach this map): it is never indexed
+  // and never probed, so an unreported one is pending like any other id.
   std::map<std::pair<uint32_t, uint32_t>, EntityId> by_mid_;
 };
 
