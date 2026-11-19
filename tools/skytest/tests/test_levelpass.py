@@ -1032,8 +1032,9 @@ class RequiredStepsPlan(unittest.TestCase):
         h = lp.script_h(p, None).splitlines()
         k = h.index("log LEVELPASS phase required")
         self.assertLess(h.index("sweep_deadline 0"), k)
-        self.assertIn("pickup nearest:TutorialLockedGate_key:8000 40", h[k:])
-        self.assertIn("interact nearest:TutorialLockedGate_keylock:1500 30", h[k:])
+        self.assertIn(f"pickup TutorialLockedGate_key {lp.KEY_PICKUP_S}", h[k:])  # the exact name, never nearest:
+        self.assertIn(f"interact TutorialLockedGate_keylock {lp.KEY_PRESS_S}", h[k:])
+        self.assertFalse([l for l in h if "nearest:" in l])
         self.assertEqual(lp.position_literals("\n".join(h)), [])
         d = lp.script_d(p)
         self.assertIn(f"online_wait_peer_near_entity {p.required[0].gate_ref} {lp.D_NEAR} {lp.D_COME_WAIT_S}", d)

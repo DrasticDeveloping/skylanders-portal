@@ -297,9 +297,11 @@ class RequiredSteps(unittest.TestCase):
         self.assertEqual(v.status, lc.BY_TELEPORT)
         first = v.counts.split("first step not done: ")[1]
         self.assertTrue(first.startswith("TutorialLockedGate (key gate): performed ("), first)
-        self.assertIn("opened on H, not on S, D; picked up on H: H/game.log:", first)
-        self.assertIn("; no carried key row on S: H/data/Online/session/game.log:1:", first)
-        self.assertIn("; pressed at the lock on H: H/game.log:", first)
+        self.assertIn("opened on H at 00:11:25.000, not on S, D; key touched and following on H: H/game.log:", first)
+        self.assertIn("; S for the key: H/data/Online/session/game.log:1: Online: world unsupported carried_item", first)
+        self.assertIn("; no held press at the lock on H (", first)
+        self.assertIn("; interact on H: H/game.log:", first)
+        self.assertIn("; D's own key: no line after its level start", first)
 
     def test_no_level_data_is_said(self) -> None:
         run = RunFolder([], H_JOIN + H_NEXT, D_JOIN + D_NEXT, result={"levelpass": {"verdict": "PASS", "not_covered": []}}).run()

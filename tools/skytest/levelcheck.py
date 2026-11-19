@@ -1534,6 +1534,11 @@ REQ_LINE = re.compile(r"Input script: LEVELPASS required (r\d+) (\S+) (\S+)(?: n
 GATES_SKIPPED = re.compile(r"Input script: LEVELPASS gates not attempted \(--no-gates\)")
 
 
+def when(line: Line) -> str:
+    """A line's time of day to the millisecond, or ?."""
+    return line.t.strftime("%H:%M:%S.%f")[:-3] if line.t is not None else "?"
+
+
 def gate_open_ids(log: Log, name: str, mover: bool = False) -> list[Line]:
     """One line per distinct `<name>#<id>` this game shows opened, in order."""
     n = re.escape(name)
@@ -1557,26 +1562,39 @@ def gate_opened(run: Run, name: str) -> Line | None:
 
 
 def key_gate_trail(run: Run, name: str, k: int) -> list[str]:
-    """Where a carried key's way broke, in order: picked up on H, its row on S, pressed at the lock."""
+    """A key gate's carried key, in order (the k-th gate of that name): touched and following on H, what S
+    logged for the key, the held press at the lock on H, S's decision, and D's own copy of the key."""
     h = run.clients.get("H")
-    out = []
-    picked = h.find(re.compile(r"Dev: pickup " + re.escape(name) + r"_key#\S+ (done|failed)")) if h else []
+    out: list[str] = []
+    key = re.escape(name) + r"_key#\S+"
+    picked = h.find(re.compile(r"Dev: pickup " + key + r" (done|failed)")) if h else []
     if len(picked) <= k or picked[k][1].group(1) != "done":
-        out.append("not picked up on H: " + (picked[k][0].cite() if len(picked) > k else
-                                              absent(h, f"`pickup {name}_key ... done`") if h else "no H log"))
-        return out
-    out.append(f"picked up on H: {picked[k][0].cite()}")
-    if run.server is not None:
-        row = run.server.find(re.compile(r"Online: world (?:unsupported carried_item|tracked carried_item) "
-                                         + re.escape(name) + r"_key#\S+ .*"))
-        if row and "unsupported" in row[0][0].text:
-            out.append(f"no carried key row on S: {row[0][0].cite()}")
-    pressed = h.find(re.compile(r"Dev: interact " + re.escape(name) + r"_keylock#\S+ (done|failed)"))
-    if len(pressed) <= k or pressed[k][1].group(1) != "done":
-        out.append("not pressed at the lock on H: " + (pressed[k][0].cite() if len(pressed) > k else
-                                                         absent(h, f"`interact {name}_keylock ... done`")))
+        out.append("key not carried on H: " + (picked[k][0].cite() if len(picked) > k else
+                                                absent(h, f"`pickup {name}_key ... done`") if h else "no H log"))
     else:
-        out.append(f"pressed at the lock on H: {pressed[k][0].cite()}")
+        out.append(f"key touched and following on H: {picked[k][0].cite()}")
+    if run.server is not None:
+        # What S tracked or did with the key (its row, a carry, a claim), not its level-start volume line.
+        s_key = [l for l, _m in run.server.find(re.compile(r"Online: .*\b" + key + r".*"))
+                 if "single-fire volume" not in l.text]
+        out.append(f"S for the key: {s_key[-1].cite()}" if s_key else
+                   absent(run.server, f"naming {name}_key (other than its level-start volume)"))
+        decided = run.server.find(re.compile(r"Online: .*gate\.open.*|Online: decided .*gate.*"))
+        if decided:
+            out.append(f"S's decision: {decided[0][0].cite()}")
+    if h is not None:
+        held = h.find(re.compile(r"Online: backend press (held|released|cancelled|refused|slow)[^\n]*" + re.escape(name)))
+        out.append("press at the lock on H: " + "; ".join(l.cite() for l, _m in held[:3]) if held else
+                   "no held press at the lock on H (" + absent(h, f"`backend press held ... {name}`") + ")")
+        pressed = h.find(re.compile(r"Dev: interact " + re.escape(name) + r"_keylock#\S+ (done|failed).*"))
+        if len(pressed) > k:
+            out.append(f"interact on H: {pressed[k][0].cite()}")
+    d = run.clients.get("D")
+    if d is not None:
+        d_key = [l for l, _m in d.find(re.compile(r"Online: .*\b" + key + r".*"))
+                 if "single-fire volume" not in l.text and "unsupported carried_item" not in l.text]
+        out.append(f"D's own key: {d_key[-1].cite()}" if d_key else
+                   "D's own key: no line after its level start (still at home: nothing on D moves or removes it)")
     return out
 
 
@@ -1632,13 +1650,14 @@ def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[st
         if g.kind == "battle gate" and where.get("S") is None:
             trail.append(battle_gate_left(run, data, g))
         if missing:
-            opened_on = [w for w in where if where[w] is not None]
+            opened_on = [f"{w} at {when(where[w])}" for w in where if where[w] is not None]
             shut.append(f"{g.name} ({g.kind}): performed ({req[0].cite()}); opened on "
                         f"{', '.join(opened_on) or 'no game'}, not on {', '.join(missing)}"
                         + ("; " + "; ".join(trail) if trail else ""))
         else:
             done.append(f"{g.name} ({g.kind}): opened on {', '.join(where)}: "
-                        + "; ".join(f"{w} {line.cite()}" for w, line in where.items()))
+                        + "; ".join(f"{w} at {when(line)} {line.cite()}" for w, line in where.items())
+                        + ("; " + "; ".join(trail) if trail else ""))
     return shut, done
 
 
