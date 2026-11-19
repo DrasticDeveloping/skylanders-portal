@@ -6,6 +6,7 @@ Run: python -I -m unittest discover -s tools/skytest/tests -p "test_levelpass.py
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 import tempfile
@@ -280,14 +281,23 @@ class Plans(unittest.TestCase):
     def test_budget_drops_quiet_visits(self):
         objs = [lp.Obj(f"Lift_{i}", "C", (i * 5000.0, 0.0, 0.0), lp.GROUP_INTERACT) for i in range(1, 40)]
         c = lp.Content("madeup", "made", (0.0, 0.0, 0.0), objs)
-        # No exit: the estimate keeps only the sweep's margin for it (as the sweep's deadline does).
-        budget = lp.BOOT_S + lp.LEVEL_LOAD_S + lp.SWEEP_MARGIN_S + 10 * lp.VISIT_S
+        # No exit: the estimate keeps only the sweep's margin for it (as the sweep's deadline does), and the
+        # sweep's measured spread inside the deadline (SWEEP_SPREAD_S: ww1's 175 s sweep had none left).
+        budget = lp.BOOT_S + lp.LEVEL_LOAD_S + lp.SWEEP_MARGIN_S + lp.SWEEP_SPREAD_S + 10 * lp.VISIT_S
         p = lp.make_plan(c, late_join=False, budget_s=budget)
         self.assertLessEqual(p.estimate_s, budget)
         self.assertEqual(len(p.stops), 10)
         self.assertTrue(any("over the budget" in x for x in p.left_out))
         # The nearest stay.
         self.assertEqual(p.stops[0].cluster.center, (5000.0, 0.0, 0.0))
+
+    def test_the_sweep_keeps_its_spread_free(self):
+        """One visit fewer when the stops would fill the sweep's deadline to the second (ww1, 19 November)."""
+        objs = [lp.Obj(f"Lift_{i}", "C", (i * 5000.0, 0.0, 0.0), lp.GROUP_INTERACT) for i in range(1, 40)]
+        c = lp.Content("madeup", "made", (0.0, 0.0, 0.0), objs)
+        budget = lp.BOOT_S + lp.LEVEL_LOAD_S + lp.SWEEP_MARGIN_S + 10 * lp.VISIT_S
+        p = lp.make_plan(c, late_join=False, budget_s=budget)
+        self.assertEqual(len(p.stops), 10 - math.ceil(lp.SWEEP_SPREAD_S / lp.VISIT_S))
 
     def test_budget_caps_each_kind(self):
         """One per family still over the budget: at most a few actions of each kind, the first along the

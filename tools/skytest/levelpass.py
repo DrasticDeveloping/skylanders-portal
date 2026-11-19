@@ -1003,7 +1003,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
     scene_list, scene_at, scene_s, load_s = (plan_scenes(content, end, stops, exit_stop, scene_lengths or {})
                                              if scenes else ([], {}, 0.0, 0.0))
     est = estimate_seconds([s for s in stops if s is not exit_stop], late_join, end=False) + \
-        exit_reserve(no_end, end, exit_stop, timed, d_end=late_join and d_stays) + SWEEP_MARGIN_S + scene_s + load_s
+        exit_reserve(no_end, end, exit_stop, timed, d_end=late_join and d_stays) + SWEEP_MARGIN_S + scene_s + load_s         + SWEEP_SPREAD_S
     if est > budget_s:
         quiet = [s for s in stops if not s.actions and s.label not in scene_at]  # a scene's step is no quiet visit
         quiet.sort(key=lambda s: -(dist(start, s.cluster.center) if start else s.cluster.index))
@@ -1785,6 +1785,12 @@ def sweep_share(plan: Plan, budget_s: float = BUDGET_S) -> float:
 
 
 SWEEP_MARGIN_S = 30.0
+# The sweep's own spread between runs of the same plan, kept free inside its deadline: the estimate counts it,
+# the deadline does not, so a plan fits only with this much of the sweep's time to spare. Measured: ww1's
+# passes of 19 November (20261119-023714, -034121, -035313: the same 12 stops) took 179.8, 179.9 and 186.7 s
+# against a 175 s deadline; the last visit began 0.3 s inside it twice and was skipped the third time, when one
+# teleport was held 6.8 s (controls locked); every other step matched within 0.6 s.
+SWEEP_SPREAD_S = 8.0
 HOLD_CAP_S = 20         # hold_cap: one hold or fall ends a step after this (H and D, the whole pass)
 SWEEP_MIN_S = 60.0
 EXIT_WAIT_S = 60.0     # the level end's own waits after the exit's actions (online_level_end, the next level)

@@ -253,6 +253,41 @@ class RequiredSteps(unittest.TestCase):
         self.assertIn("    IntroArea_LockpickGate: no line shows it opened: not fired in this run", lines)
 
 
+class Coins(unittest.TestCase):
+    ON = [(1, "Online: coins on for the session (S's online_shared_coins on)")]
+
+    def test_a_coin_taken_and_paid(self) -> None:
+        s = self.ON + [(30, "Online: coins walked bd35d565 20 placed money coins mapped"),
+                       (60, "Online: coin claim bd35d565.4 peer 1 granted (1 other clients owed)")]
+        h = [(31, "Online: coins walked bd35d565 20 placed money coins mapped"),
+             (60, "Online: coin taken here bd35d565.4 (player 0, gold 100 -> 105, +5; S is told)")]
+        d = [(41, "Online: coins walked bd35d565 20 placed money coins mapped"),
+             (61, "Online: coin paid here bd35d565.4 (taken by another player; player 0, gold 30 -> 35, +5)")]
+        v = lc.grade_coins(RunFolder(s, H_JOIN + h + LEVEL_END, D_JOIN + d + LEVEL_END).run())
+        self.assertEqual(v.status, lc.PASS, v.findings)
+        self.assertIn("coins taken 1, paid on another game 1", v.counts)
+
+    def test_none_mapped_with_coins_on_fails_never_untested(self) -> None:
+        s = self.ON + [(90, "Online: coins 2: 0 claims granted, 0 refused, 0 placed money coins mapped here (0 this "
+                            "level), 0 ambiguous, 0 copies removed here, 0 removals waiting, 0 fan-outs owed (x)")]
+        h = [(90, "Online: coins 2: 0 placed money coins mapped, 0 taken here, 0 taken by others and paid here, 0 "
+                  "pending, 0 unpaid, 0 collected without pay, 0 claims not sent yet, 0 ambiguous, 0 copies removed here "
+                  "(the level changed)")]
+        v = lc.grade_coins(RunFolder(s, H_JOIN + h + LEVEL_END).run())
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertTrue(v.counts.startswith("0 coins mapped on every game"))
+
+    def test_an_unpaid_coin_fails_and_off_is_not_tested(self) -> None:
+        s = self.ON + [(30, "Online: coins walked bd35d565 20 placed money coins mapped")]
+        h = [(60, "Online: coin taken here bd35d565.4 (player 0, gold 100 -> 105, +5; S is told)")]
+        d = [(70, "Online: coin unpaid bd35d565.4 (no paying collect in 3 tries: x)")]
+        v = lc.grade_coins(RunFolder(s, H_JOIN + h + LEVEL_END, D_JOIN + d + LEVEL_END).run())
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertTrue(any("unpaid" in x.what for x in v.findings))
+        off = lc.grade_coins(RunFolder([(1, "Online: coins off for the session (S's online_shared_coins off)")], H_JOIN).run())
+        self.assertEqual(off.status, lc.NOT_TESTED)
+
+
 # The two pages the confirm agent checked row by row (logs/confirm/TRIAGE.txt, batch 8, runs 4 and 5): the
 # enemies row was wrong on both. Run folders on the test store (outside git: they name the disc's objects).
 CALIBRATION_RUNS = Path(r"D:/SwapForceOnline-data/tests/int2/runs")
@@ -289,6 +324,41 @@ class EnemiesCalibration(unittest.TestCase):
         self.assertIn("S's kills by player (`dead by <peer>`): H 11, D 0", v.findings[0].lines)
         self.assertIn("existed on no client: sb7fe49cd.52540001#3/0@2 (BomberSpawner_02_Spawned3#3951)", whats)
         self.assertEqual(v.status, lc.FAIL)
+
+
+
+@unittest.skipUnless((CALIBRATION_RUNS / "20261119-034752-levelpass-tutorial_b").is_dir() and TUTORIAL_B.is_dir(),
+                     "the batch 8 run folders are not on this machine")
+class LootAndCoinsCalibration(unittest.TestCase):
+    """Batch 8 runs 7 and 8 (logs/confirm/TRIAGE.txt): the clients' own accounts, the carriers, the coins."""
+    TB = CALIBRATION_RUNS / "20261119-034752-levelpass-tutorial_b"
+    WW1 = CALIBRATION_RUNS / "20261119-035316-levelpass-ww1"
+
+    def groups(self, v) -> list[tuple[str, int]]:
+        return [(x.what.split(":")[0] + " " + x.what.split(", ", 1)[1].split(" (")[0], len(x.lines)) for x in v.findings]
+
+    def test_tutorial_b(self) -> None:
+        v = lc.grade_loot(lc.load_run(self.TB))
+        self.assertIn("H: 30 obligations, 26 delivered in full, 1 differ, 3 short, 0 unfinished", v.counts)
+        self.assertIn("S to peer 1: 30 made, 27 completed, 3 ended otherwise", v.counts)
+        self.assertIn("D: 30 obligations, 0 delivered in full, 0 differ, 30 short", v.counts)
+        self.assertIn("S to peer 2: 30 made, 0 completed, 30 ended otherwise", v.counts)
+        self.assertEqual(self.groups(v), [("H its carrier has no row here", 2), ("H other", 2),
+                                          ("D its carrier's copy is asleep here", 16), ("D its carrier has no row here", 14)])
+        c = lc.grade_coins(lc.load_run(self.TB))
+        self.assertEqual(c.status, lc.FAIL)
+        self.assertTrue(c.counts.startswith("0 coins mapped on every game"))
+
+    def test_ww1(self) -> None:
+        v = lc.grade_loot(lc.load_run(self.WW1))
+        self.assertIn("H: 8 obligations, 0 delivered in full, 0 differ, 8 short", v.counts)
+        self.assertIn("D: 8 obligations, 6 delivered in full, 0 differ, 2 short", v.counts)
+        self.assertEqual(self.groups(v), [("H its carrier's copy is asleep here", 6), ("H its carrier has no row here", 2),
+                                          ("D its carrier has no row here", 2)])
+        self.assertIn("carrier IntroArea_ChompyManager_actor_0", " ".join(v.findings[0].lines))
+        self.assertTrue(lc.grade_coins(lc.load_run(self.WW1)).counts.startswith("0 coins mapped on every game"))
+        # A night run with coins off says so: not tested, never a pass.
+        self.assertEqual(lc.grade_coins(lc.load_run(TUTORIAL_B)).status, lc.NOT_TESTED)
 
 
 FIGHT = "-535,-2875,303"
@@ -380,20 +450,51 @@ class Loot(unittest.TestCase):
          (55, "Online: spill obliged w00000f2e 00000001 to peer 2 (obligation 3)"),
          (99, "Online: spill obligation 1 w00000f2c 00000001 to peer 1 ended retired peer left")]
 
-    def test_a_lost_and_a_short_delivery(self) -> None:
-        h = [(51, "Online: spill waits EA_Manager_W1_actor_0 w00000f2c.09389445 0#1 (the carrier is not resolved here yet)"),
-             (56, "Online: spill fulfilled EA_Manager_W1_actor_2 w00000f2e.0738911f 0#1 (S selected 3 items, here spawned 3)")]
-        d = [(56, "Online: spill fulfilled EA_Manager_W1_actor_0 w00000f2c.09389445 0#1 (S selected 3 items, here spawned 3)"),
-             (57, "Online: spill fulfilled EA_Manager_W1_actor_2 w00000f2e.0738911f 0#1 (S selected 3 items, here spawned 1)")]
-        v = lc.grade_loot(RunFolder(self.S, H_JOIN + h + LEVEL_END, D_JOIN + d + LEVEL_END).run())
+    def test_the_clients_own_account_and_each_shortfall_named(self) -> None:
+        """A client's own run that matched S's selection is a full delivery (batch 8: the page had called it
+        lost); every obligation not delivered in full names its carrier and why."""
+        s = self.S + [(50, "Online: spill EA_Manager_W1_actor_0 w00000f2c.09389445 0#1 selected 3 items cap 9: 2 peers"),
+                      (55, "Online: spill (null) w00000f2e.930d1f89 0#1 selected 1 items cap 9: 2 peers"),
+                      (30, f"Online: enemy placed {K1} as EA_Manager_W1_actor_0#3901 hp 1 pose 1 (S)"),
+                      (99, "Online: spill obligations to peer 1: 2 made, 2 completed, 0 ended otherwise, 0 open (it left)"),
+                      (99, "Online: spill obligations to peer 2: 2 made, 0 completed, 2 ended otherwise, 0 open (it left)")]
+        h = [(51, "Online: spill fulfilled EA_Manager_W1_actor_0 w00000f2c.09389445 0#1 (S selected 3 items, this game's "
+                  "own run matched)"),
+             (56, "Online: spill fulfilled (null) w00000f2e.930d1f89 0#1 (S selected 1 items, here spawned 1)"),
+             (98, "Online: loot delivery: 2 obligations, 2 delivered in full, 0 differ, 0 short, 0 unfinished, 0 own runs "
+                  "without S's obligation (S's selections give 4 items, here spawned 4)")]
+        d = [(45, f"Online: enemy bind {K1} by authored id 0629f659.1.1 waits (asleep here, its copy at b8): never counted"),
+             (68, "Online: spill expired ? w00000f2c.09389445 0#1 (the carrier is not resolved here yet after 18 s: the "
+                  "obligation ends unfulfilled, S's selection is withdrawn here)"),
+             (73, "Online: spill expired ? w00000f2e.930d1f89 0#1 (the carrier is not resolved here yet after 18 s: the "
+                  "obligation ends unfulfilled, S's selection is withdrawn here)"),
+             (98, "Online: loot delivery: 2 obligations, 0 delivered in full, 0 differ, 2 short, 0 unfinished, 0 own runs "
+                  "without S's obligation (S's selections give 4 items, here spawned 0)")]
+        v = lc.grade_loot(RunFolder(s, H_JOIN + h + LEVEL_END, D_JOIN + d + LEVEL_END).run())
         self.assertEqual(v.status, lc.FAIL)
-        self.assertIn("delivered in full 2, short or lost 2", v.counts)
-        whats = sorted(f.what for f in v.findings)
-        self.assertEqual(whats, ["D spawned 1 of the 3 items S selected for w00000f2e",
-                                 "H never ran S's selection for w00000f2c (obligation 1)"])
-        lost = next(f for f in v.findings if f.what.startswith("H"))
-        self.assertEqual(len(lost.lines), 3)  # S's obligation, H's last spill line, S's end of it
-        self.assertIn("spill waits", lost.lines[1])
+        self.assertIn("H: 2 obligations, 2 delivered in full, 0 differ, 0 short, 0 unfinished", v.counts)
+        self.assertIn("S to peer 1: 2 made, 2 completed, 0 ended otherwise", v.counts)
+        self.assertIn("D: 2 obligations, 0 delivered in full", v.counts)
+        whats = [x.what for x in v.findings]
+        self.assertEqual(whats, ["D: 1 obligation(s) not delivered in full, its carrier's copy is asleep here (a far "
+                                 "player: no orb where it died)",
+                                 "D: 1 obligation(s) not delivered in full, its carrier has no row here (S's entity is "
+                                 "not bound here: nobody there sees the drop)"])
+        self.assertTrue(v.findings[0].lines[0].startswith("w00000f2c (obligation 1) carrier EA_Manager_W1_actor_0: its "
+                                                          "copy slept here; D/game.log:"))
+        self.assertTrue(v.findings[1].lines[0].startswith("w00000f2e (obligation 3) carrier (null): S's entity is not "
+                                                          "bound here"))
+
+    def test_all_in_full_passes(self) -> None:
+        s = self.S[:4] + [(99, f"Online: spill obligations to peer {p}: 2 made, 2 completed, 0 ended otherwise, 0 open "
+                               "(it left)") for p in (1, 2)]
+        acct = (98, "Online: loot delivery: 2 obligations, 2 delivered in full, 0 differ, 0 short, 0 unfinished, 0 own "
+                    "runs without S's obligation (S's selections give 4 items, here spawned 4)")
+        full = [(51, "Online: spill fulfilled x w00000f2c.09389445 0#1 (S selected 3 items, here spawned 3)"),
+                (56, "Online: spill fulfilled x w00000f2e.0738911f 0#1 (S selected 1 items, this game's own run matched)"),
+                acct]
+        v = lc.grade_loot(RunFolder(s, H_JOIN + full + LEVEL_END, D_JOIN + full + LEVEL_END).run())
+        self.assertEqual(v.status, lc.PASS, v.findings)
 
     def test_loot_off_is_not_tested(self) -> None:
         v = lc.grade_loot(RunFolder([(1, "Online: loot hooks off (online_shared_loot)")], H_JOIN + [
@@ -553,7 +654,7 @@ class OtherPlayer(unittest.TestCase):
     def test_every_page_says_what_it_does_not_look_at(self) -> None:
         text = lc.page(Path("run"), [lc.Verdict("x", lc.PASS, "c")])
         self.assertIn("what this check does NOT look at", text)
-        self.assertIn("coins lying in the level", text)
+        self.assertIn("food and the wallet beyond the coins' gold lines", text)
 
 class StaticTable(unittest.TestCase):
     def test_every_level_with_data_one_row(self) -> None:

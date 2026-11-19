@@ -609,7 +609,7 @@ S_APPLIED = re.compile(r"Online: collect applied ([0-9a-f]{8}) for peer (\d+)")
 COLLECT_NATIVE = r"Online: collect native {id} "
 PARTNER_GOT = r"Online: (?:collect from S {id} |pickup copy not found {id} )"
 OWN_DROP = re.compile(r"Online: collect native ffffffff \(not reported: no source\)")
-COINS = "coins: not graded yet (the coin sharing names its log lines; this row waits for them)"
+COINS = "coins: their own row (coins)"
 
 
 def grade_pickups(run: Run) -> Verdict:
@@ -649,18 +649,133 @@ def grade_pickups(run: Run) -> Verdict:
     return Verdict("pickups", FAIL if findings else PASS, counts, applied[0][0].cite(), findings, [COINS])
 
 
+# --- coins (the shared placed money coins: game/coins.cpp, docs/online-7.md) -----------------------------------
+#
+# On when S says so (`coins on for the session (S's online_shared_coins on)`); off: not tested. Each game walks
+# its zones' placed money coins (`coins walked <zone> <n> placed money coins mapped`) and keeps an account per
+# level: a client's `coins <g>: <m> placed money coins mapped, <t> taken here, <r> taken by others and paid here,
+# <p> pending, <u> unpaid, <w> collected without pay, ...`, S's `coins <g>: <c> claims granted, <x> refused, <m>
+# placed money coins mapped here (<t> this level), ...`. A coin a client takes (`coin taken here ... gold <a> ->
+# <b>`) is granted by S and paid on the others (`coin paid here ... gold ...`). A run with coins on where no game
+# mapped a single coin fails ("0 coins mapped on every game": batch 8 runs 7 and 8, the walk never handed the
+# coin code the level's coins), never "not tested".
+COINS_SWITCH = re.compile(r"Online: coins (on|off) for the session \(S's online_shared_coins (on|off)\)")
+COINS_WALKED = re.compile(r"Online: coins walked (\S+) (\d+) placed money coins mapped")
+C_COINS = re.compile(r"Online: coins (\d+): (\d+) placed money coins mapped, (\d+) taken here, (\d+) taken by others and "
+                     r"paid here, (\d+) pending, (\d+) unpaid, (\d+) collected without pay, (\d+) claims not sent yet")
+S_COINS = re.compile(r"Online: coins (\d+): (\d+) claims granted, (\d+) refused, (\d+) placed money coins mapped here "
+                     r"\((\d+) this level\)")
+COIN_TAKEN = re.compile(r"Online: coin taken here (\S+) \(player \d+, gold (\d+) -> (\d+)")
+COIN_PAID = re.compile(r"Online: coin paid here (\S+) \(taken by another player; player \d+, gold (\d+) -> (\d+)")
+COIN_BAD = re.compile(r"Online: coin (?:unpaid|collected without pay) \S+ .*|Online: coin claim \S+ peer \d+ refused .*")
+
+
+def grade_coins(run: Run) -> Verdict:
+    """The shared coins: every game's mapped coins, each coin taken on one client and paid on the others, and
+    nothing unpaid, collected without pay or refused; 0 mapped on every game with coins on is a failure."""
+    if run.server is None:
+        return Verdict("coins", NOT_TESTED, "no server log in this run folder")
+    sw = run.server.find(COINS_SWITCH)
+    if not sw:
+        return Verdict("coins", NOT_TESTED, "S logged no `coins on|off for the session` line (a build before shared "
+                       "coins)")
+    if sw[0][1].group(1) == "off":
+        return Verdict("coins", NOT_TESTED, "shared coins are off in this run (S's online_shared_coins off)",
+                       sw[0][0].cite())
+    games = [("S", run.server)] + sorted(run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    mapped: dict[str, int] = {}
+    parts: list[str] = []
+    for who, log in games:
+        walked = sum(int(m.group(2)) for _l, m in log.find(COINS_WALKED))
+        if who == "S":
+            accts = log.find(S_COINS)
+            acct_mapped = max([int(m.group(4)) for _l, m in accts] or [0])
+            granted = sum(int(m.group(2)) for _l, m in accts)
+            refused = sum(int(m.group(3)) for _l, m in accts)
+            parts.append(f"S: walked {walked}, accounts {len(accts)} (mapped {acct_mapped}, claims granted {granted}, "
+                         f"refused {refused})")
+        else:
+            accts = log.find(C_COINS)
+            acct_mapped = max([int(m.group(2)) for _l, m in accts] or [0])
+            sums = [sum(int(m.group(i)) for _l, m in accts) for i in (3, 4, 5, 6, 7)]
+            parts.append(f"{who}: walked {walked}, accounts {len(accts)} (mapped {acct_mapped}, taken here {sums[0]}, "
+                         f"paid here {sums[1]}, pending {sums[2]}, unpaid {sums[3]}, collected without pay {sums[4]})")
+        mapped[who] = max(walked, acct_mapped)
+    counts = "; ".join(parts)
+    if not any(mapped.values()):
+        accts = [l.cite() for who, log in games for l, _m in (log.find(S_COINS if who == "S" else C_COINS))[:1]]
+        return Verdict("coins", FAIL, "0 coins mapped on every game: " + counts, sw[0][0].cite(), [Finding(
+            "0 coins mapped on every game: no game's coin code saw the level's placed money coins (no `coins "
+            "walked` line, every level's account 0 mapped), so no coin a player picks up is shared",
+            accts + [absent(log, "`coins walked`") for _w, log in games])])
+    findings: list[Finding] = []
+    unmapped = [w for w, n in mapped.items() if n == 0]
+    if unmapped:
+        findings.append(Finding(f"0 coins mapped on {', '.join(unmapped)} while others mapped some", [
+            absent(dict(games)[w], "`coins walked`") for w in unmapped]))
+    bad = [(who, l) for who, log in games for l, _m in log.find(COIN_BAD)]
+    if bad:
+        findings.append(Finding(f"{len(bad)} coin(s) unpaid, collected without pay or refused",
+                                [f"{who}: {l.cite()}" for who, l in bad[:12]]))
+    taken = [(who, l) for who, log in run.clients.items() for l, _m in log.find(COIN_TAKEN)]
+    paid = [(who, l) for who, log in run.clients.items() for l, _m in log.find(COIN_PAID)]
+    counts += f"; coins taken {len(taken)}, paid on another game {len(paid)}"
+    if not taken:
+        return Verdict("coins", FAIL if findings else NOT_TESTED, counts + " (no coin was taken in this run)",
+                       sw[0][0].cite(), findings)
+    return Verdict("coins", FAIL if findings else PASS, counts, taken[0][1].cite(), findings)
+
+
 # --- loot (chests and enemy drops: the spill) -----------------------------------------------------------
 
 HOOKS_OFF = re.compile(r"Online: loot hooks off \(online_shared_loot\)")
 S_OBLIGED = re.compile(r"Online: spill obliged (w[0-9a-f]{8}) ([0-9a-f]+) to peer (\d+) \(obligation (\d+)\)")
 S_ENDED = re.compile(r"Online: spill obligation (\d+) (w[0-9a-f]{8}) [0-9a-f]+ to peer (\d+) ended (.+)$")
+# S's account per client, at the session's end, and each client's own (the measure of delivery: batch 8 runs 7
+# and 8, the page had counted a client's own run that matched S's selection as lost: "1 of 60", "0 of 16").
+S_SUMMARY = re.compile(r"Online: spill obligations to peer (\d+): (\d+) made, (\d+) completed, (\d+) ended otherwise, "
+                       r"(\d+) open")
+DELIVERY = re.compile(r"Online: loot delivery: (\d+) obligations, (\d+) delivered in full, (\d+) differ, (\d+) short, "
+                      r"(\d+) unfinished, (\d+) own runs without S's obligation \(S's selections give (\d+) items, "
+                      r"here spawned (\d+)\)")
+# The carrier S's selection names (its spill line: `spill <Name> w<key>.<hash> <n>#<k> selected ...`).
+S_SELECTED = re.compile(r"Online: spill (\S+) (w[0-9a-f]{8})\.[0-9a-f]+ \S+ selected (\d+) items")
+# A client's end of one obligation: run in full or matched by its own run, short, differing, or expired.
 C_FULFILLED = re.compile(r"Online: spill fulfilled (?:\S+ )?(w[0-9a-f]{8})\.[0-9a-f]+ \S+ \(S selected (\d+) items, "
-                         r"here spawned (\d+)\)")
+                         r"(?:here spawned (\d+)|this game's own run matched)")
+C_DIFFERS = re.compile(r"Online: spill differs (?:\S+ )?(w[0-9a-f]{8})\.[0-9a-f]+ \S+ \((.*)\)$")
+C_EXPIRED = re.compile(r"Online: spill expired (?:\S+ )?(w[0-9a-f]{8})\.[0-9a-f]+ \S+ \((.*?) after \d+ s")
 C_SPILL = r"Online: spill \S+ (?:\S+ )?{key}\."
-DELIVERY = re.compile(r"Online: loot delivery: .+")
+# The client's copies asleep there, by name: a replica or a bind waiting for its wake, an authored sleep.
+C_ASLEEP_KEY = re.compile(r"Online: enemy (?:replica " + KEY + r" at \S+ asleep|bind " + KEY + r" .*waits \(asleep here)")
+C_SPAWN_NAME = re.compile(r"Online: enemy spawn " + KEY + r" as ([^#\s]+)")
+C_SLEPT = re.compile(r"Online: authored sleep \S+ ([^#\s]+)#\S* .*slept")
+ASLEEP, NO_ROW, OTHER = "asleep here", "no row here", "other"
+UNNAMED = ("(null)", "?", "-")
+
+
+def asleep_names(run: Run, log: Log) -> set[str]:
+    """The names of the enemies whose copy slept on this client at some time (by name: S's enemy lines and the
+    client's own spawn lines give each key's name)."""
+    names: dict[str, str] = {}
+    if run.server is not None:
+        for _line, m in run.server.find(S_PLACED):
+            names.setdefault(m.group(2), m.group(4).split("#")[0])
+    for _line, m in log.find(C_SPAWN_NAME):
+        names.setdefault(m.group(1), m.group(3))
+    out = {m.group(1) for _line, m in log.find(C_SLEPT)}
+    for _line, m in log.find(C_ASLEEP_KEY):
+        key = m.group(1) or m.group(3)
+        if key in names:
+            out.add(names[key])
+    return out
 
 
 def grade_loot(run: Run) -> Verdict:
+    """Per client: its own `loot delivery` account and S's `spill obligations to peer` (the measure: a client's
+    own run that matched S's selection is a full delivery, as both say); every obligation not delivered in
+    full names its carrier and why: asleep here (its copy slept on that client), no row here (S's entity not
+    bound there), or other (a differing own run, a short spawn, no line)."""
     own = {who: log.find(OWN_DROP) for who, log in run.clients.items()}
     own_note = ", ".join(f"{who} {len(v)}" for who, v in own.items() if v)
     notes = [f"own drops collected with no S key (this game's own selection): {own_note}"] if own_note else []
@@ -674,36 +789,83 @@ def grade_loot(run: Run) -> Verdict:
     if not obliged:
         return Verdict("loot", NOT_TESTED, "S obliged no spill to a client (no chest or drop shared in this run)",
                        notes=notes)
-    ended = {(m.group(2), int(m.group(3))): (line, m.group(4)) for line, m in run.server.find(S_ENDED)}
     peers = peer_numbers(run)
-    fulfilled: dict[str, dict[str, tuple[Line, int, int]]] = {}
-    for who, log in run.clients.items():
-        fulfilled[who] = {m.group(1): (line, int(m.group(2)), int(m.group(3))) for line, m in log.find(C_FULFILLED)}
+    summary = {int(m.group(1)): (line, m) for line, m in run.server.find(S_SUMMARY)}
+    carrier = {m.group(2): m.group(1) for _line, m in run.server.find(S_SELECTED)}
+    counts: list[str] = []
     findings: list[Finding] = []
-    full = 0
-    for line, m in obliged:
-        key, peer = m.group(1), int(m.group(3))
-        who = peers.get(peer)
-        if who is None:
-            continue
-        got = fulfilled[who].get(key)
-        s_end = ended.get((key, peer))
-        if got and got[2] >= got[1]:
-            full += 1
-            continue
+    whole = True
+    for who in sorted(run.clients, key=lambda w: (w != "H", w)):
         log = run.clients[who]
-        tried = log.find(re.compile(C_SPILL.format(key=key)))
-        here = got[0].cite() if got else (tried[-1][0].cite() if tried else absent(log, f"`spill ... {key}`"))
-        what = (f"{who} spawned {got[2]} of the {got[1]} items S selected for {key}" if got else
-                f"{who} never ran S's selection for {key} (obligation {m.group(4)})")
-        lines = [line.cite(), here] + ([s_end[0].cite()] if s_end else [])
-        findings.append(Finding(what, lines))
+        peer = next((p for p, w in peers.items() if w == who), None)
+        mine = [(line, m) for line, m in obliged if peer is not None and int(m.group(3)) == peer]
+        if not mine:
+            continue
+        acct = log.find(DELIVERY)
+        s_sum = summary.get(peer)
+        if acct:
+            d = acct[-1][1]
+            text = (f"{who}: {d.group(1)} obligations, {d.group(2)} delivered in full, {d.group(3)} differ, {d.group(4)} "
+                    f"short, {d.group(5)} unfinished (its `loot delivery`; S's selections {d.group(7)} items, spawned "
+                    f"there {d.group(8)})")
+            whole = whole and d.group(1) == d.group(2)
+        else:
+            text = f"{who}: no `loot delivery` line (its session did not end there); {len(mine)} obligations on S"
+            whole = False
+        if s_sum:
+            m = s_sum[1]
+            text += f"; S to peer {peer}: {m.group(2)} made, {m.group(3)} completed, {m.group(4)} ended otherwise"
+            whole = whole and m.group(2) == m.group(3)
+        else:
+            text += f"; S logged no `spill obligations to peer {peer}` line"
+            whole = False
+        counts.append(text)
+        full = {m.group(1) for _l, m in log.find(C_FULFILLED) if m.group(3) is None or int(m.group(3)) >= int(m.group(2))}
+        short = {m.group(1): (line, m) for line, m in log.find(C_FULFILLED)
+                 if m.group(3) is not None and int(m.group(3)) < int(m.group(2))}
+        differs = {m.group(1): (line, m) for line, m in log.find(C_DIFFERS)}
+        expired = {m.group(1): (line, m) for line, m in log.find(C_EXPIRED)}
+        sleepers = asleep_names(run, log)
+        groups: dict[str, list[str]] = {}
+        for line, m in mine:
+            key = m.group(1)
+            if key in full:
+                continue
+            name = carrier.get(key, "?")
+            label = f"{key} (obligation {m.group(4)}) carrier {name}"
+            if key in expired:
+                eline, em = expired[key]
+                why = em.group(2)
+                # An unnamed carrier ((null), ?) is never matched by name: its sleep is not known here.
+                if "not resolved" in why and name in sleepers and name not in UNNAMED:
+                    kind = ASLEEP
+                    detail = f"its copy slept here; {eline.cite()}"
+                elif "not resolved" in why:
+                    kind = NO_ROW
+                    detail = f"S's entity is not bound here; {eline.cite()}"
+                else:
+                    kind = OTHER
+                    detail = f"{why}; {eline.cite()}"
+            elif key in differs:
+                kind, detail = OTHER, f"this game's own run stood against S's selection; {differs[key][0].cite()}"
+            elif key in short:
+                sl, sm = short[key]
+                kind, detail = OTHER, f"spawned {sm.group(3)} of {sm.group(2)}; {sl.cite()}"
+            else:
+                tried = log.find(re.compile(C_SPILL.format(key=key)))
+                kind, detail = OTHER, (tried[-1][0].cite() if tried else absent(log, f"`spill ... {key}`"))
+            groups.setdefault(kind, []).append(f"{label}: {detail}")
+        for kind in (ASLEEP, NO_ROW, OTHER):
+            if kind in groups:
+                why = {ASLEEP: "its carrier's copy is asleep here (a far player: no orb where it died)",
+                       NO_ROW: "its carrier has no row here (S's entity is not bound here: nobody there sees the drop)",
+                       OTHER: "other"}[kind]
+                findings.append(Finding(f"{who}: {len(groups[kind])} obligation(s) not delivered in full, {why}",
+                                        groups[kind]))
     spills = {m.group(1) for _, m in obliged}
-    lost = {f.what.split(" for ")[1].split(" ")[0] for f in findings if " for " in f.what}
-    counts = (f"S obliged {len(spills)} spill(s) ({len(obliged)} deliveries to the clients); delivered in full {full}, "
-              f"short or lost {len(findings)} (of {len(lost)} spill(s))")
-    notes += [line.cite() for log in run.clients.values() for line, _ in log.find(DELIVERY)]
-    return Verdict("loot", FAIL if findings else PASS, counts, obliged[0][0].cite(), findings, notes)
+    head = f"S obliged {len(spills)} spill(s), {len(obliged)} deliveries to the clients"
+    status = PASS if whole and not findings else FAIL
+    return Verdict("loot", status, "; ".join([head] + counts), obliged[0][0].cite(), findings, notes)
 
 
 # --- cutscenes synced (the game repository's tools/scene_sync_check.py) ---------------------------------
@@ -923,7 +1085,7 @@ NOT_COVERED = (
     "which skylander's attack lands on the server (it replays the presses on its own hero: reach and damage may "
     "differ), player hits and damage numbers as the other player sees them",
     "the HUD and party panel: portraits (a number today), health bars, names, level, hat, lives",
-    "coins lying in the level, food and the wallet (until their log lines exist)",
+    "food and the wallet beyond the coins' gold lines",
     "the other player's knock-out, death and revive, jumps and falls as seen on the screen",
     "enemy movement, animation and attack timing, enemies aiming at the partner, enemy missiles, freezes and "
     "other victim states",
@@ -1059,7 +1221,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     run = load_run(folder)
     data = level_data(levelpass, run_level(run))
     return [grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), grade_scenes(run, repo),
-            grade_enemies(run, data), grade_pickups(run), grade_loot(run)]
+            grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run)]
 
 
 def run_head(folder: Path) -> list[str]:
