@@ -694,6 +694,36 @@ class Case(unittest.TestCase):
         self.assertEqual(solo.layout, "server+1")
         self.assertNotIn("D", solo.peers)
 
+    def test_an_unresolved_exit_target_ends_the_pass(self):
+        """Item 3: an exit step whose target finds no entity is H's forbidden line (fail fast ends the run at
+        once); a sweep step's is not; the report names the step and the target."""
+        p = lp.make_plan(content())
+        h = lp.script_h(p, lp.LATE_JOIN_MARK)
+        self.assertEqual(lp.exit_refs(h), ["auth:madeup:2"])
+        s = self.load(lp.spec_toml(p))
+        self.assertEqual(s.peers["H"].forbid, lp.exit_forbid(h))
+        self.assertEqual(s.peers["D"].forbid, [])
+        rx = re.compile(s.peers["H"].forbid[0])
+        prefix = "[2026-11-18 16:42:12.345] [info] [core] [t2144] "
+        line = prefix + "Dev: enter_trigger auth:madeup:2 failed (no entity: no authored object madeup:2 in this level's walks) after 0.0 s"
+        self.assertTrue(rx.search(line))
+        self.assertTrue(rx.search(prefix + "Dev: goto_entity auth:madeup:2 failed (no entity: no such entity) after 0.0 s"))
+        # A sweep target, another failure of the exit's own target, and a longer id are not the line.
+        self.assertFalse(rx.search(prefix + "Dev: goto_entity auth:madeup:6 failed (no entity: no such entity) after 0.0 s"))
+        self.assertFalse(rx.search(prefix + "Dev: enter_trigger auth:madeup:2 failed (teleport failed) after 3.0 s"))
+        self.assertFalse(rx.search(prefix + "Dev: enter_trigger auth:madeup:21 failed (no entity: x) after 0.0 s"))
+        text = "\n".join([prefix + "Input script: LEVELPASS phase exit", line])
+        got = lp.unresolved_exit(text, h)
+        self.assertIn("`enter_trigger auth:madeup:2` found no entity: no authored object madeup:2", got)
+        self.assertIn("no wait for the level end", got)
+        self.assertEqual(lp.unresolved_exit(prefix + "Input script: LEVELPASS phase exit\n", h), "")
+        # The ww1 literal of 18 November: a name the exit addresses.
+        self.assertTrue(re.search(lp.exit_forbid("log LEVELPASS phase exit\ngoto_entity LevelOutro_Trigger\n"
+                                                 "enter_trigger LevelOutro_Trigger\nlog LEVELPASS done\n")[0],
+                                  "Dev: goto_entity LevelOutro_Trigger failed (no entity: no such entity) after 0.0 s"))
+        # --no-end and a timed level address no exit target: no forbid.
+        self.assertNotIn("forbid", lp.spec_toml(lp.make_plan(content(), no_end=True)))
+
     def base(self, d_extra: str = "", top: str = "") -> str:
         return "\n".join([
             'name = "x"', 'layout = "server+2"', 'stage = "8"', 'server = "host"', 'scenes = "skip"', top,

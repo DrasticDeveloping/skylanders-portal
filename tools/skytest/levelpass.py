@@ -1045,6 +1045,57 @@ def end_words(plan: Plan) -> str:
     return "none found in the content"
 
 
+# A step of the exit phase whose target does not resolve ends the pass at once (fail fast on H's
+# `forbid`): nothing after it can happen, and the level end's wait would only run out (ww1, 18 November
+# 2026: `goto_entity LevelOutro_Trigger failed (no entity: no such entity)`, then 60 s for nothing, 11
+# times). The route helpers log `Dev: <command> <selector> failed (no entity: <why>)` with the selector
+# as the script gave it (route_actions.cpp, RouteRun::Fail). A sweep step's unresolved target stays a
+# tool finding and the sweep goes on: no later step waits on it.
+EXIT_STEP_COMMANDS = ("goto_entity", "enter_trigger", "fight_near", "interact", "attack_until", "pickup",
+                      "encounter_clear", "wait_entity_gone")
+EXIT_FATAL_WHAT = "the exit's target did not resolve: the pass ends here, no wait for the level end"
+
+
+def exit_refs(script: str) -> list[str]:
+    """The targets the exit phase's steps address (between `LEVELPASS phase exit` and `LEVELPASS done`)."""
+    out: list[str] = []
+    inside = False
+    for line in script.splitlines():
+        if line.startswith("log LEVELPASS phase exit"):
+            inside = True
+            continue
+        if line.startswith("log LEVELPASS done") or line.startswith("log LEVELPASS phase next-level"):
+            inside = False
+        parts = line.split()
+        if inside and len(parts) >= 2 and parts[0] in EXIT_STEP_COMMANDS and parts[1] not in out:
+            out.append(parts[1])
+    return out
+
+
+def exit_forbid(script: str) -> list[str]:
+    """H's `forbid` for the exit: one pattern, a step of the exit naming one of its targets that found no
+    entity; [] when the exit addresses none (a timed level, --no-end)."""
+    refs = exit_refs(script)
+    if not refs:
+        return []
+    return [r"Dev: \S+ (?:" + "|".join(re.escape(r) for r in refs) + r") failed \(no entity"]
+
+
+EXIT_UNRESOLVED = re.compile(r"Dev: (\S+) (\S+) failed \((no entity[^)]*)\)")
+
+
+def unresolved_exit(h_text: str, script: str) -> str:
+    """The first exit step whose target did not resolve, in words ('' for none)."""
+    refs = set(exit_refs(script))
+    at = h_text.find("Input script: LEVELPASS phase exit")
+    if at < 0 or not refs:
+        return ""
+    for m in EXIT_UNRESOLVED.finditer(h_text[at:]):
+        if m.group(2) in refs:
+            return f"`{m.group(1)} {m.group(2)}` found {m.group(3)}: {EXIT_FATAL_WHAT}"
+    return ""
+
+
 def exit_seconds(plan: Plan) -> float:
     """The exit phase's share: its actions' own timeouts and the level end's waits."""
     if plan.no_end:
@@ -1659,6 +1710,7 @@ def spec_toml(plan: Plan) -> str:
     pass: every step's failure is a finding of the report, not a failed expectation."""
     late = plan.late_join
     h = script_h(plan, LATE_JOIN_MARK if late else None)
+    forbid = exit_forbid(h)
     out = [f'name = "{case_name(plan.level, plan.no_end)}"',
            f'layout = "{"server+2" if late else "server+1"}"',
            'stage = "8"',
@@ -1672,6 +1724,7 @@ def spec_toml(plan: Plan) -> str:
            "",
            "[peer.H]",
            f"args = {_toml_list(probe_args(H_ARGS, plan.probe, plan.game_args))}",
+           *([f"forbid = {_toml_list(forbid)}"] if forbid else []),
            "script = \'\'\'\n" + h + "\'\'\'",
            ]
     if late:

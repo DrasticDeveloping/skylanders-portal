@@ -9072,6 +9072,11 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                 notes.append(f"runner: {why}")
         except (OSError, ValueError):
             pass
+    unresolved = lp.unresolved_exit(texts["H"], script)
+    if unresolved:
+        notes.insert(0, f"pass ended at the exit: {unresolved}")
+        findings.append(lp.Finding(severity=lp.TOOL, kind="tool", family="exit", what=lp.EXIT_FATAL_WHAT, obj="",
+                                   step="", lines=[unresolved], peer="H"))
     findings, artefact_notes = lp.audit_artefacts(findings, texts)
     findings = lp.exit_not_reached(findings, texts["H"])
     notes += artefact_notes
