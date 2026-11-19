@@ -69,6 +69,10 @@ class Log:
     who: str
     path: str
     lines: list[str]
+    # A log the game rotated (`game.<n>.log` older, `game.log` the newest: S's log in a long run, batch 12 case 7,
+    # ww1 20261119-124636, rotated at 12:51:56): its files' lines in time order, each file's (path, first index)
+    # here, so a line is cited in its own file. Empty: one file, `path`.
+    parts: list[tuple[str, int]] = field(default_factory=list)
 
     def find(self, rx: re.Pattern) -> list[tuple[Line, re.Match]]:
         out = []
@@ -85,7 +89,11 @@ class Log:
             k = raw.find("Input script: ")
         if k < 0:
             k = raw.find("] ", 26) + 2 if raw.startswith("[") else 0
-        return Line(self.path, i + 1, raw[k:].rstrip(), stamp(raw))
+        path, first = self.path, 0
+        for part, start in self.parts:
+            if start <= i:
+                path, first = part, start
+        return Line(path, i - first + 1, raw[k:].rstrip(), stamp(raw))
 
     def last_time(self) -> datetime | None:
         for raw in reversed(self.lines):
@@ -101,10 +109,20 @@ def stamp(raw: str) -> datetime | None:
 
 
 def read_log(run: Path, rel: str, who: str) -> Log | None:
+    """A game's log with the files the game rotated before it (`game.<n>.log`, the highest n the oldest), in time
+    order (Log.parts)."""
     p = run / rel
     if not p.is_file():
         return None
-    return Log(who, rel.replace("\\", "/"), p.read_text(encoding="utf-8", errors="replace").splitlines())
+    older = sorted((q for q in p.parent.glob(f"{p.stem}.*{p.suffix}") if q.stem[len(p.stem) + 1:].isdigit()),
+                   key=lambda q: -int(q.stem[len(p.stem) + 1:]))
+    lines: list[str] = []
+    parts: list[tuple[str, int]] = []
+    base = rel.replace("\\", "/").rsplit("/", 1)[0] + "/" if "/" in rel.replace("\\", "/") else ""
+    for q in older + [p]:
+        parts.append((base + q.name, len(lines)))
+        lines += q.read_text(encoding="utf-8", errors="replace").splitlines()
+    return Log(who, rel.replace("\\", "/"), lines, parts if older else [])
 
 
 @dataclass
@@ -839,6 +857,33 @@ FOLLOW_ON = re.compile(r"Online: auto follow the host \(peer (\d+)\) \(script\)"
 PUPPET_FOR = re.compile(r"Online: puppet (\d+) for peer (\d+) spawned at .*\(generation (\d+)\)")
 PUPPET_POSE = re.compile(r"Online: puppet (\d+) pose \d+ at (-?[\d.]+),(-?[\d.]+),(-?[\d.]+) ")
 H_ACT = re.compile(r"Input script: LEVELPASS act (v\d+)_\d+ ")
+# A sweep step its deadline skipped (`Dev: <command> <target> ... skipped: the sweep's time is up`), and the act it
+# belongs to (H's `LEVELPASS act <v>_<i> <kind> <name> ...` before it).
+ACT_LINE = re.compile(r"Input script: LEVELPASS act (v\d+_\d+) (\S+) (\S+)")
+STEP_SKIPPED = re.compile(r"Dev: \S+ .* skipped: the sweep's time is up")
+# The rows an act's kind would have tested (W13): a pickup's collect and coins, a chest's or a crate's spill, a
+# fight's enemies, a trigger's or a talk's scene and the enemies it releases.
+KIND_ROWS = {"pickup": ("pickups", "coins"), "interact": ("loot", "pickups"), "attack": ("loot", "enemies"),
+             "fight": ("enemies",), "enter": ("cutscenes", "enemies"), "talk": ("cutscenes",)}
+
+
+def skipped_acts(h: Log | None) -> list[tuple[str, str, str, Line]]:
+    """Each act of H's sweep whose step its deadline skipped: (label, kind, name, the skip line), once per act."""
+    out: list[tuple[str, str, str, Line]] = []
+    if h is None:
+        return out
+    current = None
+    for i, raw in enumerate(h.lines):
+        m = ACT_LINE.search(raw)
+        if m:
+            current = (m.group(1), m.group(2), m.group(3))
+            continue
+        if "LEVELPASS visit" in raw or "LEVELPASS phase" in raw:
+            current = None
+            continue
+        if current is not None and STEP_SKIPPED.search(raw) and (not out or out[-1][0] != current[0]):
+            out.append((*current, h.line(i)))
+    return out
 
 
 def peer_poses(server: Log) -> dict[int, list[tuple[datetime, tuple[float, float, float], Line]]]:
@@ -874,7 +919,12 @@ def grade_together(run: Run) -> Verdict:
     poses = peer_poses(run.server)
     hp, dp = poses.get(peers.get("H", -1), []), poses.get(peers.get("D", -1), [])
     stops: dict[str, Line] = {}
+    # A step the sweep's deadline skipped is no stop where H acted (W14: ww1 20261119-124636's v19, v22, v24).
+    skipped = {label for label, _k, _n, _l in skipped_acts(h)}
     for line, m in h.find(H_ACT):
+        full = ACT_LINE.search(line.text)
+        if full is not None and full.group(1) in skipped:
+            continue
         if line.t is not None and (on[0][0].t is None or line.t >= on[0][0].t):
             stops.setdefault(m.group(1), line)
     if not stops:
@@ -1822,7 +1872,27 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     for v in rows:
         if v.name in ("enemies", "loot"):
             v.notes.append(where)
+    # A sweep that skipped steps for time: each NOT TESTED row those steps would have tested says so (W13).
+    skipped = skipped_acts(run.clients.get("H"))
+    for v in rows:
+        mine = [s for s in skipped if v.name in KIND_ROWS.get(s[1], ())]
+        # Not for a row the run turned off (shared coins or loot off, scenes skipped): time made no difference there.
+        off = re.search(r"\boff\b|--dev_skip_scenes", v.counts)
+        if v.status == NOT_TESTED and mine and not off:
+            v.notes.insert(0, f"not tested partly for time: the sweep's deadline skipped {len(mine)} step(s) that "
+                              f"test it: " + ", ".join(f"{label} {kind} {name}" for label, kind, name, _l in mine[:6])
+                           + f" ({mine[0][3].cite()})")
     return rows
+
+
+def skipped_head(h: Log | None) -> list[str]:
+    """The page's head line for a sweep that skipped steps for time, with the NOT TESTED rows they would test."""
+    skipped = skipped_acts(h)
+    if not skipped:
+        return []
+    rows = sorted({r for _l, kind, _n, _x in skipped for r in KIND_ROWS.get(kind, ())})
+    return [f"the sweep skipped {len(skipped)} act(s) for time ({skipped[0][3].cite()}); rows they would test: "
+            f"{', '.join(rows)} (a NOT TESTED row among them says so)"]
 
 
 def run_head(folder: Path) -> list[str]:
@@ -1835,7 +1905,8 @@ def run_head(folder: Path) -> list[str]:
     secs = r.get("seconds")
     return [f"case {r.get('case', '?')}: runner status {r.get('status', '?')}, "
             f"{(secs / 60):.1f} min" if isinstance(secs, (int, float)) else f"case {r.get('case', '?')}",
-            f"build snapshot {prov.get('build') or '?'}, runner {prov.get('runner') or '?'}"]
+            f"build snapshot {prov.get('build') or '?'}, runner {prov.get('runner') or '?'}",
+            *skipped_head(read_log(folder, "H/game.log", "H"))]
 
 
 def overall(verdicts: list[Verdict]) -> str:

@@ -5,6 +5,7 @@ Run: python -I -m unittest discover -s tools/skytest/tests -p "test_levelcheck.p
 """
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 import unittest
@@ -65,6 +66,46 @@ class RunFolder:
 
     def run(self) -> lc.Run:
         return lc.load_run(self.path)
+
+
+
+class RotatedLog(unittest.TestCase):
+    """W14: S's log rotated in a long run (`game.1.log` older, `game.log` newest); its early lines are read too, and
+    each line is cited in its own file."""
+
+    def test_rotated_files_are_read_in_time_order(self) -> None:
+        f = RunFolder([(300, "Online: puppet 1 pose 9 at 1,2,3 client at 1,2,3 off 0 age 1 ms")], H_JOIN)
+        session = f.path / "H" / "data" / "Online" / "session"
+        (session / "game.1.log").write_text(log([(100, "Online: early S line")]), encoding="utf-8")
+        (session / "game.2.log").write_text(log([(50, "Online: earliest S line")]), encoding="utf-8")
+        s = f.run().server
+        self.assertEqual([l.text for l in (s.line(i) for i in range(len(s.lines)))],
+                         ["Online: earliest S line", "Online: early S line",
+                          "Online: puppet 1 pose 9 at 1,2,3 client at 1,2,3 off 0 age 1 ms"])
+        self.assertEqual(s.find(re.compile(r"early S line"))[0][0].cite(),
+                         "H/data/Online/session/game.1.log:1: Online: early S line")
+        self.assertTrue(s.find(re.compile(r"puppet 1 pose"))[0][0].cite().startswith("H/data/Online/session/game.log:1:"))
+
+
+class SkippedForTime(unittest.TestCase):
+    """W13: steps the sweep's deadline skipped are no stops where H acted, and a NOT TESTED row they would test says
+    so (not a row the run turned off)."""
+    H = [(60, "Input script: LEVELPASS act v19_1 pickup SoulGem_lockjaw CPhysicalEntity ref auth:ww1:12086"),
+         (60.1, "Dev: goto_entity auth:ww1:12086 skipped: the sweep's time is up"),
+         (60.2, "Dev: pickup auth:ww1:12086 10 skipped: the sweep's time is up"),
+         (61, "Input script: LEVELPASS visit v20 objects 3 (A, B, C) ref auth:ww1:4666"),
+         (61.1, "Dev: goto_entity auth:ww1:4666 skipped: the sweep's time is up"),
+         (62, "Input script: LEVELPASS act v22_1 interact TreasureChest002 CPhysicalEntity ref auth:ww1:12198"),
+         (62.1, "Dev: goto_entity auth:ww1:12198 skipped: the sweep's time is up")]
+
+    def test_skipped_acts_once_each_and_the_rows_they_test(self) -> None:
+        run = RunFolder([], H_JOIN + self.H).run()
+        got = [(label, kind, name) for label, kind, name, _l in lc.skipped_acts(run.clients["H"])]
+        self.assertEqual(got, [("v19_1", "pickup", "SoulGem_lockjaw"), ("v22_1", "interact", "TreasureChest002")])
+        head = lc.skipped_head(run.clients["H"])
+        self.assertTrue(head[0].startswith("the sweep skipped 2 act(s) for time (H/game.log:"), head)
+        self.assertIn("rows they would test: coins, loot, pickups", head[0])
+
 
 
 class Windows(unittest.TestCase):
@@ -622,6 +663,16 @@ class KeyGateCalibration(unittest.TestCase):
         self.assertIn("opened on S, H, D: S at 06:54:11.795 ", done[0])
         self.assertEqual(len(shut), 1, shut)
         self.assertIn("the press went to TutorialLockedGate#2607, the gate an earlier step pressed", shut[0])
+
+
+@unittest.skipUnless((CALIBRATION_RUNS / "20261119-124636-levelpass-ww1").is_dir(), "batch 12's ww1 gates run is not here")
+class GatesRunCalibration(unittest.TestCase):
+    def test_together_reads_the_rotated_server_log_and_skips_the_skipped_steps(self) -> None:
+        run = lc.load_run(CALIBRATION_RUNS / "20261119-124636-levelpass-ww1")
+        v = lc.grade_together(run)
+        self.assertEqual(v.status, lc.PASS, v.counts)
+        self.assertIn("at 2 of 2 stop(s) where H acted", v.counts)
+        self.assertEqual([a[0] for a in lc.skipped_acts(run.clients["H"])], ["v2_2", "v19_1", "v22_1", "v24_1"])
 
 @unittest.skipUnless((CALIBRATION_RUNS / "20261119-111305-levelpass-ww1").is_dir(), "batch 11's ww1 coins run is not here")
 class CoinsCalibration(unittest.TestCase):
