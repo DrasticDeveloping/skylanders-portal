@@ -1678,6 +1678,8 @@ def party_boot_d() -> list[str]:
 # before its load report (12:07:44.101 / 12:07:45.106); that order is the run's, not proven by the code (the load
 # report can also come from the service frame while the barrier hold freezes the world). A mark that still lands
 # inside a load is named by late_marks (the pass and the page). H marks before its own `level` command: no race.
+# online/8-test-conditions (41d0a165) makes the mark itself keep the level the game is in (the last released one
+# while a later one loads); the order above stays as a second guard, and late_marks then finds nothing to name.
 D_MARK_BEFORE_BARRIER = True
 
 
