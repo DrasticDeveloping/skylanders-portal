@@ -425,6 +425,7 @@ bool ReadPose(ByteReader& r, PlayerPose& m) {
     // The moves' command block (protocol.h PlayerCommand): another version's is skipped, a cut one is invalid.
     const uint8_t version = r.U8();
     if (r.Ok() && version == kPlayerCommandVersion) {
+      m.command.peer_epoch = r.U32();
       m.command.held = r.U32();
       for (uint8_t& p : m.command.presses) p = r.U8();
       std::array<float, 1> magnitude{};
@@ -522,6 +523,7 @@ bool Fields(ByteWriter& w, const PlayerPose& m) {
   if (m.has_command) {
     // The moves' command block, last (protocol.h PlayerCommand).
     w.U8(kPlayerCommandVersion);
+    w.U32(m.command.peer_epoch);
     w.U32(m.command.held);
     for (const uint8_t p : m.command.presses) w.U8(p);
     const std::array<float, 1> magnitude{m.command.magnitude};

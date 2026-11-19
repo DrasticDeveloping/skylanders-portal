@@ -954,13 +954,14 @@ void Moves() {
   CHECK(RoundTrip(p));
   PlayerPose c = p;
   c.has_command = true;
+  c.command.peer_epoch = 0x01020304u;
   c.command.held = 0x00000810u;  // JUMP and BLOCK held
   c.command.presses = {7, 0, 255};
   c.command.magnitude = 0.75f;
   c.command.move = {0.6f, -0.8f, 0.f};
   CHECK(RoundTrip(c));
   const std::vector<uint8_t> with = EncodeMessage(c);
-  REQUIRE_OR_RETURN_VOID(with.size() == plain.size() + 24);
+  REQUIRE_OR_RETURN_VOID(with.size() == plain.size() + 28);
   // Past the header (whose length differs) the plain pose's fields are the first bytes of the new one.
   CHECK(std::equal(plain.begin() + kMessageHeaderSize, plain.end(), with.begin() + kMessageHeaderSize));
   {
