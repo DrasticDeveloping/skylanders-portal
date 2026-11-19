@@ -1066,6 +1066,10 @@ def dismiss_after(o: Obj | None) -> list[str]:
 # 3 s (paused, ...)`): nothing after it can run until a press closes what paused it. H's forbidden line, so
 # the pass ends at once instead of failing every later step after 23 s (ww1, 20261118-195819: 3.5 minutes).
 PAUSE_FATAL = r"Dev: \S+ \S+ no player frame took a read for \d+ s \(paused"
+# A copy made from S's run-time spawn rows (or its twin, or what it made) still in the entity table after its
+# despawn: at the level change it would outlive the package of its data (online/5-endfight-spawns). H's
+# forbidden line: the pass ends at once, with the crash's cause named, instead of the crash.
+MADE_COPY_LEFT = r"Online: runtime spawn (?:made copy|twin) .* still in the entity table"
 
 
 def script_h(plan: Plan, late_join_after: str | None) -> str:
@@ -2116,7 +2120,7 @@ def spec_toml(plan: Plan) -> str:
     pass: every step's failure is a finding of the report, not a failed expectation."""
     late = plan.late_join
     h = script_h(plan, LATE_JOIN_MARK if late else None)
-    forbid = exit_forbid(h) + [PAUSE_FATAL]
+    forbid = exit_forbid(h) + [PAUSE_FATAL, MADE_COPY_LEFT]
     out = [f'name = "{case_name(plan.level, plan.no_end)}"',
            f'layout = "{"server+2" if late else "server+1"}"',
            'stage = "8"',
