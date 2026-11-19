@@ -1660,9 +1660,27 @@ def party_boot_h(lobby: bool, new_slot: bool) -> list[str]:
 
 
 def party_boot_d() -> list[str]:
-    """D in the lobby: its figure, the join by code, then it follows the host's pick into play."""
+    """D in the lobby: its figure, the join by code, then it follows the host's pick into play. D marks its first
+    level as soon as it is in play there, before that level's start is released (D_MARK_BEFORE_BARRIER)."""
     return ["waitfor online_title 300", "waitfor title_ready 240", f"place 0 {{figures}}/{FIGURE_D}",
-            "online_join {joincode}", "waitfor online_in_play 300", "waitfor online_barrier 300", "wait_free 120"]
+            "online_join {joincode}", "waitfor online_in_play 300", "online_mark_level", "waitfor online_barrier 300",
+            "wait_free 120"]
+
+
+# D's mark of its first level (the pick's) and H's `level` command raced: the barrier of the first level releases
+# both clients on the same tick, H then runs `wait_free`, `online_mark_level`, `level <x>` (0.28 s) and D `wait_free`,
+# `online_mark_level` (0.31 s). `online_mark_level` keeps the latest generation ANNOUNCED here, so D's mark 0.02 s
+# after the level under test began loading kept that level, and its wait for "the level after the mark" was met
+# only by the level after it (batch 12 run 2, tutorial_b 20261119-120551: D `level 2 ...: load` 12:07:45.454,
+# `online_mark_level: generation 2` 12:07:45.472, `waitfor online_level_after_mark met after 135.4 s` in the hub).
+# D now marks right after `waitfor online_in_play` in its first level, before that level's barrier: H sends `level`
+# only after the barrier, and the barrier waits for D's own load report. In the batch 12 run D was in play 1.0 s
+# before its load report (12:07:44.101 / 12:07:45.106); that order is the run's, not proven by the code (the load
+# report can also come from the service frame while the barrier hold freezes the world). A mark that still lands
+# inside a load is named by late_marks (the pass and the page). H marks before its own `level` command: no race.
+# online/8-test-conditions (41d0a165) makes the mark itself keep the level the game is in (the last released one
+# while a later one loads); the order above stays as a second guard, and late_marks then finds nothing to name.
+D_MARK_BEFORE_BARRIER = True
 
 
 def boot_lines(host: bool, figure: str) -> list[str]:
@@ -2315,7 +2333,7 @@ def script_d(plan: Plan) -> str:
         # level), then the level under test when H's `level` command loads it. No visits of its own: no
         # condition tells D that H's sweep is over, and the graders read D's lines for every key wherever it
         # stands; D is in the session from the lobby to the next level, as a second player is.
-        lines = party_boot_d() + ["online_mark_level", "log LEVELPASS D in the first level",
+        lines = party_boot_d() + ["log LEVELPASS D in the first level",
                                   f"waitfor {NEXT_LEVEL} 600", "waitfor online_barrier 300", "wait_free 120",
                                   "online_mark_level", f"hold_cap {scene_hold_cap(plan)}", "log LEVELPASS D in",
                                   "online_audit d-in"]
@@ -2962,6 +2980,50 @@ def next_level_seen(text: str, level: str) -> bool:
     return bool(later) and later[0] in released
 
 
+MARK_LINE = re.compile(r"Online: online_mark_level: generation (\d+)")
+LOG_STAMP = re.compile(r"^\[\d{4}-\d\d-\d\d (\d\d:\d\d:\d\d\.\d+)\]")
+
+
+@dataclass
+class LateMark:
+    generation: int
+    path: str
+    load_no: int      # 1-based line of `level <g> <path>: load`
+    load_at: str
+    mark_no: int      # 1-based line of `online_mark_level: generation <g>`
+    mark_at: str
+
+    def words(self, who: str = "") -> str:
+        return (f"{who + chr(39) + 's ' if who else ''}mark landed inside a load: `online_mark_level: generation "
+                f"{self.generation}` at {self.mark_at} (line {self.mark_no}), after `level {self.generation} "
+                f"{self.path}: load` at {self.load_at} (line {self.load_no}) and before its start was released: the "
+                "mark keeps the level being loaded, so the script's wait for the next level waited for the level after "
+                "it (the mark race: the test tool's fault, not the game's)")
+
+
+def late_marks(text: str) -> list[LateMark]:
+    """Each `online_mark_level` that came while a later generation was loading here: its `level <g> <path>: load`
+    already logged and its `barrier <g> released` not yet (D_MARK_BEFORE_BARRIER)."""
+    loading: dict[int, tuple[str, int, str]] = {}
+    out = []
+    for no, line in enumerate(text.splitlines(), 1):
+        stamp = LOG_STAMP.match(line)
+        at = stamp.group(1) if stamp else "?"
+        m = LEVEL_LOAD_LINE.search(line)
+        if m:
+            loading[int(m.group(1))] = (m.group(2), no, at)
+            continue
+        m = CLIENT_BARRIER.search(line)
+        if m:
+            loading.pop(int(m.group(1)), None)
+            continue
+        m = MARK_LINE.search(line)
+        if m and int(m.group(1)) in loading:
+            path, load_no, load_at = loading[int(m.group(1))]
+            out.append(LateMark(int(m.group(1)), path, load_no, load_at, no, at))
+    return out
+
+
 def client_progress(text: str, peer: str, level: str = "") -> str:
     """How far one client got, in words, from its log: its marks, and for the next level the game's own
     evidence (next_level_seen) when the level is known."""
@@ -2972,6 +3034,9 @@ def client_progress(text: str, peer: str, level: str = "") -> str:
     marked = (H_NEXT if peer == "H" else D_NEXT) in text
     if marked and (not level or next_level_seen(text, level)):
         return "reached the next level"
+    late = late_marks(text)
+    if late:
+        return "its " + late[0].words()
     loads = [m.group(2) for m in LEVEL_LOAD_LINE.finditer(text)]
     if peer == "H" and len(loads) >= 3 or peer == "D" and loads:
         return f"saw the level change ({loads[-1]}), not the next level's mark"
