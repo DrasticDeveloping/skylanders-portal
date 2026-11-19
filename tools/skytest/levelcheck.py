@@ -2222,7 +2222,25 @@ def page(folder: Path, verdicts: list[Verdict], head: list[str] | None = None) -
             out.append(f"  {v.name}: {f.what}")
             out += [f"      {x}" for x in f.lines]
     out += not_covered_lines()
+    out += [f"  - {name}: no ground a player can stand on near it (a target in the air): the level reaches it "
+            "another way (a ride, a launch, a script that moves it) the pass does not take; not covered by the pass"
+            for name in no_floor_targets(folder)]
     return "\n".join(out)
+
+
+def no_floor_targets(folder: Path) -> list[str]:
+    """W27: the targets the route refused for having no floor near them (`route teleport ... failed (no floor: ...)
+    (target <Name#id>)`) on any client, each once, by name without its id."""
+    seen: list[str] = []
+    for who in ("H", "D"):
+        log = read_log(folder, f"{who}/game.log", who)
+        for _line, m in (log.find(NO_FLOOR) if log is not None else []):
+            if not re.fullmatch(r"\S+#\d+", m.group(2)):
+                continue  # a fight's area or an asleep target's stored position: no entity of the level by name
+            name = m.group(2).split("#")[0]
+            if name not in seen:
+                seen.append(name)
+    return seen
 
 
 # --- the static table: every level's end and mechanics from its data, no game ----------------------------
