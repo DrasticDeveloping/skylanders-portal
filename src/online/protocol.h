@@ -571,8 +571,12 @@ struct SessionClosed {
 // client still plays it, so every client holds its player (repeated while held); kUnhold: no client plays
 // it any more (or a peer left, a silent copy left, the level changed), the hold is released. kShare
 // server to client: the session's switches for the shared skip and the hold (the scene sequence's bit 0
-// and bit 1; no recipient), sent at each join so every client follows S's one value. Like kOpen and
-// kRelease they carry no end reason and no skips.
+// and bit 1; no recipient), sent at each join so every client follows S's one value. kStart server to
+// client: S's world sent a cutscene's Play telegram natively (not a request's step), named by its
+// telegram key (recipient: the messenger's world ref; name_hash: the list owner's hash; the scene
+// sequence: the list index << 16 | S's count of that telegram in the generation); every client sends
+// the same telegram from its own copy unless its own game sent it (the game's scene_share_rules.h
+// ScenePairing). Like kOpen and kRelease they carry no end reason and no skips.
 enum class ScenePhase : uint8_t {
   kOpen = 1,
   kAck = 2,
@@ -582,6 +586,7 @@ enum class ScenePhase : uint8_t {
   kHold = 6,
   kUnhold = 7,
   kShare = 8,
+  kStart = 9,
 };
 enum class SceneKind : uint8_t {
   kCutscene = 1,      // a CCutsceneManager play
