@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import sys
+import os
 import tempfile
 import threading
 import time
@@ -28,6 +29,10 @@ def setUpModule() -> None:
     skytest.token_restriction = lambda: ""
     skytest.CPU_SAMPLE_S = 0.1
     skytest.GB_PER_GAME = 0.0
+    # build_guard.py: a build of this PC holding its slot must not make these cases wait (the guard's own
+    # tests set it); a runner these tests start as a process reads an empty slot folder.
+    skytest.build_holders = lambda: []
+    os.environ["SFO_BUILD_SLOT_DIR"] = tempfile.mkdtemp(prefix="skytest-no-builds-")
 
 
 def tearDownModule() -> None:

@@ -129,6 +129,7 @@ import swap_pairs  # noqa: E402
 import memory_growth  # noqa: E402  (stage 5's soak grade)
 import occurrence_outcomes  # noqa: E402  (stage 5's occurrence grade)
 import known_failures  # noqa: E402  (a pointless rerun refused: the last two results failed alike)
+import build_guard  # noqa: E402  (no session while a build holds its slot)
 
 STORE = ".replication-tests"
 CLIENTS = ["H", "D", "E", "F"]
@@ -2764,6 +2765,9 @@ class CaseResult:
     # known_failures.py: the why of `--rerun-known-failure` when this case ran although its last two
     # results on the build failed with the same first reason; '' otherwise.
     rerun_known_failure: str = ""
+    # build_guard.py: `started beside a build (...): --ignore-build: <why>` when it started while a build
+    # held its slot; '' otherwise.
+    ignored_build: str = ""
 
 
 def crash_exit_code(code: int | None) -> bool:
@@ -6152,7 +6156,7 @@ def build_results(cfg: Config, build: str, current: Path | None = None) -> dict[
 
 # A result that never started the game (no machine room, the circuit breaker, not ready) does not decide a
 # per-build case: the result before it stands.
-PER_BUILD_NOT_RUN = ("capacity", "breaker", "not ready", "known failure")
+PER_BUILD_NOT_RUN = ("capacity", "breaker", "not ready", "known failure", "build running")
 
 
 def per_build_state(cfg: Config, spec: Spec, entries: list[tuple[str, str, dict]], build: str) -> dict:
@@ -7461,6 +7465,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         raise SystemExit("--per-build goes with --gate (`test --gate --per-build`: the per-build gate cases)")
     run_not_ready = bool(getattr(a, "run_not_ready", False))
     rerun_why = (getattr(a, "rerun_known_failure", None) or "").strip()
+    ignore_build = (getattr(a, "ignore_build", None) or "").strip()
+    if getattr(a, "ignore_build", None) is not None and not ignore_build:
+        raise SystemExit("--ignore-build needs the reason: why this case may run beside a build")
+    build_wait_s = 60.0 * float(getattr(a, "build_wait_min", None) or build_guard.BUILD_WAIT_MIN)
     if getattr(a, "rerun_known_failure", None) is not None and not rerun_why:
         raise SystemExit("--rerun-known-failure needs the reason: why this rerun can end otherwise")
     bulk_on = bool(getattr(a, "bulk", False))
@@ -7702,7 +7710,16 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                                    reasons=[lease.capacity], started=time.strftime("%Y%m%d-%H%M%S"))
                 elif (t := tripped(spec)) is not None:  # it tripped while this case waited
                     r = breaker_result(spec, t)
+            build_line = ""
             try:
+                if r is None and not unit:
+                    # build_guard.py: no session starts while a build holds its slot (it waits, then gives up).
+                    went, _waited, build_line = build_guard.wait_for_builds(
+                        spec.name, build_wait_s, ignore_build, build_holders, lambda s: print(s, flush=True))
+                    if went == build_guard.GIVE_UP:
+                        r = CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage,
+                                       status=build_guard.BUILD_RUNNING, reasons=[build_line],
+                                       exclusive=runs_alone(spec), started=time.strftime("%Y%m%d-%H%M%S"))
                 if r is None:
                     case_begins()
                     if runs_alone(spec):
@@ -7734,6 +7751,8 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 r.provenance = {**prov, "build_stamp": " ".join(stamps)}  # the game's own (its log's first line)
             if refusal is not None and rerun_why:
                 r.rerun_known_failure = rerun_why
+            if build_line and r.status != build_guard.BUILD_RUNNING:
+                r.ignored_build = build_line
             r.scenes = scene_policy(cfg, spec)
             if cfg.bulk is not None:
                 r.mode = "bulk"
@@ -7864,6 +7883,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         label = gate_label(gate)
         print(f"{label}: {gate['actual_minutes']:.0f} min (the cases {gate['case_minutes']:.0f} min; expected"
               f" {gate['minutes']:.0f}); {gate['verdict']['line'].removeprefix(label + ': ')}")
+    building = [r for r in results if r.status == build_guard.BUILD_RUNNING]
+    if building:
+        print(f"{len(building)} case(s) not started: a build held its slot past the wait (not met): "
+              f"{', '.join(r.case for r in building)}")
     known = [r for r in results if r.status == known_failures.KNOWN_FAILURE]
     if known:
         print(f"{len(known)} case(s) not started as a known failure (their last two results on this build failed"
@@ -7873,10 +7896,18 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     print(f"report: {out / 'report.md'}")
     if known and len(known) == len(failed) and not touched and not queue_unmatched:
         return EXIT_KNOWN_FAILURE  # its own exit code: nothing ran that failed anew
+    if building and len(building) == len(failed) and not touched and not queue_unmatched:
+        return EXIT_BUILD_RUNNING
     return 1 if failed or touched or queue_unmatched else 0
 
 
 EXIT_KNOWN_FAILURE = 3   # `test`: every case that did not pass was refused as a known failure (no game started)
+EXIT_BUILD_RUNNING = 4   # `test`: every case that did not pass waited for a build past the limit (no game started)
+
+
+def build_holders() -> list[dict]:
+    """Who holds a build slot now (build_guard.py; the tests replace it)."""
+    return build_guard.held_slots(build_guard.slot_dir())
 
 
 def cmd_compare(cfg: Config, a: argparse.Namespace) -> int:
@@ -8630,6 +8661,14 @@ def live_start(cfg: Config, a: argparse.Namespace) -> int:
                 if c == "H" else []) + extra[c] for c in clients}
     prologue = live_session.prologues(clients, a.level, late)
     show = not a.hide_server
+    ignore = (getattr(a, "ignore_build", None) or "").strip()
+    if getattr(a, "ignore_build", None) is not None and not ignore:
+        raise live_session.LiveError("--ignore-build needs the reason")
+    went, _w, _line = build_guard.wait_for_builds(
+        f"live session {name}", 60.0 * float(getattr(a, "build_wait_min", None) or build_guard.BUILD_WAIT_MIN),
+        ignore, build_holders, lambda s: print(s, flush=True))
+    if went == build_guard.GIVE_UP:
+        return EXIT_BUILD_RUNNING
     folder.mkdir(parents=True)
     spec_text = live_session.session_spec_text(f"live-{tag}", layout, clients, prologue, args, show,
                                                f"live session {name}")
@@ -8876,6 +8915,9 @@ def add_live_parser(sub) -> None:
                    help="the session stops itself after this long without a send (0: never)")
     s.add_argument("--start-timeout", type=float, default=live_session.DEFAULT_START_TIMEOUT,
                    help="seconds to wait for live mode before returning (the session goes on)")
+    s.add_argument("--ignore-build", default=None, metavar="WHY", help="start even while a build holds its slot"
+                   " (else the start waits for it, at most --build-wait-min); WHY is printed")
+    s.add_argument("--build-wait-min", type=float, default=None, metavar="MIN", help="as `test`'s")
     s.add_argument("--no-server-live", action="store_true", help="S gets no live file (an older build without"
                    " dev_server_follow gets none anyway)")
     s.add_argument("--allow-restricted", action="store_true", help="as `test --allow-restricted`")
@@ -8986,10 +9028,11 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     ns = argparse.Namespace(cases=[lp.case_name(a.level)], stage=None, max_games=0, gate=False, per_build=False,
                             allow_restricted=False, jobs=1, run_not_ready=False, no_breaker=False, queue=None,
                             remote=None, remote_manifest=None, remote_token_file=None,
-                            rerun_known_failure=a.rerun_known_failure)
+                            rerun_known_failure=a.rerun_known_failure, ignore_build=a.ignore_build,
+                            build_wait_min=a.build_wait_min)
     code = cmd_test(replace(cfg, cases_dir=cases), ns)
-    if code == EXIT_KNOWN_FAILURE:
-        print(f"levelpass {a.level}: not started, a known failure (above); no report", flush=True)
+    if code in (EXIT_KNOWN_FAILURE, EXIT_BUILD_RUNNING):
+        print(f"levelpass {a.level}: not started ({'a known failure' if code == EXIT_KNOWN_FAILURE else 'a build held its slot'}, above); no report", flush=True)
         return code
     wall = time.monotonic() - t0
     runs = sorted(p for p in (cfg.store / "runs").glob(f"*-{lp.case_name(a.level)}")
@@ -9099,6 +9142,11 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--rerun-known-failure", default=None, metavar="WHY", help="start a case even when its last two"
                    " results on this build with the same case content failed with the same first reason (known"
                    " failure); WHY (required) says what can end otherwise and is written into the result")
+    t.add_argument("--build-wait-min", type=float, default=None, metavar="MIN", help="how long a case waits for a"
+                   f" build that holds its slot (tools/build_low.py) before it is not started (default"
+                   f" {build_guard.BUILD_WAIT_MIN:.0f})")
+    t.add_argument("--ignore-build", default=None, metavar="WHY", help="start cases even while a build holds its"
+                   " slot; WHY (required) is written into the result")
     t.set_defaults(fn=cmd_test)
     ls = sub.add_parser("list")
     ls.add_argument("--gate", action="store_true", help="the gate cases and their expected minutes (from each"
@@ -9150,6 +9198,9 @@ def main(argv: list[str] | None = None) -> int:
                      " --game-arg=--online_authored_ids=2")
     lp_.add_argument("--plan-only", action="store_true", help="write the generated case and print the plan; start"
                      " no game")
+    lp_.add_argument("--build-wait-min", type=float, default=None, metavar="MIN", help="as `test`'s")
+    lp_.add_argument("--ignore-build", default=None, metavar="WHY", help="as `test`'s: start beside a build, WHY"
+                     " written into the result")
     lp_.add_argument("--rerun-known-failure", default=None, metavar="WHY", help="as `test`'s: run the pass although"
                      " its last two results on this build with the same generated case failed with the same first"
                      " reason; WHY is written into the result")

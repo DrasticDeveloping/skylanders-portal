@@ -39,6 +39,10 @@ def setUpModule() -> None:
     # The machine budget's memory check (PS15) reads the real machine's free memory: off here (another
     # program's load must not make a test a capacity result); MachineTest sets it.
     skytest.GB_PER_GAME = 0.0
+    # build_guard.py: a build of this PC holding its slot must not make these cases wait (the guard's own
+    # tests set it); a runner these tests start as a process reads an empty slot folder.
+    skytest.build_holders = lambda: []
+    os.environ["SFO_BUILD_SLOT_DIR"] = tempfile.mkdtemp(prefix="skytest-no-builds-")
 
 
 def tearDownModule() -> None:
@@ -682,6 +686,29 @@ quit
         self.spec("kf", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB +
                   'expect = ["never in any log either"]\n')
         self.assertEqual(self.run_cases("kf")["cases"][0]["status"], "fail")
+
+    def test_a_case_waits_for_a_build_then_is_not_started_unless_a_reason_is_given(self) -> None:
+        # build_guard.py: a build slot held past --build-wait-min: `build running`, no game, exit 4;
+        # --ignore-build starts it and the result says why.
+        self.spec("bw", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB)
+        build = {"worktree": "C:/w/x", "recipes": ["build-release"], "pid": 7, "since": "14:00:00"}
+        skytest.build_holders = lambda: [build]
+        try:
+            a = argparse.Namespace(cases=["bw"], stage=None, max_games=5, build_wait_min=0.0001)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = skytest.cmd_test(self.cfg, a)
+            self.assertEqual(code, skytest.EXIT_BUILD_RUNNING)
+            self.assertIn("bw: waits for a build to end (C:/w/x (build-release), pid 7", out.getvalue())
+            self.assertEqual(list((self.cfg.store / "runs").glob("*-bw")), [])
+            a = argparse.Namespace(cases=["bw"], stage=None, max_games=5, ignore_build="a test of the override")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(skytest.cmd_test(self.cfg, a), 0)
+            res = json.loads((sorted((self.cfg.store / "runs").glob("*-bw"))[-1] / "result.json")
+                             .read_text(encoding="utf-8"))
+            self.assertEqual(res["status"], "pass")
+            self.assertIn("--ignore-build: a test of the override", res["ignored_build"])
+        finally:
+            skytest.build_holders = lambda: []
 
     def write_janitor(self, body: str) -> None:
         tools = self.repo / "tools"
