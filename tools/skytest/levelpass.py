@@ -1019,6 +1019,14 @@ def action_lines(a: Action, label: str, after: str = "") -> list[str]:
         out.append(f"interact {ref} {ACTION_TIMEOUT[a.action]}")
     elif a.action == PICKUP:
         out.append(f"pickup {ref} {ACTION_TIMEOUT[PICKUP]}")
+        # A major collectible's pickup (the game's CollectibleComponent: a Soul Gem, a story scroll, a map, a
+        # hat, a legendary treasure, a butterfly) locks every hero's controls and opens the game's found
+        # screen (CollectibleData.displayUI), which pauses the game until a press closes it (its controls come
+        # back on CCollectibleTrackerUIClosedMessage). The stored data does not say which collectibles are
+        # major, so every pickup of the collectible component gets the press once and the wait for the hero
+        # (a minor one's press is a jump). A screen it does not close: the next step's pause line is H's
+        # forbidden line (PAUSE_FATAL), the pass ends there.
+        out += list(DISMISS_LINES)
     elif a.action == EXIT_A and exit_kind(o) == FIGHT:
         out += [f"fight_near {ref} {EXIT_FIGHT_RADIUS} {EXIT_FIGHT_S}",
                 f"fight_near {ref} {EXIT_FIGHT_RADIUS} {EXIT_LATE_WAVE_S}"]
@@ -1030,6 +1038,11 @@ def action_lines(a: Action, label: str, after: str = "") -> list[str]:
 
 
 FIGHT_RADIUS = 1500
+DISMISS_LINES = ("tap a", "wait_free 15")
+# A route step that finds the game paused with its player frames stopped (`no player frame took a read for
+# 3 s (paused, ...)`): nothing after it can run until a press closes what paused it. H's forbidden line, so
+# the pass ends at once instead of failing every later step after 23 s (ww1, 20261118-195819: 3.5 minutes).
+PAUSE_FATAL = r"Dev: \S+ \S+ no player frame took a read for \d+ s \(paused"
 
 
 def script_h(plan: Plan, late_join_after: str | None) -> str:
@@ -1837,6 +1850,24 @@ ENDED_FOR_TIME = re.compile(r"did not quit within \d+ s")
 SKIPPED = re.compile(r"Dev: (\S+) (\S+).* skipped: the sweep's time is up")
 
 
+PAUSE_LINE = re.compile(r"no player frame took a read for \d+ s \(paused")
+PAUSED_HELD = re.compile(r"\((?:[^)]*, )?paused[,)]")
+
+
+def paused_after(h_text: str) -> str:
+    """The step after which the game paused: the last LEVELPASS act or visit before H's first line that
+    found it paused ('' for none)."""
+    step = ""
+    for line in h_text.splitlines():
+        m = MARK.search(line)
+        if m and m.group(1).startswith(("act ", "visit ")):
+            step = m.group(1)
+            continue
+        if "Dev: " in line and PAUSED_HELD.search(line):
+            return step
+    return ""
+
+
 def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan) -> tuple[str, list[str]]:
     """The pass's verdict and what it did not cover: FAIL for a failed run that was not only stopped for
     time; INCOMPLETE when the runner stopped it at the soft budget, steps were skipped at the sweep's
@@ -1853,8 +1884,12 @@ def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan) -> tu
                                        or plan.timed)
     if planned_end and "Input script: LEVELPASS phase next-level" not in h_text:
         missed.append("the level's end and the next level (not reached)")
-    if status not in ("pass",) and not (timed_out and all(ENDED_FOR_TIME.search(r) or r.startswith("peers failed")
-                                                         for r in reasons)):
+    paused = paused_after(h_text) if any(PAUSE_LINE.search(r) for r in reasons) else ""
+    if paused:
+        missed.insert(0, f"the game stayed paused with its frames stopped after `{paused}` (a screen the pass's press"
+                         " did not close); the pass ended at the next step")
+    if status not in ("pass",) and not paused and not (timed_out and all(
+            ENDED_FOR_TIME.search(r) or r.startswith("peers failed") for r in reasons)):
         return FAIL, missed
     return (INCOMPLETE if missed else PASS), missed
 
@@ -1912,7 +1947,7 @@ def spec_toml(plan: Plan) -> str:
     pass: every step's failure is a finding of the report, not a failed expectation."""
     late = plan.late_join
     h = script_h(plan, LATE_JOIN_MARK if late else None)
-    forbid = exit_forbid(h)
+    forbid = exit_forbid(h) + [PAUSE_FATAL]
     out = [f'name = "{case_name(plan.level, plan.no_end)}"',
            f'layout = "{"server+2" if late else "server+1"}"',
            'stage = "8"',

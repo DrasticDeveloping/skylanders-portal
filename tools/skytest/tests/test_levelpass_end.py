@@ -324,5 +324,39 @@ class Budget(unittest.TestCase):
         self.assertEqual(lp.pass_verdict("pass", [], "", self.plan(no_end=True)), (lp.PASS, []))
 
 
+class Pause(unittest.TestCase):
+    """ww1 20261118-195819: a Soul Gem's found screen paused H after its pickup; every later step failed after
+    23 s for 3.5 minutes. The lines below are that run's."""
+    P = "[2026-11-18 20:01:35.152] [info] [core] [t3768] "
+    PICKUP_HELD = P + "Dev: pickup (null)#3594 held too long (paused, controls locked, frames stopped, at -799.75,118.96,3890.20 kill z -8000)"
+    NEXT = P + "Dev: goto_entity auth:ww1:4666 no player frame took a read for 3 s (paused, controls locked): waiting"
+
+    def test_a_pickup_presses_the_found_screen_away_and_waits_for_the_hero(self):
+        o = lp.Obj("Gem", "CPhysicalEntity", (1.0, 2.0, 3.0), lp.GROUP_PICKUPS, ref="auth:ww1:12086")
+        lines = lp.action_lines(lp.Action(lp.PICKUP, o, "x"), "v19_1")
+        self.assertEqual(lines[-3:], [f"pickup auth:ww1:12086 {lp.ACTION_TIMEOUT[lp.PICKUP]}", "tap a", "wait_free 15"])
+        self.assertNotIn("tap a", lp.action_lines(lp.Action(lp.ATTACK, o, "x"), "v1_1"))
+
+    def test_the_next_step_finding_the_game_paused_ends_the_pass(self):
+        rx = re.compile(lp.PAUSE_FATAL)
+        self.assertTrue(rx.search(self.NEXT))
+        self.assertFalse(rx.search(self.PICKUP_HELD))  # the pickup's own hold: the press comes after it
+        self.assertFalse(rx.search(self.P + "Dev: goto_entity auth:ww1:1 no player frame took a read for 3 s (controls locked): waiting"))
+        self.assertIn(lp.PAUSE_FATAL, lp.spec_toml(lp.make_plan(lp.Content("x", "x", (0.0, 0.0, 0.0), []), late_join=False)))
+
+    def test_the_verdict_names_the_step_after_which_the_game_paused(self):
+        h = "\n".join([self.P + "Input script: LEVELPASS visit v19 objects 4 (SoulGem_lockjaw) ref auth:ww1:12341",
+                       self.P + "Input script: LEVELPASS act v19_1 pickup SoulGem_lockjaw CPhysicalEntity ref auth:ww1:12086",
+                       self.P + "Dev: pickup (null)#3594 held (controls locked)", self.PICKUP_HELD,
+                       self.P + "Input script: LEVELPASS visit v22 objects 18 (Barrel04) ref auth:ww1:4666", self.NEXT])
+        self.assertEqual(lp.paused_after(h), "act v19_1 pickup SoulGem_lockjaw CPhysicalEntity ref auth:ww1:12086")
+        plan = lp.make_plan(lp.Content("ww1", "x", (0.0, 0.0, 0.0), []), late_join=False)
+        verdict, missed = lp.pass_verdict("fail", [f"stopped early: H {self.NEXT} (fail fast)", "peers failed: H"], h, plan)
+        self.assertEqual(verdict, lp.INCOMPLETE)
+        self.assertIn("paused with its frames stopped after `act v19_1 pickup SoulGem_lockjaw", missed[0])
+        # Another failure stays a failure.
+        self.assertEqual(lp.pass_verdict("fail", ["stopped early: H Crash: x (fail fast)"], h, plan)[0], lp.FAIL)
+
+
 if __name__ == "__main__":
     unittest.main()
