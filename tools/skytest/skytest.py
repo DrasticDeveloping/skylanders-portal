@@ -9467,6 +9467,26 @@ def levelpass_folder(cfg: Config, given: str | None) -> Path:
     return folder
 
 
+def measured_scene_lengths(cfg: Config, level: str, runs: int = 5) -> dict[str, float]:
+    """The cutscene lengths measured in this store's newest level-pass runs of the level (H's log: each scene
+    played to its natural end), for --scenes play's estimate; empty when none was measured yet."""
+    import levelpass as lp
+    out: dict[str, float] = {}
+    folders = sorted((d for d in (cfg.store / "runs").glob(f"*-levelpass-{level}*") if d.is_dir()),
+                     key=lambda d: d.name, reverse=True) if (cfg.store / "runs").is_dir() else []
+    seen = 0
+    for d in folders:
+        log = d / "H" / "game.log"
+        if not log.is_file():
+            continue
+        for name, s in lp.scene_lengths_from_log(log.read_text(encoding="utf-8", errors="replace")).items():
+            out[name] = max(out.get(name, 0.0), s)
+        seen += 1
+        if seen >= runs:
+            break
+    return out
+
+
 def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     """One automatic level pass: the plan from the level's content, one generated case through `test`
     (its guards, the machine's slots, fail fast), then the report from the run's logs."""
@@ -9480,7 +9500,10 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         raise SystemExit("levelpass: --no-end is for the generated pass, not --predictions")
     plan = lp.make_plan(content, full=a.full, late_join=not a.no_late_join, provoke=a.provoke or "",
                         no_end=a.no_end, d_stays=not a.d_leaves_before_end,
-                        d_lobby=not getattr(a, "d_joins_late", False), new_slot=getattr(a, "new_slot", False))
+                        d_lobby=not getattr(a, "d_joins_late", False), new_slot=getattr(a, "new_slot", False),
+                        scenes=getattr(a, "scenes", "skip") == "play",
+                        scene_lengths=measured_scene_lengths(cfg, a.level) if getattr(a, "scenes", "skip") == "play"
+                        else None)
     plan.probe = not a.no_probe
     try:
         plan.game_args = [lp.check_game_arg(g) for g in (a.game_arg or [])]
@@ -9645,6 +9668,10 @@ def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
     lp_.add_argument("--d-joins-late", action="store_true", help="D joins late, into the level under test (the"
                      " parked path); by default both clients join in the lobby, the host picks the slot and the"
                      " party enters the level together (the owner's order)")
+    lp_.add_argument("--scenes", choices=("skip", "play"), default="skip", help="play: the cutscenes in full,"
+                     " each scene's trigger entered in the sweep, the expected scenes in H's script for the level"
+                     " check's cutscenes row, their lengths (measured in earlier runs, else 60 s at the load and"
+                     " 15 s) in the estimate")
     lp_.add_argument("--new-slot", action="store_true", help="the host starts a new game in the lobby instead of"
                      " the save's continue")
     lp_.add_argument("--d-leaves-before-end", action="store_true", help="D ends its session before the exit, as"

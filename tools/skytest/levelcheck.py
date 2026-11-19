@@ -540,14 +540,49 @@ def grade_scenes(run: Run, repo: Path | None, start_tol: float = 1.0, end_tol: f
     counts = (f"{len(both) - len(findings)} of {len(both)} scene(s) both clients were in played together "
               f"(start within {start_tol} s, end within {end_tol} s); {len(rows) - len(both)} outside the time both "
               "were in the level")
+    notes = expected_scene_notes(h, rows)
     skipped = [p for p in run.result.get("peers", []) if isinstance(p, dict) and SKIP_SCENES.search(str(p.get("command", "")))]
     example = scene_line(h, both[0].key[1], (both[0].h or both[0].d).start) if both else ""
     if skipped:
         return Verdict("cutscenes", NOT_TESTED, "scenes are skipped in this run (--dev_skip_scenes): " + counts, example,
-                       notes=[f"FAIL-shaped differences while skipping: {len(findings)}"] if findings else [])
+                       notes=([f"FAIL-shaped differences while skipping: {len(findings)}"] if findings else []) + notes)
     if not both:
-        return Verdict("cutscenes", NOT_TESTED, counts)
-    return Verdict("cutscenes", FAIL if findings else PASS, counts, example, findings)
+        return Verdict("cutscenes", NOT_TESTED, counts, notes=notes)
+    return Verdict("cutscenes", FAIL if findings else PASS, counts, example, findings, notes)
+
+
+EXPECTED_SCENES = re.compile(r"Input script: LEVELPASS scenes expected: (.*)$")
+
+
+def expected_scene_notes(h: Log, rows) -> list[str]:
+    """The level pass's expected scenes (`LEVELPASS scenes expected: <name>@<how>[+entered], ...`, written from
+    the level's data, levelpass.scenes_expected_line) against the scenes the clients played: how many were
+    played on both, and the ones on neither, named (not reached: a scene whose start the run never came to
+    is no failure by itself; one the sweep entered and that neither client played is said so)."""
+    found = h.find(EXPECTED_SCENES)
+    if not found:
+        return []
+    line, m = found[0]
+    expected = []
+    for part in m.group(1).split(", "):
+        if "@" in part:
+            name, how = part.rsplit("@", 1)
+            expected.append((name, how))
+    played = {}
+    for r in rows:
+        name = r.key[1][4:] if r.key[1].startswith("run@") else r.key[1]
+        played[name] = played.get(name, 0) | (1 if r.h else 0) | (2 if r.d else 0)
+    both = [n for n, _ in expected if played.get(n) == 3]
+    one_side = [n for n, _ in expected if played.get(n) in (1, 2)]
+    entered_none = [n for n, how in expected if how.endswith("+entered") and not played.get(n)]
+    neither = [f"{n} ({how})" for n, how in expected if not played.get(n) and not how.endswith("+entered")]
+    out = [f"expected from the level data: {len(expected)} ({line.cite()}); played on both clients {len(both)}, "
+           f"on one {len(one_side)}, on neither {len(entered_none) + len(neither)}"]
+    if entered_none:
+        out.append("entered by the sweep but played on neither client: " + ", ".join(entered_none))
+    if neither:
+        out.append("not reached (on neither client): " + ", ".join(neither))
+    return out
 
 
 # --- completable (the level pass's own verdict) --------------------------------------------------------
