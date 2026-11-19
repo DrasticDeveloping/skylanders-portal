@@ -696,6 +696,11 @@ class Plan:
     # into the level under test (the parked path; --d-joins-late).
     d_lobby: bool = False
     new_slot: bool = False          # --new-slot: H starts a new game in the lobby instead of the save's continue
+    # D follows H through the level (the game's Auto follow, `online_auto_follow on`, right after the party is
+    # in): D presses nothing, is invulnerable as H is (D_ARGS), and is where H acts, so the enemies and the loot
+    # are graded where both players stand (levelcheck's together row). False: D stays where it entered
+    # (--d-stays), or the game does not register the command yet (skytest: the checkout's command table).
+    d_follow: bool = False
     # The server's window: shown at 640x360 as in every playtest the owner watches (the case's
     # show_server_window: H gets --dev_show_server_window=true and Host starts its server with it); hidden,
     # with the release's draw skip, only with --server-hidden (real play's hidden server).
@@ -1918,6 +1923,10 @@ def script_d(plan: Plan) -> str:
                                   f"waitfor {NEXT_LEVEL} 600", "waitfor online_barrier 300", "wait_free 120",
                                   "online_mark_level", f"hold_cap {scene_hold_cap(plan)}", "log LEVELPASS D in",
                                   "online_audit d-in"]
+        if plan.d_follow:
+            # From here D's hero follows H's (the game's Auto follow: a move whenever it is farther than 400 and
+            # free on the ground); D's script presses nothing more, it only waits for the level's end.
+            lines += ["online_auto_follow on", "log LEVELPASS D follows H"]
         if d_through_end(plan):
             lines += ["log LEVELPASS D stays for the level end", f"waitfor {NEXT_LEVEL} {D_LEVEL_END_WAIT_S}",
                       "wait_free 120", "log LEVELPASS D next level", "online_audit d-next"]

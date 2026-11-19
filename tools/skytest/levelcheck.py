@@ -20,6 +20,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -726,6 +727,85 @@ def grade_coins(run: Run) -> Verdict:
     return Verdict("coins", FAIL if findings else PASS, counts, taken[0][1].cite(), findings)
 
 
+# --- together: D near H where H acted (the second player follows the first) ------------------------------
+#
+# With the follow on (D's `Online: auto follow the host (peer 1) (script)`: `online_auto_follow on` after the
+# party is in), the game moves D's hero next to H's whenever it is farther than FOLLOW_NEAR. Per stop where H
+# acted (H's first `LEVELPASS act v<n>_<k>` line), S's puppet poses (`puppet <n> pose <seq> at <x,y,z>`, every
+# 2 s; the puppet of each peer from `puppet <n> for peer <p> spawned ... (generation <g>)`: the slots swap at a
+# level change) say whether D stood within FOLLOW_NEAR of H within FOLLOW_WINDOW after it, so the enemies and
+# the loot rows are read where both players stand. Without the follow: not tested (D stayed where it entered).
+FOLLOW_NEAR = 400.0           # the follow moves the hero when it is farther than this (client/auto_follow.h)
+FOLLOW_WINDOW = timedelta(seconds=5)   # a move a second at most, poses every 2 s
+POSE_PAIR = timedelta(seconds=1.5)     # two puppets' poses this close in time are compared
+FOLLOW_ON = re.compile(r"Online: auto follow the host \(peer (\d+)\) \(script\)")
+PUPPET_FOR = re.compile(r"Online: puppet (\d+) for peer (\d+) spawned at .*\(generation (\d+)\)")
+PUPPET_POSE = re.compile(r"Online: puppet (\d+) pose \d+ at (-?[\d.]+),(-?[\d.]+),(-?[\d.]+) ")
+H_ACT = re.compile(r"Input script: LEVELPASS act (v\d+)_\d+ ")
+
+
+def peer_poses(server: Log) -> dict[int, list[tuple[datetime, tuple[float, float, float], Line]]]:
+    """Each peer's poses on S, by the puppet each pose names and that puppet's peer at the time."""
+    owner: dict[int, int] = {}
+    out: dict[int, list] = {}
+    for i, raw in enumerate(server.lines):
+        m = PUPPET_FOR.search(raw)
+        if m:
+            owner[int(m.group(1))] = int(m.group(2))
+            continue
+        m = PUPPET_POSE.search(raw)
+        if m and int(m.group(1)) in owner:
+            line = server.line(i)
+            if line.t is not None:
+                out.setdefault(owner[int(m.group(1))], []).append(
+                    (line.t, (float(m.group(2)), float(m.group(3)), float(m.group(4))), line))
+    return out
+
+
+def grade_together(run: Run) -> Verdict:
+    """Per stop where H acted: was D within FOLLOW_NEAR of H (S's poses) in the seconds after?"""
+    d, h = run.clients.get("D"), run.clients.get("H")
+    if d is None or h is None:
+        return Verdict("together", NOT_TESTED, "one client in this run (no second player to follow)")
+    on = d.find(FOLLOW_ON)
+    if not on:
+        return Verdict("together", NOT_TESTED, "D did not follow H (no `auto follow the host ... (script)` on D: "
+                       "--d-stays, or a build without online_auto_follow): D stayed where it entered")
+    if run.server is None:
+        return Verdict("together", NOT_TESTED, "no server log: no poses", on[0][0].cite())
+    peers = {w: p for p, w in peer_numbers(run).items()}
+    poses = peer_poses(run.server)
+    hp, dp = poses.get(peers.get("H", -1), []), poses.get(peers.get("D", -1), [])
+    stops: dict[str, Line] = {}
+    for line, m in h.find(H_ACT):
+        if line.t is not None and (on[0][0].t is None or line.t >= on[0][0].t):
+            stops.setdefault(m.group(1), line)
+    if not stops:
+        return Verdict("together", NOT_TESTED, "H acted at no stop after D's follow began", on[0][0].cite())
+    near, apart, unknown = [], [], []
+    findings: list[Finding] = []
+    for label, act in stops.items():
+        win_h = [p for p in hp if act.t <= p[0] <= act.t + FOLLOW_WINDOW]
+        win_d = [p for p in dp if act.t <= p[0] <= act.t + FOLLOW_WINDOW]
+        pairs = [(math.dist(a[1][:2], b[1][:2]), a, b) for a in win_h for b in win_d if abs(a[0] - b[0]) <= POSE_PAIR]
+        if not pairs:
+            unknown.append(label)
+            continue
+        dist, a, b = min(pairs, key=lambda x: x[0])
+        if dist <= FOLLOW_NEAR:
+            near.append(f"{label} ({dist:.0f})")
+        else:
+            apart.append(f"{label} ({dist:.0f})")
+            findings.append(Finding(f"{label}: D was {dist:.0f} from H while H acted (the follow keeps it within "
+                                    f"{FOLLOW_NEAR:.0f})", [act.cite(), a[2].cite(), b[2].cite()]))
+    counts = (f"D near H (within {FOLLOW_NEAR:.0f} on S's poses) at {len(near)} of {len(stops)} stop(s) where H acted"
+              + (f"; apart at {len(apart)}" if apart else "") + (f"; no poses at {len(unknown)}" if unknown else ""))
+    notes = [f"near: {', '.join(near)}"] if near else []
+    notes += [f"no pose pair within {POSE_PAIR.seconds + 0.5:.1f} s: {', '.join(unknown)}"] if unknown else []
+    status = FAIL if findings else (PASS if near else NOT_TESTED)
+    return Verdict("together", status, counts, on[0][0].cite(), findings, notes)
+
+
 # --- loot (chests and enemy drops: the spill) -----------------------------------------------------------
 
 HOOKS_OFF = re.compile(r"Online: loot hooks off \(online_shared_loot\)")
@@ -1220,8 +1300,17 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     gates (completable) and its held enemies (a fight that lands nothing)."""
     run = load_run(folder)
     data = level_data(levelpass, run_level(run))
-    return [grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), grade_scenes(run, repo),
-            grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run)]
+    together = grade_together(run)
+    rows = [grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
+            grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run)]
+    # The enemies and the loot are read where both players stand only when D followed H: each says which.
+    where = (f"read with D following H: {together.counts}" if together.status in (PASS, FAIL) else
+             "read with D where it entered the level (no follow in this run): D's enemies and loot far from H are "
+             "asleep there")
+    for v in rows:
+        if v.name in ("enemies", "loot"):
+            v.notes.append(where)
+    return rows
 
 
 def run_head(folder: Path) -> list[str]:

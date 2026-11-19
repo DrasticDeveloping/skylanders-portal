@@ -253,6 +253,32 @@ class RequiredSteps(unittest.TestCase):
         self.assertIn("    IntroArea_LockpickGate: no line shows it opened: not fired in this run", lines)
 
 
+class Together(unittest.TestCase):
+    """With the follow on, each stop where H acted says whether D stood within the follow distance of H on S's
+    poses (the puppet of each peer from `puppet <n> for peer <p> spawned`, swapped at a level change)."""
+    S = [(20, "Online: puppet 2 for peer 1 spawned at 0,0,0 (generation 2)"),
+         (20, "Online: puppet 1 for peer 2 spawned at 0,0,0 (generation 2)"),
+         (61, "Online: puppet 2 pose 10 at 1000.00,0.00,0.00 client at 1000.00,0.00,0.00 off 0.00 age 30 ms"),
+         (61.5, "Online: puppet 1 pose 11 at 1100.00,50.00,0.00 client at 1100.00,50.00,0.00 off 0.00 age 30 ms"),
+         (91, "Online: puppet 2 pose 20 at 9000.00,0.00,0.00 client at 9000.00,0.00,0.00 off 0.00 age 30 ms"),
+         (91.5, "Online: puppet 1 pose 21 at 1100.00,50.00,0.00 client at 1100.00,50.00,0.00 off 0.00 age 30 ms")]
+    H = [(60, "Input script: LEVELPASS act v3_1 fight Greeble CActor ref auth:x:1"),
+         (90, "Input script: LEVELPASS act v4_1 attack Crate CPhysicalEntity ref auth:x:2")]
+
+    def test_near_and_apart_per_stop(self) -> None:
+        d = [(45, "Online: auto follow the host (peer 1) (script)")]
+        v = lc.grade_together(RunFolder(self.S, H_JOIN + self.H + LEVEL_END, D_JOIN + d + LEVEL_END).run())
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.counts, "D near H (within 400 on S's poses) at 1 of 2 stop(s) where H acted; apart at 1")
+        self.assertEqual(v.notes, ["near: v3 (112)"])
+        self.assertTrue(v.findings[0].what.startswith("v4: D was 7900 from H while H acted"))
+
+    def test_no_follow_is_not_tested_and_the_rows_say_where_they_were_read(self) -> None:
+        v = lc.grade_together(RunFolder(self.S, H_JOIN + self.H + LEVEL_END, D_JOIN + LEVEL_END).run())
+        self.assertEqual(v.status, lc.NOT_TESTED)
+        self.assertIn("D stayed where it entered", v.counts)
+
+
 class Coins(unittest.TestCase):
     ON = [(1, "Online: coins on for the session (S's online_shared_coins on)")]
 
