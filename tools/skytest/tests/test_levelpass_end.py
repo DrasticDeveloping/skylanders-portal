@@ -358,5 +358,37 @@ class Pause(unittest.TestCase):
         self.assertEqual(lp.pass_verdict("fail", ["stopped early: H Crash: x (fail fast)"], h, plan)[0], lp.FAIL)
 
 
+class CountedFightNotes(unittest.TestCase):
+    """tutorial_b 20261118-200515: S's counter heard 7 of 11; the rest were spawns no client had. Its lines."""
+    P = "[2026-11-18 20:07:28.127] [info] [core] [t39348] Online: "
+
+    def test_the_counter_heard_and_what_no_client_could_fight(self):
+        chains, logic = fight_level()
+        content = lp.Content(level="lvl", source="made up", start=(0.0, 0.0, 0.0), objects=[
+            lp.Obj("SpawnPoint", "CEntity", (180.0, 20.0, 10.0), lp.GROUP_ENEMIES, ident="a", ref="auth:lvl:9"),
+            lp.Obj("Lobber", "CActor", (100.0, 0.0, 0.0), lp.GROUP_ENEMIES, ident="a", ref="auth:lvl:10")])
+        content.level_end_chains, content.logic = chains, logic
+        p = lp.make_plan(content, late_join=False)
+        s = "\n".join([
+            self.P + "relay activator Lobber@0xB8488C1C +16 -1 -> PeerPuppet_1#3829 (relay Counter#2633, native activator Counter#2633, x",
+            self.P + "relay activator Lobber@0xB8488C1C +16 -1 -> PeerPuppet_1#3829 (relay Counter#2633, native activator Counter#2633, y",
+            self.P + "relay activator (null)@0xB847D414 +16 -1 -> PeerPuppet_1#3829 (relay Counter#2633, native activator Counter#2633, x",
+            self.P + "relay native - +16 -1 -> native (relay CrashSP_01#2630, native activator CrashSP_01#2630, x",
+            self.P + "relay activator Counter@0xB8482298 +16 -1 -> PeerPuppet_1#3829 (relay Plane#2616, native activator Plane#2616, x",
+            self.P + "enemy run-time spawns of Plane not shared (its spawner can move)",
+            self.P + "runtime spawn SpawnPoint_Spawned1 not claimed (ambiguous parent)",
+            self.P + "enemy run-time spawns of Area3_CageStep_LG_02 not shared (its spawner can move)"])
+        h = "\n".join([self.P + "enemy bind a00000f1b.53ddf3dd.79d73383@2 (pending past grace: missing)",
+                       "[t1] Input script: LEVELPASS phase exit",
+                       self.P + "enemy bind s72f3a0bd.52540001#1/0@2 (pending past grace: missing)"])
+        notes = lp.counted_fight_notes(p, s, h)
+        self.assertIn("S's Counter heard 2 of its 3 counted deaths (S's relay lines: Lobber, (null))", notes[0])
+        self.assertIn("did not share the run-time spawns of Plane, SpawnPoint with the clients", notes[1])
+        self.assertNotIn("Area3_CageStep", notes[1])  # not a sender of the counted fight
+        self.assertIn("H never bound 1 enemy spawn(s) S shared during the exit", notes[2])
+        self.assertIn("s72f3a0bd.52540001#1/0@2", notes[2])
+        self.assertEqual(lp.counted_fight_notes(lp.make_plan(lp.Content("x", "x", (0.0, 0.0, 0.0), []), late_join=False), s, h), [])
+
+
 if __name__ == "__main__":
     unittest.main()

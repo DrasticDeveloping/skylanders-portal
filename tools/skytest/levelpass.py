@@ -1868,6 +1868,43 @@ def paused_after(h_text: str) -> str:
     return ""
 
 
+RELAYED_TO = r"relay (?:activator (\S+?)@(0x[0-9A-Fa-f]+)|native (\S+)) \+16 .*?\(relay {counter}#\d+"
+NOT_SHARED = re.compile(r"Online: enemy run-time spawns of (\S+) not shared \(([^)]*)\)|"
+                        r"Online: runtime spawn (\S+?)_Spawned\d+ not claimed \(([^)]*)\)")
+BIND_MISSING = re.compile(r"Online: enemy bind (\S+) \(pending past grace: missing\)")
+
+
+def counted_fight_notes(plan: Plan, s_text: str, h_text: str) -> list[str]:
+    """For a counted end fight: the deaths S's counter heard (each sender once: S's relay lines to the counter,
+    a death by a client's puppet or S's own), and the enemies of the fight a client could not fight (S's
+    run-time spawns it did not share, and the shared ones the client never bound); [] for other ends."""
+    end = plan.end
+    if end is None or end.kind != le.FIGHT or not end.counter:
+        return []
+    counter = end.counter.split(".")[-1]
+    rx = re.compile(RELAYED_TO.format(counter=re.escape(counter)))
+    heard: list[str] = []
+    for m in rx.finditer(s_text):
+        who = f"{m.group(1)}@{m.group(2)}" if m.group(1) else m.group(3)
+        if who not in heard:
+            heard.append(who)
+    out = [f"end fight: S's {counter} heard {len(heard)} of its {end.count} counted deaths (S's relay lines: "
+           + (", ".join(h.split("@")[0] for h in heard) or "none") + ")"]
+    units = {k.split(".")[-1] for k in end.counted}
+    unshared = sorted({m.group(1) or m.group(3) for m in NOT_SHARED.finditer(s_text)
+                       if (m.group(1) or m.group(3)) in units})
+    if unshared:
+        out.append("end fight: S did not share the run-time spawns of " + ", ".join(unshared)
+                   + " with the clients (`enemy run-time spawns of <spawner> not shared` or `runtime spawn ... not"
+                   " claimed`): no client can fight them")
+    at = h_text.find("Input script: LEVELPASS phase exit")
+    missing = sorted({m.group(1) for m in BIND_MISSING.finditer(h_text[at:] if at >= 0 else "")})
+    if missing:
+        out.append(f"end fight: H never bound {len(missing)} enemy spawn(s) S shared during the exit (`enemy bind <id>"
+                   " (pending past grace: missing)`): " + ", ".join(missing[:6]))
+    return out
+
+
 def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan) -> tuple[str, list[str]]:
     """The pass's verdict and what it did not cover: FAIL for a failed run that was not only stopped for
     time; INCOMPLETE when the runner stopped it at the soft budget, steps were skipped at the sweep's
