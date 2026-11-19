@@ -391,7 +391,7 @@ bool ValidReaction(uint8_t outcome) {
   return outcome >= uint8_t(ReactionOutcome::kLanded) && outcome <= uint8_t(ReactionOutcome::kMissed);
 }
 bool ValidScenePhase(uint8_t phase) {
-  return phase >= uint8_t(ScenePhase::kOpen) && phase <= uint8_t(ScenePhase::kUnhold);
+  return phase >= uint8_t(ScenePhase::kOpen) && phase <= uint8_t(ScenePhase::kShare);
 }
 bool ValidSceneKind(uint8_t kind) {
   return kind == uint8_t(SceneKind::kCutscene) || kind == uint8_t(SceneKind::kConversation);

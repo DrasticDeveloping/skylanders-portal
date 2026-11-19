@@ -678,7 +678,7 @@ void Version2Scenes() {
   // Every phase and kind survives a round trip; a level-load scene has no recipient (kNone).
   const SceneKey loaded{1, EntityRef{RefKind::kNone, 2}, NameHash("Tutorial_B_Intro")};
   for (ScenePhase p : {ScenePhase::kOpen, ScenePhase::kAck, ScenePhase::kRelease, ScenePhase::kSkip,
-                       ScenePhase::kHold, ScenePhase::kUnhold}) {
+                       ScenePhase::kHold, ScenePhase::kUnhold, ScenePhase::kShare}) {
     CHECK(RoundTrip(SceneBarrier{p, 2, loaded, SceneKind::kCutscene}));
     CHECK(RoundTrip(SceneBarrier{p, 2, Scene(), SceneKind::kConversation}));
   }
@@ -686,6 +686,15 @@ void Version2Scenes() {
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kSkip, 2, loaded, SceneKind::kCutscene})[4] == 5);
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kHold, 2, loaded, SceneKind::kCutscene})[4] == 6);
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kUnhold, 2, loaded, SceneKind::kCutscene})[4] == 7);
+  // kShare: the session's switches in the scene sequence, no recipient.
+  {
+    const SceneKey share{3, EntityRef{RefKind::kNone, 0}, 0};
+    const auto b = EncodeMessage(SceneBarrier{ScenePhase::kShare, 0, share, SceneKind::kCutscene});
+    REQUIRE_OR_RETURN_VOID(!b.empty());
+    CHECK(b[4] == 8 && b[9] == 3);
+    CHECK(RoundTrip(SceneBarrier{ScenePhase::kShare, 0, share, SceneKind::kCutscene}));
+    CHECK(EncodeMessage(SceneBarrier{ScenePhase::kShare, 0, share, SceneKind::kCutscene, SceneEndReason::kNone, 1}).empty());
+  }
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kSkip, 2, loaded, SceneKind::kCutscene, SceneEndReason::kStop}).empty());
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kHold, 2, loaded, SceneKind::kCutscene, SceneEndReason::kNone, 1}).empty());
   for (SceneEndReason e : {SceneEndReason::kNatural, SceneEndReason::kStop, SceneEndReason::kLevelChange,
@@ -713,7 +722,7 @@ void Version2Scenes() {
   // Not encoded: an unknown phase or kind, an end reason outside kEnd (or none in it), skips
   // outside kEnd, a recipient ref with stray fields.
   CHECK(EncodeMessage(SceneBarrier{ScenePhase(0), 2, loaded, SceneKind::kCutscene}).empty());
-  CHECK(EncodeMessage(SceneBarrier{ScenePhase(8), 2, loaded, SceneKind::kCutscene}).empty());
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase(9), 2, loaded, SceneKind::kCutscene}).empty());
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kOpen, 2, loaded, SceneKind(3)}).empty());
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kOpen, 2, loaded, SceneKind::kCutscene, SceneEndReason::kStop}).empty());
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kEnd, 2, loaded, SceneKind::kCutscene, SceneEndReason::kNone}).empty());
@@ -728,7 +737,7 @@ void Version2Scenes() {
     REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 33);
     const size_t phase = kMessageHeaderSize, kind = kMessageHeaderSize + 30, end = kind + 1;
     CHECK(DecodeMessages(b).has_value());
-    b[phase] = 8;  // past kUnhold
+    b[phase] = 9;  // past kShare
     CHECK(!DecodeMessages(b).has_value());
     b[phase] = uint8_t(ScenePhase::kHold);  // a hold with an end reason
     CHECK(!DecodeMessages(b).has_value());
