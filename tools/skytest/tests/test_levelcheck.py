@@ -441,6 +441,40 @@ class RequiredSteps(unittest.TestCase):
         self.assertIn("D at ", done)
         self.assertNotIn("wait_moved", done)
 
+    def gate_run(self, h_pass: str, d_pass: str, d_pass_t: float) -> lc.Verdict:
+        import levelpass_holds as lh
+        data = lc.LevelData("madeup", {}, [lh.Gate("Finale_DemonGate008", "e8", lh.BATTLE_GATE, True, "win its fight")])
+        auth = "Online: authored obj bd35d565 1 6496 class ada5591b entity 1 name 4f8d6c1f name0 811c9dc5 mid {} state " \
+               "registered flags 28000000 act 1 pos -4074.10 4190.17 733.27 text Finale_DemonGate008"
+        row = "Online: world 2 a0000093d.4f8d6c1f.ada5591b@2 written"
+        unlocked = "Online: backend key gate a0000093d.4f8d6c1f.ada5591b@2 watched b8146710 (unlocked Scripts.DemonLock=3)"
+        s = [(10, auth.format("93d")), (11, row), (90, row)]
+        h = [(10, auth.format("93d")), (70, "Input script: LEVELPASS required r1 battle_gate Finale_DemonGate008 (x)"),
+             (90.4, unlocked), (95, f"Dev: pass_gate Finale_DemonGate008#2365 {h_pass}")]
+        d = [(10, auth.format("95a")), (90.3, unlocked), (d_pass_t, f"Dev: pass_gate Finale_DemonGate008#2394 {d_pass}")]
+        return lc.grade_completable(RunFolder(s, H_JOIN + h + H_NEXT, D_JOIN + d + D_NEXT, result=self.PASSED).run(), data)
+
+    def test_a_gate_passed_on_foot_by_both(self) -> None:
+        ok = "done (passed on foot: from 1,2,3 to 4,5,6, 240 beyond the gate's plane after 1 walk(s) (arrived)) after 6.0 s"
+        v = self.gate_run(ok, ok, 96)
+        self.assertEqual(v.status, lc.PASS, v.notes)
+        done = [n for n in v.notes if n.startswith("required, done: ")][0]
+        self.assertIn("; passed on foot by H at 00:11:35.000, D at 00:11:36.000", done)
+
+    def test_open_but_not_passable_and_a_walk_before_the_open(self) -> None:
+        ok = "done (passed on foot: from 1,2,3 to 4,5,6, 240 beyond the gate's plane after 1 walk(s) (arrived)) after 6.0 s"
+        stuck = ("failed (not passed on foot: stopped at 1,2,3, 41 before the gate's plane (from 0,0,0 toward 9,9,9; 30 "
+                 "walk(s), the last stuck)) after 60.0 s")
+        v = self.gate_run(ok, stuck, 97)
+        self.assertEqual(v.status, lc.BY_TELEPORT)
+        first = v.counts.split("first step not done: ")[1]
+        self.assertTrue(first.startswith("Finale_DemonGate008 (battle gate): opened on S, H, D but gate open but not "
+                                         "passable on D: not passed on foot: stopped at 1,2,3"), first)
+        self.assertIn("passed on foot by H at 00:11:35.000", first)
+        early = self.gate_run(ok, stuck, 80)  # D's walk ended before the gate opened on D: not counted either way
+        self.assertEqual(early.status, lc.PASS, early.notes)
+        self.assertIn("D's walk ended before the gate opened there", [n for n in early.notes if "done" in n][0])
+
     def test_no_level_data_is_said(self) -> None:
         run = RunFolder([], H_JOIN + H_NEXT, D_JOIN + D_NEXT, result={"levelpass": {"verdict": "PASS", "not_covered": []}}).run()
         v = lc.grade_completable(run, None)

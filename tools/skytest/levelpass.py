@@ -715,6 +715,7 @@ class Plan:
     scene_load_s: float = 0.0
     scene_extra_s: float = 0.0      # the scenes' own seconds: added to the budget and the case's timeout
     required_s: float = 0.0         # the gates phase's own budget (its performed steps' seconds): added the same way
+    pass_gates: bool = False        # W23: the build has pass_gate (the checkout's command table)
     figures_h: list[str] = field(default_factory=lambda: [FIGURE_H])  # H's figure files (W21: a swapper is two)
     figures_d: list[str] = field(default_factory=lambda: [FIGURE_D])
     # The fights the level's script holds (levelpass_holds): what each fight did about them (a release entered
@@ -1243,6 +1244,15 @@ GATE_FIGHT_QUIET_S = 10
 # 3 s after the demon gate opened; tutorial_b 20261119-065111's key gate the same). The level check reads the lock
 # state on each game (S's gate row written again, each client's `backend key gate <ref> ... (unlocked ...)`).
 ACTIVATION_RADIUS = re.compile(r"activationRadius (\d+)")
+# W23: after a gate's step each client WALKS through the gate (`pass_gate`, a route command: one teleport before the
+# gate, then the move input to the point as far beyond it): an opened gate drops its collision, its origin never
+# moves, so only a walk proves a player can pass it. H right after its step; D when H is at the gate, its follow off
+# meanwhile (a follow teleport would carry it through), for as long as the gate may take to open on D. Only when the
+# build's command table has pass_gate (Plan.pass_gates).
+PASS_DISTANCE = 300
+PASS_H_S = 30            # H's walk, after its own step opened the gate (the server's row may land later on H)
+PASS_D_MAX_S = 120       # D's: the gate opens on D when S's row lands; pass_gate's own cap
+PASS_TELEPORT_S = 5      # the one teleport before the gate
 
 
 def manifest_entity(manifest: dict | None, key: str) -> dict | None:
@@ -1292,6 +1302,7 @@ class ReqStep:
     d: list[str]
     est_s: float
     why_not: str = ""         # "" when the pass performs it
+    yaw: float | None = None  # the gate's orientation in the level's data (pass_gate's passage axis)
 
 
 def budget_words(plan: Plan) -> str:
@@ -1325,6 +1336,9 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
         ref = o.ref if o is not None else ""
         head = f"log LEVELPASS required {label} {g.kind.replace(' ', '_')} {_safe(g.name)}"
         step = ReqStep(label, g, g.kind, ref, [], [], 0.0)
+        orient = (manifest_entity(content.manifest, f"{g.unit}.{g.name}") or {}).get("orient")
+        if isinstance(orient, list) and len(orient) == 3 and isinstance(orient[2], (int, float)):
+            step.yaw = float(orient[2])
         out.append(step)
         if not ref:
             step.why_not = "no live reference to the gate"
@@ -1399,6 +1413,24 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
 GATES_SKIPPED = "LEVELPASS gates not attempted (--no-gates)"
 
 
+def pass_line(r: ReqStep, seconds: float) -> str:
+    """`pass_gate` for a required gate (W23), with the data's yaw when it has one."""
+    return f"pass_gate {r.gate_ref} {PASS_DISTANCE} {int(seconds)}" + (f" yaw {r.yaw:.4f}" if r.yaw is not None else "")
+
+
+def d_pass_lines(plan: Plan, r: ReqStep) -> list[str]:
+    """D's walk through a required gate (W23): when H is there, its follow off meanwhile, as long as the gate may
+    take to open on D (H's step's own seconds and its walk, PASS_D_MAX_S at most)."""
+    follow = plan.d_follow
+    return [f"log LEVELPASS D passes required {r.label} {_safe(r.gate.name)}",
+            # H comes to the gates after the sweep: the wait covers the sweep's deadline too.
+            f"online_wait_peer_near_entity {r.gate_ref} {D_NEAR} "
+            f"{int(D_COME_WAIT_S + sweep_share(plan, plan_budget(plan)))}",
+            *(["online_auto_follow off"] if follow else []),
+            pass_line(r, min(PASS_D_MAX_S, r.est_s + PASS_H_S)),
+            *(["online_auto_follow on"] if follow else [])]
+
+
 def required_lines(plan: Plan) -> list[str]:
     """H's required phase: each step's lines, or the reason it is not performed; with --no-gates one line that
     says the gates were not attempted."""
@@ -1412,7 +1444,8 @@ def required_lines(plan: Plan) -> list[str]:
             out.append(f"log LEVELPASS required {r.label} {r.kind.replace(' ', '_')} {_safe(r.gate.name)} not performed: "
                        f"{_safe(r.why_not)}")
         else:
-            out += r.h
+            # W23: H walks through the gate after its step, before the step's audit.
+            out += r.h[:-1] + ([pass_line(r, PASS_H_S)] if plan.pass_gates else []) + r.h[-1:]
     return out
 
 
@@ -2420,7 +2453,8 @@ def d_come_lines(plan: Plan) -> list[str]:
             continue
         out += [f"log LEVELPASS D comes to required {r.label} {_safe(r.gate.name)}",
                 f"online_wait_peer_near_entity {r.gate_ref} {D_NEAR} {D_COME_WAIT_S}",
-                f"goto_entity {r.gate_ref} {EXIT_FIGHT_STANDOFF}", *r.d]
+                f"goto_entity {r.gate_ref} {EXIT_FIGHT_STANDOFF}", *r.d,
+                *(d_pass_lines(plan, r)[2:] if plan.pass_gates else [])]
     end = plan.end
     if end is not None and end.kind == le.FIGHT and not plan.end_missing and not plan.no_end:
         anchor = _ref(plan.end_objs, end.anchor)
@@ -2453,6 +2487,10 @@ def script_d(plan: Plan) -> str:
             lines += ["online_auto_follow on", "log LEVELPASS D follows H"]
         if d_brought(plan):
             lines += d_come_lines(plan)
+        elif plan.pass_gates and d_through_end(plan):
+            for r in plan.required:  # W23: D, following H, walks through each gate H opened
+                if not r.why_not:
+                    lines += d_pass_lines(plan, r)
         if d_through_end(plan):
             lines += ["log LEVELPASS D stays for the level end", f"waitfor {NEXT_LEVEL} {D_LEVEL_END_WAIT_S}",
                       "wait_free 120", "log LEVELPASS D next level", "online_audit d-next"]

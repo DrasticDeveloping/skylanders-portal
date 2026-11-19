@@ -1908,16 +1908,51 @@ def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[st
         trail = key_gate_trail(run, g.name, k) if g.kind == "key gate" else []
         if g.kind == "battle gate" and where.get("S") is None:
             trail.append(battle_gate_left(run, data, g))
+        passed, faults, unchecked = gate_passes(run, g.name, k, where)
+        walk = ([f"passed on foot by {', '.join(passed)}"] if passed else []) + unchecked
         if missing:
             opened_on = [f"{w} at {when(where[w])}" for w in where if where[w] is not None]
             shut.append(f"{g.name} ({g.kind}): attempted by the pass ({req[0].cite()}: its own line, no proof of anything the game did); opened on "
                         f"{', '.join(opened_on) or 'no game'}, not on {', '.join(missing)}"
-                        + ("; " + "; ".join(trail) if trail else ""))
+                        + ("; " + "; ".join(faults + walk + trail) if faults or walk or trail else ""))
+        elif faults:
+            shut.append(f"{g.name} ({g.kind}): opened on {', '.join(where)} but " + "; ".join(faults)
+                        + ("; " + "; ".join(walk + trail) if walk or trail else ""))
         else:
             done.append(f"{g.name} ({g.kind}): opened on {', '.join(where)}: "
                         + "; ".join(f"{w} at {when(line)} {line.cite()}" for w, line in where.items())
-                        + ("; " + "; ".join(trail) if trail else ""))
+                        + ("; " + "; ".join(walk + trail) if walk or trail else ""))
     return shut, done
+
+
+# W23: each client's walk through the gate (`Dev: pass_gate <Name#id> done (passed on foot: ...)` / `failed (not
+# passed on foot: ...)` / `failed (not walkable straight: ...)`, the k-th of that name for the k-th gate). A walk
+# that failed after the gate opened on that game is "gate open but not passable" (a finding); one that ended before
+# it opened there, or a line that is no player's way (not walkable straight), is said and not counted either way.
+PASS_GATE = re.compile(r"Dev: pass_gate (\S+#\d+) (done|failed) \((.*)\)")
+
+
+def gate_passes(run: Run, name: str, k: int, where: dict) -> tuple[list[str], list[str], list[str]]:
+    """(passed: "<who> at <t>", faults, not checked) for the k-th gate of this name on each client."""
+    passed, faults, unchecked = [], [], []
+    for who in sorted(run.clients, key=lambda w: (w != "H", w)):
+        log = run.clients[who]
+        mine = [(line, m) for line, m in log.find(PASS_GATE) if m.group(1).split("#")[0] == name]
+        if len(mine) <= k:
+            if log.find(PASS_GATE):
+                unchecked.append(f"no walk through it on {who}")
+            continue
+        line, m = mine[k]
+        if m.group(2) == "done":
+            passed.append(f"{who} at {when(line)}")
+        elif m.group(3).startswith("not walkable straight"):
+            unchecked.append(f"passing not checked on {who}: {m.group(3)} ({line.cite()})")
+        elif where.get(who) is not None and where[who].t is not None and line.t is not None and where[who].t <= line.t:
+            faults.append(f"gate open but not passable on {who}: {m.group(3)} ({line.cite()}; opened there at "
+                          f"{when(where[who])})")
+        else:
+            unchecked.append(f"{who}'s walk ended before the gate opened there ({line.cite()})")
+    return passed, faults, unchecked
 
 
 # "Reached the next level" is the game's own evidence on that client: a level loaded after the level under test

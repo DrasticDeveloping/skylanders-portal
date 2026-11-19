@@ -1061,6 +1061,25 @@ class RequiredStepsPlan(unittest.TestCase):
             self.assertIn(f"gates phase {gated.required_s:.0f} s of its own", words)
             self.assertIn(f"total {lp.BUDGET_S + gated.required_s:.0f} s", words)
 
+    def test_each_client_walks_through_each_gate(self) -> None:
+        # W23: H after its step (before the audit), D when H is at the gate with its follow off; the data's yaw.
+        p = self.plan("tutorial_b")
+        p.pass_gates, p.d_follow = True, True
+        h = lp.script_h(p, None).splitlines()
+        for r in p.required:
+            i = h.index(f"online_audit {r.label}")
+            self.assertEqual(h[i - 1], f"pass_gate {r.gate_ref} {lp.PASS_DISTANCE} {lp.PASS_H_S} yaw {r.yaw:.4f}")
+        self.assertEqual(p.required[0].yaw, 0.6109)
+        d = lp.script_d(p).splitlines()
+        j = d.index(f"log LEVELPASS D passes required r1 TutorialLockedGate")
+        self.assertEqual(d[j + 2], "online_auto_follow off")
+        self.assertTrue(d[j + 3].startswith(f"pass_gate {p.required[0].gate_ref} {lp.PASS_DISTANCE} "))
+        self.assertEqual(d[j + 4], "online_auto_follow on")
+        self.assertEqual(lp.position_literals("\n".join(h + d)), [])
+        off = self.plan("tutorial_b")  # a build without pass_gate: no walk
+        self.assertFalse([l for l in lp.script_h(off, None).splitlines() + lp.script_d(off).splitlines()
+                          if l.startswith("pass_gate")])
+
     def test_no_gates_keeps_the_full_sweep_and_says_so(self) -> None:
         gated, free = self.plan("tutorial_b"), self.plan("tutorial_b", no_gates=True)
         self.assertEqual(free.required, [])

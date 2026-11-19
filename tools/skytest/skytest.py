@@ -9519,6 +9519,16 @@ def lock_commands_known(cfg: Config) -> bool:
         "lock_ready" in table.conditions
 
 
+def pass_gate_known(cfg: Config) -> bool:
+    """The game registers `pass_gate` (W23; the checkout's tests/script_commands.toml)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        return "pass_gate" in la.CommandTable.load(path).registered
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+
+
 def auto_follow_known(cfg: Config) -> bool:
     """The game registers `online_auto_follow` (the checkout's tests/script_commands.toml: the launch builder
     refuses a script with a command the table does not have)."""
@@ -9585,6 +9595,14 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                         scene_lengths=measured_scene_lengths(cfg, a.level) if getattr(a, "scenes", "skip") == "play"
                         else None, lock_commands=lock_commands_known(cfg), no_gates=getattr(a, "no_gates", False))
     plan.probe = not a.no_probe
+    plan.pass_gates = pass_gate_known(cfg)  # W23: H and D walk through each gate H opened
+    if plan.pass_gates:  # the walks' seconds in the gates phase's budget (H's; D's run beside H's next steps)
+        extra = sum(lp.PASS_H_S + lp.PASS_TELEPORT_S for r in plan.required if not r.why_not)
+        for r in plan.required:
+            if not r.why_not:
+                r.est_s += lp.PASS_H_S + lp.PASS_TELEPORT_S
+        plan.required_s += extra
+        plan.estimate_s += extra
     # W21: a named figure (or a swapper's two halves) for H or D, from the copied figure folder.
     for who, opt in (("h", "h_figure"), ("d", "d_figure")):
         name = getattr(a, opt, None)
