@@ -339,21 +339,28 @@ class Pause(unittest.TestCase):
         gem = lp.Obj("Gem", "CPhysicalEntity", (1.0, 2.0, 3.0), lp.GROUP_PICKUPS, ref="auth:ww1:12086",
                      components=["Scripts.CollectibleComponentData"])
         lines = lp.action_lines(lp.Action(lp.PICKUP, gem, "x"), "v19_1")
-        self.assertEqual(lines[1:], ["goto_entity auth:ww1:12086", "tap b", "wait_free 15",
-                                     f"pickup auth:ww1:12086 {lp.ACTION_TIMEOUT[lp.PICKUP]}", "tap b", "wait_free 15"])
+        seq = list(lp.DISMISS_LINES)
+        self.assertEqual(seq[:4], ["tap a", "waitfor hero_free 2", "tap b", "waitfor hero_free 2"])
+        self.assertEqual(len(seq), 4 * lp.DISMISS_ROUNDS)
+        self.assertEqual(lines[1:], ["goto_entity auth:ww1:12086", *seq,
+                                     f"pickup auth:ww1:12086 {lp.ACTION_TIMEOUT[lp.PICKUP]}", *seq])
         # The visit's teleport to it: B before anything else runs (the pickup's pause line would end the pass).
         stop = lp.Stop(label="v19", cluster=lp.Cluster(0, gem.pos, [gem]), actions=[lp.Action(lp.PICKUP, gem, "x")],
                        visit_only=[])
         s = lp.stop_lines(stop)
-        self.assertEqual(s[1:4], ["goto_entity auth:ww1:12086", "tap b", "wait_free 15"])
-        self.assertLess(s.index("tap b"), next(i for i, l in enumerate(s) if l.startswith("pickup ")))
+        self.assertEqual(s[1:2 + len(seq)], ["goto_entity auth:ww1:12086", *seq])
+        self.assertLess(s.index("tap a"), next(i for i, l in enumerate(s) if l.startswith("pickup ")))
         # Keyed on the component (or the probe's collectible class), never the name; no A, back or start.
         box = lp.Obj("Gem_Box", "CPhysicalEntity", (1.0, 2.0, 3.0), lp.GROUP_INTERACT, ref="auth:ww1:5",
                      components=["Scripts.DestructibleComponentData"])
         self.assertEqual(lp.dismiss_after(box), [])
-        self.assertEqual(lp.dismiss_after(lp.Obj("x", "CCollectible", (0.0, 0.0, 0.0), lp.GROUP_PICKUPS)), ["tap b", "wait_free 15"])
+        self.assertEqual(lp.dismiss_after(lp.Obj("x", "CCollectible", (0.0, 0.0, 0.0), lp.GROUP_PICKUPS)), seq)
+        # No dead-session wait in the sequence (a round that times out is no fatal line).
+        import skytest
+        self.assertFalse(any(re.search(rx, "Input script: waitfor hero_free timed out after 2.0 s")
+                             for _w, rx in skytest.DEFAULT_FATAL))
         text = "\n".join(s + lines)
-        for press in ("tap a", "tap back", "tap start"):
+        for press in ("tap back", "tap start"):
             self.assertNotIn(press, text)
 
     def test_the_next_step_finding_the_game_paused_ends_the_pass(self):

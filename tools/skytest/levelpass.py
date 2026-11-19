@@ -1039,13 +1039,19 @@ FIGHT_RADIUS = 1500
 # A major collectible (the game's CollectibleComponent: a Soul Gem, a story scroll, a map, a hat, a legendary
 # treasure, a butterfly) is collected as soon as the hero lands on it or picks it up: every hero's controls
 # go off and the game's found screen (CollectibleData.displayUI) pauses the game until a press closes it
-# (its controls come back on CCollectibleTrackerUIClosedMessage). B closes it, A does not (soulgem-found-
-# screen, 20261118-212923: `try a` timed out, `try b` freed the game after 1.5 s; back opened the session's
-# pause, which nothing freed: no back or start press in a pass). The stored data does not say which
-# collectibles are major, so every step that teleports to an object of the collectible component, or picks
-# it up, is followed by B and the wait for the hero (on a minor one, or a free hero, B is an attack). A
-# screen B does not close: the next step's pause line is H's forbidden line (PAUSE_FATAL), the pass ends.
-DISMISS_LINES = ("tap b", "wait_free 15")
+# (its controls come back on CCollectibleTrackerUIClosedMessage). What closes it is not known yet: one A
+# did not (ww1 20261118-195819), one B did not (ww1 20261118-221508), A and then B 6 s later did
+# (soulgem-found-screen 20261118-212923; the soulgem-found-screen-* cases tell "a second press" from "B
+# after A"). So every step that teleports to an object of the collectible component, or picks it up, is
+# followed by up to six rounds of A and B, each press followed by a short wait for the hero: a free hero
+# passes each wait at once (a jump and an attack, about 1.5 s for the whole sequence; a script cannot
+# condition on the pause), a screen gets twelve presses over about 25 s. Never back or start (back opened the
+# session's pause, which nothing freed). A screen the sequence does not close: the next step's pause line is
+# H's forbidden line (PAUSE_FATAL), the pass ends INCOMPLETE. The stored data does not say which collectibles
+# are major, so the rule is the component's, never a name's.
+DISMISS_ROUNDS = 6
+DISMISS_LINES = tuple(line for _ in range(DISMISS_ROUNDS)
+                      for line in ("tap a", "waitfor hero_free 2", "tap b", "waitfor hero_free 2"))
 
 
 def is_collectible(o: Obj) -> bool:
