@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 PASS, FAIL, NOT_TESTED = "PASS", "FAIL", "NOT TESTED"
+INCOMPLETE = "INCOMPLETE"   # completable only: the level pass did not cover its plan (never a pass)
 
 STAMP = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})\]")
 # An enemy row's key: placed `a<id>.<hash>.<hash>@<gen>`, a run-time spawn `s<hash>.<hash>#<n>/<m>@<gen>`.
@@ -546,17 +547,79 @@ def grade_scenes(run: Run, repo: Path | None, start_tol: float = 1.0, end_tol: f
     return Verdict("cutscenes", FAIL if findings else PASS, counts, example, findings)
 
 
+# --- completable (the level pass's own verdict) --------------------------------------------------------
+
+H_NEXT = re.compile(r"Input script: LEVELPASS phase next-level")
+D_NEXT = re.compile(r"Input script: LEVELPASS D next level")
+
+
+def grade_completable(run: Run) -> Verdict:
+    """The level pass's verdict (result.json `levelpass`, written by `levelpass`) and each client's mark of
+    the next level. Two players: a run without D does not show it (NOT TESTED)."""
+    lp = run.result.get("levelpass") if isinstance(run.result.get("levelpass"), dict) else None
+    if lp is None:
+        return Verdict("completable", NOT_TESTED, "not a level pass (result.json has no `levelpass` verdict)")
+    verdict = str(lp.get("verdict", ""))
+    missed = [str(x) for x in lp.get("not_covered", []) or []]
+    reached = {}
+    for who, rx in (("H", H_NEXT), ("D", D_NEXT)):
+        log = run.clients.get(who)
+        hit = log.find(rx) if log else []
+        reached[who] = hit[0][0] if hit else None
+    counts = (f"level pass {verdict or '?'}; next level reached: " +
+              ", ".join(f"{w} {'yes' if line else 'no'}" for w, line in reached.items() if w in run.clients))
+    example = next((line.cite() for line in reached.values() if line), "")
+    notes = [f"not covered: {m}" for m in missed]
+    if verdict == "FAIL":
+        return Verdict("completable", FAIL, counts, example, notes=notes)
+    if verdict == "INCOMPLETE":
+        return Verdict("completable", INCOMPLETE, counts, example, notes=notes)
+    if "D" not in run.clients:
+        return Verdict("completable", NOT_TESTED, counts + " (one client in this run: two players not shown)", example,
+                       notes=notes)
+    if verdict == "PASS" and all(reached.values()):
+        return Verdict("completable", PASS, counts, example, notes=notes)
+    missing = [w for w, line in reached.items() if line is None]
+    return Verdict("completable", FAIL, counts, example, [Finding(f"{', '.join(missing)} logged no next-level mark", [
+        absent(run.clients[w], f"`{(H_NEXT if w == 'H' else D_NEXT).pattern}`") for w in missing if w in run.clients])],
+        notes)
+
+
 # --- the page ------------------------------------------------------------------------------------------
 
 
 def grade(folder: Path, repo: Path | None) -> list[Verdict]:
     run = load_run(folder)
-    return [grade_lobby(run), grade_slot(run), grade_scenes(run, repo), grade_enemies(run), grade_pickups(run),
-            grade_loot(run)]
+    return [grade_completable(run), grade_lobby(run), grade_slot(run), grade_scenes(run, repo), grade_enemies(run),
+            grade_pickups(run), grade_loot(run)]
+
+
+def run_head(folder: Path) -> list[str]:
+    """The page's head from the run's result.json: the case, its status, minutes, build snapshot, runner."""
+    try:
+        r = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ["run: no result.json"]
+    prov = r.get("provenance") if isinstance(r.get("provenance"), dict) else {}
+    secs = r.get("seconds")
+    return [f"case {r.get('case', '?')}: runner status {r.get('status', '?')}, "
+            f"{(secs / 60):.1f} min" if isinstance(secs, (int, float)) else f"case {r.get('case', '?')}",
+            f"build snapshot {prov.get('build') or '?'}, runner {prov.get('runner') or '?'}"]
+
+
+def overall(verdicts: list[Verdict]) -> str:
+    """The page's one word: FAIL when a grader failed, INCOMPLETE when the pass did not cover its plan, PASS
+    only when every row passed, else NOT ALL TESTED (and which rows)."""
+    if any(v.status == FAIL for v in verdicts):
+        return "FAIL: " + ", ".join(v.name for v in verdicts if v.status == FAIL)
+    if any(v.status == INCOMPLETE for v in verdicts):
+        return "INCOMPLETE"
+    rest = [v.name for v in verdicts if v.status != PASS]
+    return "PASS" if not rest else "NOT ALL TESTED: " + ", ".join(rest)
 
 
 def page(folder: Path, verdicts: list[Verdict], head: list[str] | None = None) -> str:
-    out = [f"level check: {folder}", *(head or []), ""]
+    out = [f"level check: {folder}", *(head or []), f"overall: {overall(verdicts)}", ""]
     for v in verdicts:
         out += v.page_lines()
     more = [(v, f) for v in verdicts for f in v.findings[1:]]

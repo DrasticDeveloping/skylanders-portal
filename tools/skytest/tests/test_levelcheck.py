@@ -46,7 +46,8 @@ def tearDownModule() -> None:
 
 
 class RunFolder:
-    def __init__(self, s: list, h: list, d: list | None = None, peers: list | None = None) -> None:
+    def __init__(self, s: list, h: list, d: list | None = None, peers: list | None = None,
+                 result: dict | None = None) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         FOLDERS.append(self.tmp)
         self.path = Path(self.tmp.name)
@@ -56,9 +57,10 @@ class RunFolder:
         if d is not None:
             (self.path / "D").mkdir()
             (self.path / "D" / "game.log").write_text(log(d), encoding="utf-8")
-        if peers is not None:
+        if peers is not None or result is not None:
             import json
-            (self.path / "result.json").write_text(json.dumps({"peers": peers}), encoding="utf-8")
+            (self.path / "result.json").write_text(json.dumps({"peers": peers or [], **(result or {})}),
+                                                   encoding="utf-8")
 
     def run(self) -> lc.Run:
         return lc.load_run(self.path)
@@ -203,6 +205,84 @@ class Scenes(unittest.TestCase):
         self.assertTrue(v.findings[0].lines[0].startswith("H/game.log:"), v.findings[0].lines)
         skipped = RunFolder([], H_JOIN + h, D_JOIN + d, peers=[{"command": "x --dev_skip_scenes=true"}])
         self.assertEqual(lc.grade_scenes(skipped.run(), GAME_REPO).status, lc.NOT_TESTED)
+
+
+H_NEXT = [(216, "Input script: LEVELPASS phase next-level")]
+D_NEXT = [(216, "Input script: LEVELPASS D next level")]
+
+
+class Completable(unittest.TestCase):
+    def verdict(self, lp: dict | None, h=(), d=()) -> lc.Verdict:
+        result = {"levelpass": lp} if lp is not None else {}
+        return lc.grade_completable(RunFolder([], H_JOIN + list(h), D_JOIN + list(d), result=result).run())
+
+    def test_the_pass_and_both_marks(self) -> None:
+        v = self.verdict({"verdict": "PASS", "not_covered": []}, H_NEXT, D_NEXT)
+        self.assertEqual(v.status, lc.PASS)
+        self.assertIn("H yes, D yes", v.counts)
+        self.assertTrue(v.example.startswith("H/game.log:4:"), v.example)
+
+    def test_incomplete_failed_and_no_pass_are_never_a_pass(self) -> None:
+        v = self.verdict({"verdict": "INCOMPLETE", "not_covered": ["the level's end and the next level (not reached)"]})
+        self.assertEqual(v.status, lc.INCOMPLETE)
+        self.assertEqual(v.notes, ["not covered: the level's end and the next level (not reached)"])
+        self.assertEqual(self.verdict({"verdict": "PASS", "not_covered": []}, H_NEXT).status, lc.FAIL)  # D no mark
+        self.assertEqual(self.verdict(None).status, lc.NOT_TESTED)
+        self.assertEqual(lc.overall([v, lc.Verdict("x", lc.PASS, "")]), "INCOMPLETE")
+        self.assertEqual(lc.overall([lc.Verdict("x", lc.PASS, ""), lc.Verdict("y", lc.NOT_TESTED, "")]),
+                         "NOT ALL TESTED: y")
+
+
+class Command(unittest.TestCase):
+    """`levelcheck <level>`: the level pass (its guards are cmd_levelpass's: refused, it returns its code and
+    no page is written), then the graders on its run folder, one page in the levelpass folder."""
+
+    def setUp(self) -> None:
+        import types
+        import skytest
+        self.sk = skytest
+        tmp = tempfile.TemporaryDirectory()
+        FOLDERS.append(tmp)
+        self.lp_folder = Path(tmp.name) / "levelpass"
+        self.lp_folder.mkdir()
+        self.cfg = types.SimpleNamespace(repo=Path(tmp.name) / "game")
+        self.real = skytest.cmd_levelpass
+        self.addCleanup(setattr, skytest, "cmd_levelpass", self.real)
+
+    def args(self, **kw):
+        import argparse
+        base = dict(level="tutorial_b", grade=None, predictions=False, plan_only=False, folder=str(self.lp_folder))
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_a_refused_pass_writes_no_page(self) -> None:
+        self.sk.cmd_levelpass = lambda cfg, a: self.sk.EXIT_KNOWN_FAILURE
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(self.sk.cmd_levelcheck(self.cfg, self.args()), self.sk.EXIT_KNOWN_FAILURE)
+        self.assertIn("no run to grade", out.getvalue())
+        self.assertEqual(list(self.lp_folder.glob("*-check-*.txt")), [])
+
+    def test_the_pass_run_is_graded_on_one_page(self) -> None:
+        run = RunFolder([], H_JOIN + H_NEXT, D_JOIN + D_NEXT,
+                        result={"levelpass": {"verdict": "PASS", "not_covered": []}, "case": "levelpass-tutorial_b"})
+
+        def fake(cfg, a):
+            a.check["run"] = run.path
+            a.check["report"] = self.lp_folder / "tutorial_b-pass-x.txt"
+            return 0
+        self.sk.cmd_levelpass = fake
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = self.sk.cmd_levelcheck(self.cfg, self.args())
+        pages = list(self.lp_folder.glob("tutorial_b-check-*.txt"))
+        self.assertEqual(len(pages), 1)
+        text = pages[0].read_text(encoding="utf-8")
+        self.assertIn("overall: NOT ALL TESTED", text)  # lobby (late join), scenes, enemies ... said, not passed
+        self.assertIn("completable  PASS", text)
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":

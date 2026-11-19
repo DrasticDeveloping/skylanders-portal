@@ -7684,14 +7684,42 @@ def cmd_levelcheck(cfg: Config, a: argparse.Namespace) -> int:
     Exit 0 when nothing failed (NOT TESTED included: it is said, never counted as a pass), 1 when a grader
     found a difference."""
     import levelcheck as lc
-    if not a.grade:
-        raise SystemExit("levelcheck: give --grade <run folder>")
-    folder = Path(a.grade)
-    if not folder.is_dir():
-        raise SystemExit(f"levelcheck: no run folder {folder}")
-    verdicts = lc.grade(folder, cfg.repo)
-    print(lc.page(folder, verdicts))
-    return 1 if any(v.status == lc.FAIL for v in verdicts) else 0
+    if bool(a.grade) == bool(a.level):
+        raise SystemExit("levelcheck: give a level (a level pass, then its grade) or --grade <run folder>")
+    if a.grade:
+        folder = Path(a.grade)
+        if not folder.is_dir():
+            raise SystemExit(f"levelcheck: no run folder {folder}")
+        verdicts = lc.grade(folder, cfg.repo)
+        print(lc.page(folder, verdicts, lc.run_head(folder)))
+        return levelcheck_exit(lc, verdicts)
+    if a.predictions:
+        raise SystemExit("levelcheck: --predictions is levelpass's own mode; the check grades the generated pass")
+    # The level pass itself (its case through `test`: the known-failure refusal, the build-slot wait and the
+    # preflight gate), then the graders on its own run folder.
+    a.check = {}
+    code = cmd_levelpass(cfg, a)
+    run = a.check.get("run")
+    if a.plan_only or run is None:
+        if not a.plan_only:
+            print(f"levelcheck {a.level}: no run to grade (levelpass exit {code})", flush=True)
+        return code
+    verdicts = lc.grade(run, cfg.repo)
+    head = lc.run_head(run) + [f"level pass report: {a.check.get('report', '-')}"]
+    text = lc.page(run, verdicts, head)
+    out = levelpass_folder(cfg, getattr(a, "folder", None)) / f"{a.level}-check-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+    out.write_text(text + "\n", encoding="utf-8")
+    print(text, flush=True)
+    print(f"levelcheck {a.level}: page {out}", flush=True)
+    return levelcheck_exit(lc, verdicts)
+
+
+def levelcheck_exit(lc, verdicts) -> int:
+    """1 when a grader failed, EXIT_INCOMPLETE when the pass did not cover its plan, else 0 (NOT TESTED rows
+    are said on the page, never counted as passed)."""
+    if any(v.status == lc.FAIL for v in verdicts):
+        return 1
+    return EXIT_INCOMPLETE if any(v.status == lc.INCOMPLETE for v in verdicts) else 0
 
 
 def cmd_prune(cfg: Config, a: argparse.Namespace) -> int:
@@ -9507,6 +9535,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         print(f"levelpass {a.level}: no run folder (the case did not start; exit {code})", flush=True)
         return code or 1
     run = runs[-1]
+    if isinstance(getattr(a, "check", None), dict):  # levelcheck grades this run after the report
+        a.check["run"] = run
     script = (run / "H" / "script.txt").read_text(encoding="utf-8", errors="replace") \
         if (run / "H" / "script.txt").is_file() else lp.script_h(plan, None)
     labels = lp.step_labels(script)
@@ -9589,6 +9619,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         report += "\n" + lpp.verdict_text(lpp.verdicts(bugs, texts))
     out = folder / f"{a.level}-{'predictions' if a.predictions else 'pass'}-{stamp}.txt"
     out.write_text(report, encoding="utf-8")
+    if isinstance(getattr(a, "check", None), dict):
+        a.check["report"] = out
     print(report, flush=True)
     print(f"levelpass {a.level}: report {out}", flush=True)
     print(f"levelpass {a.level}: {head}", flush=True)
@@ -9596,6 +9628,42 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
 
 
 EXIT_INCOMPLETE = 5   # levelpass: the pass did not cover its plan (soft budget, skipped steps, end not reached)
+
+
+def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
+    """The level pass's options (levelpass, and levelcheck which runs one)."""
+    lp_.add_argument("--full", action="store_true", help="act on every object (default: each action family at"
+                     " most 3 times, every cluster still visited)")
+    lp_.add_argument("--no-late-join", action="store_true", help="no second client D near the end")
+    lp_.add_argument("--d-leaves-before-end", action="store_true", help="D ends its session before the exit, as"
+                     " before 19 November (late join and leave without a second client at the end); by default D"
+                     " stays through the level end and must reach the next level itself for a PASS")
+    lp_.add_argument("--no-end", action="store_true", help="stop after the last mid-level step: the level's end is"
+                     " neither acted on nor waited for, the pass is judged on the mid-level steps, the report says"
+                     " the end was not attempted (its own case, levelpass-<level>-no-end): for evidence from the"
+                     " middle of a level")
+    lp_.add_argument("--folder", default=None, help="the levelpass folder (default: tests/skytest.toml's"
+                     " [levelpass] folder)")
+    lp_.add_argument("--provoke", default=None, metavar="KIND", help="the audit's proof: after the first visit H"
+                     " makes one object of KIND (breakable) differ on its own (dev_audit_diverge); the report must"
+                     " show it as a provoked difference")
+    lp_.add_argument("--predictions", action="store_true", help="the predictions run: each predicted co-op bug of"
+                     " the level (<levelpass>/predictions.toml) as steps, snapshots and a check, a verdict per bug")
+    lp_.add_argument("--no-probe", action="store_true", help="the authored probe off in every game: objects only by"
+                     " the names the probe saw live (no auth: ids); to tell a crash of the probe from the game's")
+    lp_.add_argument("--game-arg", action="append", default=None, metavar="--NAME=VALUE", help="one more game"
+                     " setting for H and D (repeatable; a setting Host forwards reaches the hosted S too), e.g."
+                     " --game-arg=--online_authored_ids=2")
+    lp_.add_argument("--plan-only", action="store_true", help="write the generated case and print the plan; start"
+                     " no game")
+    lp_.add_argument("--build-wait-min", type=float, default=None, metavar="MIN", help="as `test`'s")
+    lp_.add_argument("--ignore-build", default=None, metavar="WHY", help="as `test`'s: start beside a build, WHY"
+                     " written into the result")
+    lp_.add_argument("--ignore-preflight", default=None, metavar="WHY", help="as `test`'s: start the generated case"
+                     " although its preflight found an error, WHY written into the result")
+    lp_.add_argument("--rerun-known-failure", default=None, metavar="WHY", help="as `test`'s: run the pass although"
+                     " its last two results on this build with the same generated case failed with the same first"
+                     " reason; WHY is written into the result")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -9680,41 +9748,13 @@ def main(argv: list[str] | None = None) -> int:
     lp_ = sub.add_parser("levelpass", help="the automatic level pass: one session, a sweep generated from the"
                          " level's data, the audit's verdict, a report in the levelpass folder")
     lp_.add_argument("level", help="the level's short name (tutorial_a, tutorial_b, ww1)")
-    lp_.add_argument("--full", action="store_true", help="act on every object (default: each action family at"
-                     " most 3 times, every cluster still visited)")
-    lp_.add_argument("--no-late-join", action="store_true", help="no second client D near the end")
-    lp_.add_argument("--d-leaves-before-end", action="store_true", help="D ends its session before the exit, as"
-                     " before 19 November (late join and leave without a second client at the end); by default D"
-                     " stays through the level end and must reach the next level itself for a PASS")
-    lp_.add_argument("--no-end", action="store_true", help="stop after the last mid-level step: the level's end is"
-                     " neither acted on nor waited for, the pass is judged on the mid-level steps, the report says"
-                     " the end was not attempted (its own case, levelpass-<level>-no-end): for evidence from the"
-                     " middle of a level")
-    lp_.add_argument("--folder", default=None, help="the levelpass folder (default: tests/skytest.toml's"
-                     " [levelpass] folder)")
-    lp_.add_argument("--provoke", default=None, metavar="KIND", help="the audit's proof: after the first visit H"
-                     " makes one object of KIND (breakable) differ on its own (dev_audit_diverge); the report must"
-                     " show it as a provoked difference")
-    lp_.add_argument("--predictions", action="store_true", help="the predictions run: each predicted co-op bug of"
-                     " the level (<levelpass>/predictions.toml) as steps, snapshots and a check, a verdict per bug")
-    lp_.add_argument("--no-probe", action="store_true", help="the authored probe off in every game: objects only by"
-                     " the names the probe saw live (no auth: ids); to tell a crash of the probe from the game's")
-    lp_.add_argument("--game-arg", action="append", default=None, metavar="--NAME=VALUE", help="one more game"
-                     " setting for H and D (repeatable; a setting Host forwards reaches the hosted S too), e.g."
-                     " --game-arg=--online_authored_ids=2")
-    lp_.add_argument("--plan-only", action="store_true", help="write the generated case and print the plan; start"
-                     " no game")
-    lp_.add_argument("--build-wait-min", type=float, default=None, metavar="MIN", help="as `test`'s")
-    lp_.add_argument("--ignore-build", default=None, metavar="WHY", help="as `test`'s: start beside a build, WHY"
-                     " written into the result")
-    lp_.add_argument("--ignore-preflight", default=None, metavar="WHY", help="as `test`'s: start the generated case"
-                     " although its preflight found an error, WHY written into the result")
-    lp_.add_argument("--rerun-known-failure", default=None, metavar="WHY", help="as `test`'s: run the pass although"
-                     " its last two results on this build with the same generated case failed with the same first"
-                     " reason; WHY is written into the result")
+    add_levelpass_options(lp_)
     lp_.set_defaults(fn=cmd_levelpass)
-    lc_ = sub.add_parser("levelcheck", help="grade a run against the owner's definition of working (levelcheck.py)")
-    lc_.add_argument("--grade", metavar="RUN", default=None, help="a run folder to grade (no game)")
+    lc_ = sub.add_parser("levelcheck", help="the level check: a level pass, then its run graded against the owner's"
+                         " definition of working on one page (levelcheck.py); or --grade an existing run")
+    lc_.add_argument("level", nargs="?", default=None, help="the level's short name (runs `levelpass <level>` first)")
+    lc_.add_argument("--grade", metavar="RUN", default=None, help="grade this run folder instead (no game)")
+    add_levelpass_options(lc_)
     lc_.set_defaults(fn=cmd_levelcheck)
     pr = sub.add_parser("prune", help="remove the store's run folders older than some hours (through the janitor)")
     pr.add_argument("--older-than", type=float, required=True, metavar="HOURS",
