@@ -1822,6 +1822,22 @@ def key_gate_trail(run: Run, name: str, k: int) -> list[str]:
                                                 absent(h, f"`pickup {name}_key ... done`") if h else "no H log"))
     else:
         out.append(f"key touched and following on H: {picked[k][0].cite()}")
+    # W25: the key by name, who carried it and when (a client's `carried key <ref> row carried by <p>/<e> here (key
+    # <Name#id>)`), and S's `carried key <ref> row consumed (by <p>)`.
+    if h is not None and len(picked) > k and picked[k][1].group(1) == "done":
+        label = re.search(r"pickup (\S+_key#\d+)", picked[k][0].text)
+        carried = h.find(re.compile(r"Online: carried key (\S+) row carried by (\d+)/\d+ here \(key "
+                                    + re.escape(label.group(1)) + r"\)")) if label else []
+        if carried:
+            line, m = carried[0]
+            who = peer_numbers(run).get(int(m.group(2)), f"peer {m.group(2)}")
+            words = f"its key {label.group(1)}: carried by {who} from {when(line)}"
+            if run.server is not None:
+                gone = run.server.find(re.compile(r"Online: carried key " + re.escape(m.group(1))
+                                                  + r" row consumed \(by (\d+)\)"))
+                if gone:
+                    words += f", consumed at {when(gone[0][0])} (S)"
+            out.append(words + f" ({line.cite()})")
     if run.server is not None:
         # What S tracked or did with the key (its row, a carry, a claim), not its level-start volume line.
         s_key = [l for l, _m in run.server.find(re.compile(r"Online: .*\b" + key + r".*"))

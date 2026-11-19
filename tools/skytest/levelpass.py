@@ -1250,6 +1250,13 @@ ACTIVATION_RADIUS = re.compile(r"activationRadius (\d+)")
 # meanwhile (a follow teleport would carry it through), for as long as the gate may take to open on D. Only when the
 # build's command table has pass_gate (Plan.pass_gates).
 PASS_DISTANCE = 300
+# W26: a required gate H could not pass right after its own step (its walk "not passed on foot": the gate stayed
+# shut, or it is open but not passable) ends the level there: H's fatal line, the runner stops the run, and the
+# pass's verdict says "gate <name> not opened: <why>; the rest of the level not attempted". By the owner's
+# definition the level is then not completable; the minutes after it prove nothing (batch 14 case 2: the pass went on
+# to the end fight with D left behind gate 2, the fight could not end, 486 s spent). D's walks never stop it, nor
+# does "not walkable straight" (a line that is no player's way); --no-gates keeps the teleport past every gate.
+REQUIRED_GATE_FATAL = r"Dev: pass_gate \S+ failed \(not passed on foot"
 PASS_H_S = 30            # H's walk, after its own step opened the gate (the server's row may land later on H)
 PASS_D_MAX_S = 120       # D's: the gate opens on D when S's row lands; pass_gate's own cap
 PASS_TELEPORT_S = 5      # the one teleport before the gate
@@ -1344,7 +1351,7 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
             step.why_not = "no live reference to the gate"
         elif g.kind == lh.KEY_GATE:
             step.h = [f"{head} (fetch its key {_safe(g.key_data)})", f"goto_entity {ref}",
-                      f"pickup {g.name}_key {KEY_PICKUP_S}", f"goto_entity {ref}",
+                      f"pickup key_of:{ref} {KEY_PICKUP_S}", f"goto_entity {ref}",
                       f"interact nearest:{g.name}_keylock:{KEY_LOCK_NEAR} {KEY_PRESS_S}", f"online_audit {label}"]
             step.est_s = REQ_KEY_S
         elif g.kind == lh.SPARK_LOCK:
@@ -3222,6 +3229,26 @@ def clients_line(plan: Plan, h_text: str, d_text: str) -> str:
     return "clients: " + "; ".join(out)
 
 
+GATE_STOP = re.compile(r"Dev: pass_gate (\S+?)#\d+ failed \(not passed on foot: (.*)\) after")
+REQUIRED_HEAD = re.compile(r"Input script: LEVELPASS required (r\d+) \S+ (\S+)")
+STEP_FAILED = re.compile(r"Dev: (\S+ \S+) failed \((.*)\) after")
+
+
+def required_gate_stop(h_text: str) -> str:
+    """W26: the verdict's words for a level stopped at a required gate H could not pass: the gate, the first failed
+    step of its required step before the walk (why it did not open), and that the rest was not attempted; "" else."""
+    lines = h_text.splitlines()
+    for i, line in enumerate(lines):
+        m = GATE_STOP.search(line)
+        if not m:
+            continue
+        start = max((j for j in range(i) if REQUIRED_HEAD.search(lines[j])), default=0)
+        why = next((f"{f.group(1)} failed ({f.group(2)[:160]})" for f in map(STEP_FAILED.search, lines[start:i]) if f),
+                   f"H's walk stopped at it: {m.group(2)[:160]}")
+        return f"gate {m.group(1)} not opened: {why}; the rest of the level not attempted"
+    return ""
+
+
 def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan, d_text: str = "") -> tuple[str, list[str]]:
     """The pass's verdict and what it did not cover: FAIL for a failed run that was not only stopped for
     time; INCOMPLETE when the runner stopped it at the soft budget, steps were skipped at the sweep's
@@ -3244,6 +3271,9 @@ def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan, d_tex
     if d_through_end(plan) and not (D_NEXT in d_text and next_level_seen(d_text, plan.level)):
         missed.append(f"D did not reach the next level ({client_progress(d_text, 'D', plan.level)}): the pass shows "
                       "one client only")
+    stopped = required_gate_stop(h_text)
+    if stopped:
+        missed.insert(0, stopped)
     paused = paused_after(h_text) if any(PAUSE_LINE.search(r) for r in reasons) else ""
     if paused:
         missed.insert(0, f"the game stayed paused with its frames stopped after `{paused}` (a screen the pass's press"
@@ -3313,7 +3343,8 @@ def spec_toml(plan: Plan) -> str:
     h_args = probe_args(H_ARGS, plan.probe, plan.game_args)
     if lobby:  # the join by code with the host's let in: the server's Hello gate on (the party flow's)
         h_args = [x for x in h_args if x not in LOBBY_H_ARGS_DROP] + [x for x in LOBBY_H_ARGS_ADD if x not in h_args]
-    forbid = exit_forbid(h) + [PAUSE_FATAL, MADE_COPY_LEFT]
+    forbid = exit_forbid(h) + [PAUSE_FATAL, MADE_COPY_LEFT] + \
+        ([REQUIRED_GATE_FATAL] if plan.pass_gates and any(not r.why_not for r in plan.required) else [])
     out = [f'name = "{case_name(plan.level, plan.no_end)}"',
            f'layout = "{"server+2" if late else "server+1"}"',
            'stage = "8"',
