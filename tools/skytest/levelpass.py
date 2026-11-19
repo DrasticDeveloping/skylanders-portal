@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 
 import levelpass_end as le
 import levelpass_holds as lh
+import levelpass_pieces as lpc
 
 # --- content ------------------------------------------------------------------------------------------
 
@@ -715,6 +716,10 @@ class Plan:
     # The fights the level's script holds (levelpass_holds): what each fight did about them (a release entered
     # before it, or the fight left out: "needs a lock opened", nothing releases them), in words.
     held: list[str] = field(default_factory=list)
+    # The run-time movers' start triggers (levelpass_pieces): each a pieces step at the sweep's start (enter the
+    # trigger, stand 600 from its first spawner, stay three spawn periods), so the level check's pieces row has
+    # S's fires and each client's islands to grade. (MoverStart, trigger Obj, spawner Obj)
+    pieces: list = field(default_factory=list)
                                     # (--d-leaves-before-end: D ends its session before the exit, as before)
 
 
@@ -1004,11 +1009,14 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
     # sweep_share): a plan the estimate fits is a sweep its deadline does not cut (before, the estimate kept
     # EXIT_S and the deadline the exit's own timeouts: every tutorial_b pass of 18 November had a step
     # skipped at the deadline).
+    pieces, pieces_s = plan_pieces(content, set(end.keys() | set(end.path_keys)) if end is not None else set(),
+                                   left_out)
     timed = (end.kind == le.TIMED) if end is not None else (bool(content.level_end) and exit_stop is None)
     scene_list, scene_at, scene_s, load_s = (plan_scenes(content, end, stops, exit_stop, scene_lengths or {})
                                              if scenes else ([], {}, 0.0, 0.0))
     est = estimate_seconds([s for s in stops if s is not exit_stop], late_join, end=False) + \
-        exit_reserve(no_end, end, exit_stop, timed, d_end=late_join and d_stays) + SWEEP_MARGIN_S + scene_s + load_s         + SWEEP_SPREAD_S
+        exit_reserve(no_end, end, exit_stop, timed, d_end=late_join and d_stays) + SWEEP_MARGIN_S + scene_s + load_s + \
+        SWEEP_SPREAD_S + pieces_s
     if est > budget_s:
         quiet = [s for s in stops if not s.actions and s.label not in scene_at]  # a scene's step is no quiet visit
         quiet.sort(key=lambda s: -(dist(start, s.cluster.center) if start else s.cluster.index))
@@ -1034,7 +1042,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
                 unplaced=unplaced, estimate_s=round(est, 1), full=full, late_join=late_join, exit_stop=exit_stop,
                 provoke=provoke, no_end=no_end, end=end, end_objs=end_objs, end_missing=end_missing, timed=timed,
                 d_stays=d_stays, scenes=scenes, scene_list=scene_list, scene_at=scene_at, scene_load_s=load_s,
-                held=held_notes)
+                held=held_notes, pieces=pieces)
 
 
 # --- fights the level's script holds (levelpass_holds) ------------------------------------------------------
@@ -1144,6 +1152,39 @@ def gates_words(content: Content) -> list[str]:
         return []
     return [f"{g.name} ({g.kind}: {g.opener})" for g in lh.required_gates(content.manifest, content.logic, content.level)
             if g.required]
+
+
+# --- run-time movers (levelpass_pieces) ----------------------------------------------------------------------
+
+PIECES_STANDOFF = 600   # where the step stands from the first spawner: the movers' path in view and loaded
+
+
+def plan_pieces(content: Content, forbidden: set[str], left_out: list[str]) -> tuple[list, float]:
+    """The pieces steps (levelpass_pieces.mover_starts) whose trigger and first spawner have a live reference,
+    and their seconds for the estimate; one without is named in `left_out`."""
+    if not content.logic:
+        return [], 0.0
+    by_key = {obj_key(o): o for o in content.objects if o.name}
+    out, secs = [], 0.0
+    for m in lpc.mover_starts(content.logic, content.level, forbidden):
+        trig = by_key.get(m.trigger)
+        spawner = next((by_key[k] for k in m.spawners if k in by_key and by_key[k].ref), None)
+        if trig is None or not trig.ref or spawner is None:
+            left_out.append(f"pieces: {m.name} (starts {', '.join(m.spawner_names)}) not visited: no live reference")
+            continue
+        out.append((m, trig, spawner))
+        secs += 2 * VISIT_S + m.stay_s
+    return out, secs
+
+
+def pieces_lines(plan: Plan) -> list[str]:
+    """Each pieces step: enter its trigger, stand where its movers go, stay three spawn periods, audit."""
+    out = []
+    for k, (m, trig, spawner) in enumerate(plan.pieces, 1):
+        out += [f"log LEVELPASS pieces p{k} {_safe(m.name)} starts {', '.join(_safe(n) for n in m.spawner_names)} "
+                f"stay {m.stay_s:.0f} s", f"enter_trigger {trig.ref}", f"goto_entity {spawner.ref} {PIECES_STANDOFF}",
+                f"wait {int(m.stay_s * 1000)}", f"online_audit p{k}"]
+    return out
 
 
 # --- scenes in full (--scenes play) ---------------------------------------------------------------------------
@@ -1493,6 +1534,7 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
               "log LEVELPASS phase sweep", *([scenes_expected_line(plan)] if plan.scenes else []),
               "online_audit start", f"hold_cap {scene_hold_cap(plan)}",
               f"sweep_deadline {sweep_share(plan, BUDGET_S + plan.scene_extra_s):.0f}"]
+    lines += pieces_lines(plan)  # first in the sweep: the deadline never skips them
     n_stops = len(plan.stops)
     marked = False
     for i, s in enumerate(plan.stops):
