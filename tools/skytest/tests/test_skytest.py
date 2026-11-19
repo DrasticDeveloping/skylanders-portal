@@ -642,6 +642,47 @@ quit
         spec.peers["H"].args.append("--dev_x=1")
         self.assertNotEqual(skytest.args_sha256(self.cfg, spec), prov["args_sha256"])
 
+    def test_a_known_failure_is_not_started_again_unless_a_reason_is_given(self) -> None:
+        # known_failures.py: two results on one build with one case content that failed with the same first
+        # reason; the third start is refused (no game, no run folder, exit 3), --rerun-known-failure runs it
+        # and records why. result.json records the build and the case content's hash.
+        self.spec("kf", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB +
+                  'expect = ["never in any log"]\n')
+        first = self.run_cases("kf")
+        second = self.run_cases("kf")
+        for r in (first, second):
+            self.assertEqual(r["cases"][0]["status"], "fail")
+        prov = second["cases"][0]["provenance"]
+        self.assertEqual(len(prov["case_sha256"]), 64)
+        self.assertEqual(prov["build"], Path(second["snapshot"]).name)
+        on_disk = json.loads((Path(second["cases"][0]["folder"]) / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["provenance"]["case_sha256"], prov["case_sha256"])
+        runs_before = sorted((self.cfg.store / "runs").glob("*-kf"))
+        third = self.run_cases("kf")
+        case = third["cases"][0]
+        self.assertEqual(case["status"], "known failure")
+        self.assertEqual(third["exit"], skytest.EXIT_KNOWN_FAILURE)
+        self.assertEqual(case["peers"], [])
+        self.assertIn(first["cases"][0]["folder"], case["reasons"][0])
+        self.assertIn(second["cases"][0]["folder"], case["reasons"][0])
+        self.assertEqual(sorted((self.cfg.store / "runs").glob("*-kf")), runs_before)
+        # The override runs it and says why in the result.
+        a = argparse.Namespace(cases=["kf"], stage=None, max_games=5, rerun_known_failure="the fake game changed")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_test(self.cfg, a)
+        self.assertEqual(code, 1)
+        self.assertIn("run again (--rerun-known-failure: the fake game changed)", out.getvalue())
+        res = json.loads((sorted((self.cfg.store / "runs").glob("*-kf"))[-1] / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual((res["status"], res["rerun_known_failure"]), ("fail", "the fake game changed"))
+        # An empty reason is refused before anything starts.
+        with self.assertRaises(SystemExit):
+            skytest.cmd_test(self.cfg, argparse.Namespace(cases=["kf"], stage=None, max_games=5,
+                                                          rerun_known_failure="  "))
+        # Another case content (the spec's text) starts again.
+        self.spec("kf", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB +
+                  'expect = ["never in any log either"]\n')
+        self.assertEqual(self.run_cases("kf")["cases"][0]["status"], "fail")
+
     def write_janitor(self, body: str) -> None:
         tools = self.repo / "tools"
         tools.mkdir(exist_ok=True)

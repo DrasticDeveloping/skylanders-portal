@@ -128,6 +128,7 @@ import exclusive_grade  # noqa: E402  (stage 4's exclusive grade: a race exactly
 import swap_pairs  # noqa: E402
 import memory_growth  # noqa: E402  (stage 5's soak grade)
 import occurrence_outcomes  # noqa: E402  (stage 5's occurrence grade)
+import known_failures  # noqa: E402  (a pointless rerun refused: the last two results failed alike)
 
 STORE = ".replication-tests"
 CLIENTS = ["H", "D", "E", "F"]
@@ -2760,6 +2761,9 @@ class CaseResult:
     # "bulk" for a case of a `test --bulk` run (hidden games: BulkMode), '' for the default mode. The
     # history walks (run times, statuses, per-build results) keep the two apart (payload_mode).
     mode: str = ""
+    # known_failures.py: the why of `--rerun-known-failure` when this case ran although its last two
+    # results on the build failed with the same first reason; '' otherwise.
+    rerun_known_failure: str = ""
 
 
 def crash_exit_code(code: int | None) -> bool:
@@ -3574,9 +3578,54 @@ def fixture_sha256(cfg: Config) -> str:
     return hashlib.sha256(f"{folder_state(saves)[2]}\n{folder_state(figures)[2]}".encode()).hexdigest()
 
 
-def case_provenance(cfg: Config, spec: Spec, fixtures: str) -> dict:
-    return {"spec_sha256": spec.sha256 or file_sha256(spec.path), "args_sha256": args_sha256(cfg, spec),
-            "fixture_sha256": fixtures, "runner": runner_version()}
+def case_provenance(cfg: Config, spec: Spec, fixtures: str, build: str = "") -> dict:
+    """What ran: the spec's text, the arguments, the fixtures (each a sha256), the case content's hash over
+    the three (known_failures.case_sha256: what a rerun repeats), the build snapshot's name (build_hash; ''
+    for a case that took none) and the runner's version."""
+    spec_hash, args_hash = spec.sha256 or file_sha256(spec.path), args_sha256(cfg, spec)
+    return {"spec_sha256": spec_hash, "args_sha256": args_hash, "fixture_sha256": fixtures,
+            "case_sha256": known_failures.case_sha256(spec_hash, args_hash, fixtures), "build": build,
+            "runner": runner_version()}
+
+
+def case_history(cfg: Config, case: str) -> list[known_failures.Prior]:
+    """The case's earlier results in this store (each run folder `<stamp>-<case>` with a result.json); an
+    older result without `provenance.build` takes its session's snapshot (results.json)."""
+    runs = cfg.store / "runs"
+    out: list[known_failures.Prior] = []
+    sessions: dict[str, str] = {}
+    if not runs.is_dir():
+        return out
+    for d in runs.glob(f"*-{case}"):
+        m = known_failures.RUN_NAME.match(d.name)
+        if not m or m.group(2) != case or not (d / "result.json").is_file():
+            continue
+        try:
+            res = json.loads((d / "result.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(res, dict):
+            continue
+        snapshot = ""
+        prov = res.get("provenance") if isinstance(res.get("provenance"), dict) else {}
+        if not prov.get("build") and res.get("session"):
+            sess = str(res["session"])
+            if sess not in sessions:
+                try:
+                    sessions[sess] = str(json.loads((Path(sess) / "results.json").read_text(encoding="utf-8"))
+                                         .get("snapshot") or "")
+                except (OSError, ValueError, AttributeError):
+                    sessions[sess] = ""
+            snapshot = sessions[sess]
+        out.append(known_failures.prior_from_result(str(d), res, snapshot))
+    return out
+
+
+def known_failure_result(spec: Spec, refusal: known_failures.Refusal) -> CaseResult:
+    """A case not started as a known failure: status `known failure`, 0 s, never a pass."""
+    return CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage, status=known_failures.KNOWN_FAILURE,
+                      reasons=[f"not started: {refusal.line(spec.name)}"], exclusive=runs_alone(spec),
+                      started=time.strftime("%Y%m%d-%H%M%S"))
 
 
 # The game's test-only setting that shows the online server's window (src/online/server/server_role.cpp):
@@ -6103,7 +6152,7 @@ def build_results(cfg: Config, build: str, current: Path | None = None) -> dict[
 
 # A result that never started the game (no machine room, the circuit breaker, not ready) does not decide a
 # per-build case: the result before it stands.
-PER_BUILD_NOT_RUN = ("capacity", "breaker", "not ready")
+PER_BUILD_NOT_RUN = ("capacity", "breaker", "not ready", "known failure")
 
 
 def per_build_state(cfg: Config, spec: Spec, entries: list[tuple[str, str, dict]], build: str) -> dict:
@@ -7411,6 +7460,9 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     if per_build_run and not gate_run:
         raise SystemExit("--per-build goes with --gate (`test --gate --per-build`: the per-build gate cases)")
     run_not_ready = bool(getattr(a, "run_not_ready", False))
+    rerun_why = (getattr(a, "rerun_known_failure", None) or "").strip()
+    if getattr(a, "rerun_known_failure", None) is not None and not rerun_why:
+        raise SystemExit("--rerun-known-failure needs the reason: why this rerun can end otherwise")
     bulk_on = bool(getattr(a, "bulk", False))
     pacing = getattr(a, "bulk_pacing", None)
     if pacing and not bulk_on:
@@ -7626,7 +7678,18 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 print(f"{spec.name}: {spec.path.name} changed since it was read; the case runs the text read before"
                       " (provenance records that text's sha256)", flush=True)
             game = None if unit else game_snapshot()
-            if (t := tripped(spec)) is not None:
+            prov = case_provenance(cfg, spec, fixtures, build=game.name if game is not None else "")
+            # A pointless rerun (known_failures.py): the last two results on this build with this case
+            # content failed with the same first reason; no game starts unless --rerun-known-failure says why.
+            refusal = None if unit else known_failures.known_failure(case_history(cfg, spec.name), prov["build"],
+                                                                     prov["case_sha256"])
+            if refusal is not None and rerun_why:
+                print(f"{spec.name}: a known failure, run again (--rerun-known-failure: {rerun_why}): "
+                      f"{refusal.reason}", flush=True)
+            if refusal is not None and not rerun_why:
+                print(refusal.line(spec.name), flush=True)
+                r = known_failure_result(spec, refusal)
+            elif (t := tripped(spec)) is not None:
                 r = breaker_result(spec, t)
             elif budget is not None and not unit and len(spec.peers) <= max_games:
                 need = machine_need(spec, budget.games)
@@ -7665,7 +7728,12 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             if note := not_alone_note(spec, r.load):
                 r.machine["not_alone"] = note
                 print(f"{spec.name}: NOT ALONE: {note}", flush=True)
-            r.provenance = case_provenance(cfg, spec, fixtures)
+            r.provenance = prov
+            stamps = sorted({p.build for p in r.peers if p.build})
+            if stamps:
+                r.provenance = {**prov, "build_stamp": " ".join(stamps)}  # the game's own (its log's first line)
+            if refusal is not None and rerun_why:
+                r.rerun_known_failure = rerun_why
             r.scenes = scene_policy(cfg, spec)
             if cfg.bulk is not None:
                 r.mode = "bulk"
@@ -7796,10 +7864,19 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         label = gate_label(gate)
         print(f"{label}: {gate['actual_minutes']:.0f} min (the cases {gate['case_minutes']:.0f} min; expected"
               f" {gate['minutes']:.0f}); {gate['verdict']['line'].removeprefix(label + ': ')}")
+    known = [r for r in results if r.status == known_failures.KNOWN_FAILURE]
+    if known:
+        print(f"{len(known)} case(s) not started as a known failure (their last two results on this build failed"
+              f" with the same first reason; not met): {', '.join(r.case for r in known)}")
     if store_line:
         print(store_line)
     print(f"report: {out / 'report.md'}")
+    if known and len(known) == len(failed) and not touched and not queue_unmatched:
+        return EXIT_KNOWN_FAILURE  # its own exit code: nothing ran that failed anew
     return 1 if failed or touched or queue_unmatched else 0
+
+
+EXIT_KNOWN_FAILURE = 3   # `test`: every case that did not pass was refused as a known failure (no game started)
 
 
 def cmd_compare(cfg: Config, a: argparse.Namespace) -> int:
@@ -8908,8 +8985,12 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     started = time.strftime("%Y%m%d-%H%M%S")
     ns = argparse.Namespace(cases=[lp.case_name(a.level)], stage=None, max_games=0, gate=False, per_build=False,
                             allow_restricted=False, jobs=1, run_not_ready=False, no_breaker=False, queue=None,
-                            remote=None, remote_manifest=None, remote_token_file=None)
+                            remote=None, remote_manifest=None, remote_token_file=None,
+                            rerun_known_failure=a.rerun_known_failure)
     code = cmd_test(replace(cfg, cases_dir=cases), ns)
+    if code == EXIT_KNOWN_FAILURE:
+        print(f"levelpass {a.level}: not started, a known failure (above); no report", flush=True)
+        return code
     wall = time.monotonic() - t0
     runs = sorted(p for p in (cfg.store / "runs").glob(f"*-{lp.case_name(a.level)}")
                   if p.is_dir() and p.name[:15] >= started)
@@ -9015,6 +9096,9 @@ def main(argv: list[str] | None = None) -> int:
                    " record (package_check.py), which the agent verifies its install against")
     t.add_argument("--remote-token-file", default=None, metavar="FILE", help="with --remote: a file with the"
                    " agent's token (else it is asked for: the agent shows it on its console)")
+    t.add_argument("--rerun-known-failure", default=None, metavar="WHY", help="start a case even when its last two"
+                   " results on this build with the same case content failed with the same first reason (known"
+                   " failure); WHY (required) says what can end otherwise and is written into the result")
     t.set_defaults(fn=cmd_test)
     ls = sub.add_parser("list")
     ls.add_argument("--gate", action="store_true", help="the gate cases and their expected minutes (from each"
@@ -9066,6 +9150,9 @@ def main(argv: list[str] | None = None) -> int:
                      " --game-arg=--online_authored_ids=2")
     lp_.add_argument("--plan-only", action="store_true", help="write the generated case and print the plan; start"
                      " no game")
+    lp_.add_argument("--rerun-known-failure", default=None, metavar="WHY", help="as `test`'s: run the pass although"
+                     " its last two results on this build with the same generated case failed with the same first"
+                     " reason; WHY is written into the result")
     lp_.set_defaults(fn=cmd_levelpass)
     a = p.parse_args(argv)
     cfg = load_config(repo_root(Path(a.repo)))
