@@ -15,6 +15,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import levelpass as lp  # noqa: E402
+import levelpass_holds as lh  # noqa: E402
 
 # A runner config as a machine without [defaults] show_server_window has it (a visible run, server hidden unless the
 # case says otherwise): what show_server_args reads.
@@ -905,6 +906,65 @@ class Case(unittest.TestCase):
         self.assertEqual((dst / "shaders" / "shareable" / "a.xpso").read_bytes(), b"x" * 10)
         self.assertEqual((dst / "shaders" / "shareable" / "b.xsh").read_bytes(), b"z" * 8)
         self.assertEqual(self.sk.copy_cache(self.dir / "none", dst), 0)
+
+
+
+class HeldFights(unittest.TestCase):
+    """A fight is planned only when its held enemies' release is on the route before it (levelpass_holds)."""
+
+    def obj(self, name: str, state: str, x: float, cls: str = "CActor", comps=()) -> "lp.Obj":
+        o = lp.Obj(name=name, cls=cls, pos=(x, 0.0, 0.0), group=lp.STATIC_GROUPS[state], ident="u", kind="")
+        o.state, o.ref, o.components = state, f"auth:madeup:{int(x)}", list(comps)
+        return o
+
+    def stop(self, *objs) -> "lp.Stop":
+        fight = lp.Action(action=lp.FIGHT, obj=objs[0], why="an enemy")
+        return lp.Stop(label="v3", cluster=lp.Cluster(center=objs[0].pos, objects=list(objs), index=2),
+                       actions=[fight], visit_only=[])
+
+    def hold(self, o, *releases) -> "lh.Hold":
+        return lh.Hold(lp.obj_key(o), o.name, "u", o.pos, "job state Idle", list(releases))
+
+    def test_the_release_trigger_is_entered_before_the_fight(self) -> None:
+        g = self.obj("Greeble", "enemy", 100)
+        trig = self.obj("Wake_Trigger", "trigger", 9000, cls="CScriptTriggerEntity")
+        s = self.stop(g)
+        holds = {lp.obj_key(g): self.hold(g, lh.Release("u.Wake_Trigger", lh.ENTER, lp.obj_key(trig), ["Wake_Trigger"]))}
+        notes = lp.settle_held_fight(s, [g, trig], holds, {lp.obj_key(o): o for o in (g, trig)}, set(), set())
+        self.assertEqual([(a.action, a.obj.name) for a in s.actions], [(lp.ENTER, "Wake_Trigger"), (lp.FIGHT, "Greeble")])
+        self.assertIn("after enter Wake_Trigger", notes[0])
+
+    def test_a_lock_leaves_the_fight_out_and_says_so(self) -> None:
+        g, g1 = self.obj("Greeble", "enemy", 100), self.obj("Greeble001", "enemy", 200)
+        gate = self.obj("Lock_Gate", "lock", 5000, cls="CGameEntity")
+        r = lh.Release("u.Scene_Manager", lh.LOCK, lp.obj_key(gate), ["Lock_Gate", "Scene_Manager"], 0.5)
+        holds = {lp.obj_key(g): self.hold(g, r), lp.obj_key(g1): self.hold(g1, r)}
+        s = self.stop(g, g1)
+        notes = lp.settle_held_fight(s, [g, g1, gate], holds, {lp.obj_key(o): o for o in (g, g1, gate)}, set(), set())
+        self.assertEqual(s.actions, [])
+        self.assertIn("left out: every enemy in its reach is held: needs a lock opened: Lock_Gate (holds Greeble, "
+                      "Greeble001", notes[0])
+        self.assertIn("lock_move / lock_solve", notes[0])
+
+    def test_ambient_enemies_are_no_reason_to_fight_but_free_ones_are(self) -> None:
+        amb, free = self.obj("Ambi_Chompy_03", "enemy", 100), self.obj("Chompy", "enemy", 300)
+        holds = {lp.obj_key(amb): lh.Hold(lp.obj_key(amb), amb.name, "u", amb.pos, "its AI component disabled")}
+        s = self.stop(amb)
+        notes = lp.settle_held_fight(s, [amb], holds, {}, set(), set())
+        self.assertEqual(s.actions, [])
+        self.assertIn("ambient, nothing in the level's logic releases them: Ambi_Chompy_03", notes[0])
+        s = self.stop(amb, free)
+        notes = lp.settle_held_fight(s, [amb, free], holds, {}, set(), set())
+        self.assertEqual([a.action for a in s.actions], [lp.FIGHT])
+        self.assertIn("kept for the enemies it can hurt", notes[0])
+
+    def test_a_release_on_the_ends_path_is_never_entered_in_the_sweep(self) -> None:
+        g = self.obj("Lobber", "enemy", 100)
+        trig = self.obj("Start_Fight", "trigger", 900, cls="CScriptTriggerEntity")
+        holds = {lp.obj_key(g): self.hold(g, lh.Release("u.Start_Fight", lh.ENTER, lp.obj_key(trig), ["Start_Fight"]))}
+        s = self.stop(g)
+        lp.settle_held_fight(s, [g, trig], holds, {lp.obj_key(trig): trig}, set(), {lp.obj_key(trig)})
+        self.assertEqual(s.actions, [])
 
 
 if __name__ == "__main__":

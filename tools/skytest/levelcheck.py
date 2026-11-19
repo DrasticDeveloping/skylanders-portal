@@ -27,6 +27,10 @@ from pathlib import Path
 
 PASS, FAIL, NOT_TESTED = "PASS", "FAIL", "NOT TESTED"
 INCOMPLETE = "INCOMPLETE"   # completable only: the level pass did not cover its plan (never a pass)
+# completable only: the pass reached the end, but by teleport, past steps a player must do on the level's way
+# (levelpass_holds.required_gates: a Spark Lock, a battle gate, a key gate) that no line shows done. Never a
+# bare pass: the page names each step.
+BY_TELEPORT = "BY TELEPORT"
 
 STAMP = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})\]")
 # An enemy row's key: placed `a<id>.<hash>.<hash>@<gen>`, a run-time spawn `s<hash>.<hash>#<n>/<m>@<gen>`.
@@ -358,7 +362,7 @@ def client_enemies(log: Log) -> dict[str, ClientEnemy]:
     return out
 
 
-def grade_enemies(run: Run) -> Verdict:
+def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
     """Every enemy S had, per client: bound there, waiting asleep (its copy asleep far from that player: no
     fault by itself), or never there; and each death S logged: seen on a bound copy, or dead before bind. PASS
     only when every enemy a client was near enough to see (not asleep there) was bound there, every death of a
@@ -469,7 +473,7 @@ def grade_enemies(run: Run) -> Verdict:
         findings.insert(0, Finding(f"existed on no client: {', '.join(f'{key} ({keys[key].name})' for key in nowhere_keys)}",
                                    lines))
     first = next(iter(keys.values())).placed.cite()
-    fights, fight_findings = fight_findings_of(run, by_player, len(unrecorded))
+    fights, fight_findings = fight_findings_of(run, by_player, len(unrecorded), data)
     counts.append(fights)
     findings = fight_findings + findings  # the fights first: the most telling
     return Verdict("enemies", FAIL if findings else PASS, "; ".join(counts), first, findings)
@@ -489,7 +493,7 @@ DAMAGE_REFUSED = re.compile(r"Online: puppet \d+ damage check on .*result 0 reas
 
 
 def fight_findings_of(run: Run, by_player: dict[str, int] | None = None,
-                      unrecorded: int = 0) -> tuple[str, list[Finding]]:
+                      unrecorded: int = 0, data: LevelData | None = None) -> tuple[str, list[Finding]]:
     """H's fights against S's deaths: `by_player` the kills S credits to each client (`dead by <peer>`),
     `unrecorded` the deaths whose attacker S does not name (the encounter path: a player's kill may hide there)."""
     by_player = by_player or {}
@@ -528,6 +532,7 @@ def fight_findings_of(run: Run, by_player: dict[str, int] | None = None,
                      "explained, only that none took a hit point")
         if tally:
             lines.append(f"S's kills by player (`dead by <peer>`): {tally}")
+        lines += held_lines(run, fg, data)
         findings.append(Finding(f"a fight step failed with no damage done: {len(fg['tries'])} burst(s) at "
                                 f"{fg['area']}, no hit took a hit point", lines))
     with_bursts = [fg for fg in fights if fg["tries"]]
@@ -551,6 +556,46 @@ def fight_findings_of(run: Run, by_player: dict[str, int] | None = None,
             + (f", {len(no_burst)} failed before any burst ({no_burst[0]['end'][2][:60]})" if no_burst else "")
             + f"; {len(kills)} enemy death(s) by a player on S")
     return text, findings
+
+
+VICTIM = re.compile(r" try \d+: x at ([^#\s]+)#")
+
+
+def held_lines(run: Run, fg: dict, data: LevelData | None) -> list[str]:
+    """For a fight that took nothing: each victim's hold and release from the level's data (levelpass_holds),
+    and whether this run fired it (the pass's own act line on H, a lock's opening line), so the next reader
+    sees a held enemy instead of suspecting the game."""
+    if data is None:
+        return ["the level's data (logic.json, manifest.json) is not at hand: its holds are not shown"]
+    try:
+        at = tuple(float(v) for v in fg["area"].split(","))
+    except ValueError:
+        at = None
+    out = []
+    h = run.clients.get("H")
+    for name in dict.fromkeys(m.group(1) for line in fg["tries"] for m in [VICTIM.search(line.text)] if m):
+        cands = [x for x in data.holds.values() if x.name == name]
+        if at is not None and len(cands) > 1:
+            cands.sort(key=lambda x: sum((a - b) ** 2 for a, b in zip(x.pos, at)) if x.pos else float("inf"))
+        if not cands:
+            out.append(f"{name}: not held in the level's data (no job state, its AI not disabled)")
+            continue
+        hold = cands[0]
+        out.append(f"{name}: {hold.words()}")
+        for r in hold.releases:
+            if not r.act or not r.path:
+                continue
+            root = r.path[0]
+            if r.act == "lock":
+                line = gate_opened(run, root)
+                out.append(f"    {root} opened: {line.cite()}" if line else
+                           f"    {root}: no line shows it opened: not fired in this run")
+            else:
+                acted = h.find(re.compile(r"Input script: LEVELPASS act \S+ \S+ " + re.escape(root) + r" ")) if h else []
+                out.append(f"    the pass acted on {root}: {acted[0][0].cite()}" if acted else
+                           f"    the pass never acted on {root} (no `LEVELPASS act ... {root}` on H): not fired by "
+                           "this run")
+    return out
 
 
 def peer_of(run: Run, m: re.Match) -> str:
@@ -901,7 +946,71 @@ H_NEXT = re.compile(r"Input script: LEVELPASS phase next-level")
 D_NEXT = re.compile(r"Input script: LEVELPASS D next level")
 
 
-def grade_completable(run: Run) -> Verdict:
+@dataclass
+class LevelData:
+    """The level's own data the page reads beside the logs (levelpass_holds): its held enemies by node key and
+    its gates."""
+    level: str
+    holds: dict
+    gates: list
+
+
+def run_level(run: Run) -> str:
+    """The level of a level pass's run: its case `levelpass-<level>[-no-end]` (result.json), else ""."""
+    case = str(run.result.get("case") or "")
+    if not case.startswith("levelpass-"):
+        return ""
+    level = case[len("levelpass-"):]
+    return level[:-len("-no-end")] if level.endswith("-no-end") else level
+
+
+def level_data(levelpass: Path | None, level: str) -> LevelData | None:
+    """<levelpass>/<level>/logic.json and manifest.json read into LevelData; None when either is missing."""
+    import levelpass_holds as lh
+    if levelpass is None or not level:
+        return None
+    try:
+        logic = json.loads((levelpass / level / "logic.json").read_text(encoding="utf-8"))
+        manifest = json.loads((levelpass / level / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    disabled = [(f"{e.get('unit')}.{e.get('name')}", str(e.get("name")), str(e.get("unit")),
+                 tuple(e["position"]) if isinstance(e.get("position"), list) and len(e["position"]) == 3 else None)
+                for e in manifest.get("entities", []) or [] if isinstance(e, dict) and e.get("group") == "enemy"
+                and str((e.get("details") or {}).get("_isEnabled", "")).startswith("false")]
+    return LevelData(level, lh.holds_of(logic, disabled), lh.required_gates(manifest, logic, level))
+
+
+def gate_opened(run: Run, name: str) -> Line | None:
+    """A line that shows the gate opened: a client's `world gate <Name#id> open apply` (S's open applied there)
+    or S's `world gate <Name#id> tombstoned` / `availability <Name#id> removed`."""
+    rx = re.compile(r"Online: (?:world gate " + re.escape(name) + r"#\d+ (?:open apply|tombstoned)|availability "
+                    + re.escape(name) + r"#\d+ removed)")
+    for log in ([run.server] if run.server else []) + list(run.clients.values()):
+        hit = log.find(rx)
+        if hit:
+            return hit[0][0]
+    return None
+
+
+def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[str]]:
+    """The gates a player must open on the level's way (levelpass_holds.required_gates): the ones no line shows
+    opened, and the ones a line does, each in words."""
+    if data is None:
+        return [], []
+    shut, done = [], []
+    for g in data.gates:
+        if not g.required:
+            continue
+        line = gate_opened(run, g.name)
+        if line is None:
+            shut.append(f"{g.name} ({g.kind}: {g.opener}; no line of S, H or D shows it opened)")
+        else:
+            done.append(f"{g.name} ({g.kind}): {line.cite()}")
+    return shut, done
+
+
+def grade_completable(run: Run, data: LevelData | None = None) -> Verdict:
     """The level pass's verdict (result.json `levelpass`, written by `levelpass`) and each client's mark of
     the next level. Two players: a run without D does not show it (NOT TESTED)."""
     lp = run.result.get("levelpass") if isinstance(run.result.get("levelpass"), dict) else None
@@ -918,6 +1027,11 @@ def grade_completable(run: Run) -> Verdict:
               ", ".join(f"{w} {'yes' if line else 'no'}" for w, line in reached.items() if w in run.clients))
     example = next((line.cite() for line in reached.values() if line), "")
     notes = [f"not covered: {m}" for m in missed]
+    # The pass teleports: it can reach the end without doing what a player must on the way.
+    shut, done = required_steps(run, data)
+    if data is None:
+        counts += "; required steps on the way not checked (no level data for this run)"
+    notes += [f"required, not performed: {s}" for s in shut] + [f"required, performed: {s}" for s in done]
     if verdict == "FAIL":
         return Verdict("completable", FAIL, counts, example, notes=notes)
     if verdict == "INCOMPLETE":
@@ -926,6 +1040,9 @@ def grade_completable(run: Run) -> Verdict:
         return Verdict("completable", NOT_TESTED, counts + " (one client in this run: two players not shown)", example,
                        notes=notes)
     if verdict == "PASS" and all(reached.values()):
+        if shut:
+            return Verdict("completable", BY_TELEPORT, f"completable by teleport; required steps not performed: "
+                           f"{len(shut)}; {counts}", example, notes=notes)
         return Verdict("completable", PASS, counts, example, notes=notes)
     missing = [w for w, line in reached.items() if line is None]
     return Verdict("completable", FAIL, counts, example, [Finding(f"{', '.join(missing)} logged no next-level mark", [
@@ -936,10 +1053,13 @@ def grade_completable(run: Run) -> Verdict:
 # --- the page ------------------------------------------------------------------------------------------
 
 
-def grade(folder: Path, repo: Path | None) -> list[Verdict]:
+def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> list[Verdict]:
+    """Every row of the page; `levelpass` (the [levelpass] folder) gives the level's own data: its required
+    gates (completable) and its held enemies (a fight that lands nothing)."""
     run = load_run(folder)
-    return [grade_completable(run), grade_lobby(run), grade_slot(run), grade_bodies(run), grade_scenes(run, repo),
-            grade_enemies(run), grade_pickups(run), grade_loot(run)]
+    data = level_data(levelpass, run_level(run))
+    return [grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), grade_scenes(run, repo),
+            grade_enemies(run, data), grade_pickups(run), grade_loot(run)]
 
 
 def run_head(folder: Path) -> list[str]:
@@ -960,13 +1080,17 @@ def overall(verdicts: list[Verdict]) -> str:
     its plan, PASS only when every row passed; with every row NOT TESTED named next to it, so nobody reads the
     rest as passed."""
     untested = [v.name for v in verdicts if v.status == NOT_TESTED]
-    tail = f"; NOT TESTED: {', '.join(untested)}" if untested else ""
+    teleport = [v.name for v in verdicts if v.status == BY_TELEPORT]
+    tail = (f"; NOT TESTED: {', '.join(untested)}" if untested else "") + \
+        (f"; BY TELEPORT: {', '.join(teleport)}" if teleport else "")
     if any(v.status == FAIL for v in verdicts):
         return "FAIL: " + ", ".join(v.name for v in verdicts if v.status == FAIL) + \
             ("; INCOMPLETE" if any(v.status == INCOMPLETE for v in verdicts) else "") + tail
     if any(v.status == INCOMPLETE for v in verdicts):
         return "INCOMPLETE" + tail
-    return "PASS" if not untested else "NOT ALL TESTED: " + ", ".join(untested)
+    if untested:
+        return "NOT ALL TESTED: " + ", ".join(untested) + (f"; BY TELEPORT: {', '.join(teleport)}" if teleport else "")
+    return "PASS" if not teleport else "BY TELEPORT: " + ", ".join(teleport)
 
 
 def page(folder: Path, verdicts: list[Verdict], head: list[str] | None = None) -> str:

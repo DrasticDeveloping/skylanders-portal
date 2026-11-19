@@ -7696,7 +7696,7 @@ def cmd_levelcheck(cfg: Config, a: argparse.Namespace) -> int:
         folder = Path(a.grade)
         if not folder.is_dir():
             raise SystemExit(f"levelcheck: no run folder {folder}")
-        verdicts = lc.grade(folder, cfg.repo)
+        verdicts = lc.grade(folder, cfg.repo, levelpass_folder(cfg, getattr(a, "folder", None)))
         print(lc.page(folder, verdicts, lc.run_head(folder)))
         return levelcheck_exit(lc, verdicts)
     if a.predictions:
@@ -7710,7 +7710,7 @@ def cmd_levelcheck(cfg: Config, a: argparse.Namespace) -> int:
         if not a.plan_only:
             print(f"levelcheck {a.level}: no run to grade (levelpass exit {code})", flush=True)
         return code
-    verdicts = lc.grade(run, cfg.repo)
+    verdicts = lc.grade(run, cfg.repo, levelpass_folder(cfg, getattr(a, "folder", None)))
     head = lc.run_head(run) + [f"level pass report: {a.check.get('report', '-')}"]
     text = lc.page(run, verdicts, head)
     out = levelpass_folder(cfg, getattr(a, "folder", None)) / f"{a.level}-check-{time.strftime('%Y%m%d-%H%M%S')}.txt"
@@ -9545,6 +9545,12 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     print(f"levelpass {a.level}: content {plan.source}; {len(plan.stops)} stops, "
           f"{sum(len(st.actions) for st in plan.stops)} actions, estimate {plan.estimate_s:.0f} s; case {spec_path}",
           flush=True)
+    for h in plan.held:  # the fights the level's script holds (levelpass_holds), in words
+        print(f"levelpass {a.level}: held: {h}", flush=True)
+    gates = lp.gates_words(content)
+    if gates and not a.predictions:
+        print(f"levelpass {a.level}: gates on the way a teleporting pass does not open ({len(gates)}): "
+              f"{'; '.join(gates)}", flush=True)
     if a.plan_only:
         return 0
     t0 = time.monotonic()

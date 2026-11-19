@@ -42,6 +42,7 @@ import re
 from dataclasses import dataclass, field
 
 import levelpass_end as le
+import levelpass_holds as lh
 
 # --- content ------------------------------------------------------------------------------------------
 
@@ -92,6 +93,7 @@ class Obj:
     live_state: str = ""         # the probe's state of the object its ref names (registered, asleep, skipped)
     scene: str = ""              # its cutscene's CutsceneName (a Scripts.CutscenePlayerComponent's data)
     at_startup: bool = False     # that cutscene plays at the level's load (ActiveAtStartup)
+    ai_off: bool = False         # an enemy whose details say `_isEnabled false` (its AI disabled: levelpass_holds)
 
     def point(self) -> tuple[float, float, float]:
         """Where a teleport goes to enter it: its placed position when that is inside its trigger box
@@ -125,6 +127,7 @@ class Content:
     authored: int = 0             # objects whose live reference is the probe's exact id
     level_end_chains: list[str] = field(default_factory=list)  # the static manifest's level_end text
     logic: dict | None = None     # logic.json itself (levelpass_end.derive_end walks it)
+    manifest: dict | None = None  # manifest.json itself (levelpass_holds.required_gates reads its locks)
 
 
 PROBE_ROW = re.compile(
@@ -210,10 +213,12 @@ def parse_static_manifest(data: dict, level: str) -> Content:
         details = e.get("details") if isinstance(e.get("details"), dict) else {}
         o.scene = str(details.get("CutsceneName", "") or "")
         o.at_startup = str(details.get("ActiveAtStartup", "")).startswith("true")
+        o.ai_off = e.get("group") == "enemy" and str(details.get("_isEnabled", "")).startswith("false")
         objects.append(o)
         if start is None and e.get("group") == "level_start" and (name == start_name or not start_name):
             start = pos
     content = Content(level=level, source="static manifest", start=start, objects=objects)
+    content.manifest = data
     content.level_end = exit_senders(data.get("level_end"))
     content.level_end_receiver = exit_receiver(data.get("level_end"))
     le_text = data.get("level_end")
@@ -702,6 +707,9 @@ class Plan:
     scene_at: dict = field(default_factory=dict)
     scene_load_s: float = 0.0
     scene_extra_s: float = 0.0      # the scenes' own seconds: added to the budget and the case's timeout
+    # The fights the level's script holds (levelpass_holds): what each fight did about them (a release entered
+    # before it, or the fight left out: "needs a lock opened", nothing releases them), in words.
+    held: list[str] = field(default_factory=list)
                                     # (--d-leaves-before-end: D ends its session before the exit, as before)
 
 
@@ -900,6 +908,10 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
     # only when the stop is still in the plan after the budget's trim).
     not_registered: list[tuple[Stop | None, str]] = []
     exit_set = set(id(c) for c in exit_clusters) if exits else set()
+    holds = level_holds(content)
+    all_by_key = {obj_key(o): o for o in content.objects if o.name}
+    released: set[str] = set()       # the release acts already on the route (one entry each)
+    held_notes: list[str] = []
     for n, c in enumerate(ordered):
         actions: list[Action] = []
         visit_only: list[tuple[Obj, str]] = []
@@ -959,6 +971,9 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
             taken[family] = taken.get(family, 0) + 1
             actions.append(Action(action=act, obj=o, why=why, expect=effects.get(o.name, [])))
         stop = Stop(label=f"v{n + 1}", cluster=c, actions=actions, visit_only=visit_only)
+        if holds and id(c) not in exit_set:
+            held_notes += settle_held_fight(stop, content.objects, holds, all_by_key, released,
+                                            set(end.keys() | set(end.path_keys)) if end is not None else set())
         if lost_fight is not None and not fought:
             not_registered.append((None, lost_fight))
         if had_visit and not any(o.ref for o in c.objects):
@@ -1005,10 +1020,125 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
     if named:
         left_out.append(f"{len(named)} sweep step(s) {NOT_REGISTERED} (the probe's state; the preflight's rule): "
                         f"{', '.join(named)}")
+    ambient = sorted({h.name for h in holds.values() if h.ambient})
+    if ambient:
+        held_notes.append(f"ambient enemies nothing in the level's logic releases, never a fight's target: "
+                          f"{', '.join(ambient)}")
+    left_out += [f"held: {x}" for x in held_notes]
     return Plan(level=content.level, source=content.source, stops=stops, left_out=left_out, no_action=no_action,
                 unplaced=unplaced, estimate_s=round(est, 1), full=full, late_join=late_join, exit_stop=exit_stop,
                 provoke=provoke, no_end=no_end, end=end, end_objs=end_objs, end_missing=end_missing, timed=timed,
-                d_stays=d_stays, scenes=scenes, scene_list=scene_list, scene_at=scene_at, scene_load_s=load_s)
+                d_stays=d_stays, scenes=scenes, scene_list=scene_list, scene_at=scene_at, scene_load_s=load_s,
+                held=held_notes)
+
+
+# --- fights the level's script holds (levelpass_holds) ------------------------------------------------------
+#
+# A held enemy takes no damage until its release fires (levelpass_holds' head: ww1's intro Greebles, tutorial_b's
+# end-fight Chompy and its ambient Chompies, 19 November). A fight step is planned only when every held enemy in
+# its reach has its release on the route before it: the trigger that releases it entered, or the object whose
+# death releases it attacked, in the same stop before the fight. A release a pass cannot carry out (a lock: until
+# the Spark Lock test commands lock_move / lock_solve are merged from online/6-spark-lock; a press, an encounter
+# won, no player act in the logic) leaves the fight out when nothing else in its reach can be hurt, and says so;
+# an ambient enemy (nothing releases it) is never a reason to fight.
+
+
+def level_holds(content: Content) -> dict[str, lh.Hold]:
+    """The level's held enemies (levelpass_holds.holds_of), from its logic and the manifest's disabled ones."""
+    if not content.logic:
+        return {}
+    disabled = [(obj_key(o), o.name, o.ident, o.pos) for o in content.objects if o.ai_off and o.name]
+    return lh.holds_of(content.logic, disabled)
+
+
+def release_step(r: lh.Release, by_key: dict[str, Obj], forbidden: set[str]) -> tuple[str, Obj] | None:
+    """The sweep action that carries out a release (enter its trigger, attack what dies), or None."""
+    o = by_key.get(r.act_key)
+    if o is None or not o.ref or r.act_key in forbidden or o.loads_map:
+        return None
+    act = classify(o)[0]
+    if r.act == lh.ENTER and act == ENTER:
+        return ENTER, o
+    if r.act == lh.KILL and act == ATTACK:
+        return ATTACK, o
+    return None
+
+
+def needs_words(stuck: list[lh.Hold]) -> list[str]:
+    """Why held enemies' releases are not on the route, in words: grouped by the lock they need, ambient, or a
+    release the pass has no step for."""
+    out: list[str] = []
+    by_lock: dict[str, list[lh.Hold]] = {}
+    other: list[lh.Hold] = []
+    for h in stuck:
+        lock = next((r for r in h.releases if r.act == lh.LOCK), None)
+        if lock is not None:
+            by_lock.setdefault(lock.path[0], []).append(h)
+        elif not h.ambient:
+            other.append(h)
+    for lock, hs in sorted(by_lock.items()):
+        r = next(r for r in hs[0].releases if r.act == lh.LOCK)
+        out.append(f"needs a lock opened: {lock} (holds {', '.join(sorted({h.name for h in hs}))}: {hs[0].how}, "
+                   f"{r.words()}; no step opens a lock until lock_move / lock_solve are merged from "
+                   "online/6-spark-lock)")
+    amb = sorted({h.name for h in stuck if h.ambient})
+    if amb:
+        out.append(f"ambient, nothing in the level's logic releases them: {', '.join(amb)}")
+    for h in sorted(other, key=lambda h: h.name):
+        out.append(f"{h.name} {h.words()}: the pass has no step for that act")
+    return out
+
+
+def settle_held_fight(stop: Stop, objects: list[Obj], holds: dict[str, lh.Hold], by_key: dict[str, Obj],
+                      released: set[str], forbidden: set[str]) -> list[str]:
+    """The stop's fight against the held enemies in its reach (the section's head): the release steps put before
+    it, or the fight left out; the plan's notes, in words."""
+    fight = next((a for a in stop.actions if a.action == FIGHT), None)
+    if fight is None:
+        return []
+    near = [o for o in objects if o.state == "enemy" and placed(o) and o.name and
+            dist(o.pos, fight.obj.pos) <= FIGHT_RADIUS]
+    held = [(o, holds[obj_key(o)]) for o in near if obj_key(o) in holds]
+    if not held:
+        return []
+    free = [o for o in near if obj_key(o) not in holds] + \
+        [o for o in stop.cluster.objects if o.state in ("spawner", "encounter")]
+    adds: list[Action] = []
+    freed: list[str] = []
+    stuck: list[lh.Hold] = []
+    for o, h in held:
+        step = next((s for s in (release_step(r, by_key, forbidden) for r in h.releases) if s), None)
+        if step is None:
+            stuck.append(h)
+            continue
+        act, target = step
+        freed.append(h.name)
+        if obj_key(target) not in released:
+            released.add(obj_key(target))
+            adds.append(Action(action=act, obj=target, why=f"releases held {h.name} ({h.how}) before the fight"))
+    stuck_words = needs_words(stuck)
+    where = f"{stop.label} fight at {step_name(fight.obj)}"
+    if not free and not freed:
+        stop.actions.remove(fight)
+        return [f"{where} left out: every enemy in its reach is held: " + "; ".join(stuck_words)]
+    k = stop.actions.index(fight)
+    stop.actions[k:k] = adds
+    notes = []
+    if adds:
+        notes.append(f"{where} after {', '.join(f'{a.action} {step_name(a.obj)}' for a in adds)} (releases "
+                     f"{', '.join(sorted(set(freed)))})")
+    if stuck:
+        notes.append(f"{where} kept for the enemies it can hurt; held in its reach: " + "; ".join(stuck_words))
+    return notes
+
+
+def gates_words(content: Content) -> list[str]:
+    """The level's gates a player is asked to open on its way and the pass never opens (levelpass_holds:
+    a Spark Lock, a battle gate it may win, a key gate), in words; the plan prints them."""
+    if not content.manifest:
+        return []
+    return [f"{g.name} ({g.kind}: {g.opener})" for g in lh.required_gates(content.manifest, content.logic, content.level)
+            if g.required]
 
 
 # --- scenes in full (--scenes play) ---------------------------------------------------------------------------

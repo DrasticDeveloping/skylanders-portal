@@ -210,6 +210,49 @@ class EnemyKinds(unittest.TestCase):
                       "attacker not recorded 1)", v.counts)
 
 
+class RequiredSteps(unittest.TestCase):
+    """The pass teleports: a level's end reached past gates a player must open is "completable by teleport",
+    never a bare PASS (levelpass_holds.required_gates)."""
+
+    def data(self) -> lc.LevelData:
+        import levelpass_holds as lh
+        return lc.LevelData("madeup", {}, [lh.Gate("Intro_LockpickGate", "puzzles", lh.SPARK_LOCK, True, "solve its lock puzzle"),
+                                           lh.Gate("Finale_DemonGate", "enc8", lh.BATTLE_GATE, True, "win its fight"),
+                                           lh.Gate("ElementalGate", "ez1", "an elemental gate", False, "")])
+
+    def test_a_gate_no_line_shows_opened_is_not_performed(self) -> None:
+        run = RunFolder([(90, "Online: world gate Finale_DemonGate#2365 tombstoned (removed for good, written)")],
+                        H_JOIN + H_NEXT, D_JOIN + D_NEXT, result={"levelpass": {"verdict": "PASS", "not_covered": []}}).run()
+        v = lc.grade_completable(run, self.data())
+        self.assertEqual(v.status, lc.BY_TELEPORT)
+        self.assertTrue(v.counts.startswith("completable by teleport; required steps not performed: 1; level pass PASS"))
+        self.assertIn("required, not performed: Intro_LockpickGate (Spark Lock: solve its lock puzzle; no line of S, H or "
+                      "D shows it opened)", v.notes)
+        self.assertTrue(any(n.startswith("required, performed: Finale_DemonGate (battle gate): H/data/Online/session/"
+                                         "game.log:1:") for n in v.notes), v.notes)
+        self.assertEqual(lc.overall([v, lc.Verdict("lobby", lc.PASS, "")]), "BY TELEPORT: completable")
+        self.assertEqual(lc.overall([v, lc.Verdict("loot", lc.NOT_TESTED, "")]), "NOT ALL TESTED: loot; BY TELEPORT: completable")
+
+    def test_no_level_data_is_said(self) -> None:
+        run = RunFolder([], H_JOIN + H_NEXT, D_JOIN + D_NEXT, result={"levelpass": {"verdict": "PASS", "not_covered": []}}).run()
+        v = lc.grade_completable(run, None)
+        self.assertEqual(v.status, lc.PASS)
+        self.assertIn("required steps on the way not checked (no level data for this run)", v.counts)
+
+    def test_a_fight_on_a_held_enemy_names_its_hold_and_release(self) -> None:
+        import levelpass_holds as lh
+        hold = lh.Hold("intro.GreebleMelee", "GreebleMelee", "intro", (-535.0, -2874.6, 303.8), "job state Idle",
+                       [lh.Release("intro.Scene_Manager", lh.LOCK, "puzzles.IntroArea_LockpickGate",
+                                   ["IntroArea_LockpickGate", "Scene_Manager"], 0.5)])
+        data = lc.LevelData("madeup", {hold.key: hold}, [])
+        fg = {"area": "-535,-2875,303", "tries": [lc.Line("H/game.log", 9, "Dev: fight_area -535,-2875,303 try 1: x at "
+                                                           "GreebleMelee#3531 d 72: hp 96 -> 96 (2 enemies)", None)]}
+        lines = lc.held_lines(RunFolder([], H_JOIN).run(), fg, data)
+        self.assertIn("GreebleMelee: held (job state Idle); released by Scene_Manager (IntroArea_LockpickGate -> "
+                      "Scene_Manager; a player: open the lock IntroArea_LockpickGate)", lines)
+        self.assertIn("    IntroArea_LockpickGate: no line shows it opened: not fired in this run", lines)
+
+
 # The two pages the confirm agent checked row by row (logs/confirm/TRIAGE.txt, batch 8, runs 4 and 5): the
 # enemies row was wrong on both. Run folders on the test store (outside git: they name the disc's objects).
 CALIBRATION_RUNS = Path(r"D:/SwapForceOnline-data/tests/int2/runs")
