@@ -89,6 +89,7 @@ class Obj:
     ref: str = ""                # the live reference a script step names it by (attach_refs); "" for none
     zone: str = ""               # the static reader's zone (the level or one of its sub-zones)
     components: list[str] = field(default_factory=list)  # the static reader's component data classes
+    live_state: str = ""         # the probe's state of the object its ref names (registered, asleep, skipped)
 
     def point(self) -> tuple[float, float, float]:
         """Where a teleport goes to enter it: its placed position when that is inside its trigger box
@@ -712,10 +713,17 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
     """The plan; without --full, over the budget, the sample per family goes down to 2, then 1 (the
     plan says so), after the quiet visits were dropped. `no_end` (--no-end): the level's end is found
     (the plan names it) but not attempted, and its time is not in the estimate."""
+    # drop_unreachable leaves steps out by clearing their objects' refs: each try starts from the refs as loaded.
+    refs = [(o, o.ref) for o in content.objects]
+
+    def fresh() -> None:
+        for o, r in refs:
+            o.ref = r
     plan = _make_plan(content, full, late_join, budget_s, sample, provoke, no_end=no_end, d_stays=d_stays)
     n = sample
     while not full and plan.estimate_s > budget_s and n > 1:
         n -= 1
+        fresh()
         plan = _make_plan(content, full, late_join, budget_s, n, provoke, no_end=no_end, d_stays=d_stays)
         plan.left_out.append(f"each action family sampled {n} time(s), not {sample}, to fit the budget")
     # Still over at one per family (a level with many archetypes): at most `cap` actions of each kind
@@ -723,6 +731,7 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
     # until the plan fits; --full acts on the rest.
     cap = KIND_CAP_START
     while not full and plan.estimate_s > budget_s and cap >= 1:
+        fresh()
         plan = _make_plan(content, full, late_join, budget_s, n, provoke, kind_cap=cap, no_end=no_end,
                           d_stays=d_stays)
         plan.left_out.append(f"each action family sampled {n} time(s), not {sample}, to fit the budget")
@@ -848,38 +857,73 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
     no_action: dict[str, int] = {}
     stops: list[Stop] = []
     exit_stop = None
+    # The sweep steps left out by the preflight's object rule, named (a lost visit with its stop: it counts
+    # only when the stop is still in the plan after the budget's trim).
+    not_registered: list[tuple[Stop | None, str]] = []
+    exit_set = set(id(c) for c in exit_clusters) if exits else set()
     for n, c in enumerate(ordered):
         actions: list[Action] = []
         visit_only: list[tuple[Obj, str]] = []
         fought = False
+        lost_fight: str | None = None
+        had_visit = any(o.ref for o in c.objects)
         for o in sorted(c.objects, key=lambda o: (ACTION_ORDER[classify(o)[0]], o.name, o.ident)):
             act, why = classify(o)
             if o.name and o.name in exit_names:
                 act, why = EXIT_A, "the level-end chain's sender: acted on last"
+            # Not registered at the load (the probe's state): no step may address it (a preflight error). The
+            # exit's clusters keep theirs (a failing exit target is a real error: the pass must not start).
+            unregistered = (id(c) not in exit_set and act != EXIT_A and o.ref.startswith("auth:")
+                            and not reachable(o, []))
             if act != VISIT and not o.ref:
                 act, why = VISIT, "no live reference (no probe id, no name a lookup takes)"
             if act == VISIT:
+                if unregistered:  # the cluster's visit goes to another of its objects
+                    o.ref, why = "", NOT_REGISTERED
                 visit_only.append((o, why))
                 no_action_key = f"{stem(o.name) or o.cls}: {why}"
                 no_action[no_action_key] = no_action.get(no_action_key, 0) + 1
                 continue
-            if act == FIGHT or (act == EXIT_A and exit_kind(o) == FIGHT):
-                if fought:
-                    continue  # one fight per cluster covers its spawners and encounters
-                fought = True
+            if (act == FIGHT or (act == EXIT_A and exit_kind(o) == FIGHT)) and fought:
+                if unregistered:
+                    o.ref = ""
+                continue  # one fight per cluster covers its spawners and encounters
             family = (act, family_of(o))
             if not full and act != EXIT_A and taken.get(family, 0) >= sample:
                 left[family] = left.get(family, 0) + 1
+                if unregistered:
+                    o.ref = ""
                 visit_only.append((o, f"sampled out ({act}: {sample} of its family taken)"))
                 continue
             if kind_cap and act != EXIT_A and per_kind.get(act, 0) >= kind_cap:
                 left[family] = left.get(family, 0) + 1
+                if unregistered:
+                    o.ref = ""
                 visit_only.append((o, f"over the budget ({act}: at most {kind_cap} of each kind)"))
                 continue
+            if unregistered:
+                # A step the script would have had: left out, and not its family's sample (the next of the
+                # family, here or further on, takes it; the next fighter of the cluster takes its fight: the
+                # cluster's one fight is named once, and only when no fighter of the cluster is left).
+                o.ref = ""
+                if act != FIGHT:
+                    not_registered.append((None, f"{act} {step_name(o)}"))
+                elif lost_fight is None:
+                    lost_fight = f"{act} {step_name(o)}"
+                visit_only.append((o, NOT_REGISTERED))
+                no_action_key = f"{stem(o.name) or o.cls}: {NOT_REGISTERED}"
+                no_action[no_action_key] = no_action.get(no_action_key, 0) + 1
+                continue
+            if act == FIGHT or (act == EXIT_A and exit_kind(o) == FIGHT):
+                fought = True
             per_kind[act] = per_kind.get(act, 0) + 1
             taken[family] = taken.get(family, 0) + 1
             actions.append(Action(action=act, obj=o, why=why, expect=effects.get(o.name, [])))
         stop = Stop(label=f"v{n + 1}", cluster=c, actions=actions, visit_only=visit_only)
+        if lost_fight is not None and not fought:
+            not_registered.append((None, lost_fight))
+        if had_visit and not any(o.ref for o in c.objects):
+            not_registered.append((stop, f"visit {stop.label}"))
         if any(a.action == EXIT_A for a in actions):
             if exit_stop is None:
                 exit_stop = stop
@@ -891,6 +935,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
     if exit_stop is not None:
         stops.remove(exit_stop)
         stops.append(exit_stop)
+    not_registered += drop_unreachable(stops, exit_stop, no_action)
     left_out = [f"{family[0]} {family[1]}: {k} more not acted on (sampled)" for family, k in sorted(left.items())]
     if other_zone:
         zones = sorted({o.zone for o in other_zone})
@@ -915,6 +960,10 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
             dropped += 1
         if dropped:
             left_out.append(f"{dropped} visit(s) of clusters with no sampled action (over the budget)")
+    named = [text for s, text in not_registered if s is None or s in stops]
+    if named:
+        left_out.append(f"{len(named)} sweep step(s) {NOT_REGISTERED} (the probe's state; the preflight's rule): "
+                        f"{', '.join(named)}")
     return Plan(level=content.level, source=content.source, stops=stops, left_out=left_out, no_action=no_action,
                 unplaced=unplaced, estimate_s=round(est, 1), full=full, late_join=late_join, exit_stop=exit_stop,
                 provoke=provoke, no_end=no_end, end=end, end_objs=end_objs, end_missing=end_missing, timed=timed,
@@ -984,10 +1033,14 @@ def attach_refs(objects: list[Obj], probe: list[Obj] | None, names_only: bool = 
         if not names_only and best is not None and dist(best.pos, o.pos) <= JOIN_DISTANCE:
             zone, index = best.ident.rsplit("#", 1)
             o.ref = f"auth:{zone}:{index}"
+            o.live_state = state_word(best.state)
             joined += 1
         elif probe is None or o.name.lower() in live_names:
             # A name the probe saw live (its refname may be another name at run time otherwise).
             o.ref = name_ref(o.name)
+            states = {state_word(p.state) for p in by_name.get(o.name.lower(), [])}
+            o.live_state = "registered" if "registered" in states else ("asleep" if "asleep" in states else
+                                                                          (min(states) if states else ""))
         else:
             o.ref = ""
     return joined
@@ -1381,6 +1434,79 @@ LATE_JOIN_LEAD = 6     # D starts this many stops before the sweep ends (its boo
 D_VISITS = 6           # the late joiner's visits (each streams an area in; every audit covers all its rows)
 
 
+# --- what the preflight lets a generated case address (preflight.py's object rules) ------------------------
+#
+# The pass's cases go through the runner's preflight gate. An `auth:` step on an object the probe recorded
+# as not registered at the load (`skipped`) is a preflight error; so is a name step whose objects are none
+# of them registered, unless an earlier step (goto_entity, enter_trigger, interact, attack_until, pickup)
+# addressed something within STREAM_NEAR of it (its area streamed in). Such a sweep step is left out of
+# the script and listed as NOT_REGISTERED (the report says so before the run, not after 20 s of trying);
+# the exit's steps are never left out (a failing exit target is a real error: the pass must not start).
+NOT_REGISTERED = "not visited: not registered at load"
+STREAM_NEAR = 4000.0   # preflight.py's STREAM_RADIUS
+
+
+def state_word(state: str) -> str:
+    """A probe state's first word (`skipped act0` is skipped), the way preflight.py reads it."""
+    return state.split()[0] if state.split() else ""
+
+
+def reachable(o: Obj, seen: list[tuple[float, float, float]]) -> bool:
+    """Whether a step on `o` passes the preflight's object rule after steps on the positions `seen`."""
+    if not o.ref:
+        return False
+    if o.ref.startswith("auth:"):
+        return o.live_state != "skipped"
+    if o.live_state in ("", "registered"):
+        return True
+    return any(dist(o.pos, v) <= STREAM_NEAR for v in seen)
+
+
+def step_name(o: Obj) -> str:
+    """An object as the not-registered list names it: its name (or class) and its probe id."""
+    ident = o.ref[5:].replace(":", "#", 1) if o.ref.startswith("auth:") else o.ident
+    return f"{o.name or o.cls}" + (f" {ident}" if ident else "")
+
+
+def drop_unreachable(stops: list[Stop], exit_stop: Stop | None,
+                     no_action: dict[str, int]) -> list[tuple[Stop | None, str]]:
+    """The sweep's steps in script order, by the preflight's object rule with the positions of the steps before
+    them (a name whose objects are all asleep at the load passes only near an earlier waking step): a visit
+    whose target fails goes to the next object of its cluster, an action whose target fails is left out;
+    each such object visited only (NOT_REGISTERED, counted in `no_action`). The steps left out, named (a lost
+    visit with its stop)."""
+    seen: list[tuple[float, float, float]] = []
+    out: list[tuple[Stop | None, str]] = []
+
+    def leave_out(s: Stop, o: Obj) -> None:
+        o.ref = ""
+        s.visit_only.append((o, NOT_REGISTERED))
+        key = f"{stem(o.name) or o.cls}: {NOT_REGISTERED}"
+        no_action[key] = no_action.get(key, 0) + 1
+    for s in stops:
+        if s is exit_stop:
+            continue
+        had_visit = visit_obj(s) is not None
+        while (v := visit_obj(s)) is not None and not reachable(v, seen):
+            leave_out(s, v)
+        if (v := visit_obj(s)) is not None:
+            seen.append(v.pos)
+        elif had_visit:
+            out.append((s, f"visit {s.label}"))
+        kept = []
+        for a in s.actions:
+            if a.obj.ref and not reachable(a.obj, seen):
+                leave_out(s, a.obj)
+            if not a.obj.ref:  # left out here, or its ref went with a visit target left out above
+                out.append((None, f"{a.action} {step_name(a.obj)}"))
+                continue
+            kept.append(a)
+            if a.action in (ATTACK, INTERACT_A, TALK, PICKUP, ENTER):
+                seen.append(a.obj.pos)
+        s.actions = kept
+    return out
+
+
 def visit_obj(s: Stop) -> Obj | None:
     """The object a stop's teleport goes to: its first object with a live reference, None for none."""
     for o in s.cluster.objects:
@@ -1421,7 +1547,8 @@ def script_d(plan: Plan) -> str:
     lines += ["waitfor online_in_play 300", "online_join {join}", "waitfor online_barrier 300", "wait_free 120",
               "online_mark_level", f"hold_cap {HOLD_CAP_S}",
               "log LEVELPASS D in", "online_audit d-in"]
-    acted = [s for s in plan.stops if s.actions and s is not plan.exit_stop and visit_ref(s)]
+    acted = [s for s in plan.stops if s.actions and s is not plan.exit_stop and visit_ref(s)
+             and reachable(visit_obj(s), [])]
     if len(acted) > D_VISITS:
         step = len(acted) / D_VISITS
         acted = [acted[int(i * step)] for i in range(D_VISITS - 1)] + [acted[-1]]

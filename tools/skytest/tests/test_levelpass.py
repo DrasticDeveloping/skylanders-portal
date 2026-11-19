@@ -312,6 +312,67 @@ class Plans(unittest.TestCase):
         self.assertEqual(lever.expect, ["StringMessage -> Lift_Platform (moves)"])
 
 
+UNREGISTERED = """
+== pickups and collectibles: 3
+    4000     4000.0       0.0      0.0  CPhysicalEntity            Gem_01                               [madeup#16] skipped act0
+    4010     4010.0       0.0      0.0  CPhysicalEntity            Gem_02                               [madeup#17] registered
+    7000     7000.0       0.0      0.0  CPhysicalEntity            Scroll_01                            [madeup#18] skipped
+
+== completeness
+"""
+
+
+def unregistered_content(exit_state: str = "registered") -> lp.Content:
+    text = PROBE.replace("\n== completeness\n", UNREGISTERED).replace(
+        "[madeup#2] registered", f"[madeup#2] {exit_state}")
+    c = lp.parse_probe_manifest(text, "madeup")
+    lp.attach_refs(c.objects, c.objects)
+    return c
+
+
+class NotRegistered(unittest.TestCase):
+    """A generated case passes its own preflight: no sweep step addresses an object the probe recorded as not
+    registered at the load (an auth: error in preflight.py), or a name whose objects all sleep with no earlier
+    step near; such steps are left out and named; the exit's never are."""
+
+    def test_state_word(self):
+        self.assertEqual(lp.state_word("skipped act0"), "skipped")
+        self.assertEqual(lp.state_word(""), "")
+        c = unregistered_content()
+        gem = next(o for o in c.objects if o.name == "Gem_01")
+        self.assertEqual((gem.ref, gem.live_state), ("auth:madeup:16", "skipped"))
+
+    def test_sample_goes_to_a_registered_sibling(self):
+        p = lp.make_plan(unregistered_content(), sample=1)
+        picked = [a.obj.name for s in p.stops for a in s.actions if a.action == lp.PICKUP]
+        self.assertEqual(picked, ["Gem_02"])
+        line = next(x for x in p.left_out if lp.NOT_REGISTERED in x)
+        self.assertIn("pickup Gem_01 madeup#16", line)
+        for script in (lp.script_h(p, None), lp.script_d(p)):
+            self.assertNotIn("auth:madeup:16", script)
+            self.assertNotIn("auth:madeup:18", script)
+
+    def test_lost_visit_is_named_and_the_exit_kept(self):
+        p = lp.make_plan(unregistered_content(exit_state="skipped"), sample=1)
+        line = next(x for x in p.left_out if lp.NOT_REGISTERED in x)
+        scroll = next(s for s in p.stops if any(o.name == "Scroll_01" for o in s.cluster.objects))
+        self.assertIn(f"visit {scroll.label}", line)
+        self.assertEqual(lp.visit_ref(scroll), "")
+        # The exit is never left out: its failing target is the preflight's error, the pass does not start.
+        self.assertIn("madeup:2", "\n".join(a.obj.ref for a in p.exit_stop.actions))
+
+    def test_name_asleep_needs_an_earlier_step_near(self):
+        def stop(label, x, state):
+            o = lp.Obj(f"Thing_{label}", "C", (x, 0.0, 0.0), lp.GROUP_INTERACT, ref=f"Thing_{label}")
+            o.live_state = state
+            return lp.Stop(label=label, cluster=lp.Cluster(0, o.pos, [o]), actions=[], visit_only=[])
+        stops = [stop("v1", 0.0, "registered"), stop("v2", lp.STREAM_NEAR - 100.0, "asleep"),
+                 stop("v3", 50000.0, "asleep")]
+        out = lp.drop_unreachable(stops, None, {})
+        self.assertEqual([t for _, t in out], ["visit v3"])
+        self.assertEqual([lp.visit_ref(s) for s in stops], ["Thing_v1", "Thing_v2", ""])
+
+
 class Scripts(unittest.TestCase):
     def check_script(self, text: str):
         for line in text.splitlines():
