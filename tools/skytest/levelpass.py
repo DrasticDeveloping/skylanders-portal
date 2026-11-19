@@ -1203,6 +1203,52 @@ SCENE_LOAD_S = 60.0       # a scene at the level's load, never measured yet (tut
 SCENE_S = 15.0            # any other scene, never measured yet (tutorial_b's lobber intro: 14 s)
 SCENE_WAIT_MARGIN_S = 30  # wait_free after entering a scene's trigger: its length and this
 SCENE_STEP_S = 6.0        # the enter step itself and its audit
+# The seconds earlier runs of the level were held by scenes inside the sweep (H's `scene hold on here` ..
+# `released here` between `LEVELPASS phase sweep` and `phase audit`: conversations and scenes the sweep did not
+# enter itself included), under this key of the measured lengths (skytest's measured_scene_lengths). Batch 10's
+# tutorial_b with scenes played: 56.6 s (the Tessa conversation 33.6, the lobber intro 10.4, the chompy intro
+# 12.6), where the estimate counted the two entered scene triggers only.
+SWEEP_SCENES_KEY = "__sweep_scenes__"
+SCENE_HOLD_ON = re.compile(r"Online: scene hold on here")
+SCENE_HOLD_OFF = re.compile(r"Online: scene hold released here")
+PHASE_LINE = re.compile(r"Input script: LEVELPASS phase (\S+)")
+STAMP_LINE = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})\]")
+
+
+def sweep_scene_seconds_from_log(text: str) -> float | None:
+    """The seconds H was held by scenes inside the sweep of one run (the hold lines between the sweep's and the
+    audit's phase marks); None when the log has no sweep or no scene hold line."""
+    import datetime as _dt
+    in_sweep = False
+    total, began, seen = 0.0, None, False
+    for line in text.splitlines():
+        p = PHASE_LINE.search(line)
+        if p:
+            in_sweep = p.group(1) == "sweep"
+            continue
+        if not in_sweep:
+            continue
+        m = STAMP_LINE.match(line)
+        if m is None:
+            continue
+        t = _dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f")
+        if SCENE_HOLD_ON.search(line) and began is None:
+            began, seen = t, True
+        elif SCENE_HOLD_OFF.search(line) and began is not None:
+            total += (t - began).total_seconds()
+            began = None
+    return total if seen else None
+
+
+def sweep_scene_estimate(scenes: list, lengths: dict[str, float]) -> float:
+    """The scenes' seconds inside the sweep: each scene of the data that plays there (not at the load, not on the
+    end's path), its measured length or SCENE_S, an entered one with its step; at least what earlier runs of the
+    level were held by scenes in their sweep (SWEEP_SCENES_KEY)."""
+    data = sum(float(lengths.get(sc.name, SCENE_S)) + (SCENE_STEP_S if sc.entered else 0.0)
+               for sc in scenes if sc.kind not in ("load", "end"))
+    measured = lengths.get(SWEEP_SCENES_KEY)
+    steps = sum(SCENE_STEP_S for sc in scenes if sc.entered)
+    return max(data, float(measured) + steps) if measured is not None else data
 
 
 @dataclass
@@ -1260,14 +1306,12 @@ def scenes_of(content: Content, end=None) -> list[SceneStart]:
 def scene_seconds(content: Content, end, lengths: dict[str, float]) -> float:
     """What the scenes add to a pass before its stops exist: the load's scenes, and each trigger-started
     scene the sweep can enter (its length and its step)."""
-    total = 0.0
-    for sc in scenes_of(content, end):
-        length = float(lengths.get(sc.name, SCENE_LOAD_S if sc.kind == "load" else SCENE_S))
-        if sc.kind == "load":
-            total += length
-        elif sc.kind == "trigger" and sc.starter is not None and sc.starter.ref and reachable(sc.starter, []):
-            total += length + SCENE_STEP_S
-    return total
+    scenes = scenes_of(content, end)
+    total = sum(float(lengths.get(sc.name, SCENE_LOAD_S)) for sc in scenes if sc.kind == "load")
+    for sc in scenes:
+        sc.entered = sc.kind == "trigger" and sc.starter is not None and bool(sc.starter.ref) and \
+            reachable(sc.starter, [])
+    return total + sweep_scene_estimate(scenes, lengths)
 
 
 def plan_scenes(content: Content, end, stops: list[Stop], exit_stop: Stop | None,
@@ -1295,7 +1339,7 @@ def plan_scenes(content: Content, end, stops: list[Stop], exit_stop: Stop | None
         host.actions = [a for a in host.actions if a.obj is not st]
         scene_at.setdefault(host.label, []).append(sc)
         sc.entered = True
-        sweep_s += sc.length + SCENE_STEP_S
+    sweep_s = sweep_scene_estimate(scene_list, lengths)
     return scene_list, scene_at, sweep_s, load_s
 
 
@@ -1327,9 +1371,44 @@ def scene_hold_cap(plan: Plan) -> int:
     return max(HOLD_CAP_S, int(max(sc.length for sc in plan.scene_list)) + SCENE_WAIT_MARGIN_S)
 
 
+def stop_seconds(plan: Plan, s: Stop) -> float:
+    """A stop's planned seconds: its visit, its actions, its audit and its scenes."""
+    t = VISIT_S + sum(ACTION_EXPECT[a.action] + ACTION_MOVE_S for a in s.actions) + (AUDIT_S if s.actions else 0.0)
+    return t + sum(sc.length + SCENE_STEP_S for sc in plan.scene_at.get(s.label, []))
+
+
+def sweep_rearm(plan: Plan) -> list[float]:
+    """For each sweep stop (in the script's order, the exit's stop counted as 0), the deadline set before it:
+    the sweep's share times the planned share of it and the stops after it (at least SWEEP_MIN_S / 4)."""
+    share = sweep_share(plan, BUDGET_S + plan.scene_extra_s)
+    secs = [0.0 if s is plan.exit_stop else stop_seconds(plan, s) for s in plan.stops]
+    total = sum(secs) or 1.0
+    out, left = [], total
+    for v in secs:
+        out.append(max(SWEEP_MIN_S / 4, share * left / total))
+        left -= v
+    return out
+
+
+D_NEAR = 1500            # D counts as there within this of the scene's starter or the end's anchor (the fight's reach)
+D_STANDOFF = 400         # where each stands beside a starter before it is entered
+D_COME_WAIT_S = 240      # D's wait for H at the next starter or the end (H may be slower than its plan)
+H_WAIT_D_S = 60          # H's wait for D before it enters a starter or fights the end
+
+
+def d_brought(plan: Plan) -> bool:
+    """D comes to H before each scene starter and the end fight: D is in the level with H (the lobby boot) and
+    stays to its end, but does not follow H (no online_auto_follow in this build, or --d-stays)."""
+    return plan.d_lobby and plan.late_join and not plan.d_follow and d_through_end(plan)
+
+
 def scene_lines(plan: Plan, s: Stop) -> list[str]:
     out = []
     for k, sc in enumerate(plan.scene_at.get(s.label, []), 1):
+        if d_brought(plan):
+            # D comes first (its script waits for H here): both stand by the starter when the scene starts.
+            out += [f"goto_entity {sc.starter.ref} {D_STANDOFF}",
+                    f"online_wait_peer_near_entity {sc.starter.ref} {D_NEAR} {H_WAIT_D_S}"]
         out += [f"log LEVELPASS scene {_safe(sc.name)} enter {sc.starter.ref}", f"enter_trigger {sc.starter.ref}",
                 f"wait_free {int(sc.length) + SCENE_WAIT_MARGIN_S}", f"online_audit {s.label}_scene{k}"]
     return out
@@ -1534,6 +1613,7 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
               "log LEVELPASS phase sweep", *([scenes_expected_line(plan)] if plan.scenes else []),
               "online_audit start", f"hold_cap {scene_hold_cap(plan)}",
               f"sweep_deadline {sweep_share(plan, BUDGET_S + plan.scene_extra_s):.0f}"]
+    rearm = sweep_rearm(plan) if plan.scenes else []
     lines += pieces_lines(plan)  # first in the sweep: the deadline never skips them
     n_stops = len(plan.stops)
     marked = False
@@ -1544,6 +1624,10 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
             marked = True
         if s is plan.exit_stop:
             continue
+        if plan.scenes:
+            # Scenes played: the deadline moves by what the scenes took. After the wait for no scene open here,
+            # the deadline is set again to this stop's planned share of the sweep and the stops after it.
+            lines += ["wait_free 120", f"sweep_deadline {rearm[i]:.0f}"]
         lines += stop_lines(s)
         lines += scene_lines(plan, s)
         if plan.provoke and i == 0:
@@ -1758,6 +1842,8 @@ def end_lines(plan: Plan) -> list[str]:
     area = fight_area(end, objs)
     anchor = _ref(objs, end.anchor)
     out += [f"goto_entity {anchor}", "wait_free 60"]
+    if d_brought(plan):
+        out.append(f"online_wait_peer_near_entity {anchor} {D_NEAR} {H_WAIT_D_S}")  # D comes to the end fight
     for k in end.starters:
         ref = _ref(objs, k)
         if not ref:
@@ -1952,6 +2038,28 @@ def stop_lines(s: Stop) -> list[str]:
 D_LEVEL_END_WAIT_S = 600   # D's wait for the level end: the whole case (its stop is at CASE_TIMEOUT_S)
 
 
+def d_come_lines(plan: Plan) -> list[str]:
+    """D, not following H: at each scene starter of the sweep, in order, it waits for H there and comes beside it;
+    then to the end fight's anchor. A wait that times out (H skipped the step) goes on to the next."""
+    out = []
+    for s in plan.stops:
+        for sc in plan.scene_at.get(s.label, []):
+            ref = sc.starter.ref
+            out += [f"log LEVELPASS D comes to scene {_safe(sc.name)}",
+                    f"online_wait_peer_near_entity {ref} {D_NEAR} {D_COME_WAIT_S}", f"goto_entity {ref} {D_STANDOFF}"]
+    end = plan.end
+    if end is not None and end.kind == le.FIGHT and not plan.end_missing and not plan.no_end:
+        anchor = _ref(plan.end_objs, end.anchor)
+        if anchor:
+            out += ["log LEVELPASS D comes to the end fight",
+                    f"online_wait_peer_near_entity {anchor} {D_NEAR} {D_LEVEL_END_WAIT_S}",
+                    f"goto_entity {anchor} {EXIT_FIGHT_STANDOFF}"]
+    return out
+
+
+EXIT_FIGHT_STANDOFF = 600   # D beside the end fight's anchor: within the fight, out of its first press
+
+
 def script_d(plan: Plan) -> str:
     """D's script (the late joiner): boot, its own hub, join the session ({join}), the visit and audit
     of up to D_VISITS stops H acted on (spread over the level), then it ends its session (H waits for
@@ -1969,6 +2077,8 @@ def script_d(plan: Plan) -> str:
             # From here D's hero follows H's (the game's Auto follow: a move whenever it is farther than 400 and
             # free on the ground); D's script presses nothing more, it only waits for the level's end.
             lines += ["online_auto_follow on", "log LEVELPASS D follows H"]
+        if d_brought(plan):
+            lines += d_come_lines(plan)
         if d_through_end(plan):
             lines += ["log LEVELPASS D stays for the level end", f"waitfor {NEXT_LEVEL} {D_LEVEL_END_WAIT_S}",
                       "wait_free 120", "log LEVELPASS D next level", "online_audit d-next"]

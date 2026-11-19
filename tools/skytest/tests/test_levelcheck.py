@@ -466,6 +466,20 @@ class Pieces(unittest.TestCase):
                                             "within 1 s; places 210 pair(s), 0 over 64 (median 1.6"), v.counts)
 
 
+
+B10_TB = CALIBRATION_RUNS / "20261119-050629-levelpass-tutorial_b"
+
+
+@unittest.skipUnless(B10_TB.is_dir() and (GAME_REPO / "tools" / "scene_sync_check.py").is_file(),
+                     "batch 10's run folder or the game repository's scene checker is not here")
+class ScenesWhereCalibration(unittest.TestCase):
+    def test_the_missing_scenes_say_d_was_not_there(self) -> None:
+        v = lc.grade_scenes(lc.load_run(B10_TB), GAME_REPO)
+        self.assertIn("missing on one client: 0 with both players there (game), 3 with the other player farther than "
+                      "1500 (test)", v.counts)
+        self.assertTrue(all(x.what.startswith("D was not there (test): 4287") for x in v.findings), v.findings)
+        self.assertTrue(v.findings[0].lines[-1].startswith("H/data/Online/session/game.log:"))
+
 FIGHT = "-535,-2875,303"
 PLACED = [(30, f"Online: enemy placed {K1} as GreebleMelee#3531 hp 96 pose 26 (S)")]
 SEEN = [(31, f"Online: enemy spawn {K1} as GreebleMelee#b848ac60 (bind placed)")]

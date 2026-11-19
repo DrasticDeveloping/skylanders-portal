@@ -1161,14 +1161,39 @@ def grade_scenes(run: Run, repo: Path | None, start_tol: float = 1.0, end_tol: f
         both.append(r)
     out, ok = tool.judge(both, start_tol, end_tol, None)
     findings = []
+    poses = peer_poses(run.server) if run.server is not None else {}
+    peers = {w: p for p, w in peer_numbers(run).items()}
+    away = there = 0
     for r, text in zip(both, out):
         if text.startswith("FAIL"):
             g, name, n = r.key
-            findings.append(Finding(text[5:], [scene_line(h, name, r.h.start if r.h else None),
-                                               scene_line(d, name, r.d.start if r.d else None)]))
+            lines = [scene_line(h, name, r.h.start if r.h else None), scene_line(d, name, r.d.start if r.d else None)]
+            what = text[5:]
+            if (r.h is None) != (r.d is None):
+                # Missing on one client: how far it stood from the other when the scene started there decides
+                # whose the finding is (the test's placement or the game's sharing).
+                missing = "D" if r.d is None else "H"
+                start = (r.h or r.d).start
+                where = players_apart(poses, peers, start)
+                if where is None:
+                    what += f"; where {missing} stood is not known (no pose of both on S within {POSE_AT_S.seconds} s)"
+                else:
+                    dist_, la, lb = where
+                    if dist_ > SCENE_THERE:
+                        away += 1
+                        what = (f"{missing} was not there (test): {dist_:.0f} from the other player when the scene "
+                                f"started ({name}); {what}")
+                    else:
+                        there += 1
+                        what = (f"{missing} was there and did not get the scene (game): {dist_:.0f} from the other "
+                                f"player when it started ({name}); {what}")
+                    lines += [la.cite(), lb.cite()]
+            findings.append(Finding(what, lines))
     counts = (f"{len(both) - len(findings)} of {len(both)} scene(s) both clients were in played together "
               f"(start within {start_tol} s, end within {end_tol} s); {len(rows) - len(both)} outside the time both "
-              "were in the level")
+              "were in the level"
+              + (f"; missing on one client: {there} with both players there (game), {away} with the other player "
+                 f"farther than {SCENE_THERE:.0f} (test)" if there or away else ""))
     notes = expected_scene_notes(h, rows)
     skipped = [p for p in run.result.get("peers", []) if isinstance(p, dict) and SKIP_SCENES.search(str(p.get("command", "")))]
     example = scene_line(h, both[0].key[1], (both[0].h or both[0].d).start) if both else ""
@@ -1178,6 +1203,26 @@ def grade_scenes(run: Run, repo: Path | None, start_tol: float = 1.0, end_tol: f
     if not both:
         return Verdict("cutscenes", NOT_TESTED, counts, notes=notes)
     return Verdict("cutscenes", FAIL if findings else PASS, counts, example, findings, notes)
+
+
+# A scene played on one client only: the other stood within SCENE_THERE of it on S's poses when the scene started
+# (it was there: the game's sharing), or farther (it was not there: the test's placement; batch 10's tutorial_b,
+# D at the level start 35 km from the end arena, failed every scene that only starts where a player stands).
+SCENE_THERE = 1500.0
+POSE_AT_S = timedelta(seconds=3)
+
+
+def players_apart(poses: dict, peers: dict, at) -> tuple[float, Line, Line] | None:
+    """H's and D's distance on S's poses nearest `at` (each within POSE_AT_S), with the two pose lines."""
+    if at is None:
+        return None
+    near = []
+    for who in ("H", "D"):
+        ps = [p for p in poses.get(peers.get(who, -1), []) if abs(p[0] - at) <= POSE_AT_S]
+        if not ps:
+            return None
+        near.append(min(ps, key=lambda p: abs(p[0] - at)))
+    return math.dist(near[0][1], near[1][1]), near[0][2], near[1][2]
 
 
 EXPECTED_SCENES = re.compile(r"Input script: LEVELPASS scenes expected: (.*)$")
