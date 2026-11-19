@@ -331,11 +331,28 @@ class Pause(unittest.TestCase):
     PICKUP_HELD = P + "Dev: pickup (null)#3594 held too long (paused, controls locked, frames stopped, at -799.75,118.96,3890.20 kill z -8000)"
     NEXT = P + "Dev: goto_entity auth:ww1:4666 no player frame took a read for 3 s (paused, controls locked): waiting"
 
-    def test_a_pickup_presses_the_found_screen_away_and_waits_for_the_hero(self):
-        o = lp.Obj("Gem", "CPhysicalEntity", (1.0, 2.0, 3.0), lp.GROUP_PICKUPS, ref="auth:ww1:12086")
-        lines = lp.action_lines(lp.Action(lp.PICKUP, o, "x"), "v19_1")
-        self.assertEqual(lines[-3:], [f"pickup auth:ww1:12086 {lp.ACTION_TIMEOUT[lp.PICKUP]}", "tap a", "wait_free 15"])
-        self.assertNotIn("tap a", lp.action_lines(lp.Action(lp.ATTACK, o, "x"), "v1_1"))
+    def test_b_follows_every_step_that_lands_on_or_picks_up_a_collectible(self):
+        """soulgem-found-screen 20261118-212923: B closes the found screen, A does not; landing on the gem
+        (the visit's goto_entity) already collects it."""
+        gem = lp.Obj("Gem", "CPhysicalEntity", (1.0, 2.0, 3.0), lp.GROUP_PICKUPS, ref="auth:ww1:12086",
+                     components=["Scripts.CollectibleComponentData"])
+        lines = lp.action_lines(lp.Action(lp.PICKUP, gem, "x"), "v19_1")
+        self.assertEqual(lines[1:], ["goto_entity auth:ww1:12086", "tap b", "wait_free 15",
+                                     f"pickup auth:ww1:12086 {lp.ACTION_TIMEOUT[lp.PICKUP]}", "tap b", "wait_free 15"])
+        # The visit's teleport to it: B before anything else runs (the pickup's pause line would end the pass).
+        stop = lp.Stop(label="v19", cluster=lp.Cluster(0, gem.pos, [gem]), actions=[lp.Action(lp.PICKUP, gem, "x")],
+                       visit_only=[])
+        s = lp.stop_lines(stop)
+        self.assertEqual(s[1:4], ["goto_entity auth:ww1:12086", "tap b", "wait_free 15"])
+        self.assertLess(s.index("tap b"), next(i for i, l in enumerate(s) if l.startswith("pickup ")))
+        # Keyed on the component (or the probe's collectible class), never the name; no A, back or start.
+        box = lp.Obj("Gem_Box", "CPhysicalEntity", (1.0, 2.0, 3.0), lp.GROUP_INTERACT, ref="auth:ww1:5",
+                     components=["Scripts.DestructibleComponentData"])
+        self.assertEqual(lp.dismiss_after(box), [])
+        self.assertEqual(lp.dismiss_after(lp.Obj("x", "CCollectible", (0.0, 0.0, 0.0), lp.GROUP_PICKUPS)), ["tap b", "wait_free 15"])
+        text = "\n".join(s + lines)
+        for press in ("tap a", "tap back", "tap start"):
+            self.assertNotIn(press, text)
 
     def test_the_next_step_finding_the_game_paused_ends_the_pass(self):
         rx = re.compile(lp.PAUSE_FATAL)
