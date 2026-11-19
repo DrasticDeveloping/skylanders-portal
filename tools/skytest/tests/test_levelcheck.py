@@ -220,18 +220,55 @@ class RequiredSteps(unittest.TestCase):
                                            lh.Gate("Finale_DemonGate", "enc8", lh.BATTLE_GATE, True, "win its fight"),
                                            lh.Gate("ElementalGate", "ez1", "an elemental gate", False, "")])
 
-    def test_a_gate_no_line_shows_opened_is_not_performed(self) -> None:
+    PASSED = {"levelpass": {"verdict": "PASS", "not_covered": []}}
+
+    def test_not_performed_names_the_first_step_and_a_battle_gate_opened_everywhere(self) -> None:
+        h = [(60, "Input script: LEVELPASS required r1 Spark_Lock Intro_LockpickGate not performed: needs a lock opened: "
+                  "this build has no lock_solve / lock_ready (online/6-spark-lock is not in it)"),
+             (70, "Input script: LEVELPASS required r2 battle_gate Finale_DemonGate (win its fight: Wave1)"),
+             (91, "Online: world gate Finale_DemonGate#2365 open apply: 1 lock(s) set UnLocked first (x)")]
+        d = [(92, "Online: world gate Finale_DemonGate#2370 open apply: 1 lock(s) set UnLocked first (x)")]
         run = RunFolder([(90, "Online: world gate Finale_DemonGate#2365 tombstoned (removed for good, written)")],
-                        H_JOIN + H_NEXT, D_JOIN + D_NEXT, result={"levelpass": {"verdict": "PASS", "not_covered": []}}).run()
+                        H_JOIN + h + H_NEXT, D_JOIN + d + D_NEXT, result=self.PASSED).run()
         v = lc.grade_completable(run, self.data())
         self.assertEqual(v.status, lc.BY_TELEPORT)
-        self.assertTrue(v.counts.startswith("completable by teleport; required steps not performed: 1; level pass PASS"))
-        self.assertIn("required, not performed: Intro_LockpickGate (Spark Lock: solve its lock puzzle; no line of S, H or "
-                      "D shows it opened)", v.notes)
-        self.assertTrue(any(n.startswith("required, performed: Finale_DemonGate (battle gate): H/data/Online/session/"
-                                         "game.log:1:") for n in v.notes), v.notes)
+        self.assertTrue(v.counts.startswith("completable by teleport; first step not done: Intro_LockpickGate (Spark Lock): "
+                                            "not performed: needs a lock opened"), v.counts)
+        self.assertIn("required steps not done: 1 of 2", v.counts)
+        self.assertTrue(any(n.startswith("required, done: Finale_DemonGate (battle gate): opened on S, H, D: S ")
+                            for n in v.notes), v.notes)
         self.assertEqual(lc.overall([v, lc.Verdict("lobby", lc.PASS, "")]), "BY TELEPORT: completable")
         self.assertEqual(lc.overall([v, lc.Verdict("loot", lc.NOT_TESTED, "")]), "NOT ALL TESTED: loot; BY TELEPORT: completable")
+
+    def test_by_play_when_every_gate_opened_on_all_three(self) -> None:
+        import levelpass_holds as lh
+        data = lc.LevelData("madeup", {}, [lh.Gate("Finale_DemonGate", "enc8", lh.BATTLE_GATE, True, "win its fight")])
+        h = [(70, "Input script: LEVELPASS required r1 battle_gate Finale_DemonGate (win its fight: Wave1)"),
+             (91, "Dev: wait_moved Finale_DemonGate#2365 done (gone after moving 300 from 1,2,3)")]
+        d = [(92, "Online: world gate Finale_DemonGate#2370 open apply: 1 lock(s) set UnLocked first (x)")]
+        run = RunFolder([(90, "Online: availability Finale_DemonGate#2365 removed (script) bd35d565.1.6496")],
+                        H_JOIN + h + H_NEXT, D_JOIN + d + D_NEXT, result=self.PASSED).run()
+        v = lc.grade_completable(run, data)
+        self.assertEqual(v.status, lc.PASS, v.counts)
+        self.assertTrue(v.counts.startswith("completable by play: 1 required step(s) performed, every gate opened on S, H, D"))
+
+    def test_a_carried_key_says_where_it_broke(self) -> None:
+        import levelpass_holds as lh
+        data = lc.LevelData("madeup", {}, [lh.Gate("TutorialLockedGate", "a2", lh.KEY_GATE, True, "fetch its key K",
+                                                   key_data="LockedDoorKey_Intro")])
+        h = [(60, "Input script: LEVELPASS required r1 key_gate TutorialLockedGate (fetch its key LockedDoorKey_Intro)"),
+             (70, "Dev: pickup TutorialLockedGate_key#2609 done (carried by the hero (Hero#1 12 from it))"),
+             (80, "Dev: interact TutorialLockedGate_keylock#2608 done (fired by a tap of rt; state 5 (interacted), player 0)"),
+             (85, "Dev: wait_moved TutorialLockedGate#2607 done (settled at 1,2,3, 120 from 1,2,3 (most 120), z +0)")]
+        s = [(20, "Online: world unsupported carried_item TutorialLockedGate_key#2609 (spawned without a stable key)")]
+        run = RunFolder(s, H_JOIN + h + H_NEXT, D_JOIN + D_NEXT, result=self.PASSED).run()
+        v = lc.grade_completable(run, data)
+        self.assertEqual(v.status, lc.BY_TELEPORT)
+        first = v.counts.split("first step not done: ")[1]
+        self.assertTrue(first.startswith("TutorialLockedGate (key gate): performed ("), first)
+        self.assertIn("opened on H, not on S, D; picked up on H: H/game.log:", first)
+        self.assertIn("; no carried key row on S: H/data/Online/session/game.log:1:", first)
+        self.assertIn("; pressed at the lock on H: H/game.log:", first)
 
     def test_no_level_data_is_said(self) -> None:
         run = RunFolder([], H_JOIN + H_NEXT, D_JOIN + D_NEXT, result={"levelpass": {"verdict": "PASS", "not_covered": []}}).run()

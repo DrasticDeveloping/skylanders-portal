@@ -1015,6 +1015,43 @@ class ScenesCalibration(unittest.TestCase):
         text = (BATCH10_TB / "H" / "game.log").read_text(encoding="utf-8", errors="replace")
         self.assertAlmostEqual(lp.sweep_scene_seconds_from_log(text), 56.54, places=2)
 
+
+LEVELPASS_DATA = Path.home() / "Documents" / "T3Code" / "SwapForceOnline-work" / "levelpass"
+
+
+@unittest.skipUnless((LEVELPASS_DATA / "ww1" / "manifest.json").is_file(), "the levelpass folder's data is not here")
+class RequiredStepsPlan(unittest.TestCase):
+    """The gates a player opens on the way, opened the way a player does (plan_required)."""
+
+    def plan(self, level: str, **kw):
+        return lp.make_plan(lp.load_content(LEVELPASS_DATA, level), d_lobby=True, **kw)
+
+    def test_tutorial_b_carries_both_keys(self) -> None:
+        p = self.plan("tutorial_b")
+        self.assertEqual([(r.kind, r.why_not) for r in p.required], [("key gate", ""), ("key gate", "")])
+        h = lp.script_h(p, None).splitlines()
+        k = h.index("log LEVELPASS phase required")
+        self.assertLess(h.index("sweep_deadline 0"), k)
+        self.assertIn("pickup nearest:TutorialLockedGate_key:8000 40", h[k:])
+        self.assertIn("interact nearest:TutorialLockedGate_keylock:1500 30", h[k:])
+        self.assertEqual(lp.position_literals("\n".join(h)), [])
+        d = lp.script_d(p)
+        self.assertIn(f"online_wait_peer_near_entity {p.required[0].gate_ref} {lp.D_NEAR} {lp.D_COME_WAIT_S}", d)
+
+    def test_ww1_fights_its_battle_gates_and_waits_for_the_lock_commands(self) -> None:
+        p = self.plan("ww1")
+        kinds = [(r.kind, bool(r.why_not)) for r in p.required]
+        self.assertEqual(kinds, [("Spark Lock", True), ("battle gate", False), ("Spark Lock", True), ("battle gate", False),
+                                 ("Spark Lock", True), ("battle gate", False)])
+        saw = next(r for r in p.required if r.gate.name == "PuzzleGateSawtooth001")
+        self.assertTrue(saw.h[1].startswith("enter_trigger "))  # the caged Greebles' release first
+        self.assertTrue(saw.h[2].startswith("fight_near ") and saw.h[2].endswith(f" 1500 {lp.GATE_FIGHT_S}"))
+        ec = next(r for r in p.required if r.gate.name == "EC001_DemonGate")
+        self.assertTrue(ec.h[1].startswith("encounter_clear ") and ec.h[1].endswith(" exact"))
+        spark = self.plan("ww1", lock_commands=True).required[0]
+        self.assertEqual(spark.h[2:5], [f"interact {spark.gate_ref} 20", "waitfor lock_ready 30", "lock_solve 120"])
+        self.assertEqual(spark.d, [f"interact {spark.gate_ref} 20", "waitfor lock_ready 30", "lock_solve 120"])
+
 class HeldFights(unittest.TestCase):
     """A fight is planned only when its held enemies' release is on the route before it (levelpass_holds)."""
 

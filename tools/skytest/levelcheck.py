@@ -1495,20 +1495,120 @@ def gate_opened(run: Run, name: str) -> Line | None:
     return None
 
 
+# The pass's required phase (levelpass.plan_required): H's `LEVELPASS required r<k> <kind> <gate> (...)` before
+# the step, or `... not performed: <why>`. Each gate's opening is read on each game apart: a client's `world gate
+# <Name#id> open apply` (S's open applied there) or `backend key gate <Name#id> ... unlocked`, S's `world gate
+# <Name#id> tombstoned` or `availability <Name#id> removed`, and on H the step's own `wait_moved <Name#id> done`.
+# Gates of the same name (tutorial_b's two TutorialLockedGate) are told apart by their order along the level and
+# the distinct ids each game opened.
+REQ_LINE = re.compile(r"Input script: LEVELPASS required (r\d+) (\S+) (\S+)(?: not performed: (.*))?")
+
+
+def gate_open_ids(log: Log, name: str, mover: bool = False) -> list[Line]:
+    """One line per distinct `<name>#<id>` this game shows opened, in order."""
+    n = re.escape(name)
+    rx = re.compile(r"(?:Online: (?:world gate (" + n + r"#\d+) (?:open apply|tombstoned)|availability (" + n +
+                    r"#\d+) removed|backend key gate (" + n + r"#\d+)\S* unlocked)" +
+                    (r"|Dev: wait_moved (" + n + r"#\d+) done \()" if mover else ")"))
+    seen: dict[str, Line] = {}
+    for line, m in log.find(rx):
+        ident = next(g for g in m.groups() if g)
+        seen.setdefault(ident, line)
+    return list(seen.values())
+
+
+def gate_opened(run: Run, name: str) -> Line | None:
+    """A line of any game that shows the gate opened (the first)."""
+    for log in ([run.server] if run.server else []) + list(run.clients.values()):
+        ids = gate_open_ids(log, name, mover=log.who == "H")
+        if ids:
+            return ids[0]
+    return None
+
+
+def key_gate_trail(run: Run, name: str, k: int) -> list[str]:
+    """Where a carried key's way broke, in order: picked up on H, its row on S, pressed at the lock."""
+    h = run.clients.get("H")
+    out = []
+    picked = h.find(re.compile(r"Dev: pickup " + re.escape(name) + r"_key#\S+ (done|failed)")) if h else []
+    if len(picked) <= k or picked[k][1].group(1) != "done":
+        out.append("not picked up on H: " + (picked[k][0].cite() if len(picked) > k else
+                                              absent(h, f"`pickup {name}_key ... done`") if h else "no H log"))
+        return out
+    out.append(f"picked up on H: {picked[k][0].cite()}")
+    if run.server is not None:
+        row = run.server.find(re.compile(r"Online: world (?:unsupported carried_item|tracked carried_item) "
+                                         + re.escape(name) + r"_key#\S+ .*"))
+        if row and "unsupported" in row[0][0].text:
+            out.append(f"no carried key row on S: {row[0][0].cite()}")
+    pressed = h.find(re.compile(r"Dev: interact " + re.escape(name) + r"_keylock#\S+ (done|failed)"))
+    if len(pressed) <= k or pressed[k][1].group(1) != "done":
+        out.append("not pressed at the lock on H: " + (pressed[k][0].cite() if len(pressed) > k else
+                                                         absent(h, f"`interact {name}_keylock ... done`")))
+    else:
+        out.append(f"pressed at the lock on H: {pressed[k][0].cite()}")
+    return out
+
+
+def battle_gate_left(run: Run, data: "LevelData", gate) -> str:
+    """For a battle gate S did not open: its fight's enemies still alive on S (by name: the openers and the
+    encounters' actors) and whether H had them bound."""
+    if run.server is None:
+        return "no S log"
+    names = [k.split(".")[-1] for k in gate.openers]
+    keys = server_enemies(run.server)
+    seen = client_enemies(run.clients["H"]) if "H" in run.clients else {}
+    alive = []
+    for key, k in keys.items():
+        base = k.name.split("#")[0]
+        if any(base == n or base.startswith(n + "_actor_") for n in names) and k.dead is None:
+            c = seen.get(key)
+            alive.append(f"{k.name} ({'bound on H' if c is not None and c.bound else 'not bound on H'})")
+    return ("still alive on S: " + ", ".join(alive[:8])) if alive else \
+        f"none of its fight's enemies ({', '.join(names[:4])}) alive on S: it never started, or its count is elsewhere"
+
+
 def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[str]]:
-    """The gates a player must open on the level's way (levelpass_holds.required_gates): the ones no line shows
-    opened, and the ones a line does, each in words."""
+    """Each required gate (levelpass_holds.required_gates), in the pass's order: the ones not done (not performed,
+    or not opened on S, H and D, with where it broke) and the ones done, in words; the first of the first list is
+    the step the completable row names."""
     if data is None:
         return [], []
+    h = run.clients.get("H")
+    reqs = h.find(REQ_LINE) if h is not None else []
+    games = [("S", run.server)] + sorted(run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    games = [(w, lg) for w, lg in games if lg is not None]
+    opened = {}
     shut, done = [], []
-    for g in data.gates:
-        if not g.required:
+    nth: dict[str, int] = {}
+    for g in [g for g in data.gates if g.required]:
+        k = nth.get(g.name, 0)
+        nth[g.name] = k + 1
+        mine = [(line, m) for line, m in reqs if m.group(3) == g.name]
+        req = mine[k] if len(mine) > k else None
+        if req is None:
+            shut.append(f"{g.name} ({g.kind}: {g.opener}): not performed by this pass (no `LEVELPASS required ... "
+                        f"{g.name}` on H)")
             continue
-        line = gate_opened(run, g.name)
-        if line is None:
-            shut.append(f"{g.name} ({g.kind}: {g.opener}; no line of S, H or D shows it opened)")
+        if req[1].group(4):
+            shut.append(f"{g.name} ({g.kind}): not performed: {req[1].group(4)} ({req[0].cite()})")
+            continue
+        where = {}
+        for who, lg in games:
+            ids = opened.setdefault((who, g.name), gate_open_ids(lg, g.name, mover=who == "H"))
+            where[who] = ids[k] if len(ids) > k else None
+        missing = [w for w, line in where.items() if line is None]
+        trail = key_gate_trail(run, g.name, k) if g.kind == "key gate" else []
+        if g.kind == "battle gate" and where.get("S") is None:
+            trail.append(battle_gate_left(run, data, g))
+        if missing:
+            opened_on = [w for w in where if where[w] is not None]
+            shut.append(f"{g.name} ({g.kind}): performed ({req[0].cite()}); opened on "
+                        f"{', '.join(opened_on) or 'no game'}, not on {', '.join(missing)}"
+                        + ("; " + "; ".join(trail) if trail else ""))
         else:
-            done.append(f"{g.name} ({g.kind}): {line.cite()}")
+            done.append(f"{g.name} ({g.kind}): opened on {', '.join(where)}: "
+                        + "; ".join(f"{w} {line.cite()}" for w, line in where.items()))
     return shut, done
 
 
@@ -1533,7 +1633,7 @@ def grade_completable(run: Run, data: LevelData | None = None) -> Verdict:
     shut, done = required_steps(run, data)
     if data is None:
         counts += "; required steps on the way not checked (no level data for this run)"
-    notes += [f"required, not performed: {s}" for s in shut] + [f"required, performed: {s}" for s in done]
+    notes += [f"required, not done: {s}" for s in shut] + [f"required, done: {s}" for s in done]
     if verdict == "FAIL":
         return Verdict("completable", FAIL, counts, example, notes=notes)
     if verdict == "INCOMPLETE":
@@ -1543,8 +1643,13 @@ def grade_completable(run: Run, data: LevelData | None = None) -> Verdict:
                        notes=notes)
     if verdict == "PASS" and all(reached.values()):
         if shut:
-            return Verdict("completable", BY_TELEPORT, f"completable by teleport; required steps not performed: "
-                           f"{len(shut)}; {counts}", example, notes=notes)
+            return Verdict("completable", BY_TELEPORT, f"completable by teleport; first step not done: {shut[0]}; "
+                           f"required steps not done: {len(shut)} of {len(shut) + len(done)}; {counts}", example,
+                           notes=notes)
+        if data is not None and done:
+            return Verdict("completable", PASS, f"completable by play: {len(done)} required step(s) performed, every "
+                           f"gate opened on {', '.join(['S'] + sorted(run.clients, key=lambda w: (w != 'H', w)))}; "
+                           f"{counts}", example, notes=notes)
         return Verdict("completable", PASS, counts, example, notes=notes)
     missing = [w for w, line in reached.items() if line is None]
     return Verdict("completable", FAIL, counts, example, [Finding(f"{', '.join(missing)} logged no next-level mark", [

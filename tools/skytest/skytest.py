@@ -9454,6 +9454,19 @@ def add_live_parser(sub) -> None:
 LEVELPASS_DEFAULT = "~/Documents/T3Code/SwapForceOnline-work/levelpass"
 
 
+def lock_commands_known(cfg: Config) -> bool:
+    """The game registers the Spark Lock's test commands (lock_solve, lock_move) and its condition lock_ready
+    (the checkout's tests/script_commands.toml, which the launch builder checks every script against)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        table = la.CommandTable.load(path)
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+    return {"lock_solve", "lock_move"} <= set(table.registered) and table.conditions is not None and \
+        "lock_ready" in table.conditions
+
+
 def auto_follow_known(cfg: Config) -> bool:
     """The game registers `online_auto_follow` (the checkout's tests/script_commands.toml: the launch builder
     refuses a script with a command the table does not have)."""
@@ -9518,7 +9531,7 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                         d_lobby=not getattr(a, "d_joins_late", False), new_slot=getattr(a, "new_slot", False),
                         scenes=getattr(a, "scenes", "skip") == "play",
                         scene_lengths=measured_scene_lengths(cfg, a.level) if getattr(a, "scenes", "skip") == "play"
-                        else None)
+                        else None, lock_commands=lock_commands_known(cfg))
     plan.probe = not a.no_probe
     plan.server_hidden = bool(getattr(a, "server_hidden", False))
     # D follows H by default once the game registers online_auto_follow (the checkout's command table, which
@@ -9570,6 +9583,9 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
           flush=True)
     for h in plan.held:  # the fights the level's script holds (levelpass_holds), in words
         print(f"levelpass {a.level}: held: {h}", flush=True)
+    for r in plan.required:  # the gates a player opens on the way, performed or why not
+        what = r.why_not and f"not performed: {r.why_not}" or "; ".join(r.h[1:-1])
+        print(f"levelpass {a.level}: required {r.label} {r.kind} {r.gate.name}: {what}", flush=True)
     gates = lp.gates_words(content)
     if gates and not a.predictions:
         print(f"levelpass {a.level}: gates on the way a teleporting pass does not open ({len(gates)}): "
