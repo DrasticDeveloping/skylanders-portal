@@ -926,6 +926,7 @@ void Stage4() {
     CHECK(RoundTrip(PlayerActionShown{3, 2, 7, 41, 0x80000002u, 900}));
     PlayerPoseShown s;
     s.peer = 4;
+    s.peer_epoch = 0x0A0B0C0Du;  // moves final F5: every relayed pose names its player's epoch
     s.pose.pose_sequence = 12;
     s.pose.generation = 7;
     s.pose.position = {1.5f, -2.0f, 3.0f};

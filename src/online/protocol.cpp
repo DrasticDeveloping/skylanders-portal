@@ -544,6 +544,7 @@ bool Fields(ByteWriter& w, const PlayerActionShown& m) {
 }
 bool Fields(ByteWriter& w, const PlayerPoseShown& m) {
   w.U16(m.peer);
+  w.U32(m.peer_epoch);  // moves final F5
   return Fields(w, m.pose);
 }
 bool Fields(ByteWriter& w, const OccurrenceAccept& m) {
@@ -932,6 +933,7 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
     case MessageType::kPlayerPoseShown: {
       PlayerPoseShown m;
       m.peer = r.U16();
+      m.peer_epoch = r.U32();  // moves final F5
       ok = r.Ok() && ReadPose(r, m.pose);
       result = m;
       break;

@@ -663,9 +663,15 @@ struct PlayerActionShown {
 };
 
 // Stage 4 (docs/online-4.md section 4.3, D6): server to the other clients, fast lane: another
-// player's pose as S accepted it (newest only, no distance filter).
+// player's pose as S accepted it (newest only, no distance filter). Moves final F5: `peer_epoch`, the peer's
+// `player` row epoch S knows when it relays (0: none known), after the peer id, so a receiver binds EVERY relayed
+// pose (with or without a command block) to the player it came from: S reuses peer ids, and a delayed pose must
+// not move the next player's body. Wire: peer u16, peer epoch u32, then the pose. The layout changed in place:
+// within one session every game runs the same build (S refuses another build's Hello: session.cpp, kDigest), so
+// no reader of the old layout meets it.
 struct PlayerPoseShown {
   uint16_t peer = 0;
+  uint32_t peer_epoch = 0;
   PlayerPose pose;
   bool operator==(const PlayerPoseShown&) const = default;
 };
