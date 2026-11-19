@@ -1047,14 +1047,29 @@ class RequiredStepsPlan(unittest.TestCase):
         d = lp.script_d(p)
         self.assertIn(f"online_wait_peer_near_entity {p.required[0].gate_ref} {lp.D_NEAR} {lp.D_COME_WAIT_S}", d)
 
+    def test_the_gates_phase_has_its_own_budget(self) -> None:
+        # W13 (batch 12 case 7, ww1 20261119-124636): the gates took the sweep's time (deadline 60 s, 175 s without).
+        for level in ("tutorial_b", "ww1"):
+            gated, free = self.plan(level), self.plan(level, no_gates=True)
+            self.assertGreater(gated.required_s, 0, level)
+            self.assertEqual(gated.required_s, sum(r.est_s for r in gated.required if not r.why_not))
+            self.assertEqual(lp.plan_budget(gated), lp.BUDGET_S + gated.required_s)
+            self.assertEqual(lp.sweep_share(gated, lp.plan_budget(gated)), lp.sweep_share(free, lp.plan_budget(free)),
+                             level)
+            self.assertEqual(len(gated.stops), len(free.stops), level)
+            self.assertIn(f"timeout = {int(lp.CASE_TIMEOUT_S + gated.required_s)}", lp.spec_toml(gated))
+            words = lp.budget_words(gated)
+            self.assertIn(f"gates phase {gated.required_s:.0f} s of its own", words)
+            self.assertIn(f"total {lp.BUDGET_S + gated.required_s:.0f} s", words)
+
     def test_no_gates_keeps_the_full_sweep_and_says_so(self) -> None:
         gated, free = self.plan("tutorial_b"), self.plan("tutorial_b", no_gates=True)
         self.assertEqual(free.required, [])
-        self.assertGreater(len(free.stops), len(gated.stops))
+        self.assertEqual(len(free.stops), len(gated.stops))  # W13: the gates no longer shrink the sweep
         self.assertLessEqual(free.estimate_s, lp.BUDGET_S)
         self.assertIn(f"log {lp.GATES_SKIPPED}", lp.script_h(free, None).splitlines())
-        self.assertTrue(lp.budget_words(free).startswith("--no-gates: gates not attempted"))
-        self.assertTrue(lp.budget_words(gated).startswith("gates phase: 2 of 2 required gate(s) performed"))
+        self.assertIn("; gates not attempted (--no-gates); total 600 s", lp.budget_words(free))
+        self.assertIn("gates phase 100 s of its own (2 of 2 required gate(s) performed)", lp.budget_words(gated))
 
     def test_ww1_fights_its_battle_gates_and_waits_for_the_lock_commands(self) -> None:
         p = self.plan("ww1")

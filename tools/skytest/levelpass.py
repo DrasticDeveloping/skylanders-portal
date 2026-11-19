@@ -713,6 +713,7 @@ class Plan:
     scene_at: dict = field(default_factory=dict)
     scene_load_s: float = 0.0
     scene_extra_s: float = 0.0      # the scenes' own seconds: added to the budget and the case's timeout
+    required_s: float = 0.0         # the gates phase's own budget (its performed steps' seconds): added the same way
     # The fights the level's script holds (levelpass_holds): what each fight did about them (a release entered
     # before it, or the fight left out: "needs a lock opened", nothing releases them), in words.
     held: list[str] = field(default_factory=list)
@@ -786,6 +787,17 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
     plan = _make_plan(content, full, late_join, budget_s, sample, provoke, no_end=no_end, d_stays=d_stays,
                       scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands,
                       no_gates=no_gates)
+    # The gates phase has its own budget (W13): its performed steps' seconds are added to the budget as the scenes'
+    # are, so the sweep keeps the size it has without gates. Batch 12 case 7 (ww1 20261119-124636) took them out of
+    # the ten minutes: `sweep_deadline 60 s` (175 s without gates), ten sweep steps skipped for time. The owner's
+    # rule (2026-11-19): a level check with gates may take more than ten minutes; the plan prints both budgets.
+    required_s = sum(r.est_s for r in plan.required if not r.why_not)
+    if required_s:
+        budget_s += required_s
+        fresh()
+        plan = _make_plan(content, full, late_join, budget_s, sample, provoke, no_end=no_end, d_stays=d_stays,
+                          scenes=scenes, scene_lengths=scene_lengths, lock_commands=lock_commands,
+                          no_gates=no_gates)
     n = sample
     while not full and plan.estimate_s > budget_s and n > 1:
         n -= 1
@@ -809,7 +821,14 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
     plan.sample = n
     plan.d_lobby, plan.new_slot = d_lobby, new_slot
     plan.scene_extra_s = extra
+    plan.required_s = required_s
     return plan
+
+
+def plan_budget(plan: Plan) -> float:
+    """The pass's whole budget: the owner's ten minutes (the sweep and the end), the scenes' seconds and the gates
+    phase's own (W13)."""
+    return BUDGET_S + plan.scene_extra_s + plan.required_s
 
 
 KIND_CAP_START = 8   # the first per-kind cap tried when one action per family is still over the budget
@@ -1230,15 +1249,19 @@ class ReqStep:
 
 
 def budget_words(plan: Plan) -> str:
-    """Which of the two budgets the plan is in: the gates phase (its steps and seconds, the sweep shrunk for them)
-    or --no-gates (the full sweep, the ten-minute budget)."""
+    """The plan's budgets: the sweep and the end's (the ten minutes, the scenes' seconds added), the gates phase's
+    own (W13: never taken from the sweep) or why there is none, and the total."""
+    sweep = f"sweep and end {BUDGET_S:.0f} s" + (f" + scenes {plan.scene_extra_s:.0f} s" if plan.scene_extra_s else "")
     if plan.no_gates:
-        return f"--no-gates: gates not attempted, the full sweep in the {BUDGET_S / 60:.0f}-minute budget"
-    done = [r for r in plan.required if not r.why_not]
-    if not plan.required:
-        return "no required gate in this level: the full sweep"
-    return (f"gates phase: {len(done)} of {len(plan.required)} required gate(s) performed, "
-            f"{sum(r.est_s for r in done):.0f} s, the sweep shrunk for them (a level with gates takes what it takes)")
+        gates = "gates not attempted (--no-gates)"
+    elif not plan.required:
+        gates = "no required gate in this level"
+    else:
+        done = [r for r in plan.required if not r.why_not]
+        gates = (f"gates phase {plan.required_s:.0f} s of its own ({len(done)} of {len(plan.required)} required "
+                 f"gate(s) performed)")
+    return (f"budgets: {sweep}; {gates}; total {plan_budget(plan):.0f} s ({plan_budget(plan) / 60:.1f} min); the sweep's "
+            f"deadline {sweep_share(plan, plan_budget(plan)):.0f} s")
 
 
 def plan_required(content: Content, holds: dict, forbidden: set[str], lock_commands: bool) -> list[ReqStep]:
@@ -1577,7 +1600,7 @@ def stop_seconds(plan: Plan, s: Stop) -> float:
 def sweep_rearm(plan: Plan) -> list[float]:
     """For each sweep stop (in the script's order, the exit's stop counted as 0), the deadline set before it:
     the sweep's share times the planned share of it and the stops after it (at least SWEEP_MIN_S / 4)."""
-    share = sweep_share(plan, BUDGET_S + plan.scene_extra_s)
+    share = sweep_share(plan, plan_budget(plan))
     secs = [0.0 if s is plan.exit_stop else stop_seconds(plan, s) for s in plan.stops]
     total = sum(secs) or 1.0
     out, left = [], total
@@ -1868,7 +1891,7 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
               "online_mark_level",  # the level under test: its next level is `online_level_after_mark` (NEXT_LEVEL)
               "log LEVELPASS phase sweep", *([scenes_expected_line(plan)] if plan.scenes else []),
               "online_audit start", f"hold_cap {scene_hold_cap(plan)}",
-              f"sweep_deadline {sweep_share(plan, BUDGET_S + plan.scene_extra_s):.0f}"]
+              f"sweep_deadline {sweep_share(plan, plan_budget(plan)):.0f}"]
     rearm = sweep_rearm(plan) if plan.scenes else []
     lines += pieces_lines(plan)  # first in the sweep: the deadline never skips them
     n_stops = len(plan.stops)
@@ -2821,9 +2844,10 @@ def report_text(level: str, plan: Plan, wall_s: float, phases: list[tuple[str, f
                 crash: str, sums: dict[str, list[str]], run_folder: str, notes: list[str],
                 boot: list[tuple[str, float]] | None = None) -> str:
     lines = [f"Level pass: {level}", f"run folder: {run_folder}", f"content: {plan.source}",
-             f"wall clock: {wall_s:.0f} s ({'under' if wall_s <= BUDGET_S + plan.scene_extra_s else 'OVER'} the "
-             f"{BUDGET_S + plan.scene_extra_s:.0f} s budget"
-             + (f", {plan.scene_extra_s:.0f} s of it the scenes'" if plan.scene_extra_s else "") + "); "
+             f"wall clock: {wall_s:.0f} s ({'under' if wall_s <= plan_budget(plan) else 'OVER'} the "
+             f"{plan_budget(plan):.0f} s budget"
+             + (f", {plan.scene_extra_s:.0f} s of it the scenes'" if plan.scene_extra_s else "")
+             + (f", {plan.required_s:.0f} s of it the gates phase's" if plan.required_s else "") + "); "
              f"estimate was {plan.estimate_s:.0f} s",
              f"pass: {'full' if plan.full else 'sampled (each action family at most ' + str(plan.sample) + ' times)'}, "
              f"{len(plan.stops)} stops, {sum(len(s.actions) for s in plan.stops)} actions, "
@@ -3166,7 +3190,7 @@ def spec_toml(plan: Plan) -> str:
            'server = "host"',
            f'description = "The automatic level pass of {plan.level}{" without its end (--no-end)" if plan.no_end else ""}'
            ' (skytest levelpass; generated, not committed)"',
-           f"timeout = {int(CASE_TIMEOUT_S + plan.scene_extra_s)}",
+           f"timeout = {int(CASE_TIMEOUT_S + plan.scene_extra_s + plan.required_s)}",
            *(['scenes = "play"', 'scenes_reason = "the level check grades the cutscenes, played in full on both clients"']
              if plan.scenes else ['scenes = "skip"']),
            f"show_server_window = {'false' if plan.server_hidden else 'true'}",
