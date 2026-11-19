@@ -563,11 +563,21 @@ struct SessionClosed {
 // itself). Each client that plays a matching occurrence of its own (the same kind, name hash and
 // recipient in that generation) answers kAck. S's scene end goes to every client as kEnd.
 // Directions: kOpen, kRelease and kEnd server to client; kAck client to server. Gameplay lane.
+// The shared skip and hold (the game repository's online/6-scene-skip-shared; its docs/online-6.md):
+// kSkip, kHold and kUnhold server to client, each naming an occurrence by its generation, kind, name hash
+// and recipient (the scene sequence is S's when it knows one, else 0). kSkip: every client that plays a
+// matching occurrence skips its own copy through the game's own skip now (one decision of S's per
+// occurrence). kHold: a client still plays the occurrence, so every client holds its player; kUnhold: no
+// client plays it any more (or a peer left, the bound passed, the level changed), the hold is released.
+// Like kOpen and kRelease they carry no end reason and no skips.
 enum class ScenePhase : uint8_t {
   kOpen = 1,
   kAck = 2,
   kRelease = 3,
   kEnd = 4,
+  kSkip = 5,
+  kHold = 6,
+  kUnhold = 7,
 };
 enum class SceneKind : uint8_t {
   kCutscene = 1,      // a CCutsceneManager play
