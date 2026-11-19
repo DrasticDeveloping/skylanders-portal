@@ -216,6 +216,7 @@ def absent(log: Log, what: str) -> str:
 # --- lobby and save slot -------------------------------------------------------------------------------
 
 HOST_SLOT = re.compile(r"Online: host: the server (?:continues|started) .*?slot (\d+)")
+OWNER_PICK = re.compile(r"Online: host: the server follows the owner's pick \((.+)\)")
 TITLE_ENTRY = re.compile(r"Online: title entry: (.+)$")
 HUB = re.compile(r"^(town|hub)", re.I)
 
@@ -227,9 +228,11 @@ def grade_slot(run: Run) -> Verdict:
             continue
         hits += [(line, m.group(0)) for line, m in log.find(TITLE_ENTRY)]
         hits += [(line, m.group(0)) for line, m in log.find(HOST_SLOT)]
+        hits += [(line, m.group(0)) for line, m in log.find(OWNER_PICK)]
     if not hits:
         return Verdict("save slot", NOT_TESTED, "no `title entry:` or `host: the server ... slot` line in any log")
-    slot = next((line for line, _ in hits if "title entry" in line.text and "slot" in line.text), hits[0][0])
+    slot = next((line for line, _ in hits if "follows the owner's pick" in line.text),
+                next((line for line, _ in hits if "title entry" in line.text and "slot" in line.text), hits[0][0]))
     what = slot.text.split(": ", 1)[1] if ": " in slot.text else slot.text
     return Verdict("save slot", PASS, f"{what} ({len(hits)} line(s) on the slot in the run's logs)", slot.cite())
 
@@ -706,6 +709,26 @@ def static_row(folder: Path, level: str) -> StaticRow:
                      (folder / f"{level}-manifest.txt").is_file(), detail)
 
 
+def summary_line(rows: list[StaticRow]) -> str:
+    """The table's one line for the owner: the levels with an end in their data that the pass can end today,
+    those it cannot (per reason), those whose end is unknown (with the node)."""
+    with_end = [r for r in rows if r.ends != "no level end in the data"]
+    can = [r for r in with_end if not r.needs]
+    unknown = [r for r in with_end if r.needs.startswith("unknown")]
+    cannot: dict[str, list[str]] = {}
+    for r in with_end:
+        if r.needs and not r.needs.startswith("unknown"):
+            cannot.setdefault(r.needs.split(":")[0], []).append(r.level)
+    own = [r.level for r in can if r.ends.startswith("on its own")]
+    return ("Today: of the " + str(len(with_end)) + " levels with an end in their data, the pass can end "
+            + str(len(can)) + " (" + ", ".join(r.level for r in can)
+            + (f"; {', '.join(own)} by waiting, it ends on its own" if own else "") + "); it cannot end "
+            + str(sum(len(v) for v in cannot.values())) + " ("
+            + "; ".join(f"{k} {len(v)}: {', '.join(v)}" for k, v in sorted(cannot.items(), key=lambda x: (-len(x[1]), x[0])))
+            + "); unknown " + str(len(unknown)) + " ("
+            + ", ".join(f"{r.level} at {r.needs.split(': ', 1)[1]}" for r in unknown) + ").")
+
+
 def static_table(folder: Path) -> str:
     levels = sorted(p.parent.name for p in folder.glob("*/logic.json"))
     rows = [static_row(folder, lv) for lv in levels]
@@ -726,6 +749,7 @@ def static_table(folder: Path) -> str:
         "  walking the level's own telegrams back from its map load. 'The pass cannot end it': the end needs what the",
         "  next column says (a mini-game's result, a turret, a boss, a ride, a menu choice), or 'unknown' at the node",
         "  where the reader stopped. Counts: objects of that kind in the level. Probe data: the pass can run (yes/no).",
+        summary_line(rows),
         "",
         line(heads),
         line(["-" * w for w in width]),

@@ -681,6 +681,11 @@ class Plan:
     end_objs: dict = field(default_factory=dict)  # node key -> Obj of the end's objects (their refs)
     end_missing: str = ""           # why the derived end cannot be acted on (an object with no live reference)
     d_stays: bool = True            # D stays through the level end and must reach the next level itself
+    # The owner's order (the level check's default, `levelpass`/`levelcheck` without --d-joins-late): both
+    # clients join in the lobby, H picks the slot, the party enters the level together. False: D joins late,
+    # into the level under test (the parked path; --d-joins-late).
+    d_lobby: bool = False
+    new_slot: bool = False          # --new-slot: H starts a new game in the lobby instead of the save's continue
                                     # (--d-leaves-before-end: D ends its session before the exit, as before)
 
 
@@ -709,7 +714,8 @@ def estimate_seconds(stops: list[Stop], late_join: bool, end: bool = True) -> fl
 
 
 def make_plan(content: Content, full: bool = False, late_join: bool = True, budget_s: float = BUDGET_S,
-              sample: int = SAMPLE, provoke: str = "", no_end: bool = False, d_stays: bool = True) -> Plan:
+              sample: int = SAMPLE, provoke: str = "", no_end: bool = False, d_stays: bool = True,
+              d_lobby: bool = False, new_slot: bool = False) -> Plan:
     """The plan; without --full, over the budget, the sample per family goes down to 2, then 1 (the
     plan says so), after the quiet visits were dropped. `no_end` (--no-end): the level's end is found
     (the plan names it) but not attempted, and its time is not in the estimate."""
@@ -744,6 +750,7 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
         plan.left_out.append(f"each kind of action at most {cap} times, to fit the budget (--full acts on all)")
         cap -= 1
     plan.sample = n
+    plan.d_lobby, plan.new_slot = d_lobby, new_slot
     return plan
 
 
@@ -996,6 +1003,35 @@ GENERATED_NAME = re.compile(r"_componentDataOverrides_|_entityData$|^CEntityData
 JOIN_DISTANCE = 5.0     # a content object and a probe object this close (same name) are one object
 
 
+# The party boot (the owner's lobby and save slot, lifted from the party-c / party-n flows of batch 5, not
+# copied): H hosts as F4 > Online > Host does (`online_host -1`: S boots to its title and waits for the
+# owner's own pick), D joins in the lobby by the session's join code and H lets it in (the server's Hello
+# gate on), then H picks in the game's own menu: Story, then the save's continue (`a`) or a new game
+# (`down`, `a`, `a`); S follows the owner's pick and both clients arrive in play behind one barrier. Every
+# wait a condition; no overlay key presses (no debounce waits).
+LOBBY_H_ARGS_DROP = ("--dev_hello_ungated_loopback=true",)
+LOBBY_H_ARGS_ADD = ("--dev_hello_gate_loopback=true",)
+
+
+def party_boot_h(lobby: bool, new_slot: bool) -> list[str]:
+    lines = ["waitfor online_title 300", "waitfor title_ready 240", "online_host -1", "waitfor online_connected 150"]
+    if lobby:
+        lines += ["waitfor online_join_pending 300", "online_let_in", "online_wait_peers 2 120",
+                  "log LEVELPASS lobby: both clients in, the host picks"]
+    lines += ["waitfor menu_ready 60", "tap start", "waitfor menu_ready 60", "tap a", "waitfor menu_ready 60"]
+    lines += (["tap down", "waitfor menu_ready 60", "tap a", "waitfor menu_ready 60", "tap a"] if new_slot
+              else ["tap a"])
+    lines += ["waitfor front_end_left 120", f"place 0 {{figures}}/{FIGURE_H}", "waitfor online_in_play 300",
+              "waitfor online_barrier 300", "wait_free 120"]
+    return lines
+
+
+def party_boot_d() -> list[str]:
+    """D in the lobby: its figure, the join by code, then it follows the host's pick into play."""
+    return ["waitfor online_title 300", "waitfor title_ready 240", f"place 0 {{figures}}/{FIGURE_D}",
+            "online_join {joincode}", "waitfor online_in_play 300", "waitfor online_barrier 300", "wait_free 120"]
+
+
 def boot_lines(host: bool, figure: str) -> list[str]:
     """The shortest boot the specs use: title, Host (H), the two menu presses, the figure, the hub; no
     fixed wait anywhere (each step a condition)."""
@@ -1133,8 +1169,9 @@ MADE_COPY_LEFT = r"Online: runtime spawn (?:made copy|twin) .* still in the enti
 
 def script_h(plan: Plan, late_join_after: str | None) -> str:
     """H's script: boot, Host, the level, the sweep, the late join's wait, the exit."""
-    lines = boot_lines(True, FIGURE_H)
-    lines += ["waitfor online_server_hub 300", "online_mark_level", f"level {plan.level}",
+    # The one boot (party_boot_h): the lobby (with D) or the host alone (D joins late, or no D).
+    lines = party_boot_h(plan.late_join and plan.d_lobby and late_join_after is None, plan.new_slot)
+    lines += ["online_mark_level", f"level {plan.level}",
               "waitfor online_level_after_mark 300", "waitfor online_barrier 300", "wait_free 120",
               "online_mark_level",  # the level under test: its next level is `online_level_after_mark` (NEXT_LEVEL)
               "log LEVELPASS phase sweep", "online_audit start", f"hold_cap {HOLD_CAP_S}",
@@ -1158,7 +1195,8 @@ def script_h(plan: Plan, late_join_after: str | None) -> str:
     lines.append("sweep_deadline 0")
     lines.append("log LEVELPASS phase audit")
     lines.append("online_audit end")
-    d_end = late_join_after is not None and d_through_end(plan)
+    lobby = plan.late_join and plan.d_lobby and late_join_after is None
+    d_end = (late_join_after is not None or lobby) and d_through_end(plan)
     if plan.late_join and late_join_after is not None and d_end:
         # D stays (the default): H waits for D in the session now, so the level ends with two players in it.
         lines += ["log LEVELPASS phase late-join", "waitfor online_peer_was_in 300", "online_wait_peers 2 120",
@@ -1551,6 +1589,20 @@ def script_d(plan: Plan) -> str:
     """D's script (the late joiner): boot, its own hub, join the session ({join}), the visit and audit
     of up to D_VISITS stops H acted on (spread over the level), then it ends its session (H waits for
     that: online_alone)."""
+    if plan.d_lobby:
+        # In the lobby with H (party_boot_d): into the first level the pick loads (the save's hub, a new game's
+        # level), then the level under test when H's `level` command loads it. No visits of its own: no
+        # condition tells D that H's sweep is over, and the graders read D's lines for every key wherever it
+        # stands; D is in the session from the lobby to the next level, as a second player is.
+        lines = party_boot_d() + ["online_mark_level", "log LEVELPASS D in the first level",
+                                  f"waitfor {NEXT_LEVEL} 600", "waitfor online_barrier 300", "wait_free 120",
+                                  "online_mark_level", f"hold_cap {HOLD_CAP_S}", "log LEVELPASS D in",
+                                  "online_audit d-in"]
+        if d_through_end(plan):
+            lines += ["log LEVELPASS D stays for the level end", f"waitfor {NEXT_LEVEL} {D_LEVEL_END_WAIT_S}",
+                      "wait_free 120", "log LEVELPASS D next level", "online_audit d-next"]
+        lines += ["log LEVELPASS D done", "online_end", "quit"]
+        return "\n".join(lines) + "\n"
     lines = boot_lines(False, FIGURE_D)
     lines += ["waitfor online_in_play 300", "online_join {join}", "waitfor online_barrier 300", "wait_free 120",
               "online_mark_level", f"hold_cap {HOLD_CAP_S}",
@@ -2262,7 +2314,11 @@ def spec_toml(plan: Plan) -> str:
     cache comes from the build snapshot. Fail fast on a dead session or a crash; nothing else stops the
     pass: every step's failure is a finding of the report, not a failed expectation."""
     late = plan.late_join
-    h = script_h(plan, LATE_JOIN_MARK if late else None)
+    lobby = late and plan.d_lobby
+    h = script_h(plan, LATE_JOIN_MARK if late and not lobby else None)
+    h_args = probe_args(H_ARGS, plan.probe, plan.game_args)
+    if lobby:  # the join by code with the host's let in: the server's Hello gate on (the party flow's)
+        h_args = [x for x in h_args if x not in LOBBY_H_ARGS_DROP] + [x for x in LOBBY_H_ARGS_ADD if x not in h_args]
     forbid = exit_forbid(h) + [PAUSE_FATAL, MADE_COPY_LEFT]
     out = [f'name = "{case_name(plan.level, plan.no_end)}"',
            f'layout = "{"server+2" if late else "server+1"}"',
@@ -2276,11 +2332,15 @@ def spec_toml(plan: Plan) -> str:
            'shader_cache = "snapshot"',
            "",
            "[peer.H]",
-           f"args = {_toml_list(probe_args(H_ARGS, plan.probe, plan.game_args))}",
+           f"args = {_toml_list(h_args)}",
            *([f"forbid = {_toml_list(forbid)}"] if forbid else []),
            "script = \'\'\'\n" + h + "\'\'\'",
            ]
-    if late:
+    if lobby:
+        out += ["", "[peer.D]", f"args = {_toml_list(probe_args(D_ARGS, plan.probe, plan.game_args))}",
+                *([f"wait_needs = {D_WAIT_NEEDS}"] if d_through_end(plan) else []),
+                "script = \'\'\'\n" + script_d(plan) + "\'\'\'"]
+    elif late:
         out += ["", "[peer.D]", f"args = {_toml_list(probe_args(D_ARGS, plan.probe, plan.game_args))}", f"start_after = '{LATE_JOIN_MARK}'",
                 *([f"wait_needs = {D_WAIT_NEEDS}"] if d_through_end(plan) else []),
                 "script = \'\'\'\n" + script_d(plan) + "\'\'\'"]
