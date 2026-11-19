@@ -130,6 +130,7 @@ import memory_growth  # noqa: E402  (stage 5's soak grade)
 import occurrence_outcomes  # noqa: E402  (stage 5's occurrence grade)
 import known_failures  # noqa: E402  (a pointless rerun refused: the last two results failed alike)
 import build_guard  # noqa: E402  (no session while a build holds its slot)
+import script_checks  # noqa: E402  (a script that waits on a session it never starts; a wait whose peer is gone)
 
 STORE = ".replication-tests"
 CLIENTS = ["H", "D", "E", "F"]
@@ -819,6 +820,10 @@ class PeerSpec:
     # Not started by the run's end: the peer fails `never started`.
     start_after: str = ""
     start_peer: str = "H"
+    # wait_needs = { <condition> = ["D"] } (script_checks.needed_peer_gone): this peer's `waitfor <condition>`
+    # can be met only with those peers' games running; when one exited while such a wait is still ahead or
+    # running, fail fast ends the run (the game logs a wait's end, not its start: the spec says which).
+    wait_needs: dict[str, list[str]] = field(default_factory=dict)
 
 
 SETTINGS_FILE_VALUES = ("template", "none")
@@ -1215,6 +1220,8 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             files=peer_files(path.name, n, own.get("files", common.get("files", {}))),
             start_after=str(own.get("start_after", "")),
             start_peer=str(own.get("start_peer", "H")),
+            wait_needs=parse_wait_needs(path.name, n, own.get("wait_needs", common.get("wait_needs", {})), names,
+                                        script),
         )
         if peers[n].start_after:
             if n in ("H", "S") or kind != "local":
@@ -1252,6 +1259,15 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         raise SpecError(f"{path.name}: save_slots: a hosted server has no data folder of its own (Host copies the"
                         " owner's slot into its session folder)")
     check_join_code_peers(path.name, peers, server)
+    if server == "host":
+        # A client that waits on a session before it hosts or joins one waits for nothing (script_checks).
+        for n, ps in peers.items():
+            if n != "S" and (why := script_checks.host_problem(ps.script)):
+                raise SpecError(f"{path.name}: peer {n}: {why}")
+    for n, ps in peers.items():
+        for cond, needed in ps.wait_needs.items():
+            if server == "host" and "S" in needed:
+                raise SpecError(f"{path.name}: peer {n}: wait_needs {cond}: a hosted S is no process of its own")
     synthetic = load_synthetic(path.name, d, names, server)
     grades = d.get("grade", {})
     for gname, g in grades.items():
@@ -2834,9 +2850,14 @@ class FailFast:
     session), the line is no longer in the log that is graded, so the hit is dropped and the watch
     goes on."""
 
-    def __init__(self, logs: dict[str, Path], patterns: dict[str, list[str]]) -> None:
+    def __init__(self, logs: dict[str, Path], patterns: dict[str, list[str]],
+                 needs: dict[str, dict[str, list[str]]] | None = None, scripts: dict[str, str] | None = None) -> None:
         self.tails = {n: LogTail(p) for n, p in logs.items()}
         self.patterns = {n: [re.compile(rx, re.M) for rx in patterns.get(n, [])] for n in logs}
+        # wait_needs (script_checks.needed_peer_gone): each waiting peer's planned waits and the ends seen.
+        self.needs = {n: c for n, c in (needs or {}).items() if c}
+        self.planned = {n: script_checks.wait_counts((scripts or {}).get(n, "")) for n in self.needs}
+        self.done: dict[str, dict[str, int]] = {n: {} for n in self.needs}
         self.hit: tuple[str, str] | None = None
         self.hit_at = 0.0
         self._hit_generation: int | None = None  # the hit line's log generation; None for an exit code
@@ -2856,11 +2877,18 @@ class FailFast:
             self.hit = self._hit_generation = None
         for n, tail in self.tails.items():
             for line in tail.new_lines():
+                if n in self.done and (cond := script_checks.wait_done(line)):
+                    self.done[n][cond] = self.done[n].get(cond, 0) + 1
                 if any(rx.search(line) for rx in self.patterns[n]):
                     return self._found((n, line.strip()[:200]), tail.generation)
         for n, p in (procs or {}).items():
             if crash_exit_code(code := p.poll()):
                 return self._found((n, f"exit code 0x{code & 0xFFFFFFFF:08X}"), None)
+        if self.needs and procs:
+            gone = script_checks.needed_peer_gone(self.needs, self.planned, self.done,
+                                                  {n: p.poll() for n, p in procs.items()})
+            if gone is not None:
+                return self._found(gone, None)
         return None
 
 
@@ -2894,6 +2922,21 @@ def peer_fatal_lines(spec: Spec, peer: str) -> list[tuple[str, str]]:
 def fail_fast_patterns(spec: Spec, peer: str) -> list[str]:
     """A peer's fatal lines for fail fast: exactly the forbidden lines grade_peer fails it on."""
     return [rx for rx, _ in peer_fatal_lines(spec, peer)]
+
+
+def parse_wait_needs(spec_name: str, peer: str, raw: object, names: list[str], script: str) -> dict[str, list[str]]:
+    """A peer's wait_needs: {condition: [other peers]}, each condition one its script waits for."""
+    if not isinstance(raw, dict):
+        raise SpecError(f"{spec_name}: peer {peer}: wait_needs is a table (condition = [peers])")
+    waits = script_checks.wait_counts(script)
+    out: dict[str, list[str]] = {}
+    for cond, needed in raw.items():
+        if cond not in waits:
+            raise SpecError(f"{spec_name}: peer {peer}: wait_needs {cond}: its script has no `waitfor {cond}`")
+        if not isinstance(needed, list) or not needed or any(p not in names or p == peer for p in needed):
+            raise SpecError(f"{spec_name}: peer {peer}: wait_needs {cond}: a list of other peers of {names}")
+        out[str(cond)] = [str(p) for p in needed]
+    return out
 
 
 def peer_script(spec: Spec, peer: str, figures: Path, join: str = "", joincode: str = "") -> str:
@@ -4945,7 +4988,9 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             # Fail fast: the first fatal line (or crash exit) moves the stop to a grace after it.
             watch = FailFast({**{n: peer_log_path(run, n, hosted) for n in names}, **syn_logs},
                              {**{n: fail_fast_patterns(spec, n) for n in names},
-                              **{n: s.forbid + SYNTHETIC_FATAL for n, s in spec.synthetic.items()}}) \
+                              **{n: s.forbid + SYNTHETIC_FATAL for n, s in spec.synthetic.items()}},
+                             needs={n: spec.peers[n].wait_needs for n in names if n in spec.peers},
+                             scripts={n: spec.peers[n].script for n in names if n in spec.peers}) \
                 if spec.fail_fast else None
             stop_at, next_check, early = deadline, 0.0, False
             while len(ended) < len(procs) and time.monotonic() < stop_at:
