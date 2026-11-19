@@ -919,6 +919,33 @@ class Case(unittest.TestCase):
 
 
 
+
+class SecondPlayerFollows(unittest.TestCase):
+    """D follows H through the level once the party is in (the game's Auto follow); --d-stays keeps the old D."""
+
+    def test_d_turns_the_follow_on_after_it_is_in(self) -> None:
+        plan = lp.make_plan(content(), d_lobby=True)
+        self.assertNotIn("online_auto_follow", lp.script_d(plan))  # off unless the command is known (skytest)
+        plan.d_follow = True
+        lines = lp.script_d(plan).splitlines()
+        k = lines.index("online_auto_follow on")
+        self.assertLess(lines.index("log LEVELPASS D in"), k)
+        self.assertEqual(lines[k + 1], "log LEVELPASS D follows H")
+        # D presses nothing after it: it only waits for the level's end.
+        self.assertFalse([l for l in lines[k:] if l.split(" ")[0] in ("tap", "press", "hold", "interact",
+                                                                         "goto_entity", "enter_trigger")])
+
+    def test_the_command_is_used_only_when_the_game_registers_it(self) -> None:
+        import tempfile
+        import skytest as sk
+        with tempfile.TemporaryDirectory() as tmp:
+            table = Path(tmp) / "script_commands.toml"
+            cfg = type("Cfg", (), {"script_commands": table, "repo": Path(tmp)})()
+            table.write_text('[commands]\nonline_end = "none"\n', encoding="utf-8")
+            self.assertFalse(sk.auto_follow_known(cfg))
+            table.write_text('[commands]\nonline_end = "none"\nonline_auto_follow = "none"\n', encoding="utf-8")
+            self.assertTrue(sk.auto_follow_known(cfg))
+
 class HeldFights(unittest.TestCase):
     """A fight is planned only when its held enemies' release is on the route before it (levelpass_holds)."""
 

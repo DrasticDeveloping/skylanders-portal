@@ -9454,6 +9454,17 @@ def add_live_parser(sub) -> None:
 LEVELPASS_DEFAULT = "~/Documents/T3Code/SwapForceOnline-work/levelpass"
 
 
+def auto_follow_known(cfg: Config) -> bool:
+    """The game registers `online_auto_follow` (the checkout's tests/script_commands.toml: the launch builder
+    refuses a script with a command the table does not have)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        return "online_auto_follow" in la.CommandTable.load(path).registered
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+
+
 def levelpass_folder(cfg: Config, given: str | None) -> Path:
     if given:
         folder = expand(given)
@@ -9506,6 +9517,14 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                         else None)
     plan.probe = not a.no_probe
     plan.server_hidden = bool(getattr(a, "server_hidden", False))
+    # D follows H by default once the game registers online_auto_follow (the checkout's command table, which
+    # the launch builder checks every script against: before that build nothing changes); --d-stays keeps D
+    # where it entered.
+    follow_known = auto_follow_known(cfg)
+    plan.d_follow = plan.d_lobby and not getattr(a, "d_stays", False) and follow_known
+    if plan.d_lobby and not getattr(a, "d_stays", False) and not follow_known:
+        print(f"levelpass {a.level}: D stays where it entered: this game does not register online_auto_follow yet",
+              flush=True)
     try:
         plan.game_args = [lp.check_game_arg(g) for g in (a.game_arg or [])]
     except ValueError as e:
@@ -9676,6 +9695,9 @@ def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
     lp_.add_argument("--d-joins-late", action="store_true", help="D joins late, into the level under test (the"
                      " parked path); by default both clients join in the lobby, the host picks the slot and the"
                      " party enters the level together (the owner's order)")
+    lp_.add_argument("--d-stays", action="store_true", help="D stays where it entered the level (the old"
+                     " behaviour); by default D's hero follows H's through the stops (the game's Auto follow,"
+                     " online_auto_follow on) once the game registers that command")
     lp_.add_argument("--scenes", choices=("skip", "play"), default="skip", help="play: the cutscenes in full,"
                      " each scene's trigger entered in the sweep, the expected scenes in H's script for the level"
                      " check's cutscenes row, their lengths (measured in earlier runs, else 60 s at the load and"
