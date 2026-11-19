@@ -1,5 +1,9 @@
-"""The automatic level pass (`skytest.py levelpass <level> [--full] [--no-late-join]`): one session that
-boots once, a sweep generated from the level's own data, an automatic verdict from the game's audit.
+"""The automatic level pass (`skytest.py levelpass <level> [--full] [--no-late-join] [--no-end]`): one
+session that boots once, a sweep generated from the level's own data, the level's end derived from its
+logic (levelpass_end.py: a trigger to enter, a counted fight, or a timed level), an automatic verdict from
+the game's audit. `--no-end` stops after the last mid-level step (its own case, levelpass-<level>-no-end).
+An exit that cannot happen (its approach finds no entity, or an object it needs has no live reference)
+is H's forbidden line: fail fast ends the run there, never a level-end wait that cannot be met.
 
 Pure code here (no game, no files beyond what the caller hands in), unit-tested in
 tests/test_levelpass.py with made-up content; skytest.py's cmd_levelpass runs it through the normal
