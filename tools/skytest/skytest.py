@@ -7678,6 +7678,22 @@ def prune_snapshots(cfg: Config, current: str) -> str:
     return "snapshots: " + ((r.stdout or "").strip() or (r.stderr or "").strip()[-300:])
 
 
+def cmd_levelcheck(cfg: Config, a: argparse.Namespace) -> int:
+    """`levelcheck --grade <run folder>`: the level check's graders (levelcheck.py) on a run that exists, no
+    game: lobby, save slot, cutscenes, enemies, pickups, loot, each with its counts and one cited line.
+    Exit 0 when nothing failed (NOT TESTED included: it is said, never counted as a pass), 1 when a grader
+    found a difference."""
+    import levelcheck as lc
+    if not a.grade:
+        raise SystemExit("levelcheck: give --grade <run folder>")
+    folder = Path(a.grade)
+    if not folder.is_dir():
+        raise SystemExit(f"levelcheck: no run folder {folder}")
+    verdicts = lc.grade(folder, cfg.repo)
+    print(lc.page(folder, verdicts))
+    return 1 if any(v.status == lc.FAIL for v in verdicts) else 0
+
+
 def cmd_prune(cfg: Config, a: argparse.Namespace) -> int:
     """`prune --older-than <hours>`: the store's run and session folders older than that, through the
     janitor (never through a directory link); it prints what it removed and what that freed."""
@@ -9697,6 +9713,9 @@ def main(argv: list[str] | None = None) -> int:
                      " its last two results on this build with the same generated case failed with the same first"
                      " reason; WHY is written into the result")
     lp_.set_defaults(fn=cmd_levelpass)
+    lc_ = sub.add_parser("levelcheck", help="grade a run against the owner's definition of working (levelcheck.py)")
+    lc_.add_argument("--grade", metavar="RUN", default=None, help="a run folder to grade (no game)")
+    lc_.set_defaults(fn=cmd_levelcheck)
     pr = sub.add_parser("prune", help="remove the store's run folders older than some hours (through the janitor)")
     pr.add_argument("--older-than", type=float, required=True, metavar="HOURS",
                     help="a run or session folder whose newest file is older than this many hours goes")
