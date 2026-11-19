@@ -991,8 +991,13 @@ def grade_pieces(run: Run, data: "LevelData | None" = None) -> Verdict:
 # --- loot (chests and enemy drops: the spill) -----------------------------------------------------------
 
 HOOKS_OFF = re.compile(r"Online: loot hooks off \(online_shared_loot\)")
-S_OBLIGED = re.compile(r"Online: spill obliged (w[0-9a-f]{8}) ([0-9a-f]+) to peer (\d+) \(obligation (\d+)\)")
-S_ENDED = re.compile(r"Online: spill obligation (\d+) (w[0-9a-f]{8}) [0-9a-f]+ to peer (\d+) ended (.+)$")
+# A carrier's key in the loot lines: a world ref `w<mID>` (a client's line adds `.<name hash>`), or a run-time
+# enemy's row `s<spawner digest>.<tag hash>#<ordinal>` (the game names a run-time enemy's drop by its row since
+# batch 11 run 4: sibling spawns of one spawner differ only in the ordinal).
+CARRIER = r"(w[0-9a-f]{8}|s[0-9a-f]{8}\.[0-9a-f]{8}#\d+)"
+W_TAIL = r"(?:\.[0-9a-f]+)?"  # a world ref's name hash in a client's line (none after a run-time row)
+S_OBLIGED = re.compile(r"Online: spill obliged " + CARRIER + r" ([0-9a-f]+) to peer (\d+) \(obligation (\d+)\)")
+S_ENDED = re.compile(r"Online: spill obligation (\d+) " + CARRIER + r" [0-9a-f]+ to peer (\d+) ended (.+)$")
 # S's account per client, at the session's end, and each client's own (the measure of delivery: batch 8 runs 7
 # and 8, the page had counted a client's own run that matched S's selection as lost: "1 of 60", "0 of 16").
 S_SUMMARY = re.compile(r"Online: spill obligations to peer (\d+): (\d+) made, (\d+) completed, (\d+) ended otherwise, "
@@ -1001,13 +1006,13 @@ DELIVERY = re.compile(r"Online: loot delivery: (\d+) obligations, (\d+) delivere
                       r"(\d+) unfinished, (\d+) own runs without S's obligation \(S's selections give (\d+) items, "
                       r"here spawned (\d+)\)")
 # The carrier S's selection names (its spill line: `spill <Name> w<key>.<hash> <n>#<k> selected ...`).
-S_SELECTED = re.compile(r"Online: spill (\S+) (w[0-9a-f]{8})\.[0-9a-f]+ \S+ selected (\d+) items")
+S_SELECTED = re.compile(r"Online: spill (\S+) " + CARRIER + W_TAIL + r" \S+ selected (\d+) items")
 # A client's end of one obligation: run in full or matched by its own run, short, differing, or expired.
-C_FULFILLED = re.compile(r"Online: spill fulfilled (?:\S+ )?(w[0-9a-f]{8})\.[0-9a-f]+ \S+ \(S selected (\d+) items, "
+C_FULFILLED = re.compile(r"Online: spill fulfilled (?:\S+ )?" + CARRIER + W_TAIL + r" \S+ \(S selected (\d+) items, "
                          r"(?:here spawned (\d+)|this game's own run matched)")
-C_DIFFERS = re.compile(r"Online: spill differs (?:\S+ )?(w[0-9a-f]{8})\.[0-9a-f]+ \S+ \((.*)\)$")
-C_EXPIRED = re.compile(r"Online: spill expired (?:\S+ )?(w[0-9a-f]{8})\.[0-9a-f]+ \S+ \((.*?) after \d+ s")
-C_SPILL = r"Online: spill \S+ (?:\S+ )?{key}\."
+C_DIFFERS = re.compile(r"Online: spill differs (?:\S+ )?" + CARRIER + W_TAIL + r" \S+ \((.*)\)$")
+C_EXPIRED = re.compile(r"Online: spill expired (?:\S+ )?" + CARRIER + W_TAIL + r" \S+ \((.*?) after \d+ s")
+C_SPILL = r"Online: spill \S+ (?:\S+ )?{key}[.\s]"
 # The client's copies asleep there, by name: a replica or a bind waiting for its wake, an authored sleep.
 C_ASLEEP_KEY = re.compile(r"Online: enemy (?:replica " + KEY + r" at \S+ asleep|bind " + KEY + r" .*waits \(asleep here)")
 C_SPAWN_NAME = re.compile(r"Online: enemy spawn " + KEY + r" as ([^#\s]+)")
@@ -1114,7 +1119,7 @@ def grade_loot(run: Run) -> Verdict:
                 sl, sm = short[key]
                 kind, detail = OTHER, f"spawned {sm.group(3)} of {sm.group(2)}; {sl.cite()}"
             else:
-                tried = log.find(re.compile(C_SPILL.format(key=key)))
+                tried = log.find(re.compile(C_SPILL.format(key=re.escape(key))))
                 kind, detail = OTHER, (tried[-1][0].cite() if tried else absent(log, f"`spill ... {key}`"))
             groups.setdefault(kind, []).append(f"{label}: {detail}")
         for kind in (ASLEEP, NO_ROW, OTHER):
