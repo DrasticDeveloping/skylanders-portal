@@ -8188,6 +8188,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 breaker.record(spec.name, r.folder, r.signature)
                 if (t := breaker.tripped()) is not None:
                     tell_breaker(t)
+            # A caller's own verdict of the case (the level pass: W15), decided before the case's status line is
+            # printed and its result.json, report.md and results.json are written, so all of them carry one verdict.
+            if (case_verdict := getattr(a, "case_verdict", None)) is not None:
+                case_verdict(spec, r)
             return r
 
         def finished() -> list[CaseResult]:
@@ -9515,6 +9519,16 @@ def lock_commands_known(cfg: Config) -> bool:
         "lock_ready" in table.conditions
 
 
+def pass_gate_known(cfg: Config) -> bool:
+    """The game registers `pass_gate` (W23; the checkout's tests/script_commands.toml)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        return "pass_gate" in la.CommandTable.load(path).registered
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+
+
 def auto_follow_known(cfg: Config) -> bool:
     """The game registers `online_auto_follow` (the checkout's tests/script_commands.toml: the launch builder
     refuses a script with a command the table does not have)."""
@@ -9581,6 +9595,22 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                         scene_lengths=measured_scene_lengths(cfg, a.level) if getattr(a, "scenes", "skip") == "play"
                         else None, lock_commands=lock_commands_known(cfg), no_gates=getattr(a, "no_gates", False))
     plan.probe = not a.no_probe
+    plan.pass_gates = pass_gate_known(cfg)  # W23: H and D walk through each gate H opened
+    if plan.pass_gates:  # the walks' seconds in the gates phase's budget (H's; D's run beside H's next steps)
+        extra = sum(lp.PASS_H_S + lp.PASS_TELEPORT_S for r in plan.required if not r.why_not)
+        for r in plan.required:
+            if not r.why_not:
+                r.est_s += lp.PASS_H_S + lp.PASS_TELEPORT_S
+        plan.required_s += extra
+        plan.estimate_s += extra
+    # W21: a named figure (or a swapper's two halves) for H or D, from the copied figure folder.
+    for who, opt in (("h", "h_figure"), ("d", "d_figure")):
+        name = getattr(a, opt, None)
+        if name:
+            try:
+                setattr(plan, f"figures_{who}", lp.figure_files(fixture_dirs(cfg)[1], name))
+            except ValueError as e:
+                raise SystemExit(f"levelpass: --{who}-figure: {e}") from None
     plan.server_hidden = bool(getattr(a, "server_hidden", False))
     plan.long_pause_s = int(getattr(a, "long_pause", 0) or 0)
     plan.long_pause_at = getattr(a, "long_pause_at", "") or ""
@@ -9638,6 +9668,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     # The plan's first line: its estimate and which budget it is in (the gates phase, or --no-gates).
     print(f"levelpass {a.level}: estimate {plan.estimate_s:.0f} s ({lp.budget_words(plan)}); content {plan.source}; "
           f"{len(plan.stops)} stops, {sum(len(st.actions) for st in plan.stops)} actions; case {spec_path}", flush=True)
+    print(f"levelpass {a.level}: figures: H {lp.figure_words(plan.figures_h)}"
+          + (f"; D {lp.figure_words(plan.figures_d)}" if plan.late_join else ""), flush=True)
     for n in notices:
         print(f"levelpass {a.level}: {n}", flush=True)
     for h in plan.held:  # the fights the level's script holds (levelpass_holds), in words
@@ -9653,11 +9685,28 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         return 0
     t0 = time.monotonic()
     started = time.strftime("%Y%m%d-%H%M%S")
+    # The pass's verdict (R3), decided as the case ends (W15): batch 12 case 7 printed the runner's `PASS` while
+    # the level pass's verdict and result.json said INCOMPLETE (its sweep skipped steps for time). An incomplete
+    # pass is the case's status `incomplete` from the first line printed about it on.
+    decided: dict = {}
+
+    def case_verdict(_spec, r) -> None:
+        if not r.folder or not Path(r.folder).is_dir():
+            return
+        run_dir = Path(r.folder)
+        d_text = read_peer_log(run_dir, "D", False) if (run_dir / "D").is_dir() else ""
+        verdict, missed = lp.pass_verdict(r.status, list(r.reasons), read_peer_log(run_dir, "H", False), plan, d_text)
+        decided["verdict"] = (verdict, missed)
+        if verdict == lp.INCOMPLETE and r.status in ("pass", "fail"):
+            r.status = "incomplete"
+            r.reasons.append("levelpass: incomplete: " + "; ".join(missed))
+
     ns = argparse.Namespace(cases=[case], stage=None, max_games=0, gate=False, per_build=False,
                             allow_restricted=False, jobs=1, run_not_ready=False, no_breaker=False, queue=None,
                             remote=None, remote_manifest=None, remote_token_file=None,
                             rerun_known_failure=a.rerun_known_failure, ignore_build=a.ignore_build,
-                            build_wait_min=a.build_wait_min, ignore_preflight=a.ignore_preflight)
+                            build_wait_min=a.build_wait_min, ignore_preflight=a.ignore_preflight,
+                            case_verdict=case_verdict)
     code = cmd_test(replace(cfg, cases_dir=cases), ns)
     if code in (EXIT_KNOWN_FAILURE, EXIT_BUILD_RUNNING, EXIT_PREFLIGHT):
         why = {EXIT_KNOWN_FAILURE: "a known failure", EXIT_BUILD_RUNNING: "a build held its slot",
@@ -9737,8 +9786,9 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         rj_now = json.loads(result.read_text(encoding="utf-8")) if result.is_file() else {}
     except (OSError, ValueError):
         rj_now = {}
-    verdict, missed = lp.pass_verdict(str(rj_now.get("status", "fail")), list(rj_now.get("reasons", [])), texts["H"],
-                                      plan, texts.get("D", ""))
+    # The verdict decided as the case ended (case_verdict), else (a run folder of an older runner) from result.json.
+    verdict, missed = decided.get("verdict") or lp.pass_verdict(
+        str(rj_now.get("status", "fail")), list(rj_now.get("reasons", [])), texts["H"], plan, texts.get("D", ""))
     if crash:
         verdict = lp.FAIL
     head = f"verdict: {verdict}" + (f" (not covered: {'; '.join(missed)})" if missed else "") + \
@@ -9782,6 +9832,11 @@ def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
                      " dismisses a pause screen within seconds")
     lp_.add_argument("--long-pause-at", default="", metavar="NAME", help="the object whose pickup takes the long"
                      " pause (default: the plan's first pickup of a collectible)")
+    lp_.add_argument("--h-figure", default=None, metavar="NAME", help="H's figure from the copied figure folder"
+                     " (default Roller Brawl): `<NAME>.dump`, or a swapper's two halves (`<NAME> Top.dump` in slot 0,"
+                     " `<NAME> Bottom.dump` in slot 1)")
+    lp_.add_argument("--d-figure", default=None, metavar="NAME", help="D's figure, as --h-figure (default Scorp);"
+                     " e.g. --d-figure \"Spy Rise\" puts a swapper on D")
     lp_.add_argument("--d-stays", action="store_true", help="D stays where it entered the level (the old"
                      " behaviour); by default D's hero follows H's through the stops (the game's Auto follow,"
                      " online_auto_follow on) once the game registers that command")

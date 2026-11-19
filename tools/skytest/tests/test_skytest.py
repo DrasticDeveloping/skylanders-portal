@@ -186,6 +186,31 @@ quit
 """
 '''
 
+    def test_a_callers_verdict_is_the_one_printed_and_written(self) -> None:
+        # W15 (batch 12 case 7): the console printed the runner's PASS while the level pass's verdict and the
+        # case's result.json said INCOMPLETE. A caller's case_verdict decides before the status line and the files.
+        self.spec("lp", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB)
+        seen = []
+
+        def case_verdict(spec, r) -> None:
+            seen.append(r.status)
+            r.status = "incomplete"
+            r.reasons.append("levelpass: incomplete: 10 step(s) skipped at the sweep's deadline")
+
+        a = argparse.Namespace(cases=["lp"], stage=None, max_games=5, case_verdict=case_verdict)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_test(self.cfg, a)
+        text = out.getvalue()
+        self.assertEqual(seen, ["pass"])
+        self.assertIn("  INCOMPLETE: levelpass: incomplete: 10 step(s) skipped", text)
+        self.assertNotIn("  PASS", text)
+        report = text.strip().splitlines()[-1].split("report: ", 1)[1]
+        session = json.loads((Path(report).parent / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(session["cases"][0]["status"], "incomplete")
+        own = json.loads((Path(session["cases"][0]["folder"]) / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(own["status"], "incomplete")
+        self.assertIn("| lp | server+1 | 0 | INCOMPLETE |", (Path(report).parent / "report.md").read_text(encoding="utf-8"))
+
     def test_a_layout_runs_every_peer_and_ends_them(self) -> None:
         self.spec("two", 'layout = "server+2"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB +
                   'expect = ["Where: town_state10"]\n')

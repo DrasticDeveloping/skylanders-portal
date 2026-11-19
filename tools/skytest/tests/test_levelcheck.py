@@ -5,6 +5,7 @@ Run: python -I -m unittest discover -s tools/skytest/tests -p "test_levelcheck.p
 """
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 import unittest
@@ -66,6 +67,93 @@ class RunFolder:
     def run(self) -> lc.Run:
         return lc.load_run(self.path)
 
+
+
+class RotatedLog(unittest.TestCase):
+    """W14: S's log rotated in a long run (`game.1.log` older, `game.log` newest); its early lines are read too, and
+    each line is cited in its own file."""
+
+    def test_rotated_files_are_read_in_time_order(self) -> None:
+        f = RunFolder([(300, "Online: puppet 1 pose 9 at 1,2,3 client at 1,2,3 off 0 age 1 ms")], H_JOIN)
+        session = f.path / "H" / "data" / "Online" / "session"
+        (session / "game.1.log").write_text(log([(100, "Online: early S line")]), encoding="utf-8")
+        (session / "game.2.log").write_text(log([(50, "Online: earliest S line")]), encoding="utf-8")
+        s = f.run().server
+        self.assertEqual([l.text for l in (s.line(i) for i in range(len(s.lines)))],
+                         ["Online: earliest S line", "Online: early S line",
+                          "Online: puppet 1 pose 9 at 1,2,3 client at 1,2,3 off 0 age 1 ms"])
+        self.assertEqual(s.find(re.compile(r"early S line"))[0][0].cite(),
+                         "H/data/Online/session/game.1.log:1: Online: early S line")
+        self.assertTrue(s.find(re.compile(r"puppet 1 pose"))[0][0].cite().startswith("H/data/Online/session/game.log:1:"))
+
+
+class SkippedForTime(unittest.TestCase):
+    """W13: steps the sweep's deadline skipped are no stops where H acted, and a NOT TESTED row they would test says
+    so (not a row the run turned off)."""
+    H = [(60, "Input script: LEVELPASS act v19_1 pickup SoulGem_lockjaw CPhysicalEntity ref auth:ww1:12086"),
+         (60.1, "Dev: goto_entity auth:ww1:12086 skipped: the sweep's time is up"),
+         (60.2, "Dev: pickup auth:ww1:12086 10 skipped: the sweep's time is up"),
+         (61, "Input script: LEVELPASS visit v20 objects 3 (A, B, C) ref auth:ww1:4666"),
+         (61.1, "Dev: goto_entity auth:ww1:4666 skipped: the sweep's time is up"),
+         (62, "Input script: LEVELPASS act v22_1 interact TreasureChest002 CPhysicalEntity ref auth:ww1:12198"),
+         (62.1, "Dev: goto_entity auth:ww1:12198 skipped: the sweep's time is up")]
+
+    def test_skipped_acts_once_each_and_the_rows_they_test(self) -> None:
+        run = RunFolder([], H_JOIN + self.H).run()
+        got = [(label, kind, name) for label, kind, name, _l in lc.skipped_acts(run.clients["H"])]
+        self.assertEqual(got, [("v19_1", "pickup", "SoulGem_lockjaw"), ("v22_1", "interact", "TreasureChest002")])
+        head = lc.skipped_head(run.clients["H"])
+        self.assertTrue(head[0].startswith("the sweep skipped 2 act(s) for time (H/game.log:"), head)
+        self.assertIn("rows they would test: coins, loot, pickups", head[0])
+
+
+
+
+class FiguresHead(unittest.TestCase):
+    def test_the_page_names_each_players_figures(self) -> None:
+        f = RunFolder([], H_JOIN, D_JOIN)
+        (f.path / "H" / "script.txt").write_text("place 0 C:/x/figures/Roller Brawl.dump\nquit\n", encoding="utf-8")
+        (f.path / "D" / "script.txt").write_text("place 0 C:/x/figures/Spy Rise Top.dump\n"
+                                                 "place 1 C:/x/figures/Spy Rise Bottom.dump\nquit\n", encoding="utf-8")
+        self.assertEqual(lc.figures_head(f.path),
+                         ["figures: H Roller Brawl; D Spy Rise (a swapper: Spy Rise Top + Spy Rise Bottom)"])
+
+
+class Objectives(unittest.TestCase):
+    """W22: S's objective rows against each client's applies, per generation and objective (the objectives' author's
+    grading)."""
+    LIST = "Online: objective list 3 tracker b84c05cc gen 2"
+    SHARED = "Online: objectives shared for the session (S's online_shared_objectives, in its rows)"
+
+    def run_of(self, s: list, h: list, d: list) -> lc.Run:
+        return RunFolder([(20, self.LIST)] + s, H_JOIN + [(21, self.LIST), (21.5, self.SHARED)] + h,
+                         D_JOIN + [(41, self.LIST), (41.5, self.SHARED)] + d).run()
+
+    def test_equal_sequences_pass(self) -> None:
+        s = [(50, "Online: objective 00000000 0/1 (S) active"), (80, "Online: objective 00000000 1/1 (S) active")]
+        c = [(50.1, "Online: objective applied 00000000 0/1 (active)"), (80.2, "Online: objective applied 00000000 1/1 (active)")]
+        v = lc.grade_objectives(self.run_of(s, c, c))
+        self.assertEqual(v.status, lc.PASS, v.findings)
+        self.assertIn("generation 2 objective 00000000: S ['0/1 active', '1/1 active'], H ['0/1 active', '1/1 active']",
+                      v.notes[0])
+
+    def test_a_missing_step_an_own_run_and_a_missing_cancel_fail(self) -> None:
+        s = [(50, "Online: objective 00000000 0/1 (S) active"), (60, "Online: objective 00000000 0/1 (S)")]
+        h = [(50.1, "Online: objective applied 00000000 0/1 (active)"), (60.1, "Online: objective applied 00000000 0/1"),
+             (55, "Online: objective 00000000 own start run here (S showed nothing in 3000 ms: this game's alone)")]
+        d = [(50.1, "Online: objective applied 00000000 0/1 (active)")]
+        v = lc.grade_objectives(self.run_of(s, h, d))
+        self.assertEqual(v.status, lc.FAIL)
+        whats = [f.what for f in v.findings]
+        self.assertIn("H ran its own start of objective 00000000, for which S has a row in generation 2", whats)
+        self.assertTrue(any(w.startswith("D's applies differ from S's rows: generation 2 objective 00000000: S ['0/1 "
+                                         "active', '0/1'], D ['0/1 active']") for w in whats), whats)
+        self.assertTrue(any(w.startswith("H: S's objective 00000000 went inactive") for w in whats), whats)
+
+    def test_off_is_not_tested(self) -> None:
+        v = lc.grade_objectives(RunFolder([(20, self.LIST)], H_JOIN, D_JOIN).run())
+        self.assertEqual(v.status, lc.NOT_TESTED)
+        self.assertIn("online_shared_objectives is off", v.counts)
 
 class Windows(unittest.TestCase):
     def test_a_clients_time_in_each_level(self) -> None:
@@ -330,6 +418,62 @@ class RequiredSteps(unittest.TestCase):
         self.assertIn("opened on no game, not on S, H, D", first)
         self.assertIn("S's decision: H/data/Online/session/game.log:3: Online: backend gate.open refused", first)
         self.assertIn("the press went to TutorialLockedGate#2607, the gate an earlier step pressed", first)
+
+    def test_a_battle_gate_opens_by_its_lock_state_on_each_game(self) -> None:
+        # W17 (batch 12 case 7): S writes the gate's row again when it opens, each client logs the lock unlocked
+        # under S's reference; D's own entity id differs (0x95a against S's 0x93d), its own authored line names it.
+        import levelpass_holds as lh
+        data = lc.LevelData("madeup", {}, [lh.Gate("Finale_DemonGate008", "e8", lh.BATTLE_GATE, True, "win its fight")])
+        auth = "Online: authored obj bd35d565 1 6496 class ada5591b entity 1 name 4f8d6c1f name0 811c9dc5 mid {} state " \
+               "registered flags 28000000 act 1 pos -4074.10 4190.17 733.27 text Finale_DemonGate008"
+        row = "Online: world 2 a0000093d.4f8d6c1f.ada5591b@2 written"
+        unlocked = "Online: backend key gate a0000093d.4f8d6c1f.ada5591b@2 watched b8146710 (unlocked Scripts.DemonLock=3)"
+        locked = "Online: backend key gate a0000093d.4f8d6c1f.ada5591b@2 watched b8146710 (locked Scripts.DemonLock=2)"
+        s = [(10, auth.format("93d")), (11, row), (90, row)]
+        h = [(10, auth.format("93d")), (70, "Input script: LEVELPASS required r1 battle_gate Finale_DemonGate008 (x)"),
+             (89.5, locked), (90.4, unlocked)]
+        d = [(10, auth.format("95a")), (89.4, locked), (90.3, unlocked)]
+        v = lc.grade_completable(RunFolder(s, H_JOIN + h + H_NEXT, D_JOIN + d + D_NEXT, result=self.PASSED).run(), data)
+        self.assertEqual(v.status, lc.PASS, v.notes)
+        done = [n for n in v.notes if n.startswith("required, done: ")][0]
+        self.assertIn("opened on S, H, D: S at ", done)
+        self.assertIn(row, done)
+        self.assertIn("D at ", done)
+        self.assertNotIn("wait_moved", done)
+
+    def gate_run(self, h_pass: str, d_pass: str, d_pass_t: float) -> lc.Verdict:
+        import levelpass_holds as lh
+        data = lc.LevelData("madeup", {}, [lh.Gate("Finale_DemonGate008", "e8", lh.BATTLE_GATE, True, "win its fight")])
+        auth = "Online: authored obj bd35d565 1 6496 class ada5591b entity 1 name 4f8d6c1f name0 811c9dc5 mid {} state " \
+               "registered flags 28000000 act 1 pos -4074.10 4190.17 733.27 text Finale_DemonGate008"
+        row = "Online: world 2 a0000093d.4f8d6c1f.ada5591b@2 written"
+        unlocked = "Online: backend key gate a0000093d.4f8d6c1f.ada5591b@2 watched b8146710 (unlocked Scripts.DemonLock=3)"
+        s = [(10, auth.format("93d")), (11, row), (90, row)]
+        h = [(10, auth.format("93d")), (70, "Input script: LEVELPASS required r1 battle_gate Finale_DemonGate008 (x)"),
+             (90.4, unlocked), (95, f"Dev: pass_gate Finale_DemonGate008#2365 {h_pass}")]
+        d = [(10, auth.format("95a")), (90.3, unlocked), (d_pass_t, f"Dev: pass_gate Finale_DemonGate008#2394 {d_pass}")]
+        return lc.grade_completable(RunFolder(s, H_JOIN + h + H_NEXT, D_JOIN + d + D_NEXT, result=self.PASSED).run(), data)
+
+    def test_a_gate_passed_on_foot_by_both(self) -> None:
+        ok = "done (passed on foot: from 1,2,3 to 4,5,6, 240 beyond the gate's plane after 1 walk(s) (arrived)) after 6.0 s"
+        v = self.gate_run(ok, ok, 96)
+        self.assertEqual(v.status, lc.PASS, v.notes)
+        done = [n for n in v.notes if n.startswith("required, done: ")][0]
+        self.assertIn("; passed on foot by H at 00:11:35.000, D at 00:11:36.000", done)
+
+    def test_open_but_not_passable_and_a_walk_before_the_open(self) -> None:
+        ok = "done (passed on foot: from 1,2,3 to 4,5,6, 240 beyond the gate's plane after 1 walk(s) (arrived)) after 6.0 s"
+        stuck = ("failed (not passed on foot: stopped at 1,2,3, 41 before the gate's plane (from 0,0,0 toward 9,9,9; 30 "
+                 "walk(s), the last stuck)) after 60.0 s")
+        v = self.gate_run(ok, stuck, 97)
+        self.assertEqual(v.status, lc.BY_TELEPORT)
+        first = v.counts.split("first step not done: ")[1]
+        self.assertTrue(first.startswith("Finale_DemonGate008 (battle gate): opened on S, H, D but gate open but not "
+                                         "passable on D: not passed on foot: stopped at 1,2,3"), first)
+        self.assertIn("passed on foot by H at 00:11:35.000", first)
+        early = self.gate_run(ok, stuck, 80)  # D's walk ended before the gate opened on D: not counted either way
+        self.assertEqual(early.status, lc.PASS, early.notes)
+        self.assertIn("D's walk ended before the gate opened there", [n for n in early.notes if "done" in n][0])
 
     def test_no_level_data_is_said(self) -> None:
         run = RunFolder([], H_JOIN + H_NEXT, D_JOIN + D_NEXT, result={"levelpass": {"verdict": "PASS", "not_covered": []}}).run()
@@ -619,9 +763,45 @@ class KeyGateCalibration(unittest.TestCase):
         run = lc.load_run(CALIBRATION_RUNS / "20261119-065111-levelpass-tutorial_b")
         shut, done = lc.required_steps(run, lc.level_data(Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass"), "tutorial_b"))
         self.assertEqual(len(done), 1, done)
-        self.assertIn("opened on S, H, D: S at 06:54:11.795 ", done[0])
+        self.assertIn("opened on S, H, D: S at 06:54:11.743 ", done[0])  # W17: S's own row of the gate, written again
         self.assertEqual(len(shut), 1, shut)
         self.assertIn("the press went to TutorialLockedGate#2607, the gate an earlier step pressed", shut[0])
+
+
+@unittest.skipUnless((CALIBRATION_RUNS / "20261119-124636-levelpass-ww1").is_dir(), "batch 12's ww1 gates run is not here")
+class GatesRunCalibration(unittest.TestCase):
+    def test_together_reads_the_rotated_server_log_and_skips_the_skipped_steps(self) -> None:
+        run = lc.load_run(CALIBRATION_RUNS / "20261119-124636-levelpass-ww1")
+        v = lc.grade_together(run)
+        self.assertEqual(v.status, lc.PASS, v.counts)
+        self.assertIn("at 2 of 2 stop(s) where H acted", v.counts)
+        self.assertEqual([a[0] for a in lc.skipped_acts(run.clients["H"])], ["v2_2", "v19_1", "v22_1", "v24_1"])
+
+
+@unittest.skipUnless((CALIBRATION_RUNS / "20261119-124636-levelpass-ww1").is_dir() and
+                     (Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass/ww1") / "manifest.json").is_file(),
+                     "batch 12's ww1 gates run or ww1's data is not here")
+class FightGatesCalibration(unittest.TestCase):
+    def test_two_demon_gates_opened_on_every_game(self) -> None:
+        run = lc.load_run(CALIBRATION_RUNS / "20261119-124636-levelpass-ww1")
+        _shut, done = lc.required_steps(run, lc.level_data(Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass"),
+                                                           "ww1"))
+        names = [d.split(" (")[0] for d in done]
+        self.assertEqual(names, ["Finale_DemonGate008", "PuzzleGateSawtooth001"])
+        self.assertIn("S at 12:54:21.128", done[0])
+        self.assertIn("H at 12:54:21.454", done[0])
+        self.assertIn("D at 12:54:21.363", done[0])
+
+
+@unittest.skipUnless((CALIBRATION_RUNS / "20261119-135125-levelpass-tutorial_b").is_dir(), "batch 13's objectives run is not here")
+class ObjectivesCalibration(unittest.TestCase):
+    def test_batch_13s_own_start_beside_s_row_fails(self) -> None:
+        v = lc.grade_objectives(lc.load_run(CALIBRATION_RUNS / "20261119-135125-levelpass-tutorial_b"))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.counts, "S rows 3 for 2 objective(s) in 2 level(s); H applied 3; D applied 3")
+        self.assertEqual([f.what for f in v.findings],
+                         ["H ran its own start of objective 00000001, for which S has a row in generation 3",
+                          "D ran its own start of objective 00000001, for which S has a row in generation 3"])
 
 @unittest.skipUnless((CALIBRATION_RUNS / "20261119-111305-levelpass-ww1").is_dir(), "batch 11's ww1 coins run is not here")
 class CoinsCalibration(unittest.TestCase):

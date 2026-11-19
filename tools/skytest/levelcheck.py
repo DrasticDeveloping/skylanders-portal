@@ -69,6 +69,10 @@ class Log:
     who: str
     path: str
     lines: list[str]
+    # A log the game rotated (`game.<n>.log` older, `game.log` the newest: S's log in a long run, batch 12 case 7,
+    # ww1 20261119-124636, rotated at 12:51:56): its files' lines in time order, each file's (path, first index)
+    # here, so a line is cited in its own file. Empty: one file, `path`.
+    parts: list[tuple[str, int]] = field(default_factory=list)
 
     def find(self, rx: re.Pattern) -> list[tuple[Line, re.Match]]:
         out = []
@@ -85,7 +89,11 @@ class Log:
             k = raw.find("Input script: ")
         if k < 0:
             k = raw.find("] ", 26) + 2 if raw.startswith("[") else 0
-        return Line(self.path, i + 1, raw[k:].rstrip(), stamp(raw))
+        path, first = self.path, 0
+        for part, start in self.parts:
+            if start <= i:
+                path, first = part, start
+        return Line(path, i - first + 1, raw[k:].rstrip(), stamp(raw))
 
     def last_time(self) -> datetime | None:
         for raw in reversed(self.lines):
@@ -101,10 +109,20 @@ def stamp(raw: str) -> datetime | None:
 
 
 def read_log(run: Path, rel: str, who: str) -> Log | None:
+    """A game's log with the files the game rotated before it (`game.<n>.log`, the highest n the oldest), in time
+    order (Log.parts)."""
     p = run / rel
     if not p.is_file():
         return None
-    return Log(who, rel.replace("\\", "/"), p.read_text(encoding="utf-8", errors="replace").splitlines())
+    older = sorted((q for q in p.parent.glob(f"{p.stem}.*{p.suffix}") if q.stem[len(p.stem) + 1:].isdigit()),
+                   key=lambda q: -int(q.stem[len(p.stem) + 1:]))
+    lines: list[str] = []
+    parts: list[tuple[str, int]] = []
+    base = rel.replace("\\", "/").rsplit("/", 1)[0] + "/" if "/" in rel.replace("\\", "/") else ""
+    for q in older + [p]:
+        parts.append((base + q.name, len(lines)))
+        lines += q.read_text(encoding="utf-8", errors="replace").splitlines()
+    return Log(who, rel.replace("\\", "/"), lines, parts if older else [])
 
 
 @dataclass
@@ -839,6 +857,33 @@ FOLLOW_ON = re.compile(r"Online: auto follow the host \(peer (\d+)\) \(script\)"
 PUPPET_FOR = re.compile(r"Online: puppet (\d+) for peer (\d+) spawned at .*\(generation (\d+)\)")
 PUPPET_POSE = re.compile(r"Online: puppet (\d+) pose \d+ at (-?[\d.]+),(-?[\d.]+),(-?[\d.]+) ")
 H_ACT = re.compile(r"Input script: LEVELPASS act (v\d+)_\d+ ")
+# A sweep step its deadline skipped (`Dev: <command> <target> ... skipped: the sweep's time is up`), and the act it
+# belongs to (H's `LEVELPASS act <v>_<i> <kind> <name> ...` before it).
+ACT_LINE = re.compile(r"Input script: LEVELPASS act (v\d+_\d+) (\S+) (\S+)")
+STEP_SKIPPED = re.compile(r"Dev: \S+ .* skipped: the sweep's time is up")
+# The rows an act's kind would have tested (W13): a pickup's collect and coins, a chest's or a crate's spill, a
+# fight's enemies, a trigger's or a talk's scene and the enemies it releases.
+KIND_ROWS = {"pickup": ("pickups", "coins"), "interact": ("loot", "pickups"), "attack": ("loot", "enemies"),
+             "fight": ("enemies",), "enter": ("cutscenes", "enemies"), "talk": ("cutscenes",)}
+
+
+def skipped_acts(h: Log | None) -> list[tuple[str, str, str, Line]]:
+    """Each act of H's sweep whose step its deadline skipped: (label, kind, name, the skip line), once per act."""
+    out: list[tuple[str, str, str, Line]] = []
+    if h is None:
+        return out
+    current = None
+    for i, raw in enumerate(h.lines):
+        m = ACT_LINE.search(raw)
+        if m:
+            current = (m.group(1), m.group(2), m.group(3))
+            continue
+        if "LEVELPASS visit" in raw or "LEVELPASS phase" in raw:
+            current = None
+            continue
+        if current is not None and STEP_SKIPPED.search(raw) and (not out or out[-1][0] != current[0]):
+            out.append((*current, h.line(i)))
+    return out
 
 
 def peer_poses(server: Log) -> dict[int, list[tuple[datetime, tuple[float, float, float], Line]]]:
@@ -874,7 +919,12 @@ def grade_together(run: Run) -> Verdict:
     poses = peer_poses(run.server)
     hp, dp = poses.get(peers.get("H", -1), []), poses.get(peers.get("D", -1), [])
     stops: dict[str, Line] = {}
+    # A step the sweep's deadline skipped is no stop where H acted (W14: ww1 20261119-124636's v19, v22, v24).
+    skipped = {label for label, _k, _n, _l in skipped_acts(h)}
     for line, m in h.find(H_ACT):
+        full = ACT_LINE.search(line.text)
+        if full is not None and full.group(1) in skipped:
+            continue
         if line.t is not None and (on[0][0].t is None or line.t >= on[0][0].t):
             stops.setdefault(m.group(1), line)
     if not stops:
@@ -901,6 +951,107 @@ def grade_together(run: Run) -> Verdict:
     notes += [f"no pose pair within {POSE_PAIR.seconds + 0.5:.1f} s: {', '.join(unknown)}"] if unknown else []
     status = FAIL if findings else (PASS if near else NOT_TESTED)
     return Verdict("together", status, counts, on[0][0].cite(), findings, notes)
+
+
+# --- objectives: S's objective rows against each client's applies (online/6-progress-apply, the objectives' author's
+# grading, logs/progress-apply-notes.txt) ----------------------------------------------------------------------------
+# With online_shared_objectives on (each client's `objectives shared for the session (S's online_shared_objectives`),
+# per generation (each log's `objective list <n> tracker <t> gen <g>`, the level's list) and objective id: S's
+# sequence of `objective <id> <n>/<m> (S)[ active]` equals each client's `objective applied <id> <n>/<m>[ (active)]`,
+# each within OBJECTIVE_APPLY_S of S's; none of `objective <id> at ... after its apply, S has`, `objective apply
+# refused` or `objective <id> own <action> run here` for an id S has a row for in that generation; each S row going
+# inactive after it was active has an `objective cancelled <id>` on every client. Off: not tested.
+OBJECTIVE_APPLY_S = timedelta(seconds=10)
+OBJ_LIST = re.compile(r"Online: objective list \d+ tracker \S+ gen (\d+)")
+OBJ_S_ROW = re.compile(r"Online: objective ([0-9a-f]{8}) (\d+)/(\d+) \(S\)( active)?")
+OBJ_APPLIED = re.compile(r"Online: objective applied ([0-9a-f]{8}) (\d+)/(\d+)( \(active\))?")
+OBJ_SHARED = re.compile(r"Online: objectives shared for the session \(S's online_shared_objectives")
+OBJ_AFTER = re.compile(r"Online: objective ([0-9a-f]{8}) at .* after its apply, S has")
+OBJ_REFUSED = re.compile(r"Online: objective apply refused ([0-9a-f]{8})")
+OBJ_OWN_RUN = re.compile(r"Online: objective ([0-9a-f]{8}) own (\S+) run here")
+OBJ_CANCELLED = re.compile(r"Online: objective cancelled ([0-9a-f]{8})")
+
+
+def objective_lines(log: Log, rx: re.Pattern) -> list[tuple[int, Line, re.Match]]:
+    """Each line of `rx` with the generation of the objective list this game had then (0 before any)."""
+    gen, out = 0, []
+    for i, raw in enumerate(log.lines):
+        m = OBJ_LIST.search(raw)
+        if m:
+            gen = int(m.group(1))
+            continue
+        m = rx.search(raw)
+        if m:
+            out.append((gen, log.line(i), m))
+    return out
+
+
+def grade_objectives(run: Run) -> Verdict:
+    """S's objective rows against each client's applies, per generation and objective (the objectives' author's
+    grading)."""
+    if run.server is None:
+        return Verdict("objectives", NOT_TESTED, "no server log in this run folder")
+    shared = {who: log.find(OBJ_SHARED) for who, log in run.clients.items()}
+    if not any(shared.values()):
+        return Verdict("objectives", NOT_TESTED, "online_shared_objectives is off in this run (no client logged "
+                       "`objectives shared for the session`): each game runs its own objectives")
+    rows: dict[tuple[int, str], list[tuple[str, Line]]] = {}
+    for gen, line, m in objective_lines(run.server, OBJ_S_ROW):
+        rows.setdefault((gen, m.group(1)), []).append((f"{m.group(2)}/{m.group(3)}{' active' if m.group(4) else ''}",
+                                                      line))
+    findings: list[Finding] = []
+    order = sorted(run.clients, key=lambda w: (w != "H", w))
+    counts = [f"S rows {sum(len(v) for v in rows.values())} for {len(rows)} objective(s) in "
+              f"{len({g for g, _i in rows})} level(s)"]
+    for who in order:
+        log = run.clients[who]
+        applied: dict[tuple[int, str], list[tuple[str, Line]]] = {}
+        for gen, line, m in objective_lines(log, OBJ_APPLIED):
+            applied.setdefault((gen, m.group(1)), []).append(
+                (f"{m.group(2)}/{m.group(3)}{' active' if m.group(4) else ''}", line))
+        counts.append(f"{who} applied {sum(len(v) for v in applied.values())}")
+        for key in sorted(set(rows) | set(applied)):
+            s_seq, c_seq = rows.get(key, []), applied.get(key, [])
+            words = (f"generation {key[0]} objective {key[1]}: S {[v for v, _l in s_seq]}, {who} "
+                     f"{[v for v, _l in c_seq]}")
+            if [v for v, _l in s_seq] != [v for v, _l in c_seq]:
+                cite = [l.cite() for _v, l in s_seq[:3]] + [l.cite() for _v, l in c_seq[:3]]
+                findings.append(Finding(f"{who}'s applies differ from S's rows: {words}",
+                                        cite or [absent(log, "`objective applied`")]))
+                continue
+            late = [(s, c) for (_v, s), (_w, c) in zip(s_seq, c_seq)
+                    if s.t is not None and c.t is not None and c.t - s.t > OBJECTIVE_APPLY_S]
+            if late:
+                s, c = late[0]
+                findings.append(Finding(f"{who} applied S's row more than {OBJECTIVE_APPLY_S.seconds} s late "
+                                        f"({(c.t - s.t).total_seconds():.1f} s): {words}", [s.cite(), c.cite()]))
+        for gen, line, m in objective_lines(log, OBJ_AFTER):
+            findings.append(Finding(f"{who}: objective {m.group(1)} differs from S's after its apply", [line.cite()]))
+        for gen, line, m in objective_lines(log, OBJ_REFUSED):
+            findings.append(Finding(f"{who}: S's objective row {m.group(1)} was refused here", [line.cite()]))
+        for gen, line, m in objective_lines(log, OBJ_OWN_RUN):
+            if (gen, m.group(1)) in rows:
+                first = rows[(gen, m.group(1))][0][1]
+                findings.append(Finding(f"{who} ran its own {m.group(2)} of objective {m.group(1)}, for which S has a "
+                                        f"row in generation {gen}", [line.cite(), first.cite()]))
+        cancelled = {(gen, m.group(1)) for gen, _l, m in objective_lines(log, OBJ_CANCELLED)}
+        for key, seq in rows.items():
+            went = next((l for (a, _la), (b, l) in zip(seq, seq[1:]) if a.endswith(" active")
+                         and not b.endswith(" active")), None)
+            if went is not None and key not in cancelled:
+                findings.append(Finding(f"{who}: S's objective {key[1]} went inactive (generation {key[0]}) and "
+                                        "nothing cancelled it here", [went.cite(), absent(log, "`objective cancelled`")]))
+    example = next((l.cite() for seq in rows.values() for _v, l in seq), "")
+    # Each objective's sequences on S and each client (the row's evidence, PASS or FAIL).
+    notes = []
+    for key in sorted(rows):
+        per = [f"S {[v for v, _l in rows[key]]}"]
+        for who in order:
+            seq = [f"{m.group(2)}/{m.group(3)}{' active' if m.group(4) else ''}"
+                   for gen, _l, m in objective_lines(run.clients[who], OBJ_APPLIED) if (gen, m.group(1)) == key]
+            per.append(f"{who} {seq}")
+        notes.append(f"generation {key[0]} objective {key[1]}: " + ", ".join(per))
+    return Verdict("objectives", FAIL if findings else PASS, "; ".join(counts), example, findings, notes)
 
 
 # --- level pieces: run-time movers (ww1's travelling islands; docs/online-6.md "Spawned movers") ---------------
@@ -1568,21 +1719,86 @@ def server_gate_opens(run: Run, name: str) -> list[tuple[str, Line]]:
     return [(pressed[m.group(1)], line) for line, m in run.server.find(GATE_APPLIED_S) if m.group(1) in pressed]
 
 
+# A gate's lock state (W17: a Scripts.LockedObjectComponent gate opens in place, its origin never moves, so
+# wait_moved never sees it). A gate's row is named by S's reference: `a<S's entity id, 8 hex>.<name hash>.<class>`
+# (S's `authored obj <zone> <i> <index> class <class> entity 1 name <hash> ... mid <id hex> ... text <Name>` line).
+# Every game logs the same authored list with its own entity ids, so S's reference names a gate by its authored
+# index, and each game's own line for that index names its `<Name>#<id>` (ww1: Finale_DemonGate008 is S's and H's
+# 0x93d, D's 0x95a). A client shows the opening as `backend key gate <S's ref>@<g> watched <p> (unlocked
+# Scripts.<Lock>=<n>)`; S writes the gate's row once when the level starts (`world 2 <ref>@<g> written`) and again
+# when the gate opens (batch 12 case 7, ww1: Finale_DemonGate008 S 12:54:21.128, H 12:54:21.454, D 12:54:21.363;
+# PuzzleGateSawtooth001 12:56:09.599, 56:10.041, 56:10.016).
+AUTHORED_GATE = re.compile(r"Online: authored obj (\S+) \d+ (\d+) class ([0-9a-f]{8}) entity \d+ name ([0-9a-f]{8}) "
+                           r"name0 \S+ mid ([0-9a-f]+) .* text (\S+)$")
+KEY_GATE_UNLOCKED = re.compile(r"Online: backend key gate (a[0-9a-f]{8}\.[0-9a-f]{8}\.[0-9a-f]{8})@\d+ watched \S+ "
+                               r"\(unlocked ")
+GATE_ROW_WRITTEN = re.compile(r"Online: world 2 (a[0-9a-f]{8}\.[0-9a-f]{8}\.[0-9a-f]{8})@\d+ written")
+
+
+def authored_gates(log: Log, name: str) -> dict[tuple[str, str], tuple[str, str]]:
+    """This game's gates of this name: (zone, authored index) -> (its reference, its `<name>#<id>`)."""
+    out = {}
+    for _line, m in log.find(AUTHORED_GATE):
+        if m.group(6) == name:
+            ident = int(m.group(5), 16)
+            out[(m.group(1), m.group(2))] = (f"a{ident:08x}.{m.group(4)}.{m.group(3)}", f"{name}#{ident}")
+    return out
+
+
+def gate_refs(log: Log, name: str, server: Log | None = None) -> dict[str, str]:
+    """The row references of the gates of this name (S's, from `server` when given, else this game's own), each to
+    this game's `<name>#<id>` of the same authored gate."""
+    own = authored_gates(log, name)
+    named = authored_gates(server, name) if server is not None else own
+    out = {}
+    for key, (ref, _ident) in named.items():
+        if key in own:
+            out[ref] = own[key][1]
+    return out
+
+
+def lock_state_opens(log: Log, name: str, server: bool, s_log: Log | None = None) -> list[tuple[str, Line]]:
+    """(<name>#<id>, the line) for each opening this game shows by the gate's lock state: on S a gate's row written
+    again after its first write, on a client its `backend key gate <S's ref> ... (unlocked ...)` (`s_log`: S's log,
+    whose references the rows carry; None: this game's own)."""
+    refs = gate_refs(log, name, None if server else s_log)
+    if not refs:
+        return []
+    out: list[tuple[str, Line]] = []
+    if server:
+        written: set[str] = set()
+        for line, m in log.find(GATE_ROW_WRITTEN):
+            ref = m.group(1)
+            if ref in refs:
+                if ref in written:
+                    out.append((refs[ref], line))
+                written.add(ref)
+    else:
+        out = [(refs[m.group(1)], line) for line, m in log.find(KEY_GATE_UNLOCKED) if m.group(1) in refs]
+    return out
+
+
 def gate_open_ids(log: Log, name: str, mover: bool = False, run: Run | None = None) -> list[Line]:
-    """One line per distinct `<name>#<id>` this game shows opened, in order (on S, with `run`, also S's own
-    applied opens: server_gate_opens)."""
+    """One line per distinct `<name>#<id>` this game shows opened, in time order: S's own and each client's lines,
+    the lock state (lock_state_opens), on S with `run` also S's own applied opens (server_gate_opens: one that
+    follows S's write of a gate's row within 2 s is that gate's)."""
     n = re.escape(name)
     rx = re.compile(r"(?:Online: (?:world gate (" + n + r"#\d+) (?:open apply|tombstoned)|availability (" + n +
                     r"#\d+) removed|backend key gate (" + n + r"#\d+)\S* unlocked)" +
                     (r"|Dev: wait_moved (" + n + r"#\d+) done \()" if mover else ")"))
+    server = run is not None and log is run.server
     seen: dict[str, Line] = {}
-    for line, m in log.find(rx):
-        ident = next(g for g in m.groups() if g)
+    found = [(next(g for g in m.groups() if g), line) for line, m in log.find(rx)]
+    found += lock_state_opens(log, name, server, run.server if run is not None else None)
+    for ident, line in sorted(found, key=lambda x: (x[1].t or datetime.min, x[1].no)):
         seen.setdefault(ident, line)
-    if run is not None and log is run.server:
-        for ident, line in server_gate_opens(run, name):
-            seen.setdefault("pressed " + ident, line)
-    return sorted(seen.values(), key=lambda l: l.no)
+    if server:
+        rows = [(ident, line) for ident, line in lock_state_opens(log, name, True)]
+        for who_ident, line in server_gate_opens(run, name):
+            near = [ident for ident, row in rows if row.t is not None and line.t is not None and
+                    timedelta(0) <= line.t - row.t <= timedelta(seconds=2)]
+            seen.setdefault(near[-1] if near else "pressed " + who_ident, line)
+    return sorted(seen.values(), key=lambda l: (l.t or datetime.min, l.no))
 
 
 def gate_opened(run: Run, name: str) -> Line | None:
@@ -1692,16 +1908,51 @@ def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[st
         trail = key_gate_trail(run, g.name, k) if g.kind == "key gate" else []
         if g.kind == "battle gate" and where.get("S") is None:
             trail.append(battle_gate_left(run, data, g))
+        passed, faults, unchecked = gate_passes(run, g.name, k, where)
+        walk = ([f"passed on foot by {', '.join(passed)}"] if passed else []) + unchecked
         if missing:
             opened_on = [f"{w} at {when(where[w])}" for w in where if where[w] is not None]
             shut.append(f"{g.name} ({g.kind}): attempted by the pass ({req[0].cite()}: its own line, no proof of anything the game did); opened on "
                         f"{', '.join(opened_on) or 'no game'}, not on {', '.join(missing)}"
-                        + ("; " + "; ".join(trail) if trail else ""))
+                        + ("; " + "; ".join(faults + walk + trail) if faults or walk or trail else ""))
+        elif faults:
+            shut.append(f"{g.name} ({g.kind}): opened on {', '.join(where)} but " + "; ".join(faults)
+                        + ("; " + "; ".join(walk + trail) if walk or trail else ""))
         else:
             done.append(f"{g.name} ({g.kind}): opened on {', '.join(where)}: "
                         + "; ".join(f"{w} at {when(line)} {line.cite()}" for w, line in where.items())
-                        + ("; " + "; ".join(trail) if trail else ""))
+                        + ("; " + "; ".join(walk + trail) if walk or trail else ""))
     return shut, done
+
+
+# W23: each client's walk through the gate (`Dev: pass_gate <Name#id> done (passed on foot: ...)` / `failed (not
+# passed on foot: ...)` / `failed (not walkable straight: ...)`, the k-th of that name for the k-th gate). A walk
+# that failed after the gate opened on that game is "gate open but not passable" (a finding); one that ended before
+# it opened there, or a line that is no player's way (not walkable straight), is said and not counted either way.
+PASS_GATE = re.compile(r"Dev: pass_gate (\S+#\d+) (done|failed) \((.*)\)")
+
+
+def gate_passes(run: Run, name: str, k: int, where: dict) -> tuple[list[str], list[str], list[str]]:
+    """(passed: "<who> at <t>", faults, not checked) for the k-th gate of this name on each client."""
+    passed, faults, unchecked = [], [], []
+    for who in sorted(run.clients, key=lambda w: (w != "H", w)):
+        log = run.clients[who]
+        mine = [(line, m) for line, m in log.find(PASS_GATE) if m.group(1).split("#")[0] == name]
+        if len(mine) <= k:
+            if log.find(PASS_GATE):
+                unchecked.append(f"no walk through it on {who}")
+            continue
+        line, m = mine[k]
+        if m.group(2) == "done":
+            passed.append(f"{who} at {when(line)}")
+        elif m.group(3).startswith("not walkable straight"):
+            unchecked.append(f"passing not checked on {who}: {m.group(3)} ({line.cite()})")
+        elif where.get(who) is not None and where[who].t is not None and line.t is not None and where[who].t <= line.t:
+            faults.append(f"gate open but not passable on {who}: {m.group(3)} ({line.cite()}; opened there at "
+                          f"{when(where[who])})")
+        else:
+            unchecked.append(f"{who}'s walk ended before the gate opened there ({line.cite()})")
+    return passed, faults, unchecked
 
 
 # "Reached the next level" is the game's own evidence on that client: a level loaded after the level under test
@@ -1813,7 +2064,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     together = grade_together(run)
     rows = [grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run),
-            grade_pieces(run, data)]
+            grade_objectives(run), grade_pieces(run, data)]
     # The enemies and the loot are read where both players stand only when D followed H: each says which.
     followed = bool(run.clients.get("D") and run.clients["D"].find(FOLLOW_ON))
     if together.status in (PASS, FAIL):
@@ -1827,7 +2078,27 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     for v in rows:
         if v.name in ("enemies", "loot"):
             v.notes.append(where)
+    # A sweep that skipped steps for time: each NOT TESTED row those steps would have tested says so (W13).
+    skipped = skipped_acts(run.clients.get("H"))
+    for v in rows:
+        mine = [s for s in skipped if v.name in KIND_ROWS.get(s[1], ())]
+        # Not for a row the run turned off (shared coins or loot off, scenes skipped): time made no difference there.
+        off = re.search(r"\boff\b|--dev_skip_scenes", v.counts)
+        if v.status == NOT_TESTED and mine and not off:
+            v.notes.insert(0, f"not tested partly for time: the sweep's deadline skipped {len(mine)} step(s) that "
+                              f"test it: " + ", ".join(f"{label} {kind} {name}" for label, kind, name, _l in mine[:6])
+                           + f" ({mine[0][3].cite()})")
     return rows
+
+
+def skipped_head(h: Log | None) -> list[str]:
+    """The page's head line for a sweep that skipped steps for time, with the NOT TESTED rows they would test."""
+    skipped = skipped_acts(h)
+    if not skipped:
+        return []
+    rows = sorted({r for _l, kind, _n, _x in skipped for r in KIND_ROWS.get(kind, ())})
+    return [f"the sweep skipped {len(skipped)} act(s) for time ({skipped[0][3].cite()}); rows they would test: "
+            f"{', '.join(rows)} (a NOT TESTED row among them says so)"]
 
 
 def run_head(folder: Path) -> list[str]:
@@ -1840,7 +2111,32 @@ def run_head(folder: Path) -> list[str]:
     secs = r.get("seconds")
     return [f"case {r.get('case', '?')}: runner status {r.get('status', '?')}, "
             f"{(secs / 60):.1f} min" if isinstance(secs, (int, float)) else f"case {r.get('case', '?')}",
-            f"build snapshot {prov.get('build') or '?'}, runner {prov.get('runner') or '?'}"]
+            f"build snapshot {prov.get('build') or '?'}, runner {prov.get('runner') or '?'}",
+            *figures_head(folder),
+            *skipped_head(read_log(folder, "H/game.log", "H"))]
+
+
+PLACE_LINE = re.compile(r"^\s*place (\d+) .*?([^/\\]+)\.dump\s*$")
+
+
+def figures_head(folder: Path) -> list[str]:
+    """The page's line naming each player's figures (W21), from its script's `place` lines; a Top and a Bottom of
+    one name are a swapper."""
+    out = []
+    for who in ("H", "D"):
+        script = folder / who / "script.txt"
+        if not script.is_file():
+            continue
+        names = [m.group(2) for m in map(PLACE_LINE.match, script.read_text(encoding="utf-8", errors="replace")
+                                         .splitlines()) if m]
+        if not names:
+            continue
+        if len(names) == 2 and names[0].endswith(" Top") and names[1].endswith(" Bottom") and \
+                names[0][:-4] == names[1][:-7]:
+            out.append(f"{who} {names[0][:-4]} (a swapper: {names[0]} + {names[1]})")
+        else:
+            out.append(f"{who} {' + '.join(names)}")
+    return [f"figures: {'; '.join(out)}"] if out else []
 
 
 def overall(verdicts: list[Verdict]) -> str:
