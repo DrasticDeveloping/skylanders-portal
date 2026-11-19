@@ -155,6 +155,24 @@ class Objectives(unittest.TestCase):
         self.assertEqual(v.status, lc.NOT_TESTED)
         self.assertIn("online_shared_objectives is off", v.counts)
 
+
+class RouteHead(unittest.TestCase):
+    def test_no_floor_and_a_rescue_are_named(self) -> None:
+        # W24 (batch 13 case 7): the rail-ride end trigger hangs in the air; a hero stuck twice is taken out.
+        h = [(60, "Input script: LEVELPASS visit v100 objects 1 (CScriptTriggerEntityData001) ref auth:tutorial_b:8394"),
+             (61, "Dev: route teleport goto_entity failed (no floor: no ground a player can stand on within 600 of it "
+                  "(the nearest at 26890,23620,180, 1148 away): a trigger in the air) (target CScriptTriggerEntityData001#2561)"),
+             (90, "Dev: route held too long at the same spot twice (28013.73,23385.52,-500.00): taken out to the last "
+                  "ground it stood on 14176.00,21295.00,40.00")]
+        f = RunFolder([], H_JOIN + h, D_JOIN)
+        head = lc.route_head(f.path)
+        self.assertTrue(head[0].startswith("not visited on H: no floor (a trigger in the air): v100 "
+                                           "CScriptTriggerEntityData001#2561 (no floor: no ground a player can stand on"),
+                        head)
+        self.assertTrue(head[1].startswith("H held too long at the same spot twice, 1 time(s): at "
+                                           "28013.73,23385.52,-500.00: taken out to the last ground it stood on "
+                                           "14176.00,21295.00,40.00"), head)
+
 class Windows(unittest.TestCase):
     def test_a_clients_time_in_each_level(self) -> None:
         f = RunFolder([], H_JOIN + LEVEL_END, D_JOIN + LEVEL_END)
