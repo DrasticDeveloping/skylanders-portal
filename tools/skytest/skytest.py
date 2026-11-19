@@ -723,8 +723,38 @@ def owner_data_roots() -> list[Path]:
     return la.owner_data_roots()
 
 
+def plain_path(p: Path) -> Path:
+    """A resolved path without Windows' `\\\\?\\` (or `\\\\?\\UNC\\`) prefix. Python's ntpath.realpath (3.14) keeps
+    that prefix on a path that does not exist when the error code of its two lookups differs: a parent folder
+    another thread creates between them (two unit cases of one run making `snapshots`) gives 3 then 2, and
+    `\\\\?\\C:\\...\\snapshots\\unit-...partial-...` was then "outside the test store" (the flip of
+    test_unit_cases_run_through_the_scheduler_without_machine_slots, 18 November)."""
+    s = str(p)
+    if s.startswith("\\\\?\\UNC\\"):
+        return Path("\\\\" + s[len("\\\\?\\UNC\\"):])
+    if s.startswith("\\\\?\\"):
+        return Path(s[len("\\\\?\\"):])
+    return p
+
+
+def resolved(p: Path) -> Path:
+    """`p` resolved through its deepest existing ancestor (junctions and links followed there), the parts
+    that do not exist yet appended as they are: a path being made is never handed to realpath's lookups of
+    a missing path (plain_path's race)."""
+    p = Path(os.path.abspath(p))
+    tail: list[str] = []
+    cur = p
+    while not cur.exists() and cur.parent != cur:
+        tail.append(cur.name)
+        cur = cur.parent
+    base = plain_path(cur.resolve())
+    for name in reversed(tail):
+        base = base / name
+    return base
+
+
 def inside(path: Path, folder: Path) -> bool:
-    p, f = path.resolve(), folder.resolve()
+    p, f = resolved(path), resolved(folder)
     return p == f or f in p.parents
 
 
