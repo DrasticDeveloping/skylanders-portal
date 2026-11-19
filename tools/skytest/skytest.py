@@ -9534,6 +9534,11 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
                         else None, lock_commands=lock_commands_known(cfg))
     plan.probe = not a.no_probe
     plan.server_hidden = bool(getattr(a, "server_hidden", False))
+    plan.long_pause_s = int(getattr(a, "long_pause", 0) or 0)
+    plan.long_pause_at = getattr(a, "long_pause_at", "") or ""
+    if plan.long_pause_s and lp.long_pause_label(plan) is None:
+        raise SystemExit(f"levelpass: --long-pause: the plan has no pickup of "
+                         f"{plan.long_pause_at or 'a collectible'} to leave its screen up at")
     # D follows H by default once the game registers online_auto_follow (the checkout's command table, which
     # the launch builder checks every script against: before that build nothing changes); --d-stays keeps D
     # where it entered.
@@ -9715,6 +9720,11 @@ def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
     lp_.add_argument("--d-joins-late", action="store_true", help="D joins late, into the level under test (the"
                      " parked path); by default both clients join in the lobby, the host picks the slot and the"
                      " party enters the level together (the owner's order)")
+    lp_.add_argument("--long-pause", type=int, default=0, metavar="SECONDS", help="one pickup leaves the game's"
+                     " found screen up this long on purpose (the run a pause crash's fix needs); every other step"
+                     " dismisses a pause screen within seconds")
+    lp_.add_argument("--long-pause-at", default="", metavar="NAME", help="the object whose pickup takes the long"
+                     " pause (default: the plan's first pickup of a collectible)")
     lp_.add_argument("--d-stays", action="store_true", help="D stays where it entered the level (the old"
                      " behaviour); by default D's hero follows H's through the stops (the game's Auto follow,"
                      " online_auto_follow on) once the game registers that command")
