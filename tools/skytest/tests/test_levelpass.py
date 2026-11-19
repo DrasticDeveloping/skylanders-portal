@@ -1078,7 +1078,8 @@ class PauseScreens(unittest.TestCase):
         self.assertEqual(lines[0], f"hold_cap {lp.PAUSE_HOLD_S}")
         k = lines.index("pickup auth:lvl:9 10")
         self.assertTrue(lines[k + 1].startswith("log LEVELPASS pause check v3_1"))
-        self.assertEqual(lines[k + 2:], [*lp.DISMISS_LINES, "hold_cap 90", "wait_free 90"])
+        self.assertEqual(lines[k + 2:], [*lp.DISMISS_LINES, "log LEVELPASS pause check v3_1: one more B if the hero "
+                                         "is still held", "tap b", "waitfor hero_free 5", "hold_cap 90", "wait_free 90"])
         lever = lp.Action(action=lp.INTERACT_A, obj=lp.Obj("Lever", "C", (0.0, 0.0, 0.0), lp.GROUP_INTERACT, ref="auth:lvl:4"),
                           why="a switch")
         self.assertNotIn("hold_cap 4", lp.action_lines(lever, "v3_2", cap=90))  # a microgame may hold it on purpose
@@ -1114,6 +1115,89 @@ class FixedWaits(unittest.TestCase):
         ww1 = [p for p in plans if p.level == "ww1" and p.pieces]
         if ww1:
             self.assertIn("wait 25", lp.script_h(ww1[0], None).splitlines())  # the islands' stay, in seconds
+
+
+class FoundScreen:
+    """The Soul Gem's found screen as the recorded runs show it: it takes no press before READY_S after the
+    collect (A 5.1 s after it did nothing: ww1 20261119-110623; A 12 s, 13 s and 92 s after it was taken: the
+    18 November probes, ww1 20261119-051557); A takes it from "found" to the prompt, B on the prompt closes it
+    (the hero free 1.5 s later), B on "found" does nothing, A on the prompt answers Yes (the preview movie)."""
+    READY_S = 10.0
+
+    def __init__(self, start_s: float) -> None:
+        self.t, self.state, self.free_at = start_s, "found", None
+
+    def held(self) -> bool:
+        return self.free_at is None or self.t < self.free_at
+
+    def play(self, lines: list[str]) -> str:
+        for line in lines:
+            word, *rest = line.split()
+            if word in ("waitfor", "wait_free"):
+                n = float(rest[-1])
+                if self.held():
+                    self.t = min(self.t + n, self.free_at) if self.free_at is not None else self.t + n
+            elif word == "wait":
+                self.t += float(rest[0])
+            elif line == "tap a" and self.t >= self.READY_S:
+                self.state = {"found": "prompt", "prompt": "movie"}.get(self.state, self.state)
+            elif line == "tap b" and self.t >= self.READY_S and self.state == "prompt":
+                self.state, self.free_at = "closed", self.t + 1.5
+        return self.state
+
+
+W3_DISMISS = ["tap a", "waitfor hero_free 3", "tap b", "waitfor hero_free 4", "tap b", "waitfor hero_free 4"]
+FIXTURE_RUNS = Path("D:/SwapForceOnline-data/tests/int2/runs")
+
+
+class FoundScreenDismissal(unittest.TestCase):
+    """W7: the dismissal waits for the screen before its one A (batch 11 second round: W3's A, B, B came 5.1 s after
+    the collect and closed nothing; the game stayed paused until fail-fast)."""
+
+    def gem_step(self) -> list[str]:
+        o = lp.Obj("SoulGem_x", "CPhysicalEntity", (0.0, 0.0, 0.0), lp.GROUP_PICKUPS, ident="u", ref="auth:lvl:9")
+        o.components = [lp.COMP_COLLECTIBLE]
+        lines = lp.action_lines(lp.Action(action=lp.PICKUP, obj=o, why="a gem"), "v19_1", after="auth:lvl:9", cap=20)
+        return lines[lines.index("pickup auth:lvl:9 10") + 1:]
+
+    def test_the_model_matches_both_recorded_runs(self) -> None:
+        self.assertEqual(FoundScreen(5.1).play(W3_DISMISS), "found")    # 20261119-110623: never freed
+        self.assertEqual(FoundScreen(91.0).play(W3_DISMISS), "closed")  # 20261119-051557: A at 92 s, then B
+
+    def test_the_new_dismissal_closes_it_early_and_late_and_never_presses_a_twice(self) -> None:
+        after = self.gem_step()
+        self.assertEqual(after.count("tap a"), 1)
+        for start in (0.5, 4.0, 5.1, 6.0, 30.0, 91.0):
+            self.assertEqual(FoundScreen(start).play(after), "closed", start)
+
+    def test_long_pause_ends_with_the_same_dismissal(self) -> None:
+        o = lp.Obj("SoulGem_x", "CPhysicalEntity", (0.0, 0.0, 0.0), lp.GROUP_PICKUPS, ident="u", ref="auth:lvl:9")
+        o.components = [lp.COMP_COLLECTIBLE]
+        lines = lp.action_lines(lp.Action(action=lp.PICKUP, obj=o, why="a gem"), "v19_1", after="auth:lvl:9", cap=20,
+                                long_pause=60)
+        after = lines[lines.index("pickup auth:lvl:9 10") + 1:]
+        self.assertEqual(after[1:1 + len(lp.DISMISS_LINES)], list(lp.DISMISS_LINES))
+        self.assertEqual(FoundScreen(60.0).play(after), "closed")
+
+    @unittest.skipUnless((FIXTURE_RUNS / "20261119-110623-levelpass-ww1" / "H" / "game.log").is_file() and
+                         (FIXTURE_RUNS / "20261119-051557-levelpass-ww1" / "H" / "game.log").is_file(),
+                         "the two recorded ww1 runs are not on this machine")
+    def test_the_recorded_starts(self) -> None:
+        import datetime as dt
+
+        def start_of(run: str, pattern: str) -> float:
+            text = (FIXTURE_RUNS / run / "H" / "game.log").read_text(encoding="utf-8", errors="replace")
+            stamp = lambda line: dt.datetime.strptime(line[1:24], "%Y-%m-%d %H:%M:%S.%f")
+            got = next(l for l in text.splitlines() if "Online: collect native 000b0017" in l)
+            done = next(l for l in text.splitlines() if pattern in l)
+            return (stamp(done) - stamp(got)).total_seconds()
+
+        new = start_of("20261119-110623-levelpass-ww1", "LEVELPASS pause check v19_1")
+        old = start_of("20261119-051557-levelpass-ww1", "Dev: pickup (null)#3755 failed")
+        self.assertAlmostEqual(new, 5.088, places=2)
+        self.assertGreater(old, 90.0)
+        self.assertEqual(FoundScreen(new).play(W3_DISMISS), "found")        # what the new run did
+        self.assertEqual(FoundScreen(new).play(self.gem_step()), "closed")  # what W7 does from there
 
 class HeldFights(unittest.TestCase):
     """A fight is planned only when its held enemies' release is on the route before it (levelpass_holds)."""

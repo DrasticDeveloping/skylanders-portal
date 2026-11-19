@@ -1754,9 +1754,13 @@ def action_lines(a: Action, label: str, after: str = "", cap: int = 0, long_paus
         # The inner lines end with this collectible's own dismissal (dismiss_after) when it has one: one is enough.
         while inner and inner[-len(DISMISS_LINES):] == list(DISMISS_LINES):
             inner = inner[:-len(DISMISS_LINES)]
+        # Still held after A, B, B: the step ends here, not the run; one more B (a prompt the first B missed),
+        # then the pass's own cap bounds what is left, and wait_free's line names the hero's state.
         return [*head, f"hold_cap {short}", *inner,
                 f"log LEVELPASS pause check {label}: a screen that holds the hero is dismissed as a player does",
-                *DISMISS_LINES, f"hold_cap {cap}", f"wait_free {cap}"]
+                *DISMISS_LINES,
+                f"log LEVELPASS pause check {label}: one more B if the hero is still held", "tap b", "waitfor hero_free 5",
+                f"hold_cap {cap}", f"wait_free {cap}"]
     o = a.obj
     ref = o.ref
     out = [f"log LEVELPASS act {label} {a.action} {_safe(o.name) or '-'} {o.cls} ref {ref}"]
@@ -1799,7 +1803,14 @@ FIGHT_RADIUS = 1500
 # a jump and two attacks. A screen this does not close: the next step's pause line is H's forbidden line
 # (PAUSE_FATAL), the pass ends INCOMPLETE. The stored data does not say which collectibles are major, so the
 # rule is the component's, never a name's.
-DISMISS_LINES = ("tap a", "waitfor hero_free 3", "tap b", "waitfor hero_free 4", "tap b", "waitfor hero_free 4")
+# The screen takes no press in its first seconds (batch 11 second round, ww1 20261119-110623: A 5.1 s after the
+# collect did nothing, and the B, B after it nothing either, the game paused 54 s until fail-fast; A 12 s and
+# 13 s after the collect was taken in the 18 November probes, 92 s in 20261119-051557). So the dismissal first
+# waits on the game's own state: `waitfor hero_free FOUND_SCREEN_SETTLE_S` passes at once on a free hero (no
+# screen up) and on a held one gives the screen its seconds before the one A; then B, and B once more.
+FOUND_SCREEN_SETTLE_S = 12   # the one A comes 12 s or more after the screen came up (taken at 12 s in a probe)
+DISMISS_LINES = (f"waitfor hero_free {FOUND_SCREEN_SETTLE_S}", "tap a", "waitfor hero_free 3", "tap b",
+                 "waitfor hero_free 5", "tap b", "waitfor hero_free 5")
 
 
 def is_collectible(o: Obj) -> bool:
