@@ -1529,22 +1529,14 @@ def released_here(run: Run, hold, dead_by_player: bool) -> Line | str | None:
     return None
 
 
-def gate_opened(run: Run, name: str) -> Line | None:
-    """A line that shows the gate opened: a client's `world gate <Name#id> open apply` (S's open applied there)
-    or S's `world gate <Name#id> tombstoned` / `availability <Name#id> removed`."""
-    rx = re.compile(r"Online: (?:world gate " + re.escape(name) + r"#\d+ (?:open apply|tombstoned)|availability "
-                    + re.escape(name) + r"#\d+ removed)")
-    for log in ([run.server] if run.server else []) + list(run.clients.values()):
-        hit = log.find(rx)
-        if hit:
-            return hit[0][0]
-    return None
-
-
 # The pass's required phase (levelpass.plan_required): H's `LEVELPASS required r<k> <kind> <gate> (...)` before
 # the step, or `... not performed: <why>`. Each gate's opening is read on each game apart: a client's `world gate
 # <Name#id> open apply` (S's open applied there) or `backend key gate <Name#id> ... unlocked`, S's `world gate
-# <Name#id> tombstoned` or `availability <Name#id> removed`, and on H the step's own `wait_moved <Name#id> done`.
+# <Name#id> tombstoned` or `availability <Name#id> removed`, S's `backend gate.open applied <h> key <k>` (its own
+# read of its gate settled open after a client's press: the press's `backend press held <Name#id> key <k>` on that
+# client names the gate), and on H the step's own `wait_moved <Name#id> done`. S writes no `world gate ... open
+# apply` (that is a client applying S's row): the key-gate run tutorial_b 20261119-065111 opened gate 1 on S at
+# 06:54:11.795 and the page said "not on S".
 # Gates of the same name (tutorial_b's two TutorialLockedGate) are told apart by their order along the level and
 # the distinct ids each game opened.
 REQ_LINE = re.compile(r"Input script: LEVELPASS required (r\d+) (\S+) (\S+)(?: not performed: (.*))?")
@@ -1556,8 +1548,24 @@ def when(line: Line) -> str:
     return line.t.strftime("%H:%M:%S.%f")[:-3] if line.t is not None else "?"
 
 
-def gate_open_ids(log: Log, name: str, mover: bool = False) -> list[Line]:
-    """One line per distinct `<name>#<id>` this game shows opened, in order."""
+GATE_APPLIED_S = re.compile(r"Online: backend gate\.open applied \S+ key (\S+)")
+
+
+def server_gate_opens(run: Run, name: str) -> list[tuple[str, Line]]:
+    """S's own opens of a gate of this name: each `backend gate.open applied <h> key <k>` whose request a client's
+    `backend press held <name>#<id> key <k>` sent, as (that client and its <name>#<id>, S's line)."""
+    if run.server is None:
+        return []
+    pressed = {}
+    for who, log in run.clients.items():
+        for _line, m in log.find(re.compile(r"Online: backend press held (" + re.escape(name) + r"#\d+) key (\S+)")):
+            pressed.setdefault(m.group(2), f"{who}:{m.group(1)}")
+    return [(pressed[m.group(1)], line) for line, m in run.server.find(GATE_APPLIED_S) if m.group(1) in pressed]
+
+
+def gate_open_ids(log: Log, name: str, mover: bool = False, run: Run | None = None) -> list[Line]:
+    """One line per distinct `<name>#<id>` this game shows opened, in order (on S, with `run`, also S's own
+    applied opens: server_gate_opens)."""
     n = re.escape(name)
     rx = re.compile(r"(?:Online: (?:world gate (" + n + r"#\d+) (?:open apply|tombstoned)|availability (" + n +
                     r"#\d+) removed|backend key gate (" + n + r"#\d+)\S* unlocked)" +
@@ -1566,13 +1574,16 @@ def gate_open_ids(log: Log, name: str, mover: bool = False) -> list[Line]:
     for line, m in log.find(rx):
         ident = next(g for g in m.groups() if g)
         seen.setdefault(ident, line)
-    return list(seen.values())
+    if run is not None and log is run.server:
+        for ident, line in server_gate_opens(run, name):
+            seen.setdefault("pressed " + ident, line)
+    return sorted(seen.values(), key=lambda l: l.no)
 
 
 def gate_opened(run: Run, name: str) -> Line | None:
     """A line of any game that shows the gate opened (the first)."""
     for log in ([run.server] if run.server else []) + list(run.clients.values()):
-        ids = gate_open_ids(log, name, mover=log.who == "H")
+        ids = gate_open_ids(log, name, mover=log.who == "H", run=run)
         if ids:
             return ids[0]
     return None
@@ -1596,9 +1607,12 @@ def key_gate_trail(run: Run, name: str, k: int) -> list[str]:
                  if "single-fire volume" not in l.text]
         out.append(f"S for the key: {s_key[-1].cite()}" if s_key else
                    absent(run.server, f"naming {name}_key (other than its level-start volume)"))
-        decided = run.server.find(re.compile(r"Online: .*gate\.open.*|Online: decided .*gate.*"))
-        if decided:
-            out.append(f"S's decision: {decided[0][0].cite()}")
+        # One decision per press (`gate.open run` or `refused`), the k-th for the k-th gate of this name.
+        decided = run.server.find(re.compile(r"Online: backend gate\.open (?:run|refused) .*"))
+        if len(decided) > k:
+            out.append(f"S's decision: {decided[k][0].cite()}")
+        elif decided:
+            out.append(f"S's decision: none for this press (S decided {len(decided)}, the last {decided[-1][0].cite()})")
     if h is not None:
         held = h.find(re.compile(r"Online: backend press (held|released|cancelled|refused|slow)[^\n]*" + re.escape(name)))
         out.append("press at the lock on H: " + "; ".join(l.cite() for l, _m in held[:3]) if held else
@@ -1606,6 +1620,13 @@ def key_gate_trail(run: Run, name: str, k: int) -> list[str]:
         pressed = h.find(re.compile(r"Dev: interact " + re.escape(name) + r"_keylock#\S+ (done|failed).*"))
         if len(pressed) > k:
             out.append(f"interact on H: {pressed[k][0].cite()}")
+        # The gate each press went to (`backend press held <Name#id> key <k>`): a press on a gate an earlier step
+        # pressed is another gate's lock (tutorial_b 20261119-065111: step 2 pressed gate 1's lock by its name).
+        gates = [(line, m.group(1)) for line, m in
+                 h.find(re.compile(r"Online: backend press held (" + re.escape(name) + r"#\d+) key \S+"))]
+        if len(gates) > k and gates[k][1] in [g for _l, g in gates[:k]]:
+            out.append(f"the press went to {gates[k][1]}, the gate an earlier step pressed (another gate's lock, not "
+                       f"this one's): {gates[k][0].cite()}")
     d = run.clients.get("D")
     if d is not None:
         d_key = [l for l, _m in d.find(re.compile(r"Online: .*\b" + key + r".*"))
@@ -1660,7 +1681,7 @@ def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[st
             continue
         where = {}
         for who, lg in games:
-            ids = opened.setdefault((who, g.name), gate_open_ids(lg, g.name, mover=who == "H"))
+            ids = opened.setdefault((who, g.name), gate_open_ids(lg, g.name, mover=who == "H", run=run))
             where[who] = ids[k] if len(ids) > k else None
         missing = [w for w, line in where.items() if line is None]
         trail = key_gate_trail(run, g.name, k) if g.kind == "key gate" else []
