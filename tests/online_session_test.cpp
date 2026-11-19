@@ -963,6 +963,18 @@ void FakeNetworkScenes() {
   CHECK(w.RunUntil([&] { return owner.Count(CE::kSceneBarrier) == 3 && b.Count(CE::kSceneBarrier) == 3; }));
   CHECK(b.Last(CE::kSceneBarrier)->scene == end);
 
+  // To one client: the shared skip's kSkip naming that client's own play; the other gets nothing.
+  SceneBarrier skip = open;
+  skip.phase = ScenePhase::kSkip;
+  skip.scene.scene_sequence = 2;
+  CHECK(w.server.SendSceneBarrierTo(b.session->PeerId(), skip, w.net.Now()));
+  CHECK(!w.server.SendSceneBarrierTo(b.session->PeerId(), ack_phase, w.net.Now()));  // the clients' phase
+  CHECK(!w.server.SendSceneBarrierTo(999, skip, w.net.Now()));                       // no such client
+  CHECK(w.RunUntil([&] { return b.Count(CE::kSceneBarrier) == 4; }));
+  w.Run(100ms);
+  CHECK(owner.Count(CE::kSceneBarrier) == 3);
+  CHECK(b.Last(CE::kSceneBarrier)->scene == skip);
+
   // End session: a client stops acking (SessionClosed was its last message).
   w.server.EndSession(w.net.Now());
   CHECK(w.RunUntil([&] { return b.session->Closing(); }));
