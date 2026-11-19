@@ -856,6 +856,36 @@ class Loot(unittest.TestCase):
         v = lc.grade_loot(RunFolder(s, H_JOIN + full + LEVEL_END, D_JOIN + full + LEVEL_END).run())
         self.assertEqual(v.status, lc.PASS, v.findings)
 
+    def test_run_time_carriers_by_their_row(self) -> None:
+        """Batch 11 run 4: a run-time enemy's drop is named by its row (`s<spawner>.<tag>#<n>`); two sibling
+        bombers of one spawner are two carriers; one a client could not deliver is named with its line."""
+        b1, b2 = "sb7fe49cd.52540001#1", "sb7fe49cd.52540001#2"
+        s = [(50, f"Online: spill BomberSpawner_02_Spawned1 {b1} 0#1 selected 3 items cap 9: 2 peers present"),
+             (50, f"Online: spill obliged {b1} 00000001 to peer 1 (obligation 4)"),
+             (50, f"Online: spill obliged {b1} 00000001 to peer 2 (obligation 4)"),
+             (52, f"Online: spill BomberSpawner_02_Spawned2 {b2} 0#1 selected 2 items cap 9: 2 peers present"),
+             (52, f"Online: spill obliged {b2} 00000001 to peer 1 (obligation 5)"),
+             (52, f"Online: spill obliged {b2} 00000001 to peer 2 (obligation 5)"),
+             (99, "Online: spill obligations to peer 1: 2 made, 2 completed, 0 ended otherwise, 0 open (it left)"),
+             (99, "Online: spill obligations to peer 2: 2 made, 1 completed, 1 ended otherwise, 0 open (it left)")]
+        h = [(51, f"Online: spill fulfilled BomberSpawner_02_Spawned1 {b1} 0#1 (S selected 3 items, here spawned 3)"),
+             (53, f"Online: spill fulfilled BomberSpawner_02_Spawned2 {b2} 0#1 (S selected 2 items, here spawned 2)"),
+             (98, "Online: loot delivery: 2 obligations, 2 delivered in full, 0 differ, 0 short, 0 unfinished, 0 own runs "
+                  "without S's obligation (S's selections give 5 items, here spawned 5)")]
+        d = [(51, f"Online: spill fulfilled BomberSpawner_02_Spawned1 {b1} 0#1 (S selected 3 items, here spawned 3)"),
+             (53, f"Online: spill lost ? {b2} 0#1 (its run-time row ended here with no copy bound: dead or removed "
+                  "before its bind, so no copy here carries its drop)"),
+             (98, "Online: loot delivery: 2 obligations, 1 delivered in full, 0 differ, 1 short, 0 unfinished, 0 own runs "
+                  "without S's obligation (S's selections give 5 items, here spawned 3)")]
+        v = lc.grade_loot(RunFolder(s, H_JOIN + h + LEVEL_END, D_JOIN + d + LEVEL_END).run())
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertTrue(v.counts.startswith("S obliged 2 spill(s), 4 deliveries to the clients"), v.counts)
+        self.assertIn("H: 2 obligations, 2 delivered in full", v.counts)
+        self.assertEqual(len(v.findings), 1)
+        self.assertTrue(v.findings[0].what.startswith("D: 1 obligation(s) not delivered in full"))
+        self.assertTrue(v.findings[0].lines[0].startswith(f"{b2} (obligation 5) carrier BomberSpawner_02_Spawned2: "
+                                                          "D/game.log:"), v.findings[0].lines)
+
     def test_loot_off_is_not_tested(self) -> None:
         v = lc.grade_loot(RunFolder([(1, "Online: loot hooks off (online_shared_loot)")], H_JOIN + [
             (30, "Online: collect native ffffffff (not reported: no source) (827513f4)")]).run())

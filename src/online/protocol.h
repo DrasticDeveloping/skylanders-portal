@@ -563,11 +563,30 @@ struct SessionClosed {
 // itself). Each client that plays a matching occurrence of its own (the same kind, name hash and
 // recipient in that generation) answers kAck. S's scene end goes to every client as kEnd.
 // Directions: kOpen, kRelease and kEnd server to client; kAck client to server. Gameplay lane.
+// The shared skip and hold (the game repository's online/6-scene-skip-shared; its docs/online-6.md):
+// kSkip, kHold and kUnhold server to client, each naming one play of an occurrence by its generation,
+// kind, name hash and recipient, the scene sequence carrying the play (the game's scene_share_rules.h:
+// the play in its low 16 bits, a conversation skip's turn in its high 16). kSkip: every client that plays
+// that play skips its own copy through the game's own skip (one decision of S's per play). kHold: a
+// client still plays it, so every client holds its player (repeated while held); kUnhold: no client plays
+// it any more (or a peer left, a silent copy left, the level changed), the hold is released. kShare
+// server to client: the session's switches for the shared skip and the hold (the scene sequence's bit 0
+// and bit 1; no recipient), sent at each join so every client follows S's one value. kStart server to
+// client: S's world sent a cutscene's Play telegram natively (not a request's step), named by its
+// telegram key (recipient: the messenger's world ref; name_hash: the list owner's hash; the scene
+// sequence: the list index << 16 | S's count of that telegram in the generation); every client sends
+// the same telegram from its own copy unless its own game sent it (the game's scene_share_rules.h
+// ScenePairing). Like kOpen and kRelease they carry no end reason and no skips.
 enum class ScenePhase : uint8_t {
   kOpen = 1,
   kAck = 2,
   kRelease = 3,
   kEnd = 4,
+  kSkip = 5,
+  kHold = 6,
+  kUnhold = 7,
+  kShare = 8,
+  kStart = 9,
 };
 enum class SceneKind : uint8_t {
   kCutscene = 1,      // a CCutsceneManager play
