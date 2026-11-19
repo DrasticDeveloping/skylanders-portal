@@ -54,6 +54,10 @@ files removed or cut at a marker line (launch_args.copy_build); the shared snaps
                                                             --gate the gate cases and their expected
                                                             minutes, the per-build ones apart with their
                                                             last result on this build (no game started)
+    skytest.py preflight CASE ... | --all-ready             a spec's mistakes before any game: its objects
+               [--runs DIR] [--strict] [--wording]          against the level data, its waits, its log patterns
+                                                            against the code, its settings, and a replay on its
+                                                            newest recorded run (preflight.py; no game)
     skytest.py lint [--timeouts [--since STAMP]]            check every spec and the manifest; warn of fps
                                                             windows nothing grades (and of waitfor timeouts)
     skytest.py timeouts [--since STAMP]                     each waitfor condition's history in the store's
@@ -8047,6 +8051,72 @@ def cmd_list(cfg: Config, a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_preflight(cfg: Config, a: argparse.Namespace) -> int:
+    """Each problem one line (preflight.py); exit 1 on an error (on a warning too with --strict)."""
+    import preflight as pf
+    paths = sorted(cfg.cases_dir.glob("*.toml")) if cfg.cases_dir.is_dir() else []
+    chosen = []
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        try:
+            d = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as e:
+            print(f"{path.stem}: error spec -: not TOML ({e})")
+            continue
+        if (a.cases and path.stem not in a.cases) or (not a.cases and not a.all_ready):
+            continue
+        if a.all_ready and not a.cases:
+            try:
+                if spec_readiness(path, d, text):
+                    continue
+            except SpecError:
+                continue
+        chosen.append((path.stem, d, True))
+    for f in a.file or []:
+        fp = expand(f)
+        try:
+            chosen.append((fp.stem.split("@")[0], tomllib.loads(fp.read_text(encoding="utf-8")), False))
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            print(f"{fp.name}: error spec -: {e}")
+    if not chosen:
+        raise SystemExit("preflight: no case chosen (name cases or give --all-ready)")
+    folder = levelpass_folder(cfg, a.folder)
+    levels: dict = {}
+    for lvl_dir in sorted(folder.glob("*-manifest.txt")):
+        name = lvl_dir.name[: -len("-manifest.txt")]
+        lv = pf.load_level(folder, name)
+        if lv is not None:
+            levels[name] = lv
+    roots = [cfg.repo / "src" / "online", cfg.repo / "thirdparty" / "skylanders-portal" / "src",
+             cfg.repo / "thirdparty" / "rexglue-sdk" / "src"]
+    corpus = pf.build_corpus(roots)
+    allow = set(la.AllowList.load(cfg.launch_allow).rules) if cfg.launch_allow.is_file() else None
+    conditions = None
+    if cfg.script_commands.is_file():
+        conditions = set(tomllib.loads(cfg.script_commands.read_text(encoding="utf-8")).get("conditions", []))
+    runs = [cfg.store / "runs"] + [expand(r) for r in (a.runs or [])]
+    wakes = pf.build_wake_index(runs, cfg.store / "preflight-wakes.json")
+    ctx = pf.Context(levels, corpus, wakes, allow, conditions, runs, wording=a.wording)
+    errors = warns = 0
+    for line in pf.check_table(corpus):
+        print(line)
+        warns += 1
+    for name, d, current in chosen:
+        probs = pf.check_spec(name, d, ctx)
+        run = pf.latest_run(runs, name) if current else None  # an older text: no replay on newer runs
+        if run is not None:
+            probs += pf.replay(name, d, run)
+        for pr in probs:
+            print(pr.line())
+            if pr.severity == "error":
+                errors += 1
+            else:
+                warns += 1
+    print(f"preflight: {len(chosen)} case(s), {errors} error(s), {warns} warning(s); levels {', '.join(sorted(levels))};"
+          f" {len(corpus.formats)} log texts; recorded logs of {len(wakes.runs_of)} zone(s)")
+    return 1 if errors or (a.strict and warns) else 0
+
+
 def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
     problems = []
     specs = {}
@@ -9333,6 +9403,18 @@ def main(argv: list[str] | None = None) -> int:
                      " its last two results on this build with the same generated case failed with the same first"
                      " reason; WHY is written into the result")
     lp_.set_defaults(fn=cmd_levelpass)
+    pf = sub.add_parser("preflight", help="a spec's mistakes before any game runs (preflight.py)")
+    pf.add_argument("cases", nargs="*", help="case names (tests/runtime/<case>.toml)")
+    pf.add_argument("--all-ready", action="store_true", help="every spec that is ready")
+    pf.add_argument("--runs", action="append", default=None, metavar="DIR", help="one more folder of recorded runs"
+                    " (repeatable; default: this worktree's store)")
+    pf.add_argument("--strict", action="store_true", help="exit non-zero on warnings too")
+    pf.add_argument("--wording", action="store_true", help="also check each pattern's wording against the log"
+                    " statements (warnings; noisy for lines composed from fragments)")
+    pf.add_argument("--file", action="append", default=None, metavar="PATH", help="a spec file outside tests/runtime"
+                    " (an older text of a case, e.g. from git show), checked under its file name's case")
+    pf.add_argument("--folder", default=None, help="the levelpass folder (default: tests/skytest.toml's)")
+    pf.set_defaults(fn=cmd_preflight)
     a = p.parse_args(argv)
     cfg = load_config(repo_root(Path(a.repo)))
     return a.fn(cfg, a)
