@@ -9490,8 +9490,12 @@ def measured_scene_lengths(cfg: Config, level: str, runs: int = 5) -> dict[str, 
         log = d / "H" / "game.log"
         if not log.is_file():
             continue
-        for name, s in lp.scene_lengths_from_log(log.read_text(encoding="utf-8", errors="replace")).items():
+        text = log.read_text(encoding="utf-8", errors="replace")
+        for name, s in lp.scene_lengths_from_log(text).items():
             out[name] = max(out.get(name, 0.0), s)
+        held = lp.sweep_scene_seconds_from_log(text)  # what the scenes took inside that run's sweep
+        if held is not None:
+            out[lp.SWEEP_SCENES_KEY] = max(out.get(lp.SWEEP_SCENES_KEY, 0.0), held)
         seen += 1
         if seen >= runs:
             break

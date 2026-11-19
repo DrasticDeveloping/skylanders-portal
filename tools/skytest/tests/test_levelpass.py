@@ -946,6 +946,75 @@ class SecondPlayerFollows(unittest.TestCase):
             table.write_text('[commands]\nonline_end = "none"\nonline_auto_follow = "none"\n', encoding="utf-8")
             self.assertTrue(sk.auto_follow_known(cfg))
 
+
+class ScenesInTheSweep(unittest.TestCase):
+    """--scenes play: the sweep's time counts the scenes that play in it, and its deadline moves by them; D,
+    not following H, comes to each scene starter and to the end fight (batch 10's tutorial_b)."""
+
+    LOG = "\n".join([
+        "[2026-11-19 05:09:34.226] [info] [core] [t1] Input script: LEVELPASS phase sweep",
+        "[2026-11-19 05:09:56.514] [info] [core] [t1] Online: scene hold on here: this player is held (1 shared scene)",
+        "[2026-11-19 05:10:30.118] [info] [core] [t1] Online: scene hold released here (the server released it)",
+        "[2026-11-19 05:10:51.513] [info] [core] [t1] Online: scene hold on here: this player is held (1 shared scene)",
+        "[2026-11-19 05:11:01.897] [info] [core] [t1] Online: scene hold released here (the server released it)",
+        "[2026-11-19 05:12:32.943] [info] [core] [t1] Input script: LEVELPASS phase audit",
+        "[2026-11-19 05:13:18.238] [info] [core] [t1] Online: scene hold on here: this player is held (the outro)",
+        "[2026-11-19 05:13:46.844] [info] [core] [t1] Online: scene hold released here (the server released it)"])
+
+    def test_the_sweeps_scene_time_from_a_run(self) -> None:
+        self.assertAlmostEqual(lp.sweep_scene_seconds_from_log(self.LOG), 33.604 + 10.384, places=3)
+        self.assertIsNone(lp.sweep_scene_seconds_from_log("Input script: LEVELPASS phase sweep\n"))
+
+    def test_the_estimate_takes_the_larger_of_data_and_measure(self) -> None:
+        scene = lp.SceneStart("TB_Intro", "trigger", lp.Obj("x", "C", (0.0, 0.0, 0.0), lp.GROUP_TRIGGERS), entered=True)
+        other = lp.SceneStart("Talk", "other", lp.Obj("y", "C", (0.0, 0.0, 0.0), lp.GROUP_TRIGGERS))
+        load = lp.SceneStart("Intro", "load", lp.Obj("z", "C", (0.0, 0.0, 0.0), lp.GROUP_TRIGGERS))
+        lengths = {"TB_Intro": 10.0}
+        self.assertEqual(lp.sweep_scene_estimate([scene, other, load], lengths), 10.0 + lp.SCENE_STEP_S + lp.SCENE_S)
+        lengths[lp.SWEEP_SCENES_KEY] = 56.5
+        self.assertEqual(lp.sweep_scene_estimate([scene, other, load], lengths), 56.5 + lp.SCENE_STEP_S)
+
+    def plan_with_a_scene(self):
+        plan = lp.make_plan(content(), d_lobby=True)
+        plan.scenes = True
+        starter = next(o for o in plan.stops[0].cluster.objects if o.ref)
+        sc = lp.SceneStart("TB_Intro", "trigger", starter, starter=starter, length=10.0, entered=True)
+        plan.scene_at = {plan.stops[0].label: [sc]}
+        return plan, starter
+
+    def test_the_deadline_is_set_again_before_each_stop(self) -> None:
+        plan, _ = self.plan_with_a_scene()
+        rearm = lp.sweep_rearm(plan)
+        self.assertEqual(len(rearm), len(plan.stops))
+        self.assertAlmostEqual(rearm[0], lp.sweep_share(plan, lp.BUDGET_S + plan.scene_extra_s))
+        self.assertEqual(rearm, sorted(rearm, reverse=True))
+        lines = lp.script_h(plan, None).splitlines()
+        k = next(i for i, l in enumerate(lines) if l.startswith(f"log LEVELPASS visit {plan.stops[1].label} "))
+        self.assertEqual(lines[k - 2:k], ["wait_free 120", f"sweep_deadline {rearm[1]:.0f}"])
+
+    def test_d_comes_to_the_scene_starter_unless_it_follows(self) -> None:
+        plan, starter = self.plan_with_a_scene()
+        h = lp.script_h(plan, None).splitlines()
+        k = h.index(f"enter_trigger {starter.ref}")
+        self.assertEqual(h[k - 3:k - 1], [f"goto_entity {starter.ref} {lp.D_STANDOFF}",
+                                          f"online_wait_peer_near_entity {starter.ref} {lp.D_NEAR} {lp.H_WAIT_D_S}"])
+        d = lp.script_d(plan).splitlines()
+        self.assertIn(f"online_wait_peer_near_entity {starter.ref} {lp.D_NEAR} {lp.D_COME_WAIT_S}", d)
+        self.assertIn(f"goto_entity {starter.ref} {lp.D_STANDOFF}", d)
+        plan.d_follow = True  # the game's follow brings D: no waits
+        self.assertFalse([l for l in lp.script_d(plan).splitlines() if "online_wait_peer_near_entity" in l])
+        self.assertFalse([l for l in lp.script_h(plan, None).splitlines() if "online_wait_peer_near_entity" in l])
+
+
+BATCH10_TB = Path("D:/SwapForceOnline-data/tests/int2/runs/20261119-050629-levelpass-tutorial_b")
+
+
+@unittest.skipUnless((BATCH10_TB / "H" / "game.log").is_file(), "batch 10's run folder is not on this machine")
+class ScenesCalibration(unittest.TestCase):
+    def test_batch_10_tutorial_b_sweep_lost_56_s_to_scenes(self) -> None:
+        text = (BATCH10_TB / "H" / "game.log").read_text(encoding="utf-8", errors="replace")
+        self.assertAlmostEqual(lp.sweep_scene_seconds_from_log(text), 56.54, places=2)
+
 class HeldFights(unittest.TestCase):
     """A fight is planned only when its held enemies' release is on the route before it (levelpass_holds)."""
 

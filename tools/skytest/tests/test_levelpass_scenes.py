@@ -70,7 +70,8 @@ class Scenes(unittest.TestCase):
         entered = sorted(sc.name for scs in p.scene_at.values() for sc in scs)
         self.assertEqual(entered, ["LVL_ChompyIntro", "LVL_LobberIntro"])
         self.assertEqual(p.scene_load_s, lp.SCENE_LOAD_S)  # the intro was never measured
-        self.assertEqual(p.scene_extra_s, lp.SCENE_LOAD_S + 40.0 + lp.SCENE_S + 2 * lp.SCENE_STEP_S)
+        # The fight's scene (LVL_BossDown) plays inside the sweep too: its 15 s count, it is not entered.
+        self.assertEqual(p.scene_extra_s, lp.SCENE_LOAD_S + 40.0 + lp.SCENE_S + 2 * lp.SCENE_STEP_S + lp.SCENE_S)
         h = lp.script_h(p, None)
         self.assertIn("log LEVELPASS scenes expected: LVL_Intro@load, LVL_LobberIntro@trigger+entered", h)
         lobber = next(sc for scs in p.scene_at.values() for sc in scs if sc.name == "LVL_LobberIntro")
