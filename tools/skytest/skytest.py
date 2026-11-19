@@ -9145,6 +9145,25 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     report = lp.report_text(a.level, plan, wall, lp.phase_times(texts["H"]), lp.fold(findings), crash,
                             {p: lp.summaries(t) for p, t in texts.items()}, str(run), notes,
                             boot=lp.boot_phases(texts["H"]))
+    # The pass's verdict (R3): PASS, INCOMPLETE with what it did not cover, or FAIL; an incomplete pass is
+    # never a pass, in the report and in result.json (status `incomplete`).
+    rj_now = {}
+    try:
+        rj_now = json.loads(result.read_text(encoding="utf-8")) if result.is_file() else {}
+    except (OSError, ValueError):
+        rj_now = {}
+    verdict, missed = lp.pass_verdict(str(rj_now.get("status", "fail")), list(rj_now.get("reasons", [])), texts["H"],
+                                      plan)
+    if crash:
+        verdict = lp.FAIL
+    head = f"verdict: {verdict}" + (f" (not covered: {'; '.join(missed)})" if missed else "")
+    report = report.replace("\n", "\n" + head + "\n", 1)
+    if rj_now:
+        rj_now["levelpass"] = {"verdict": verdict, "not_covered": missed}
+        if verdict == lp.INCOMPLETE and rj_now.get("status") == "pass":
+            rj_now["status"] = "incomplete"
+            rj_now.setdefault("reasons", []).append("levelpass: incomplete: " + "; ".join(missed))
+        write_text_replacing(result, json.dumps(rj_now, indent=2))
     if bugs:
         import levelpass_predictions as lpp
         report += "\n" + lpp.verdict_text(lpp.verdicts(bugs, texts))
@@ -9152,7 +9171,11 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     out.write_text(report, encoding="utf-8")
     print(report, flush=True)
     print(f"levelpass {a.level}: report {out}", flush=True)
-    return 0 if not crash else 1
+    print(f"levelpass {a.level}: {head}", flush=True)
+    return {lp.PASS: 0, lp.INCOMPLETE: EXIT_INCOMPLETE}.get(verdict, 1)
+
+
+EXIT_INCOMPLETE = 5   # levelpass: the pass did not cover its plan (soft budget, skipped steps, end not reached)
 
 
 def main(argv: list[str] | None = None) -> int:

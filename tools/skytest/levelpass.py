@@ -893,11 +893,13 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
         zones = sorted({o.zone for o in other_zone})
         left_out.append(f"{len(other_zone)} object(s) of sub-zones not loaded with the level ({', '.join(zones)})")
     # Over the budget: drop visits of stops with no action, farthest from the start first; then say so.
-    est = estimate_seconds([s for s in stops if not (no_end and s is exit_stop)], late_join, end=not no_end)
-    if end is not None and not no_end:
-        # The estimate takes what the end is expected to take (END_EXPECT_S); its worst case is in the
-        # sweep's deadline (sweep_share, exit_seconds), which keeps the whole pass inside the budget.
-        est += END_EXPECT_S.get(end.kind, EXIT_S) - EXIT_S
+    # The estimate keeps for the exit exactly what the sweep's deadline keeps (exit_reserve and the margin,
+    # sweep_share): a plan the estimate fits is a sweep its deadline does not cut (before, the estimate kept
+    # EXIT_S and the deadline the exit's own timeouts: every tutorial_b pass of 18 November had a step
+    # skipped at the deadline).
+    timed = (end.kind == le.TIMED) if end is not None else (bool(content.level_end) and exit_stop is None)
+    est = estimate_seconds([s for s in stops if s is not exit_stop], late_join, end=False) + \
+        exit_reserve(no_end, end, exit_stop, timed) + SWEEP_MARGIN_S
     if est > budget_s:
         quiet = [s for s in stops if not s.actions]
         quiet.sort(key=lambda s: -(dist(start, s.cluster.center) if start else s.cluster.index))
@@ -912,8 +914,7 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
             left_out.append(f"{dropped} visit(s) of clusters with no sampled action (over the budget)")
     return Plan(level=content.level, source=content.source, stops=stops, left_out=left_out, no_action=no_action,
                 unplaced=unplaced, estimate_s=round(est, 1), full=full, late_join=late_join, exit_stop=exit_stop,
-                provoke=provoke, no_end=no_end, end=end, end_objs=end_objs, end_missing=end_missing,
-                timed=(end.kind == le.TIMED) if end is not None else (bool(content.level_end) and exit_stop is None))
+                provoke=provoke, no_end=no_end, end=end, end_objs=end_objs, end_missing=end_missing, timed=timed)
 
 
 # --- the scripts -------------------------------------------------------------------------------------------
@@ -1001,11 +1002,13 @@ def exit_kind(o: Obj) -> str:
     return ENTER
 
 
-def action_lines(a: Action, label: str) -> list[str]:
+def action_lines(a: Action, label: str, after: str = "") -> list[str]:
+    """An action's steps; `after`: the target the step before teleported to (its own teleport is not
+    repeated: the visit's goto_entity to the same object already woke it, or was held and would be again)."""
     o = a.obj
     ref = o.ref
     out = [f"log LEVELPASS act {label} {a.action} {_safe(o.name) or '-'} {o.cls} ref {ref}"]
-    if ref.startswith("auth:") and a.action in (ATTACK, INTERACT_A, TALK, PICKUP):
+    if ref.startswith("auth:") and a.action in (ATTACK, INTERACT_A, TALK, PICKUP) and ref != after:
         # The helpers find a live object; goto_entity first wakes an asleep one (its area streamed in).
         out.append(f"goto_entity {ref}")
     if a.action == FIGHT:
@@ -1157,9 +1160,6 @@ FIRST_ROUND_S = 60       # the first round of a counted fight
 ROUND_S = 30             # each later round (a wave's arrival; each ends after 10 s with no enemy near)
 FIGHT_RADIUS_MIN, FIGHT_RADIUS_MAX, FIGHT_MARGIN = 1500, 3000, 500
 END_IMPOSSIBLE = "LEVELPASS exit impossible"
-# Expected (not worst-case) seconds of the derived end, for the estimate: a trigger's approach and the
-# scenes it starts (skipped), the results; a counted fight's approach and rounds with one-hit damage.
-END_EXPECT_S = {"trigger": 75.0, "fight": 150.0}
 
 
 def obj_key(o: Obj) -> str:
@@ -1262,14 +1262,19 @@ def end_lines(plan: Plan) -> list[str]:
 
 def exit_seconds(plan: Plan) -> float:
     """The exit phase's share: its actions' own timeouts and the level end's waits."""
-    if plan.no_end:
+    return exit_reserve(plan.no_end, plan.end, plan.exit_stop, plan.timed)
+
+
+def exit_reserve(no_end: bool, end, exit_stop: Stop | None, timed: bool) -> float:
+    """exit_seconds before the Plan exists (the estimate keeps the same)."""
+    if no_end:
         return 0.0
-    if plan.end is not None:
-        return end_seconds(plan.end) if plan.end.kind != le.TIMED else EXIT_WAIT_S
-    if plan.exit_stop is None:
-        return EXIT_WAIT_S if plan.timed else 0.0
+    if end is not None:
+        return end_seconds(end) if end.kind != le.TIMED else EXIT_WAIT_S
+    if exit_stop is None:
+        return EXIT_WAIT_S if timed else 0.0
     t = EXIT_WAIT_S
-    for a in plan.exit_stop.actions:
+    for a in exit_stop.actions:
         t += (EXIT_FIGHT_S + EXIT_LATE_WAVE_S) if exit_kind(a.obj) == FIGHT else ACTION_TIMEOUT[TALK]
     return t
 
@@ -1308,7 +1313,7 @@ def stop_lines(s: Stop) -> list[str]:
         out.append(f"goto_entity {ref}")
     out.append(f"online_audit {s.label}")
     for k, a in enumerate(s.actions):
-        out += action_lines(a, f"{s.label}_{k + 1}")
+        out += action_lines(a, f"{s.label}_{k + 1}", after=ref if k == 0 else "")
     if s.actions:
         out.append(f"online_audit {s.label}_a")
     return out
@@ -1820,7 +1825,38 @@ H_ARGS = ["--dev_authored_probe=true", "--dev_backend_commands=true", "--dev_hel
           "--log_max_file_size_mb=64", "--log_max_files=4"]
 D_ARGS = ["--dev_authored_probe=true", "--dev_backend_commands=true", "--dev_damage_multiplier=-1", "--dev_hero_invulnerable=true",
           "--log_max_file_size_mb=64", "--log_max_files=4"]
-CASE_TIMEOUT_S = 1200   # the hard stop: twice the budget
+# The case's stop (R3): the owner's 10 minutes and a minute's grace, no longer twice the budget (a sweep that
+# ran 20 minutes, 18 November). A pass the runner stops there, or one with steps skipped at the sweep's
+# deadline, is INCOMPLETE (pass_verdict), never a pass.
+SOFT_GRACE_S = 60
+CASE_TIMEOUT_S = int(BUDGET_S + SOFT_GRACE_S)
+
+
+PASS, INCOMPLETE, FAIL = "PASS", "INCOMPLETE", "FAIL"
+ENDED_FOR_TIME = re.compile(r"did not quit within \d+ s")
+SKIPPED = re.compile(r"Dev: (\S+) (\S+).* skipped: the sweep's time is up")
+
+
+def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan) -> tuple[str, list[str]]:
+    """The pass's verdict and what it did not cover: FAIL for a failed run that was not only stopped for
+    time; INCOMPLETE when the runner stopped it at the soft budget, steps were skipped at the sweep's
+    deadline, or the exit it planned was not reached; PASS otherwise."""
+    missed: list[str] = []
+    skipped = [f"{m.group(1)} {m.group(2)}" for m in SKIPPED.finditer(h_text)]
+    if skipped:
+        missed.append(f"{len(skipped)} step(s) skipped at the sweep's deadline: " + ", ".join(skipped[:8])
+                      + (" ..." if len(skipped) > 8 else ""))
+    timed_out = any(ENDED_FOR_TIME.search(r) for r in reasons)
+    if timed_out:
+        missed.append(f"stopped by the runner at the soft budget ({CASE_TIMEOUT_S} s)")
+    planned_end = not plan.no_end and (plan.end is not None and plan.end.kind != le.TIMED or plan.exit_stop is not None
+                                       or plan.timed)
+    if planned_end and "Input script: LEVELPASS phase next-level" not in h_text:
+        missed.append("the level's end and the next level (not reached)")
+    if status not in ("pass",) and not (timed_out and all(ENDED_FOR_TIME.search(r) or r.startswith("peers failed")
+                                                         for r in reasons)):
+        return FAIL, missed
+    return (INCOMPLETE if missed else PASS), missed
 
 
 def probe_args(args: list[str], probe: bool, extra: list[str] | None = None) -> list[str]:

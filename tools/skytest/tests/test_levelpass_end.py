@@ -275,5 +275,54 @@ class StoredLevels(unittest.TestCase):
                                 "tutorial_a": "the level ends on its own"}[level])
 
 
+class Budget(unittest.TestCase):
+    """R3 of the 18 November run audit: the pass budgets its own time and is never a pass when it did not
+    cover its plan."""
+
+    def plan(self, no_end=False):
+        chains, logic = trigger_level()
+        content = lp.Content(level="lvl", source="made up", start=(0.0, 0.0, 0.0), objects=[
+            lp.Obj("Outro_Trigger", "CScriptTriggerEntity", (5.0, 0.0, 0.0), lp.GROUP_TRIGGERS, ident="u", ref="auth:lvl:7")]
+            + [lp.Obj(f"Box_Destructible_{i}", "C", (i * 3000.0, 0.0, 0.0), lp.GROUP_INTERACT, ident="u",
+                      ref=f"auth:lvl:{100 + i}") for i in range(1, 60)])
+        content.level_end_chains, content.logic = chains, logic
+        return lp.make_plan(content, late_join=False, no_end=no_end)
+
+    def test_the_estimate_keeps_what_the_deadline_keeps(self):
+        p = self.plan()
+        self.assertLessEqual(p.estimate_s, lp.BUDGET_S + 1)
+        sweep = p.estimate_s - (lp.BOOT_S + lp.LEVEL_LOAD_S + lp.exit_seconds(p) + lp.SWEEP_MARGIN_S)
+        self.assertLessEqual(sweep, lp.sweep_share(p) + 0.5)  # a sweep the estimate fits is one the deadline does not cut
+        self.assertEqual(lp.CASE_TIMEOUT_S, lp.BUDGET_S + lp.SOFT_GRACE_S)
+        self.assertIn(f"timeout = {lp.CASE_TIMEOUT_S}", lp.spec_toml(p))
+
+    def test_a_visit_and_its_action_teleport_once(self):
+        o = lp.Obj("Box", "C", (1.0, 2.0, 3.0), lp.GROUP_INTERACT, ref="auth:lvl:5")
+        a = lp.Action(lp.ATTACK, o, "x")
+        self.assertIn("goto_entity auth:lvl:5", lp.action_lines(a, "v1_1"))
+        self.assertNotIn("goto_entity auth:lvl:5", lp.action_lines(a, "v1_1", after="auth:lvl:5"))
+        stop = lp.Stop(label="v1", cluster=lp.Cluster(0, o.pos, [o]), actions=[a], visit_only=[])
+        self.assertEqual(lp.stop_lines(stop).count("goto_entity auth:lvl:5"), 1)
+
+    def test_the_verdict(self):
+        p = self.plan()
+        done = "Input script: LEVELPASS phase next-level\n"
+        self.assertEqual(lp.pass_verdict("pass", [], done, p), (lp.PASS, []))
+        v, missed = lp.pass_verdict("pass", [], "[t1] Dev: attack_until auth:lvl:9 12 skipped: the sweep's time is up\n" + done, p)
+        self.assertEqual(v, lp.INCOMPLETE)
+        self.assertIn("1 step(s) skipped at the sweep's deadline: attack_until auth:lvl:9", missed[0])
+        v, missed = lp.pass_verdict("pass", [], "", p)
+        self.assertEqual((v, missed), (lp.INCOMPLETE, ["the level's end and the next level (not reached)"]))
+        # Stopped at the soft budget: incomplete, not a failure of the game.
+        v, missed = lp.pass_verdict("fail", [f"did not quit within {lp.CASE_TIMEOUT_S} s; ended by the runner",
+                                             "peers failed: H"], "", p)
+        self.assertEqual(v, lp.INCOMPLETE)
+        self.assertIn(f"stopped by the runner at the soft budget ({lp.CASE_TIMEOUT_S} s)", missed)
+        # Any other failure is a failure.
+        self.assertEqual(lp.pass_verdict("fail", ["stopped early: H ... (fail fast)"], done, p)[0], lp.FAIL)
+        # --no-end: no end planned, none missed.
+        self.assertEqual(lp.pass_verdict("pass", [], "", self.plan(no_end=True)), (lp.PASS, []))
+
+
 if __name__ == "__main__":
     unittest.main()

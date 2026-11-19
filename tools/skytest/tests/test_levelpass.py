@@ -274,8 +274,10 @@ class Plans(unittest.TestCase):
     def test_budget_drops_quiet_visits(self):
         objs = [lp.Obj(f"Lift_{i}", "C", (i * 5000.0, 0.0, 0.0), lp.GROUP_INTERACT) for i in range(1, 40)]
         c = lp.Content("madeup", "made", (0.0, 0.0, 0.0), objs)
-        p = lp.make_plan(c, late_join=False, budget_s=lp.BOOT_S + lp.LEVEL_LOAD_S + lp.EXIT_S + 10 * lp.VISIT_S)
-        self.assertLessEqual(p.estimate_s, lp.BOOT_S + lp.LEVEL_LOAD_S + lp.EXIT_S + 10 * lp.VISIT_S)
+        # No exit: the estimate keeps only the sweep's margin for it (as the sweep's deadline does).
+        budget = lp.BOOT_S + lp.LEVEL_LOAD_S + lp.SWEEP_MARGIN_S + 10 * lp.VISIT_S
+        p = lp.make_plan(c, late_join=False, budget_s=budget)
+        self.assertLessEqual(p.estimate_s, budget)
         self.assertEqual(len(p.stops), 10)
         self.assertTrue(any("over the budget" in x for x in p.left_out))
         # The nearest stay.

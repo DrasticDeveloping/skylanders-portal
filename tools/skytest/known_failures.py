@@ -25,8 +25,8 @@ import re
 from dataclasses import dataclass
 
 KNOWN_FAILURE = "known failure"
-RESULT_STATUSES = ("pass", "fail", "error")   # results of a case that started its games
-FAILED = ("fail", "error")
+RESULT_STATUSES = ("pass", "fail", "error", "incomplete")   # results of a case that started its games
+FAILED = ("fail", "error", "incomplete")   # incomplete: a level pass that did not cover its plan (never a pass)
 RUN_NAME = re.compile(r"^(\d{8}-\d{6})-(.+)$")
 
 
