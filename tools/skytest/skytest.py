@@ -130,6 +130,7 @@ import live_session  # noqa: E402  (the live sessions' pure parts: `skytest.py l
 import remote_agent  # noqa: E402
 import remote_swap_grade  # noqa: E402  (stage 4's remote_swap grade over swap_pairs.py, the ordered form)
 import exclusive_grade  # noqa: E402  (stage 4's exclusive grade: a race exactly one client wins)
+import drop_tiles  # noqa: E402  (stage 8's drop_tiles grade: black or cyan 64x64 tiles in a run's pictures)
 import swap_pairs  # noqa: E402
 import memory_growth  # noqa: E402  (stage 5's soak grade)
 import occurrence_outcomes  # noqa: E402  (stage 5's occurrence grade)
@@ -179,7 +180,7 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
 GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
           "symmetry", "route", "bandwidth", "remote_swap", "exclusive", "occurrence_outcomes",
-          "memory_growth", "data_root_untouched", "level_check", "graph_trace") + backend_grades.NAMES
+          "memory_growth", "data_root_untouched", "level_check", "graph_trace", drop_tiles.NAME) + backend_grades.NAMES
 # W34: a spec's [grade.level_check] `rows = [...]` grades its run with those rows of the level check's page
 # (levelcheck.py): a row's FAIL fails the case with the row's findings as the reason; `must_test = true` fails a row
 # that says NOT TESTED too (a spec written to show it). LEVEL_CHECK_ROWS: the rows a spec may name.
@@ -1534,6 +1535,11 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             # The shared enemies' evidence grade (graph_trace_grade.py: one row tied on both sides).
             if why := graph_trace_grade.check_spec(g, names):
                 raise SpecError(f"{path.name}: grade graph_trace: {why}")
+            continue
+        if gname == drop_tiles.NAME:
+            # Stage 8 (drop_tiles.py): the pictures a run saved, judged for the black and cyan tiles.
+            if why := drop_tiles.check_spec(g, names):
+                raise SpecError(f"{path.name}: grade {gname}: {why}")
             continue
         if gname in ("occurrence_outcomes", "memory_growth"):
             # Stage 5's grades, each in its own module (its check_spec says what it takes).
@@ -4617,7 +4623,7 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
     reasons = []
     for gname, g in spec.grades.items():
         if gname in ("requests_answered", "symmetry", "save_copy", "route", "bandwidth", "remote_swap", "exclusive",
-                     DATA_ROOT_GRADE, "level_check"):
+                     DATA_ROOT_GRADE, "level_check", drop_tiles.NAME):
             continue  # graded across peers (grade_cross_peer, grade_save_copy, grade_data_root)
         if g.get("peer", "S" if gname == "server_frame_time" else "H") != r.peer:
             continue
@@ -5482,6 +5488,11 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             if droot is not None and n in droot.peers:
                 extra += grade_data_root(r, droot, droot_title)
             extra += grade_cross_peer(spec, r, {**texts, **syn_texts}, cfg.repo, thresholds or {})
+            g_tiles = spec.grades.get(drop_tiles.NAME)
+            if g_tiles is not None and g_tiles.get("peer", "H") == n:
+                # Stage 8: the pictures beside this peer's log (shots and pipeline_drop_capture frames).
+                r.graded[drop_tiles.NAME], why = drop_tiles.grade(run / n, texts.get(n, ""), g_tiles)
+                extra += why
             # A grade the manifest accepts for this case (plan 5.4: accepted failures with a reason)
             # is recorded, not failed on; everything else still has to pass.
             # Only a measured violation is accepted: a missing measurement or baseline still fails.
@@ -6294,6 +6305,10 @@ def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: di
         for p in r.peers:
             for why in p.reasons:
                 lines.append(f"- {p.peer}: {why}")
+            # Stage 8's picture grade: its verdict line, NEEDS READING included (a verdict that neither
+            # passes nor fails the case: the run's reader decides from drop_tiles.md and its crops).
+            if note := p.graded.get(drop_tiles.NAME, {}).get("note"):
+                lines.append(f"- {p.peer}: {note}")
         for p in r.peers:
             if p.startup_stall_s is not None and p.startup_stall_s > STARTUP_STALL_WARN_S:
                 lines.append(f"- WARNING: {p.peer}: startup stall {p.startup_stall_s:.1f} s (shader storage to the "
