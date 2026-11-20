@@ -9612,6 +9612,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     lp.LAUNCH_RIDES = launch_pad_known(cfg) and not getattr(a, "no_launch_rides", False)
     # W32 (c): D fights one fight a level where the build registers stand_by.
     lp.D_FIGHT = command_known(cfg, "stand_by")
+    # W31: the pieces step enters its trigger on foot where the build has walk_into.
+    lp.WALK_INTO = command_known(cfg, "walk_into")
     # W30: the late joiner waits for its arrival move before it is placed, where the build has the condition.
     conds = table_conditions(cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml"))
     lp.ARRIVAL_DONE = conds is not None and "online_arrival_done" in conds
@@ -9654,6 +9656,10 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         notices.append("D stays where it entered: this game does not register online_auto_follow yet")
     try:
         plan.game_args = [lp.check_game_arg(g) for g in (a.game_arg or [])]
+        # W31: a level with run-time movers (Cascade Glade's islands) runs with the islands shared, unless the pass
+        # names the setting itself (--game-arg=--online_island_spawns=false keeps each game's own).
+        if plan.pieces and not any(g.startswith("--online_island_spawns=") for g in plan.game_args):
+            plan.game_args.append(lp.PIECES_SETTING)
     except ValueError as e:
         raise SystemExit(f"levelpass: {e}") from None
     if plan.game_args and a.predictions:

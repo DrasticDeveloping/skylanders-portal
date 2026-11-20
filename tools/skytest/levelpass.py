@@ -1536,13 +1536,22 @@ def plan_pieces(content: Content, forbidden: set[str], left_out: list[str]) -> t
     return out, secs
 
 
+# W31: the pieces step goes to the trigger that starts the movers and waits on the ground there, never to a spawner
+# (batch 15 case 7: `goto_entity` of EZ3_IslandSpawner0 hopped H 1520 over the void, D's follow copied that point and
+# fell for four minutes). The start trigger of ww1's islands runs out over the void from a ledge, so it is entered
+# on foot from the ground nearest it (`walk_into`, where the build has it; else `enter_trigger` as before). The
+# islands are shared only with online_island_spawns: skytest passes it on a level with pieces (PIECES_SETTING).
+WALK_INTO = False
+PIECES_SETTING = "--online_island_spawns=true"
+
+
 def pieces_lines(plan: Plan) -> list[str]:
-    """Each pieces step: enter its trigger, stand where its movers go, stay three spawn periods, audit."""
+    """Each pieces step: enter its trigger from the ground, stay there three spawn periods, audit."""
     out = []
-    for k, (m, trig, spawner) in enumerate(plan.pieces, 1):
+    for k, (m, trig, _spawner) in enumerate(plan.pieces, 1):
+        enter = [f"walk_into {trig.ref} 1500 10", "wait_free 30"] if WALK_INTO else [f"enter_trigger {trig.ref}"]
         out += [f"log LEVELPASS pieces p{k} {_safe(m.name)} starts {', '.join(_safe(n) for n in m.spawner_names)} "
-                f"stay {m.stay_s:.0f} s", f"enter_trigger {trig.ref}", f"goto_entity {spawner.ref} {PIECES_STANDOFF}",
-                f"wait {int(round(m.stay_s))}", f"online_audit p{k}"]
+                f"stay {m.stay_s:.0f} s", *enter, f"wait {int(round(m.stay_s))}", f"online_audit p{k}"]
     return out
 
 

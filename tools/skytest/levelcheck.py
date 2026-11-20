@@ -1078,7 +1078,8 @@ def grade_objectives(run: Run) -> Verdict:
 # data has them): not tested, each game runs its own islands.
 PIECE_MADE_S = timedelta(seconds=1)
 PIECE_PAIR_S = timedelta(seconds=0.5)
-PIECE_NEAR = 64.0
+PIECE_NEAR = 12.0           # W31: about 10 (calibration 1.6 typically, 10.1 at most), S's place taken at the client's
+PIECE_BRACKET_S = 1.5       # line's time: interpolated between S's two lines around it, at most this far apart
 PIECE_TRACKED = re.compile(r"Online: world tracked spawner_fires ([^#\s]+)#")
 PIECE_FIRED = re.compile(r"Online: world island spawner ([^#\s]+)#\S* fired (\d+) \(tick")
 PIECE_MADE = re.compile(r"Online: world island spawner ([^#\s]+)#\S* made (\d+) here")
@@ -1131,16 +1132,34 @@ def grade_pieces(run: Run, data: "LevelData | None" = None) -> Verdict:
                 ok += 1
         c_at = log.find(PIECE_AT)
         dists, far = [], []
+        # W31: each client place against S's place at the same moment (S's two lines around it, interpolated): an
+        # island moves 100 a second, so a pair 0.5 s apart differed by up to 50 with the copies in step.
+        by_island: dict[tuple[str, str], list] = {}
         for sl, sm in s_at:
-            pair = [(cl, cm) for cl, cm in c_at if cm.group(1) == sm.group(1) and cm.group(2) == sm.group(2) and
-                    cl.t and sl.t and abs(cl.t - sl.t) <= PIECE_PAIR_S]
-            if not pair:
+            if sl.t:
+                by_island.setdefault((sm.group(1), sm.group(2)), []).append((sl, sm))
+        for cl, cm in c_at:
+            track = by_island.get((cm.group(1), cm.group(2)), [])
+            if not cl.t or not track:
                 continue
-            cl, cm = min(pair, key=lambda p: abs(p[0].t - sl.t))
-            d = math.dist(tuple(float(sm.group(i)) for i in (3, 4, 5)), tuple(float(cm.group(i)) for i in (3, 4, 5)))
+            before = [x for x in track if x[0].t <= cl.t]
+            after = [x for x in track if x[0].t >= cl.t]
+            if before and after and (after[0][0].t - before[-1][0].t).total_seconds() <= PIECE_BRACKET_S:
+                (l0, m0), (l1, m1) = before[-1], after[0]
+                span = (l1.t - l0.t).total_seconds()
+                f = 0.0 if span <= 0 else (cl.t - l0.t).total_seconds() / span
+                s_pos = tuple(float(m0.group(i)) + f * (float(m1.group(i)) - float(m0.group(i))) for i in (3, 4, 5))
+            else:
+                # No S line on each side (the island's first or last second): S's nearest within PIECE_PAIR_S.
+                near = [x for x in track if abs(x[0].t - cl.t) <= PIECE_PAIR_S]
+                if not near:
+                    continue
+                l0, m0 = min(near, key=lambda x: abs(x[0].t - cl.t))
+                s_pos = tuple(float(m0.group(i)) for i in (3, 4, 5))
+            d = math.dist(s_pos, tuple(float(cm.group(i)) for i in (3, 4, 5)))
             dists.append(d)
             if d > PIECE_NEAR:
-                far.append(f"{sl.cite()}; {cl.cite()} ({d:.1f} apart)")
+                far.append(f"{l0.cite()}; {cl.cite()} ({d:.1f} apart at the client's moment)")
         c_gone = log.find(PIECE_GONE)
         gone_missing = []
         for sl, sm in s_gone:

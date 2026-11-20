@@ -814,7 +814,7 @@ class Pieces(unittest.TestCase):
              (70.3, "Online: world island EZ3_IslandSpawner0#2460 #1 gone (lived 20000 ms)")]
         v = lc.grade_pieces(RunFolder(self.S, H_JOIN + h + LEVEL_END).run())
         self.assertEqual(v.status, lc.PASS, v.findings)
-        self.assertIn("H: tracked 1 spawner(s); made 2 of 2 within 1 s; places 2 pair(s), 0 over 64", v.counts)
+        self.assertIn("H: tracked 1 spawner(s); made 2 of 2 within 1 s; places 2 pair(s), 0 over 12", v.counts)
         self.assertIn("gone 1 of S's 1", v.counts)
 
     def test_late_far_missing_and_not_gone(self) -> None:
@@ -824,7 +824,7 @@ class Pieces(unittest.TestCase):
         v = lc.grade_pieces(RunFolder(self.S, H_JOIN + h + LEVEL_END).run())
         whats = [x.what for x in v.findings]
         self.assertEqual(whats, ["H: 1 of S's island fires never made here", "H: 1 island(s) made more than 1 s from S's fire",
-                                 "H: 1 island place(s) more than 64 from S's", "H: 1 island end(s) of S not followed here "
+                                 "H: 1 island place(s) more than 12 from S's", "H: 1 island end(s) of S not followed here "
                                  "within 1 s"])
 
     def test_off_is_not_tested_each_game_its_own(self) -> None:
