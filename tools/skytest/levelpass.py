@@ -408,15 +408,48 @@ OUTLIER_FLOOR = 8000.0
 # Actions: what the generator does at an object.
 FIGHT, ATTACK, INTERACT_A, PICKUP, ENTER, TALK, EXIT_A, VISIT = (
     "fight", "attack", "interact", "pickup", "enter", "talk", "exit", "visit")
+LAUNCH = "launch"
+# W27b: a launch pad microgame from the level's data (Scripts.MicrogameComponentData with a button and a press count,
+# Scripts.LaunchPathComponentData, a SuccessTelegrams' LaunchPathComponentMessage with AddPlayers): pressed and ridden
+# (`interact`, then `launch_pad`: the presses and the ride to its landing); every player is carried by the game's own
+# launch. On only when the build has launch_pad (the checkout's command table) and the pass was not given
+# --no-launch-rides (skytest sets LAUNCH_RIDES); otherwise visited, as before. LAUNCH_PADS: the plan's pads.
+LAUNCH_RIDES = False
+LAUNCH_PADS: dict[str, tuple[str, int]] = {}   # obj key -> (button, presses)
+LAUNCH_EXTRA_PRESSES = 3
+LAUNCH_RIDE_S = 90
+XBUTTON_PAD = {"XBUTTON_JUMP": "a", "XBUTTON_LEGS_TAIL": "b", "XBUTTON_HEAD": "y", "XBUTTON_TORSO_ARMS": "x"}
+
+
+def launch_pads(manifest: dict | None) -> dict[str, tuple[str, int]]:
+    """The level's launch pad microgames (`<unit>.<name>` -> (pad button, presses its data asks for))."""
+    out = {}
+    for e in (manifest or {}).get("entities", []) or []:
+        if not isinstance(e, dict):
+            continue
+        comps = set(e.get("components") or [])
+        details = e.get("details") or {}
+        if "Scripts.MicrogameComponentData" not in comps or "Scripts.LaunchPathComponentData" not in comps:
+            continue
+        button = XBUTTON_PAD.get(str(details.get("Button", "")))
+        presses = str(details.get("RequiredButtonPresses", ""))
+        launches = any(isinstance(f, dict) and f.get("message") == "Scripts.LaunchPathComponentMessage"
+                       and str((f.get("fields") or {}).get("AddPlayers", "")).lower() == "true"
+                       for f in e.get("fires") or [])
+        if button and presses.isdigit() and launches:
+            out[f"{e.get('unit') or ''}.{e.get('name')}"] = (button, int(presses))
+    return out
 EXIT_FIGHT_S = 90
 EXIT_LATE_WAVE_S = 30
 EXIT_RADIUS = 3000.0
 EXIT_NEAR = 5000.0     # the level-end senders taken: those this close to the chain's receiver
 EXIT_FIGHT_RADIUS = 2500   # the level-end senders this close share one exit fight (an arena)
-ACTION_ORDER = {ENTER: 0, TALK: 1, FIGHT: 2, ATTACK: 3, PICKUP: 4, INTERACT_A: 5, VISIT: 6, EXIT_A: 7}
+ACTION_ORDER = {ENTER: 0, TALK: 1, FIGHT: 2, ATTACK: 3, PICKUP: 4, INTERACT_A: 5, VISIT: 6, EXIT_A: 7, LAUNCH: 8}
 # The timeout of each action's own command (seconds) and its expected share of it (estimate).
-ACTION_TIMEOUT = {FIGHT: 25, ATTACK: 12, INTERACT_A: 10, PICKUP: 10, ENTER: 0, TALK: 10, EXIT_A: 0, VISIT: 0}
-ACTION_EXPECT = {FIGHT: 15.0, ATTACK: 5.0, INTERACT_A: 6.0, PICKUP: 5.0, ENTER: 2.0, TALK: 6.0, EXIT_A: 30.0, VISIT: 0.0}
+ACTION_TIMEOUT = {FIGHT: 25, ATTACK: 12, INTERACT_A: 10, PICKUP: 10, ENTER: 0, TALK: 10, EXIT_A: 0, VISIT: 0,
+                  LAUNCH: LAUNCH_RIDE_S}
+ACTION_EXPECT = {FIGHT: 15.0, ATTACK: 5.0, INTERACT_A: 6.0, PICKUP: 5.0, ENTER: 2.0, TALK: 6.0, EXIT_A: 30.0, VISIT: 0.0,
+                 LAUNCH: 40.0}
 
 
 STATIC_ACTION = {
@@ -471,6 +504,8 @@ def action_from_components(o: Obj) -> tuple[str, str] | None:
     a player acts on directly (a chest spawner's chest comes at run time, a battle gate opens on its
     fight, a caged NPC is freed by breaking its cage): visited only, and said so."""
     comps = set(o.components)
+    if LAUNCH_RIDES and obj_key(o) in LAUNCH_PADS:
+        return LAUNCH, "a launch pad microgame: pressed and ridden to its landing (launch_pad)"
     if o.state == "minigame" or any(c.endswith("MinigameComponentData") for c in comps):
         # A mini-game (a winch, binoculars, a launch pad): pressing it enters a mode that locks the controls
         # and stopped every later audit in ww1's run 20261118-104911 (binoculars); no script plays one yet.
@@ -510,6 +545,8 @@ def classify(o: Obj) -> tuple[str, str]:
         # pass only visits (a teleporter, a mover, a mini-game, a bounce pad) is never made an action by
         # them: ww1's Cave03_TeleToInt (a teleporter with a trigger volume) was entered and dropped the
         # hero into an interior's endless fall (run 20261118-110326).
+        if LAUNCH_RIDES and obj_key(o) in LAUNCH_PADS:  # W27b: a launch pad microgame from its data
+            return LAUNCH, "a launch pad microgame: pressed and ridden to its landing (launch_pad)"
         by_comp = action_from_components(o) if act != VISIT else None
         if by_comp is not None:
             act, why = by_comp
@@ -771,6 +808,9 @@ def make_plan(content: Content, full: bool = False, late_join: bool = True, budg
     """The plan; without --full, over the budget, the sample per family goes down to 2, then 1 (the
     plan says so), after the quiet visits were dropped. `no_end` (--no-end): the level's end is found
     (the plan names it) but not attempted, and its time is not in the estimate."""
+    LAUNCH_PADS.clear()
+    if LAUNCH_RIDES:
+        LAUNCH_PADS.update(launch_pads(content.manifest))
     # An end that needs a mechanic the pass cannot carry out (levelpass_end.UNSUPPORTED: a mini-game's result,
     # a turret, a boss, a ride, a cause the reader does not know): the sweep only, no end wait; the verdict
     # says INCOMPLETE with the end's family and node (pass_verdict).
@@ -989,13 +1029,13 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
                     o.ref = ""
                 continue  # one fight per cluster covers its spawners and encounters
             family = (act, family_of(o))
-            if not full and act != EXIT_A and taken.get(family, 0) >= sample:
+            if not full and act not in (EXIT_A, LAUNCH) and taken.get(family, 0) >= sample:
                 left[family] = left.get(family, 0) + 1
                 if unregistered:
                     o.ref = ""
                 visit_only.append((o, f"sampled out ({act}: {sample} of its family taken)"))
                 continue
-            if kind_cap and act != EXIT_A and per_kind.get(act, 0) >= kind_cap:
+            if kind_cap and act not in (EXIT_A, LAUNCH) and per_kind.get(act, 0) >= kind_cap:
                 left[family] = left.get(family, 0) + 1
                 if unregistered:
                     o.ref = ""
@@ -1250,6 +1290,13 @@ ACTIVATION_RADIUS = re.compile(r"activationRadius (\d+)")
 # meanwhile (a follow teleport would carry it through), for as long as the gate may take to open on D. Only when the
 # build's command table has pass_gate (Plan.pass_gates).
 PASS_DISTANCE = 300
+# W26: a required gate H could not pass right after its own step (its walk "not passed on foot": the gate stayed
+# shut, or it is open but not passable) ends the level there: H's fatal line, the runner stops the run, and the
+# pass's verdict says "gate <name> not opened: <why>; the rest of the level not attempted". By the owner's
+# definition the level is then not completable; the minutes after it prove nothing (batch 14 case 2: the pass went on
+# to the end fight with D left behind gate 2, the fight could not end, 486 s spent). D's walks never stop it, nor
+# does "not walkable straight" (a line that is no player's way); --no-gates keeps the teleport past every gate.
+REQUIRED_GATE_FATAL = r"Dev: pass_gate \S+ failed \(not passed on foot"
 PASS_H_S = 30            # H's walk, after its own step opened the gate (the server's row may land later on H)
 PASS_D_MAX_S = 120       # D's: the gate opens on D when S's row lands; pass_gate's own cap
 PASS_TELEPORT_S = 5      # the one teleport before the gate
@@ -1344,7 +1391,7 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
             step.why_not = "no live reference to the gate"
         elif g.kind == lh.KEY_GATE:
             step.h = [f"{head} (fetch its key {_safe(g.key_data)})", f"goto_entity {ref}",
-                      f"pickup {g.name}_key {KEY_PICKUP_S}", f"goto_entity {ref}",
+                      f"pickup key_of:{ref} {KEY_PICKUP_S}", f"goto_entity {ref}",
                       f"interact nearest:{g.name}_keylock:{KEY_LOCK_NEAR} {KEY_PRESS_S}", f"online_audit {label}"]
             step.est_s = REQ_KEY_S
         elif g.kind == lh.SPARK_LOCK:
@@ -1935,7 +1982,7 @@ def action_lines(a: Action, label: str, after: str = "", cap: int = 0, long_paus
     o = a.obj
     ref = o.ref
     out = [f"log LEVELPASS act {label} {a.action} {_safe(o.name) or '-'} {o.cls} ref {ref}"]
-    if ref.startswith("auth:") and a.action in (ATTACK, INTERACT_A, TALK, PICKUP) and ref != after:
+    if ref.startswith("auth:") and a.action in (ATTACK, INTERACT_A, TALK, PICKUP, LAUNCH) and ref != after:
         # The helpers find a live object; goto_entity first wakes an asleep one (its area streamed in).
         out.append(f"goto_entity {ref}")
         out += dismiss_after(o)
@@ -1953,6 +2000,9 @@ def action_lines(a: Action, label: str, after: str = "", cap: int = 0, long_paus
                 f"fight_near {ref} {EXIT_FIGHT_RADIUS} {EXIT_LATE_WAVE_S}"]
     elif a.action == EXIT_A and exit_kind(o) == TALK:
         out.append(f"interact {ref} {ACTION_TIMEOUT[TALK]}")
+    elif a.action == LAUNCH:
+        button, presses = LAUNCH_PADS.get(obj_key(o), ("b", 7))
+        out += [f"interact {ref} 20", f"launch_pad {ref} {button} {presses + LAUNCH_EXTRA_PRESSES} {LAUNCH_RIDE_S}"]
     elif a.action in (ENTER, EXIT_A):
         out.append(f"enter_trigger {ref}")
     return out
@@ -3222,6 +3272,26 @@ def clients_line(plan: Plan, h_text: str, d_text: str) -> str:
     return "clients: " + "; ".join(out)
 
 
+GATE_STOP = re.compile(r"Dev: pass_gate (\S+?)#\d+ failed \(not passed on foot: (.*)\) after")
+REQUIRED_HEAD = re.compile(r"Input script: LEVELPASS required (r\d+) \S+ (\S+)")
+STEP_FAILED = re.compile(r"Dev: (\S+ \S+) failed \((.*)\) after")
+
+
+def required_gate_stop(h_text: str) -> str:
+    """W26: the verdict's words for a level stopped at a required gate H could not pass: the gate, the first failed
+    step of its required step before the walk (why it did not open), and that the rest was not attempted; "" else."""
+    lines = h_text.splitlines()
+    for i, line in enumerate(lines):
+        m = GATE_STOP.search(line)
+        if not m:
+            continue
+        start = max((j for j in range(i) if REQUIRED_HEAD.search(lines[j])), default=0)
+        why = next((f"{f.group(1)} failed ({f.group(2)[:160]})" for f in map(STEP_FAILED.search, lines[start:i]) if f),
+                   f"H's walk stopped at it: {m.group(2)[:160]}")
+        return f"gate {m.group(1)} not opened: {why}; the rest of the level not attempted"
+    return ""
+
+
 def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan, d_text: str = "") -> tuple[str, list[str]]:
     """The pass's verdict and what it did not cover: FAIL for a failed run that was not only stopped for
     time; INCOMPLETE when the runner stopped it at the soft budget, steps were skipped at the sweep's
@@ -3244,6 +3314,9 @@ def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan, d_tex
     if d_through_end(plan) and not (D_NEXT in d_text and next_level_seen(d_text, plan.level)):
         missed.append(f"D did not reach the next level ({client_progress(d_text, 'D', plan.level)}): the pass shows "
                       "one client only")
+    stopped = required_gate_stop(h_text)
+    if stopped:
+        missed.insert(0, stopped)
     paused = paused_after(h_text) if any(PAUSE_LINE.search(r) for r in reasons) else ""
     if paused:
         missed.insert(0, f"the game stayed paused with its frames stopped after `{paused}` (a screen the pass's press"
@@ -3313,7 +3386,8 @@ def spec_toml(plan: Plan) -> str:
     h_args = probe_args(H_ARGS, plan.probe, plan.game_args)
     if lobby:  # the join by code with the host's let in: the server's Hello gate on (the party flow's)
         h_args = [x for x in h_args if x not in LOBBY_H_ARGS_DROP] + [x for x in LOBBY_H_ARGS_ADD if x not in h_args]
-    forbid = exit_forbid(h) + [PAUSE_FATAL, MADE_COPY_LEFT]
+    forbid = exit_forbid(h) + [PAUSE_FATAL, MADE_COPY_LEFT] + \
+        ([REQUIRED_GATE_FATAL] if plan.pass_gates and any(not r.why_not for r in plan.required) else [])
     out = [f'name = "{case_name(plan.level, plan.no_end)}"',
            f'layout = "{"server+2" if late else "server+1"}"',
            'stage = "8"',

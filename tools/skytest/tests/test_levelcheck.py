@@ -169,9 +169,31 @@ class RouteHead(unittest.TestCase):
         self.assertTrue(head[0].startswith("not visited on H: no floor (a trigger in the air): v100 "
                                            "CScriptTriggerEntityData001#2561 (no floor: no ground a player can stand on"),
                         head)
+        page = lc.page(f.path, [], [])
+        self.assertIn("  - CScriptTriggerEntityData001: no ground a player can stand on near it (a target in the air): "
+                      "the level reaches it another way (a ride, a launch, a script that moves it) the pass does not take; not "
+                      "covered by the pass",
+                      page)
         self.assertTrue(head[1].startswith("H held too long at the same spot twice, 1 time(s): at "
                                            "28013.73,23385.52,-500.00: taken out to the last ground it stood on "
                                            "14176.00,21295.00,40.00"), head)
+
+
+class LaunchRide(unittest.TestCase):
+    def test_a_trigger_in_the_air_reached_by_the_ride(self) -> None:
+        # W27b: the rail-ride trigger refused "no floor" by its own step, then reached by EpicRailpad001's launch.
+        h = [(60, "Input script: LEVELPASS visit v100 objects 1 (CScriptTriggerEntityData001) ref auth:tutorial_b:8394"),
+             (61, "Dev: route teleport goto_entity failed (no floor: no ground a player can stand on within 600 of it "
+                  "(the nearest at 1,2,3, 2583 away): a trigger in the air) (target CScriptTriggerEntityData001#2561)"),
+             (90, "Dev: launch pad (null)#2421: launched (10 presses, 450 from the pad after 1.2 s)"),
+             (95, "Online: cutscene run CScriptTriggerEntityData001#2561 starts here (players hidden: no)"),
+             (110, "Dev: launch_pad (null)#2421 done (landed at 4,5,6 after 20.0 s, 3100 from the pad) after 30.0 s")]
+        f = RunFolder([], H_JOIN + h, D_JOIN)
+        head = lc.route_head(f.path)
+        self.assertTrue(head[0].startswith("reached by the launch ride on H: CScriptTriggerEntityData001 (the ride of "
+                                           "(null)#2421; H/game.log:"), head)
+        self.assertFalse([x for x in head if x.startswith("not visited")], head)
+        self.assertNotIn("CScriptTriggerEntityData001: no ground", lc.page(f.path, [], []))
 
 class Windows(unittest.TestCase):
     def test_a_clients_time_in_each_level(self) -> None:

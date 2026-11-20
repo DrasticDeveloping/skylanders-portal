@@ -1822,6 +1822,22 @@ def key_gate_trail(run: Run, name: str, k: int) -> list[str]:
                                                 absent(h, f"`pickup {name}_key ... done`") if h else "no H log"))
     else:
         out.append(f"key touched and following on H: {picked[k][0].cite()}")
+    # W25: the key by name, who carried it and when (a client's `carried key <ref> row carried by <p>/<e> here (key
+    # <Name#id>)`), and S's `carried key <ref> row consumed (by <p>)`.
+    if h is not None and len(picked) > k and picked[k][1].group(1) == "done":
+        label = re.search(r"pickup (\S+_key#\d+)", picked[k][0].text)
+        carried = h.find(re.compile(r"Online: carried key (\S+) row carried by (\d+)/\d+ here \(key "
+                                    + re.escape(label.group(1)) + r"\)")) if label else []
+        if carried:
+            line, m = carried[0]
+            who = peer_numbers(run).get(int(m.group(2)), f"peer {m.group(2)}")
+            words = f"its key {label.group(1)}: carried by {who} from {when(line)}"
+            if run.server is not None:
+                gone = run.server.find(re.compile(r"Online: carried key " + re.escape(m.group(1))
+                                                  + r" row consumed \(by (\d+)\)"))
+                if gone:
+                    words += f", consumed at {when(gone[0][0])} (S)"
+            out.append(words + f" ({line.cite()})")
     if run.server is not None:
         # What S tracked or did with the key (its row, a carry, a claim), not its level-start volume line.
         s_key = [l for l, _m in run.server.find(re.compile(r"Online: .*\b" + key + r".*"))
@@ -2126,6 +2142,34 @@ TAKEN_OUT = re.compile(r"Dev: route held too long at the same spot twice \(([^)]
 VISIT_OR_ACT = re.compile(r"Input script: LEVELPASS (?:visit (v\d+)|act (v\d+_\d+) \S+) .*?(?:ref (\S+))?$")
 
 
+# W27b: a target in the air the level reaches by a launch pad's ride: its scripted run (`cutscene run <Name#id> starts
+# here`) begins on that client between a `launch pad <pad>: launched` and that ride's end (`launch_pad <pad> done|
+# failed`).
+LAUNCHED = re.compile(r"Dev: launch pad (\S+): launched")
+RIDE_END = re.compile(r"Dev: launch_pad (\S+) (?:done|failed)")
+RUN_START = re.compile(r"Online: cutscene run (\S+?)#\d+ starts here")
+
+
+def ride_reached(log: Log | None) -> dict[str, tuple[str, Line]]:
+    """The names whose scripted run began during a launch ride on this client: name -> (the pad, the run's line)."""
+    out: dict[str, tuple[str, Line]] = {}
+    if log is None:
+        return out
+    riding = ""
+    for i, raw in enumerate(log.lines):
+        m = LAUNCHED.search(raw)
+        if m:
+            riding = m.group(1)
+            continue
+        if RIDE_END.search(raw):
+            riding = ""
+            continue
+        m = RUN_START.search(raw)
+        if m and riding and m.group(1) not in out:
+            out[m.group(1)] = (riding, log.line(i))
+    return out
+
+
 def route_head(folder: Path) -> list[str]:
     """The page's lines for targets not visited (no floor) and heroes taken out of a stuck spot, per client."""
     out = []
@@ -2146,6 +2190,10 @@ def route_head(folder: Path) -> list[str]:
             m = TAKEN_OUT.search(raw)
             if m:
                 taken.append(f"at {m.group(1)}: {m.group(2)} ({log.line(i).cite()})")
+        rode = ride_reached(log)
+        for name, (pad, line) in rode.items():
+            out.append(f"reached by the launch ride on {who}: {name} (the ride of {pad}; {line.cite()})")
+        missed = [m for m in missed if not any(m.split(" ", 1)[-1].startswith(n + "#") for n in rode)]
         if missed:
             out.append(f"not visited on {who}: no floor (a trigger in the air): " + "; ".join(missed[:4])
                        + (f"; and {len(missed) - 4} more" if len(missed) > 4 else ""))
@@ -2206,7 +2254,28 @@ def page(folder: Path, verdicts: list[Verdict], head: list[str] | None = None) -
             out.append(f"  {v.name}: {f.what}")
             out += [f"      {x}" for x in f.lines]
     out += not_covered_lines()
+    out += [f"  - {name}: no ground a player can stand on near it (a target in the air): the level reaches it "
+            "another way (a ride, a launch, a script that moves it) the pass does not take; not covered by the pass"
+            for name in no_floor_targets(folder)]
     return "\n".join(out)
+
+
+def no_floor_targets(folder: Path) -> list[str]:
+    """W27: the targets the route refused for having no floor near them (`route teleport ... failed (no floor: ...)
+    (target <Name#id>)`) on any client, each once, by name without its id."""
+    seen: list[str] = []
+    rode: set[str] = set()
+    for who in ("H", "D"):
+        rode |= set(ride_reached(read_log(folder, f"{who}/game.log", who)))
+    for who in ("H", "D"):
+        log = read_log(folder, f"{who}/game.log", who)
+        for _line, m in (log.find(NO_FLOOR) if log is not None else []):
+            if not re.fullmatch(r"\S+#\d+", m.group(2)):
+                continue  # a fight's area or an asleep target's stored position: no entity of the level by name
+            name = m.group(2).split("#")[0]
+            if name not in seen and name not in rode:
+                seen.append(name)
+    return seen
 
 
 # --- the static table: every level's end and mechanics from its data, no game ----------------------------
