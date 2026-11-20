@@ -1535,6 +1535,31 @@ LEVEL_STAND_DZ = 10.0
 LEVEL_BARRIER_S = 300.0
 
 
+FRAMES_RESUMED = re.compile(r"Online: frames resumed here after ([\d.]+) s stopped")
+
+
+def level_change_numbers(run: Run, oline: Line, g: int, level: str, req: "Line | None") -> str:
+    """W39 item 4, numbers only: seconds from the level request (H's request line, else S's open) to each game's
+    barrier release, and each client's longest stretch with frames stopped (`frames resumed here after <s> s
+    stopped`) between the request and LEVEL_ERROR_S after its barrier."""
+    start = req if req is not None and req.t is not None else oline
+    games = ([("S", run.server)] if run.server is not None else []) + sorted(
+        run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    to_bar, stopped = [], []
+    for w, lg in games:
+        bar = next((l for l, m in lg.find(LEVEL_BARRIER) if int(m.group(1)) == g), None)
+        if bar is not None and bar.t is not None and start.t is not None:
+            to_bar.append(f"{w} {(bar.t - start.t).total_seconds():.1f} s")
+        else:
+            to_bar.append(f"{w} -")
+        if w == "S" or start.t is None:
+            continue
+        end = (bar.t if bar is not None and bar.t is not None else start.t) + timedelta(seconds=LEVEL_ERROR_S)
+        stops = [float(m.group(1)) for l, m in lg.find(FRAMES_RESUMED) if l.t is not None and start.t <= l.t <= end]
+        stopped.append(f"{w} {max(stops):.1f} s" if stops else f"{w} 0 s")
+    return (f"request to in play: {', '.join(to_bar)}; longest frames stopped: {', '.join(stopped) or '-'}")
+
+
 def _secs(a: Line, b: Line) -> float | None:
     return (b.t - a.t).total_seconds() if a.t is not None and b.t is not None else None
 
@@ -1565,7 +1590,12 @@ def grade_level_changes(run: Run) -> Verdict:
                     if m.group(1) == level and oline.t is not None and l.t is not None and
                     timedelta(seconds=-60) <= oline.t - l.t <= timedelta(seconds=60)]
             who = "H's request" if reqs else (f"S ({cause[:60]})" if cause else "S")
-        parts = [f"{level} (g{g}) by {who}"]
+        req_line = None
+        if h is not None:
+            near = [l for l, m in h.find(LEVEL_REQ) if m.group(1) == level and oline.t is not None and l.t is not None
+                    and timedelta(0) <= oline.t - l.t <= timedelta(seconds=60)]
+            req_line = near[-1] if near else None
+        parts = [f"{level} (g{g}) by {who} [{level_change_numbers(run, oline, g, level, req_line)}]"]
         bad: list[str] = []
         cites: list[str] = [oline.cite()]
         s_bar = next((l for l, m in run.server.find(LEVEL_BARRIER) if int(m.group(1)) == g), None)

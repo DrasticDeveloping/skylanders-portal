@@ -1032,7 +1032,8 @@ class LevelChanges(unittest.TestCase):
              (32, "Where: tutorial_b at 1 2 100"), (34, "Where: tutorial_b at 1 2 100")] + D_JOIN
         v = lc.grade_level_changes(lc.load_run(RunFolder(s, h, sorted(d)).path))
         self.assertEqual(v.status, lc.PASS, v)
-        self.assertIn("tutorial_b (g2) by S; H loaded", v.counts)
+        self.assertIn("tutorial_b (g2) by S [request to in play: S 11.0 s, H 11.0 s, D 11.0 s; longest frames stopped: "
+                      "H 0 s, D 0 s]; H loaded", v.counts)
         # A fall, an [error] after the load, and no body of the other player on D.
         d2 = [(20, "Online: level 2 tutorial/tutorial_b/tutorial_b: load"), (30, "Online: barrier 2 released at tick 900"),
               (32, "Where: tutorial_b at 1 2 100"), (34, "Where: tutorial_b at 1 2 -400"),
@@ -1053,6 +1054,9 @@ class LevelChanges(unittest.TestCase):
         # "Map changes are bugged": tutorial_a's entry took 67 s to the barrier, and S's own [error] lines say its level
         # entry made no progress for 30 s and its world had not run for 40 s (23:54:00, 23:54:11).
         v = lc.grade_level_changes(lc.load_run(self.OWNER_3))
+        # W39 item 4, numbers: tutorial_b's change took 29 s to the barrier, frames stopped 27.9 s on H, 27.8 s on D.
+        self.assertIn("tutorial_b (g2) by S's own change (the level's script) [request to in play: S 29.0 s, H 29.0 s, "
+                      "D 29.0 s; longest frames stopped: H 27.9 s, D 27.8 s]", v.counts)
         self.assertEqual([x.what for x in v.findings],
                          ["tutorial_a (g1): S: 2 [error] line(s) between its open and 30 s after the barrier"])
 
@@ -1060,6 +1064,8 @@ class LevelChanges(unittest.TestCase):
     def test_the_owners_second_session(self) -> None:
         # tutorial_b's change: H 14 and D 6 `stand-in ... still in the entity table before pool <n> is freed` errors.
         v = lc.grade_level_changes(lc.load_run(self.OWNER_2))
+        self.assertIn("[request to in play: S 22.0 s, H 22.0 s, D 22.0 s; longest frames stopped: H 20.7 s, D 20.7 s]",
+                      v.counts)
         self.assertEqual([x.what for x in v.findings],
                          ["tutorial_b (g2): H: 14 [error] line(s) between its load and 30 s after the barrier; D: 6 "
                           "[error] line(s) between its load and 30 s after the barrier"])
