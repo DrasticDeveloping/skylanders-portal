@@ -640,7 +640,10 @@ struct SceneBarrier {
   SceneKey scene;
   SceneKind kind = SceneKind::kCutscene;
   SceneEndReason end = SceneEndReason::kNone;
-  uint8_t skips = 0;  // kEnd: skips S applied to it (saturates at 255)
+  // kEnd: skips S applied to it (saturates at 255). kStart: what the start carries, the game's mark (its
+  // scene_share_rules.h: 0 a scene Play, else a scripted step, a join baseline or a level look state);
+  // the session never reads it. Every other phase: 0.
+  uint8_t skips = 0;
   bool operator==(const SceneBarrier&) const = default;
 };
 

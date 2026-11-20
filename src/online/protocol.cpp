@@ -396,10 +396,12 @@ bool ValidScenePhase(uint8_t phase) {
 bool ValidSceneKind(uint8_t kind) {
   return kind == uint8_t(SceneKind::kCutscene) || kind == uint8_t(SceneKind::kConversation);
 }
-// Only kEnd carries how it ended; every other phase has kNone and no skips, so two messages compare
-// equal exactly when they say the same.
+// Only kEnd carries how it ended; every other phase has kNone. The skips byte is kEnd's count and
+// kStart's mark (protocol.h SceneBarrier); every other phase has 0, so two messages compare equal exactly
+// when they say the same.
 bool ConsistentScene(const SceneBarrier& m) {
   if (m.phase == ScenePhase::kEnd) return m.end != SceneEndReason::kNone;
+  if (m.phase == ScenePhase::kStart) return m.end == SceneEndReason::kNone;
   return m.end == SceneEndReason::kNone && m.skips == 0;
 }
 

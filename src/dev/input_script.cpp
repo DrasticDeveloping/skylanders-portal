@@ -114,6 +114,10 @@ std::atomic<size_t> g_playable_until{0};
 std::atomic<bool> g_code_stick_on{false};
 std::atomic<double> g_code_stick_x{0.0};
 std::atomic<double> g_code_stick_y{0.0};
+// SetScriptRightStick: the right stick driven by code (the script has no right stick events); centred when off.
+std::atomic<bool> g_code_rstick_on{false};
+std::atomic<double> g_code_rstick_x{0.0};
+std::atomic<double> g_code_rstick_y{0.0};
 // SetScriptButtons: buttons held by code, added to the script's own presses while on.
 std::atomic<bool> g_code_buttons_on{false};
 std::atomic<uint16_t> g_code_buttons{0};
@@ -953,6 +957,10 @@ class ScriptInputDriver final : public rex::input::InputDriver {
     out_state->gamepad.right_trigger = rt ? 0xFF : 0;
     out_state->gamepad.thumb_lx = static_cast<int16_t>(x * 32767.0);
     out_state->gamepad.thumb_ly = static_cast<int16_t>(y * 32767.0);
+    if (g_code_rstick_on.load(std::memory_order_relaxed)) {
+      out_state->gamepad.thumb_rx = static_cast<int16_t>(g_code_rstick_x.load(std::memory_order_relaxed) * 32767.0);
+      out_state->gamepad.thumb_ry = static_cast<int16_t>(g_code_rstick_y.load(std::memory_order_relaxed) * 32767.0);
+    }
     return X_ERROR_SUCCESS;
   }
 
@@ -968,6 +976,8 @@ class ScriptInputDriver final : public rex::input::InputDriver {
       out_caps->gamepad.right_trigger = 0xFF;
       out_caps->gamepad.thumb_lx = static_cast<int16_t>(0x7FFF);
       out_caps->gamepad.thumb_ly = static_cast<int16_t>(0x7FFF);
+      out_caps->gamepad.thumb_rx = static_cast<int16_t>(0x7FFF);
+      out_caps->gamepad.thumb_ry = static_cast<int16_t>(0x7FFF);
     }
     return X_ERROR_SUCCESS;
   }
@@ -1092,6 +1102,12 @@ void SetScriptTriggers(bool on, bool left, bool right) {
   g_code_lt.store(left, std::memory_order_relaxed);
   g_code_rt.store(right, std::memory_order_relaxed);
   g_code_triggers_on.store(on, std::memory_order_relaxed);
+}
+
+void SetScriptRightStick(bool on, double x, double y) {
+  g_code_rstick_x.store(std::clamp(x, -1.0, 1.0), std::memory_order_relaxed);
+  g_code_rstick_y.store(std::clamp(y, -1.0, 1.0), std::memory_order_relaxed);
+  g_code_rstick_on.store(on, std::memory_order_relaxed);
 }
 
 void SetScriptStick(bool on, double x, double y) {
