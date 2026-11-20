@@ -780,6 +780,44 @@ class Together(unittest.TestCase):
         self.assertIn("D stayed where it entered", v.counts)
 
 
+class CoinsShared(unittest.TestCase):
+    # W38: each coin taken once, granted once, paid once with the same amount on the other client and removed there
+    # (the coins branch's line forms, online/8-all-coins-shared 033f2274).
+    S = [(50, "Online: coin claim s1a2b3c4.00000001#0 peer 2 granted (S's base 5.00, its toucher's base 5.00 and factor "
+              "1.00: 5.00 to every player; 2 clients told, its toucher's game among them)")]
+    D = D_JOIN + [(50, "Online: coin taken here s1a2b3c4.00000001#0 (player 8a001234, base 5.00, factor 1.00: 5.00; gold "
+                       "100 -> 105, +5; S is told)")]
+    H = H_JOIN + [(51, "Online: coin paid here s1a2b3c4.00000001#0 (taken by another player; player 8b001234 slot 0, "
+                       "S's amount 5.00: gold 30 -> 35, +5)"),
+                  (51, "Online: coin removed here s1a2b3c4.00000001#0 (taken by another player and paid here: its copy "
+                       "here without pay)")]
+
+    def test_a_coin_taken_by_one_is_paid_once_to_the_other(self) -> None:
+        v = lc.grade_coins_shared(lc.load_run(RunFolder(self.S, self.H, self.D).path))
+        self.assertEqual(v.status, lc.PASS, v)
+        self.assertIn("1 coin(s) taken (H 0, D 1); 1 paid once to every player with the same amount; coin money: "
+                      "H +5, D +5", v.counts)
+        # The coins row's patterns read the new forms too.
+        self.assertEqual(lc.COIN_TAKEN.search(self.D[-1][1]).group(1, 2, 3), ("s1a2b3c4.00000001#0", "100", "105"))
+        self.assertEqual(lc.COIN_PAID.search(self.H[-2][1]).group(1, 2, 3), ("s1a2b3c4.00000001#0", "30", "35"))
+
+    def test_unpaid_different_or_twice_fail_by_name(self) -> None:
+        h = H_JOIN + [(51, "Online: coin paid here s1a2b3c4.00000001#0 (taken by another player; player 8b001234 slot "
+                           "0, S's amount 5.00: gold 30 -> 34, +4)")]
+        v = lc.grade_coins_shared(lc.load_run(RunFolder(self.S, h, self.D).path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.findings[0].what, "coin s1a2b3c4.00000001#0: paid +4 on H, taken +5 on D; its copy on H not "
+                                             "removed")
+        self.assertIn("the players' coin money differs: H +4, D +5", [f.what for f in v.findings])
+        v = lc.grade_coins_shared(lc.load_run(RunFolder(self.S, H_JOIN, self.D + [
+            (52, "Online: coin taken here s1a2b3c4.00000001#0 (player 8a001234, base 5.00, factor 1.00: 5.00; gold 105 "
+                 "-> 110, +5; S is told)")]).path))
+        self.assertTrue(v.findings[0].what.startswith("coin s1a2b3c4.00000001#0: taken on 2 games (D, D); paid 0 "
+                                                      "time(s) on H"), v.findings[0].what)
+        self.assertEqual(lc.grade_coins_shared(lc.load_run(RunFolder(self.S, H_JOIN, D_JOIN).path)).status,
+                         lc.NOT_TESTED)
+
+
 class Coins(unittest.TestCase):
     ON = [(1, "Online: coins on for the session (S's online_shared_coins on)")]
 

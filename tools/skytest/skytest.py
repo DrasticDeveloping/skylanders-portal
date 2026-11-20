@@ -182,7 +182,7 @@ GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_t
 # W34: a spec's [grade.level_check] `rows = [...]` grades its run with those rows of the level check's page
 # (levelcheck.py): a row's FAIL fails the case with the row's findings as the reason; `must_test = true` fails a row
 # that says NOT TESTED too (a spec written to show it). LEVEL_CHECK_ROWS: the rows a spec may name.
-LEVEL_CHECK_ROWS = ("enemies hurt players", "other player's moves", "fight gates")
+LEVEL_CHECK_ROWS = ("enemies hurt players", "other player's moves", "fight gates", "coins shared")
 
 
 def server_stall_reasons(folder: Path) -> list[str]:
@@ -212,7 +212,7 @@ def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None) ->
     run = lc.load_run(folder)
     data = lc.level_data(levelpass, lc.run_level(run)) if levelpass is not None else None
     graders = {"enemies hurt players": lc.grade_player_damage, "other player's moves": lc.grade_moves,
-               "fight gates": lambda r: lc.grade_fight_gates(r, data)}
+               "fight gates": lambda r: lc.grade_fight_gates(r, data), "coins shared": lc.grade_coins_shared}
     out = []
     for name in g.get("rows", []):
         v = graders[name](run)

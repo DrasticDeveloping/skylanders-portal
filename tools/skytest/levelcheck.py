@@ -812,8 +812,9 @@ C_COINS = re.compile(r"Online: coins (\d+): (\d+) placed money coins mapped, (\d
                      r"paid here, (\d+) pending, (\d+) unpaid, (\d+) collected without pay, (\d+) claims not sent yet")
 S_COINS = re.compile(r"Online: coins (\d+): (\d+) claims granted, (\d+) refused, (\d+) placed money coins mapped here "
                      r"\((\d+) this level\)")
-COIN_TAKEN = re.compile(r"Online: coin taken here (\S+) \(player \S+, gold (\d+) -> (\d+)")
-COIN_PAID = re.compile(r"Online: coin paid here (\S+) \(taken by another player; player \S+, gold (\d+) -> (\d+)")
+COIN_TAKEN = re.compile(r"Online: coin taken here (\S+) \(player \S+, (?:base [^;]*; )?gold (\d+) -> (\d+)")
+COIN_PAID = re.compile(r"Online: coin paid here (\S+) \(taken by another player; player \S+(?: slot \d+, S's amount "
+                       r"[\d.]+:)?,? gold (\d+) -> (\d+)")
 COIN_HANDLED = re.compile(r"Online: coin claim (\S+) peer (\d+) (granted|refused)")
 COIN_BAD = re.compile(r"Online: coin (?:unpaid|collected without pay) \S+ .*|Online: coin claim \S+ peer \d+ refused .*")
 
@@ -888,6 +889,105 @@ def grade_coins(run: Run) -> Verdict:
         findings.append(Finding(f"taken twice: {len(twice)} coin(s) taken on more than one game ({', '.join(twice[:6])})",
                                 [f"{w}: {takes[w][p].cite()}" for p in twice[:3] for w in order if p in takes[w]]))
     return Verdict("coins", FAIL if findings else PASS, counts, first.cite(), findings)
+
+
+# --- coins shared: every coin paid once to every player (W38) --------------------------------------------
+#
+# The owner's third session: "coins from broken stuff still doesnt collect for both players". Per coin key K (its
+# place's key, or a drop's `s<source>.<spill>#<slot>`): exactly one game takes it (`coin taken here K (... gold a ->
+# b, +A ...)`), S grants exactly one claim for it (`coin claim K peer <p> granted`, <p> the taker), every other client
+# pays it once (`coin paid here K (... gold a' -> b', +A')`) with A' == A and removes its own copy (`coin removed here
+# K (taken by another player and paid here: ...)`), and over all K the money each client gained from coins is the same.
+# Not tested with one client, or when no coin was taken; a K taken on two games, paid twice or not at all, paid a
+# different amount, not removed, or granted other than once fails, naming the coin and its lines.
+COIN_GOLD = re.compile(r"gold (\d+) -> (\d+), ([+-]\d+)")
+COIN_REMOVED_PAID = re.compile(r"Online: coin removed here (\S+) \(taken by another player and paid here")
+COIN_GRANTED = re.compile(r"Online: coin claim (\S+) peer (\d+) granted")
+
+
+def coin_amount(line: Line) -> int | None:
+    m = COIN_GOLD.search(line.text)
+    return int(m.group(3)) if m else None
+
+
+def grade_coins_shared(run: Run) -> Verdict:
+    """Every coin taken once, granted once by S, paid once on every other client with the same amount and removed
+    there; each client's coin money the same."""
+    name = "coins shared"
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    order = sorted(run.clients, key=lambda w: (w != "H", w))
+    if len(order) < 2:
+        return Verdict(name, NOT_TESTED, "one client in this run: no other player to pay")
+    takes: dict[str, list[tuple[str, Line]]] = {}
+    pays: dict[str, list[tuple[str, Line]]] = {}
+    removed: dict[str, set[str]] = {w: set() for w in order}
+    for w in order:
+        log = run.clients[w]
+        for line, m in log.find(COIN_TAKEN):
+            takes.setdefault(m.group(1), []).append((w, line))
+        for line, m in log.find(COIN_PAID):
+            pays.setdefault(m.group(1), []).append((w, line))
+        removed[w] = {m.group(1) for _l, m in log.find(COIN_REMOVED_PAID)}
+    grants: dict[str, list[tuple[int, Line]]] = {}
+    for line, m in run.server.find(COIN_GRANTED):
+        grants.setdefault(m.group(1), []).append((int(m.group(2)), line))
+    if not takes:
+        return Verdict(name, NOT_TESTED, f"no coin was taken on any client (S granted {len(grants)} claim(s))")
+    peer_of = {w: p for p, w in peer_numbers(run).items()}
+    money = {w: 0 for w in order}
+    findings: list[Finding] = []
+    ok = 0
+    for k in sorted(takes):
+        t = takes[k]
+        bad: list[str] = []
+        cites: list[str] = []
+        if len(t) > 1:
+            bad.append(f"taken on {len(t)} games ({', '.join(w for w, _l in t)})")
+        taker, tline = t[0]
+        cites.append(f"{taker}: {tline.cite()}")
+        a = coin_amount(tline)
+        if a is None:
+            bad.append(f"its take on {taker} has no gold change")
+        else:
+            money[taker] += a
+        g = grants.get(k, [])
+        if len(g) != 1:
+            bad.append(f"S granted it {len(g)} time(s)")
+            cites += [l.cite() for _p, l in g[:2]] or [absent(run.server, f"`coin claim {k} peer <p> granted`")]
+        elif peer_of.get(taker) is not None and g[0][0] != peer_of[taker]:
+            bad.append(f"S granted it to peer {g[0][0]}, not to its taker {taker} (peer {peer_of[taker]})")
+        for w in order:
+            if w == taker:
+                continue
+            mine = [l for who, l in pays.get(k, []) if who == w]
+            if len(mine) != 1:
+                bad.append(f"paid {len(mine)} time(s) on {w}")
+                cites += [f"{w}: {l.cite()}" for l in mine[:2]] or [absent(run.clients[w], f"`coin paid here {k}`")]
+                continue
+            pa = coin_amount(mine[0])
+            if pa is None:
+                bad.append(f"its pay on {w} has no gold change")
+            else:
+                money[w] += pa
+                if a is not None and pa != a:
+                    bad.append(f"paid {pa:+d} on {w}, taken {a:+d} on {taker}")
+                    cites.append(f"{w}: {mine[0].cite()}")
+            if k not in removed[w]:
+                bad.append(f"its copy on {w} not removed")
+                cites.append(absent(run.clients[w], f"`coin removed here {k} (taken by another player and paid here`"))
+        if bad:
+            findings.append(Finding(f"coin {k}: " + "; ".join(bad), cites))
+        else:
+            ok += 1
+    counts = (f"{len(takes)} coin(s) taken ({', '.join(f'{w} {sum(1 for t in takes.values() if t[0][0] == w)}' for w in order)}); "
+              f"{ok} paid once to every player with the same amount; coin money: "
+              + ", ".join(f"{w} {money[w]:+d}" for w in order))
+    if len(set(money.values())) > 1:
+        findings.append(Finding("the players' coin money differs: " + ", ".join(f"{w} {money[w]:+d}" for w in order),
+                                [f"{w}: {takes[k][0][1].cite()}" for k in list(takes)[:1] for w in order[:1]]))
+    first = next(iter(takes.values()))[0][1]
+    return Verdict(name, FAIL if findings else PASS, counts, first.cite(), findings)
 
 
 # --- together: D near H where H acted (the second player follows the first) ------------------------------
@@ -2665,7 +2765,8 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     data = level_data(levelpass, run_level(run))
     together = grade_together(run)
     rows = [grade_server_alive(run), grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
-            grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run),
+            grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run),
+            grade_coins_shared(run), grade_loot(run),
             grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
             grade_fight_gates(run, data)]
     # The enemies and the loot are read where both players stand only when D followed H: each says which.

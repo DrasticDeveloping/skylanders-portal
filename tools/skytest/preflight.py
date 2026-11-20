@@ -697,6 +697,10 @@ def check_spec(name: str, d: dict, ctx: Context) -> list[Problem]:
         script = pd.get("script", "") or ""
         args = list(pd.get("args", []) or [])
         level = owner_levels[0] if owner_levels else None
+        # W38: a client with no `level` line of its own follows the owner's levels in order: each `waitfor
+        # online_level_after_mark`, and each `waitfor online_next_level` after its first, moves it to the next one.
+        own_levels = any(l.split()[0] in ("level", "debug_level") for l in lines_of(script))
+        follow_i, follow_seen = 0, False
         woken: set[tuple[str, int]] = set()
         visited: list[tuple[float, float, float]] = []   # where earlier steps put the hero (streams areas in)
         walked = False                                    # a route walk with no position the data can read
@@ -713,6 +717,12 @@ def check_spec(name: str, d: dict, ctx: Context) -> list[Problem]:
             cmd = w[0]
             if cmd in ("level", "debug_level") and len(w) > 1:
                 level = w[1]
+            if (cmd == "waitfor" and len(w) > 1 and not own_levels and owner_levels and
+                    w[1] in ("online_level_after_mark", "online_next_level")):
+                if w[1] == "online_level_after_mark" or follow_seen:
+                    follow_i = min(follow_i + 1, len(owner_levels) - 1)
+                    level = owner_levels[follow_i]
+                follow_seen = True
             if cmd == "online_end":
                 ended = True
             if cmd in ("goto", "navto", "walkto", "online_server_goto") and len(w) >= 4:
