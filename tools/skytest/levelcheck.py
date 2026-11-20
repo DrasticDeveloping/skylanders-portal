@@ -3672,6 +3672,68 @@ def attacks_started_line(run: Run) -> str | None:
     return "attacks started on the server: " + ", ".join(parts)
 
 
+# W39 item 5: the frame rate as numbers on the page head (no verdict): per game, from its first `barrier <g> released`
+# on (in play), the mean of its `frames <n> fps <f> ...` windows (frames over time) and the lowest per-minute rate
+# (whole minutes of consecutive windows), with the resolution scale and frame size the game drew at (`FXAA: frame
+# <w>x<h> scaled by <a>x<b>`) and its window (the command's --window_width/--window_height, else its settings.toml
+# `resolution = "<w>x<h>"`). The owner's sessions: 19 to 20 on both clients at scale 2.
+FPS_WINDOW = re.compile(r"Online: frames (\d+) fps ([\d.]+) ")
+FXAA_FRAME = re.compile(r"FXAA: frame (\d+x\d+) scaled by (\d+)x(\d+)")
+SETTINGS_RESOLUTION = re.compile(r'^\s*resolution\s*=\s*"(\d+x\d+)"', re.M)
+
+
+def frame_rate_parts(run: Run) -> list[str]:
+    games = ([("S", run.server)] if run.server is not None else []) + sorted(
+        run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    commands: dict[str, list[str]] = {}
+    for p in run.result.get("peers", []) or []:
+        if isinstance(p, dict) and p.get("command"):
+            commands[str(p.get("peer"))] = [str(a) for a in p["command"]]
+    out = []
+    for w, lg in games:
+        bar = next((l for l, _m in lg.find(LEVEL_BARRIER)), None)
+        wins = [(l, int(m.group(1)), float(m.group(2))) for l, m in lg.find(FPS_WINDOW)
+                if bar is None or (l.t is not None and bar.t is not None and l.t >= bar.t)]
+        if not wins:
+            continue
+        frames = sum(n for _l, n, _f in wins)
+        secs = sum(n / f for _l, n, f in wins if f > 0)
+        mean = frames / secs if secs else 0.0
+        lowest = None
+        for i in range(0, len(wins) - 5):
+            chunk = wins[i:i + 6]
+            if chunk[0][0].t is None or chunk[-1][0].t is None or (chunk[-1][0].t - chunk[0][0].t).total_seconds() > 65:
+                continue  # not six consecutive 10 s windows
+            f = sum(n for _l, n, _x in chunk) / sum(n / x for _l, n, x in chunk if x > 0)
+            lowest = f if lowest is None else min(lowest, f)
+        fx = lg.find(FXAA_FRAME)
+        draw = f"scale {fx[0][1].group(2)}, frame {fx[0][1].group(1)}" if fx else "scale not logged"
+        cmd = commands.get(w, [])
+        ww = next((a.split("=", 1)[1] for a in cmd if a.startswith("--window_width=")), None)
+        wh = next((a.split("=", 1)[1] for a in cmd if a.startswith("--window_height=")), None)
+        window = f"window {ww}x{wh}" if ww and wh else ""
+        if not window:
+            for cand in [run.folder / d / "settings.toml" for d, n in PLAY_NAMES.items() if n == w] + [run.folder / w / "settings.toml"]:
+                try:
+                    m = SETTINGS_RESOLUTION.search(cand.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    continue
+                if m:
+                    window = f"window {m.group(1)} (settings)"
+                    break
+        out.append(f"{w} mean {mean:.1f}, lowest minute " + (f"{lowest:.1f}" if lowest is not None else "-")
+                   + f" ({draw}" + (f", {window}" if window else "") + ")")
+    return out
+
+
+def frame_rate_head(folder: Path) -> list[str]:
+    try:
+        parts = frame_rate_parts(load_run(folder))
+    except (OSError, ValueError):
+        return []
+    return ["frame rate in play: " + "; ".join(parts)] if parts else []
+
+
 def attacks_started_head(folder: Path) -> list[str]:
     try:
         line = attacks_started_line(load_run(folder))
@@ -3704,6 +3766,7 @@ def run_head(folder: Path, levelpass: Path | None = None) -> list[str]:
             *invulnerable_head(folder),
             *launch_relay_head(folder),
             *attacks_started_head(folder),
+            *frame_rate_head(folder),
             *skipped_head(read_log(folder, "H/game.log", "H")),
             *route_head(folder)]
 

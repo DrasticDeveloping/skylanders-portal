@@ -780,6 +780,26 @@ class Together(unittest.TestCase):
         self.assertIn("D stayed where it entered", v.counts)
 
 
+class FrameRate(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+
+    def test_mean_and_lowest_minute_in_play(self) -> None:
+        h = H_JOIN + [(5, "FXAA: frame 1280x720 scaled by 2x2"), (8, "Online: frames 600 fps 60.0 p50 16 p95 17 max 20"),
+                      (30, "Online: barrier 2 released at tick 900")]
+        h += [(30 + 10 * i, f"Online: frames {200 if i < 6 else 100} fps {20.0 if i < 6 else 10.0} p50 50 p95 60 max 70")
+              for i in range(1, 13)]
+        parts = lc.frame_rate_parts(lc.load_run(RunFolder([], h, D_JOIN).path))
+        self.assertEqual(parts, ["H mean 14.2, lowest minute 10.0 (scale 2, frame 1280x720)"])  # 1700 frames in 120 s
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session(self) -> None:
+        # 19 to 20 on both clients at scale 2 (his settings: resolution 1920x1080, resolution_scale 2).
+        parts = lc.frame_rate_parts(lc.load_run(self.OWNER_3))
+        self.assertEqual(parts[1:], ["H mean 20.2, lowest minute 17.9 (scale 2, frame 1280x720, window 1920x1080 "
+                                     "(settings))", "D mean 20.2, lowest minute 18.2 (scale 2, frame 1280x720, window "
+                                     "1920x1080 (settings))"])
+
+
 class RewardsFood(unittest.TestCase):
     OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
 
