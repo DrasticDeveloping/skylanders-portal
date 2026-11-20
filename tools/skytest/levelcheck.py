@@ -133,13 +133,19 @@ class Run:
     result: dict = field(default_factory=dict)
 
 
+# W35: a play session's folder (play.py: host\ and second\, the server under host\data\Online\session\) is read as a
+# run: host is H, second is D.
+PLAY_NAMES = {"host": "H", "second": "D"}
+
+
 def load_run(folder: Path) -> Run:
-    server = read_log(folder, "H/data/Online/session/game.log", "S") or read_log(folder, "S/game.log", "S")
+    server = (read_log(folder, "H/data/Online/session/game.log", "S") or read_log(folder, "S/game.log", "S")
+              or read_log(folder, "host/data/Online/session/game.log", "S"))
     clients = {}
     for d in sorted(p for p in folder.iterdir() if p.is_dir() and p.name != "S"):
-        log = read_log(folder, f"{d.name}/game.log", d.name)
+        log = read_log(folder, f"{d.name}/game.log", PLAY_NAMES.get(d.name, d.name))
         if log is not None:
-            clients[d.name] = log
+            clients[PLAY_NAMES.get(d.name, d.name)] = log
     try:
         result = json.loads((folder / "result.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1881,12 +1887,17 @@ class LevelData:
 
 
 def run_level(run: Run) -> str:
-    """The level of a level pass's run: its case `levelpass-<level>[-no-end]` (result.json), else ""."""
+    """The level of a level pass's run: its case `levelpass-<level>[-no-end]` (result.json); W35: for any other run
+    (a spec's, a play session's) the last level H loaded that is not the hub (`level <g> <path>: load`, the path's
+    last part); else ""."""
     case = str(run.result.get("case") or "")
-    if not case.startswith("levelpass-"):
-        return ""
-    level = case[len("levelpass-"):]
-    return level[:-len("-no-end")] if level.endswith("-no-end") else level
+    if case.startswith("levelpass-"):
+        level = case[len("levelpass-"):]
+        return level[:-len("-no-end")] if level.endswith("-no-end") else level
+    h = run.clients.get("H")
+    loads = [m.group(2).split("/")[-1] for _l, m in h.find(LEVEL_LOAD)] if h is not None else []
+    loads = [x for x in loads if not x.startswith("town")]
+    return loads[-1] if loads else ""
 
 
 def level_data(levelpass: Path | None, level: str) -> LevelData | None:
@@ -2228,6 +2239,7 @@ def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[st
 # complete <Name#id>` on S (dev/trigger_tools.cpp; on S with online_sentinel or dev_trigger_commands). One without it
 # is a fault of the gate, named.
 ENCOUNTER_COMPLETE = re.compile(r"Online: encounter complete (\S+)")
+ENCOUNTER_START = re.compile(r"Online: encounter start (\S+)")
 
 
 def fight_gate_managers(run: Run, g) -> list[str]:
@@ -2284,6 +2296,40 @@ def wave_lines(run: Run, g) -> list[tuple[str, str, list[str]]]:
     return out
 
 
+# W35: a fight gate opens by its last wave's encounter act, not by a press: none of gate_open_ids' lines (an applied
+# open, a lock state line) comes for it (batch 16's fight-gate-tb: the gate opened, the row said so). Its opening:
+# S's row of the gate written again after the last wave's `encounter complete` (the row is the one S writes right
+# after the gate's own relay line, `relay ... (relay <gate>#<id>, ...)`: `world 2 <row> written`, kind 2 the gate's), and on each client its watch of that row saying
+# `unlocked` after that moment (`backend key gate <row> watched ... (unlocked ...)`).
+ROW_WRITTEN = re.compile(r"Online: world 2 (\S+) written")  # kind 2: a gate's row (W9)
+ROW_UNLOCKED = re.compile(r"Online: backend key gate (\S+) watched \S+ \(unlocked ")
+
+
+def fight_gate_opened(run: Run, gate: str, after: "Line") -> tuple[list[str], list[str]]:
+    """(the games where the gate opened after `after`, cited; the games where it did not) for a fight gate."""
+    s = run.server
+    if s is None or after.t is None:
+        return [], ["S"]
+    row = ""
+    for i, raw in enumerate(s.lines):
+        if f"(relay {gate}#" in raw:  # the gate's own relay: S writes its row right after (not the tracking lines)
+            for j in range(i + 1, min(i + 4, len(s.lines))):
+                m = ROW_WRITTEN.search(s.lines[j])
+                if m:
+                    row = m.group(1)
+                    break
+        if row:
+            break
+    opened, missing = [], []
+    w = next((line for line, m in s.find(ROW_WRITTEN) if m.group(1) == row and line.t and line.t >= after.t), None)
+    (opened if w else missing).append(f"S at {when(w)}" if w else "S")
+    for who, log in sorted(run.clients.items()):
+        u = next((line for line, m in log.find(ROW_UNLOCKED) if row and m.group(1) == row and line.t and
+                  line.t >= after.t), None)
+        (opened if u else missing).append(f"{who} at {when(u)}" if u else who)
+    return opened, missing
+
+
 def grade_fight_gates(run: Run, data: "LevelData | None" = None) -> Verdict:
     """Each required fight gate: its waves on S and H, its opening and the walk through."""
     name = "fight gates"
@@ -2297,10 +2343,14 @@ def grade_fight_gates(run: Run, data: "LevelData | None" = None) -> Verdict:
     h = run.clients.get("H")
     reqs = h.find(REQ_LINE) if h is not None else []
     clears = [m.group(1)[:60] for _l, m in h.find(ENC_CLEAR)] if h is not None else []
+    s_started = [m.group(1) for _l, m in run.server.find(ENCOUNTER_START)]
     counts, findings, untested = [], [], []
     for g in gates:
         managers = [k.split(".")[-1][:60] for k in getattr(g, "openers", []) or []]
-        fought = any(m.group(3) == g.name and not m.group(4) for _l, m in reqs) or any(n in clears for n in managers)
+        # Fought: the pass's step, H's encounter_clear of one of its managers, or (W35: a player's own fight, a play
+        # session) S starting one of them.
+        fought = (any(m.group(3) == g.name and not m.group(4) for _l, m in reqs) or any(n in clears for n in managers)
+                  or any(n.split("#")[0][:60] in managers for n in s_started))
         if not fought:
             untested.append(g.name)
             continue
@@ -2310,9 +2360,21 @@ def grade_fight_gates(run: Run, data: "LevelData | None" = None) -> Verdict:
         for i, (n, _w, faults) in enumerate(waves):
             if faults:
                 findings.append(Finding(f"{g.name} wave {i + 1} ({n}): " + "; ".join(faults), [lines[i]]))
-        opened = gate_open_ids(run.server, g.name, mover=False, run=run)
-        if not opened:
-            findings.append(Finding(f"{g.name}: never opened on S", [absent(run.server, f"an opening of {g.name}")]))
+        last = None
+        for n in managers:
+            done = [line for line, m in run.server.find(ENCOUNTER_COMPLETE) if m.group(1).split("#")[0][:60] == n]
+            if done and (last is None or (done[-1].t and last.t and done[-1].t > last.t)):
+                last = done[-1]
+        if last is None or any(f for _n, _w, f in waves if f):
+            findings.append(Finding(f"{g.name}: never opened on S (its last wave never completed there)",
+                                    [absent(run.server, f"the last wave's `encounter complete` of {g.name}")]))
+        else:
+            opened, missing = fight_gate_opened(run, g.name, last)
+            counts.append(f"{g.name} opened on " + (", ".join(opened) or "no game"))
+            if "S" in missing:
+                findings.append(Finding(f"{g.name}: never opened on S after its last wave", [last.cite()]))
+            elif missing:
+                findings.append(Finding(f"{g.name}: opened on S, not on {', '.join(missing)}", [last.cite()]))
     if untested:
         counts.append("not fought by this pass (NOT TESTED): " + ", ".join(untested))
     if not counts or all(c.startswith("not fought") for c in counts):
