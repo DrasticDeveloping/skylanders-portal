@@ -239,6 +239,11 @@ class Moves(unittest.TestCase):
         whats = [x.what for x in v.findings]
         self.assertIn("D: 1 of H's attack presses never taken by its body", whats)
         self.assertIn("D: 1 `input expired` while H's button was held", whats)
+        self.assertNotIn("NOT TESTED: block", v.counts)
+        # W40: no body showed a block (no `input block`, no held 0x800): the page says block is not tested.
+        f = RunFolder([], H_JOIN + h, D_JOIN + d[:3])
+        v = lc.grade_moves(lc.load_run(f.path))
+        self.assertTrue(v.counts.endswith(lc.BLOCK_NOT_TESTED), v.counts)
 
 
 class PlayerDamage(unittest.TestCase):

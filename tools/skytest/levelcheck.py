@@ -1630,6 +1630,11 @@ SHOT_MADE = re.compile(r"Online: puppet shot made ")
 SHOT_DROP = re.compile(r"Online: puppet shot drop (\S+)")
 BODY_DOWN = re.compile(r"Online: puppet (\d+) down \(ko, pose (\d+)\)(?!:)")
 BODY_BACK = re.compile(r"Online: puppet (\d+) back as (\S+) after (\d+) ms")
+# W40: no test presses BLOCK (logical button 11, held bit 0x800): the controller fills its logical buttons from raw
+# channels by a table it holds (sub_82B07630), and which pad button feeds 11 is not read yet; LT does not (batch 17's
+# moves-jump-block-tb: `hold lt` fed no 0x800). A run whose bodies show no block says so on the page.
+BLOCK_NOT_TESTED = ("NOT TESTED: block (logical button 11, 0x800: which pad button sets it is the controller's own "
+                    "table, sub_82B07630, not read yet; LT does not)")
 MOVES_STATE_POSES = 20      # a body's state set matches the sender's within this many poses (1 s at 20 Hz)
 MOVES_DRIFT_PER_S = 1.0     # walking: under one correction a second (in any 10 s)
 
@@ -1643,6 +1648,7 @@ def grade_moves(run: Run) -> Verdict:
     counts: list[str] = []
     findings: list[Finding] = []
     example = ""
+    blocked = False
     for who, log in sorted(run.clients.items()):
         for peer, sender in sorted(peers.items()):
             if sender == who or sender not in run.clients:
@@ -1665,6 +1671,8 @@ def grade_moves(run: Run) -> Verdict:
                 n = sum(1 for other in drifts[i:] if other.t is not None and (other.t - line.t).total_seconds() < 10)
                 worst = max(worst, n)
             inputs = [m.group(2) for _l, m in log.find(BODY_INPUT) if int(m.group(1)) == peer]
+            blocked = blocked or "block" in inputs or any(
+                int(m.group(1)) == peer and int(m.group(3), 16) & 0x800 for _l, m in log.find(BODY_HELD))
             # an `input expired` while a held button (non-zero held bits) was fed
             held_now, expired_held = False, []
             for i, raw in enumerate(log.lines):
@@ -1710,6 +1718,8 @@ def grade_moves(run: Run) -> Verdict:
                                         [downs[-1].cite(), absent(log, f"`puppet {peer} back as` after it")]))
     if not counts:
         return Verdict("other player's moves", NOT_TESTED, "no two clients with peer numbers to compare")
+    if not blocked:
+        counts.append(BLOCK_NOT_TESTED)
     return Verdict("other player's moves", FAIL if findings else PASS, "; ".join(counts), example, findings)
 
 
