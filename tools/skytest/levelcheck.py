@@ -986,6 +986,63 @@ def grade_world_events(run: Run, data: "LevelData | None") -> Verdict:
     return Verdict(name, FAIL if findings else PASS, counts, origins[0][1].cite(), findings)
 
 
+# --- level events in step (W39 item 8) ---------------------------------------------------------------------------
+#
+# The owner's third session ("tutorial_a is like completely chopped", in his words: "map visuals didnt line up with the
+# cutscenes"): H's picture went to the fly-through's white look at 23:55:24.6, about 6 s before the shared
+# TA_CoreFlyThrough started (23:55:30.4), while D's stayed normal. The scenes' author's line (online/6-owner-session3-
+# scenes), on each game: `level event <Name#id> step <n> <what> at shared tick <t> (S's step at <ts>)`. Each scripted
+# step of a level's event script happens on every game S logged it on (S and every client), as many times as on S,
+# within LEVEL_EVENT_TICKS shared ticks of S's step; a step twice on a game where S had it once, late or missing
+# fails. Steps pair by name (without the id: ids differ per game), step number and what.
+LEVEL_EVENT = re.compile(r"Online: level event (\S+?)(?:#\d+)? step (\d+) (.+?) at shared tick (-?\d+) \(S's step at "
+                         r"(-?\d+)\)")
+LEVEL_EVENT_TICKS = 30
+
+
+def grade_level_events(run: Run) -> Verdict:
+    name = "level events in step"
+    games = ([("S", run.server)] if run.server is not None else []) + sorted(
+        run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    per: dict[str, dict[tuple[str, str, str], list[tuple[Line, int, int]]]] = {}
+    for w, lg in games:
+        for l, m in lg.find(LEVEL_EVENT):
+            per.setdefault(w, {}).setdefault((m.group(1), m.group(2), m.group(3)), []).append(
+                (l, int(m.group(4)), int(m.group(5))))
+    if not per:
+        return Verdict(name, NOT_TESTED, "no `level event ... step` line on any game (a build before "
+                       "online/6-owner-session3-scenes)")
+    ref = per.get("S") or {}
+    if not ref:  # no S log or S logged none: every step any client logged
+        ref = {k: v for w in per for k, v in per[w].items()}
+    findings: list[Finding] = []
+    ok = 0
+    for key, s_steps in sorted(ref.items()):
+        bad, cites = [], []
+        for w, _lg in games:
+            if w == "S":
+                continue
+            mine = per.get(w, {}).get(key, [])
+            if len(mine) > len(s_steps):
+                bad.append(f"{len(mine)} times on {w} (S {len(s_steps)})")
+                cites += [f"{w}: {l.cite()}" for l, _t, _s in mine[:2]]
+            elif len(mine) < len(s_steps):
+                bad.append(f"missing on {w} ({len(mine)} of {len(s_steps)})")
+                cites.append(absent(dict(games)[w], f"`level event {key[0]}#.. step {key[1]} {key[2]}`"))
+            late = [(l, t, ts) for l, t, ts in mine if abs(t - ts) > LEVEL_EVENT_TICKS]
+            if late:
+                l, t, ts = late[0]
+                bad.append(f"{w} {t - ts:+d} shared ticks from S's step")
+                cites.append(f"{w}: {l.cite()}")
+        if bad:
+            findings.append(Finding(f"{key[0]} step {key[1]} {key[2]}: " + "; ".join(bad), cites[:5]))
+        else:
+            ok += 1
+    counts = (f"{len(ref)} event step(s) on S, {ok} on every game within {LEVEL_EVENT_TICKS} shared ticks, once; "
+              + ", ".join(f"{w} {sum(len(x) for x in per.get(w, {}).values())}" for w, _lg in games))
+    return Verdict(name, FAIL if findings else PASS, counts, "", findings)
+
+
 # --- enemy states and damage from S (W39) ---------------------------------------------------------------------
 #
 # The enemies author's lines (online/5-replica-attacks-land-2 4b9ae45d, S's online_enemy_state_convergence; his list
@@ -3406,7 +3463,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run),
             grade_coins_shared(run), grade_scenes_once(run), grade_level_changes(run), grade_enemy_kills(run),
             grade_gate_kinds(run, data), grade_dialog_skip(run), grade_enemy_server_damage(run),
-            grade_world_events(run, data),
+            grade_world_events(run, data), grade_level_events(run),
             grade_loot(run),
             grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
             grade_fight_gates(run, data)]

@@ -780,6 +780,34 @@ class Together(unittest.TestCase):
         self.assertIn("D stayed where it entered", v.counts)
 
 
+class LevelEvents(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+
+    def test_a_step_early_on_one_game_and_twice_on_another(self) -> None:
+        # The scenes' author's line form (online/6-owner-session3-scenes, written ahead of the build).
+        s = [(50, "Online: level event Level_EventManager#2150 step 3 white fade at shared tick 3000 (S's step at 3000)"),
+             (60, "Online: level event Level_EventManager#2150 step 4 fly-through at shared tick 3600 (S's step at 3600)")]
+        h = H_JOIN + [(44, "Online: level event Level_EventManager#2150 step 3 white fade at shared tick 2640 (S's step at "
+                           "3000)"),
+                      (60, "Online: level event Level_EventManager#2150 step 4 fly-through at shared tick 3602 (S's step "
+                           "at 3600)")]
+        d = D_JOIN + [(50, "Online: level event Level_EventManager#2151 step 3 white fade at shared tick 3004 (S's step at "
+                           "3000)"),
+                      (60, "Online: level event Level_EventManager#2151 step 4 fly-through at shared tick 3601 (S's step "
+                           "at 3600)"),
+                      (61, "Online: level event Level_EventManager#2151 step 4 fly-through at shared tick 3660 (S's step "
+                           "at 3600)")]
+        v = lc.grade_level_events(lc.load_run(RunFolder(s, h, d).path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual([f.what for f in v.findings], [
+            "Level_EventManager step 3 white fade: H -360 shared ticks from S's step",
+            "Level_EventManager step 4 fly-through: 2 times on D (S 1); D +60 shared ticks from S's step"])
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session_predates_the_lines(self) -> None:
+        self.assertEqual(lc.grade_level_events(lc.load_run(self.OWNER_3)).status, lc.NOT_TESTED)
+
+
 class WorldEvents(unittest.TestCase):
     OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
     LP = Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass")
