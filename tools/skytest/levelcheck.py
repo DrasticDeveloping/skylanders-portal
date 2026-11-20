@@ -1139,6 +1139,35 @@ def grade_rewards_food(run: Run) -> Verdict:
     return Verdict(name, FAIL if findings else PASS, "; ".join(counts), "", findings)
 
 
+# --- the server's world advances (W41) ---------------------------------------------------------------------------
+#
+# A client's own watch of S's world (online/5-server-silent-notice 2b14fc0d, client/server_silence.cpp): `[error]
+# Online: the server's world has not advanced for <n> s (last shared tick <t>)` when S's shared tick stood still while
+# this client expected it to move (its level loaded and its barrier released, no join held, S on its level), and
+# `the server's world advances again after <s> s` when it moved again. Any such [error] on any client fails. The watch
+# exists when the source tree the grade runs from has it (src/online/client/server_silence.cpp): without it, a run
+# with no such line is NOT TESTED, not passed.
+SERVER_NOT_ADVANCED = re.compile(r"\[error\] .*Online: the server's world has not advanced for ([\d.]+) s")
+SERVER_ADVANCES_AGAIN = re.compile(r"Online: the server's world advances again after ([\d.]+) s")
+SERVER_WATCH_SOURCE = Path("src") / "online" / "client" / "server_silence.cpp"
+
+
+def grade_server_world(run: Run, repo: Path | None = None) -> Verdict:
+    name = "the server's world advances"
+    stops = [(w, l, m) for w, lg in sorted(run.clients.items()) for l, m in lg.find(SERVER_NOT_ADVANCED)]
+    again = sum(len(lg.find(SERVER_ADVANCES_AGAIN)) for lg in run.clients.values())
+    if stops:
+        return Verdict(name, FAIL, f"{len(stops)} stop(s) of S's world seen by a client, {again} advance(s) again",
+                       stops[0][1].cite(), [Finding(
+                           f"{w}: S's world had not advanced for {m.group(1)} s at {when(l)}", [l.cite()])
+                           for w, l, m in stops[:6]])
+    built = repo is not None and (Path(repo) / SERVER_WATCH_SOURCE).is_file()
+    if not built:
+        return Verdict(name, NOT_TESTED, "the clients' watch of S's world is not in this source tree "
+                       "(online/5-server-silent-notice not merged): no stop line is no proof")
+    return Verdict(name, PASS, f"no client saw S's world stand still ({len(run.clients)} client(s) watched)")
+
+
 # --- level events in step (W39 item 8) ---------------------------------------------------------------------------
 #
 # The owner's third session ("tutorial_a is like completely chopped", in his words: "map visuals didnt line up with the
@@ -1168,6 +1197,10 @@ EFFECT_S = re.compile(r"Online: level effect (\S+?)(?:#\d+)? component (\d+) (on
 EFFECT_C = re.compile(r"Online: level effect (\S+?)(?:#\d+)? component (\d+) (on|off) here \(S's at shared tick")
 CONV_ENDED_S = re.compile(r"Online: conversation (\S+?)(?:#\d+)? ended on S at shared tick")
 CONV_END_S = 1.0
+# W41: the scenes author puts the conversation-lines sync (his item 9) behind its own setting, off by default; its name
+# is not given yet. The conversations-in-step part is checked only in a run that passes it (a peer's command holds
+# `--<setting>=true`), else said "not tested". Set the name here when he names it.
+CONV_SYNC_SETTING: str | None = None
 
 
 def grade_level_events(run: Run) -> Verdict:
@@ -1250,7 +1283,13 @@ def level_states_findings(run: Run, games: list) -> "tuple[list[str], list[Findi
             findings.append(Finding(f"{len(differ)} {what}(es) end in another state than S's: " + ", ".join(
                 f"{w} {k[0]} #{k[1]} {g[1]} (S {s})" for w, k, s, g in differ[:4]),
                 [f"{w}: {g[0].cite()}" for w, _k, _s, g in differ[:3]]))
-    if s_conv:
+    conv_on = CONV_SYNC_SETTING is not None and any(
+        f"--{CONV_SYNC_SETTING}=true" in (p.get("command") or []) for p in run.result.get("peers", []) or []
+        if isinstance(p, dict))
+    if s_conv and not conv_on:
+        counts.append(f"conversations ended on S {len(s_conv)}: in step NOT TESTED (the conversation-lines sync's "
+                      f"setting {CONV_SYNC_SETTING or '(not named yet)'} not passed in this run)")
+    elif s_conv:
         late = []
         for w, lg in clients:
             ends = conversation_ends(lg)
@@ -3816,6 +3855,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
             grade_coins_shared(run), grade_scenes_once(run), grade_level_changes(run), grade_enemy_kills(run),
             grade_gate_kinds(run, data), grade_dialog_skip(run), grade_enemy_server_damage(run),
             grade_world_events(run, data), grade_level_events(run), grade_rewards_food(run),
+            grade_server_world(run, repo),
             grade_loot(run),
             grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
             grade_fight_gates(run, data)]

@@ -935,9 +935,38 @@ class AuthorsFinalLines(unittest.TestCase):
         d = D_JOIN + [(45, "Online: scene local 2/L2 start conversation conversation recipient Tessa#3999 from x"),
                       (50, "Online: scene local 2/L2 end by natural after 5.0 s (2/2.w1)")]
         v = lc.grade_level_events(lc.load_run(RunFolder(s, h, d).path))
+        # W41: the conversations part only with its own setting (not named yet): said not tested.
+        self.assertEqual([f.what.split(":")[0] for f in v.findings], ["1 effect(es) end in another state than S's"])
+        self.assertIn("in step NOT TESTED", v.counts)
+        old = lc.CONV_SYNC_SETTING
+        lc.CONV_SYNC_SETTING = "online_conversation_lines"
+        try:
+            peers = [{"peer": "H", "command": ["x.exe", "--online_conversation_lines=true"]}]
+            v = lc.grade_level_events(lc.load_run(RunFolder(s, h, d, peers=peers).path))
+        finally:
+            lc.CONV_SYNC_SETTING = old
         self.assertEqual([f.what.split(":")[0] for f in v.findings], [
             "1 effect(es) end in another state than S's", "1 conversation end(s) not within 1 s of S's"])
         self.assertIn("D Tessa +30.0 s", v.findings[1].what)
+
+    def test_the_servers_world_advances(self) -> None:
+        # online/5-server-silent-notice 2b14fc0d: the clients' watch of S's world.
+        d = D_JOIN + [(60, "Online: the server's world advances again after 9.0 s (shared tick 900)")]
+        f = RunFolder([], H_JOIN, d)
+        text = (f.path / "H" / "game.log").read_text(encoding="utf-8") + \
+            "[2026-11-19 00:00:50.000] [error] [core] [t1] Online: the server's world has not advanced for 8 s (last " \
+            "shared tick 400)\n"
+        (f.path / "H" / "game.log").write_text(text, encoding="utf-8")
+        v = lc.grade_server_world(lc.load_run(f.path), None)
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertTrue(v.findings[0].what.startswith("H: S's world had not advanced for 8 s"), v.findings[0].what)
+        with tempfile.TemporaryDirectory() as repo:
+            self.assertEqual(lc.grade_server_world(lc.load_run(RunFolder([], H_JOIN, D_JOIN).path), Path(repo)).status,
+                             lc.NOT_TESTED)
+            (Path(repo) / lc.SERVER_WATCH_SOURCE).parent.mkdir(parents=True)
+            (Path(repo) / lc.SERVER_WATCH_SOURCE).write_text("//", encoding="utf-8")
+            self.assertEqual(lc.grade_server_world(lc.load_run(RunFolder([], H_JOIN, D_JOIN).path), Path(repo)).status,
+                             lc.PASS)
 
 
 class WorldEvents(unittest.TestCase):

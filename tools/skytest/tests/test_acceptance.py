@@ -24,6 +24,9 @@ class Acceptance(unittest.TestCase):
             self.assertEqual(est[0], ("a-case", 200.0, "median of 2 earlier run(s)"))
             self.assertEqual(est[1], ("b-case", 300.0, "its spec's timeout (no earlier run)"))
             self.assertEqual(est[2], ("c-case", None, "no spec in this tree"))
+            owed = acceptance.estimate(root, runs, ["element-gate-dual-tb"], [])
+            self.assertEqual(owed[0][2], acceptance.OWED["element-gate-dual-tb"])
+            self.assertIn("element-gate-dual-tb", acceptance.CASES)
             self.assertEqual(est[3][1], acceptance.LEVEL_DEFAULT_S)
             self.assertIn("estimated 23 min in all", acceptance.estimate_text(est))
 
