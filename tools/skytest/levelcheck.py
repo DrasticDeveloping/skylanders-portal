@@ -1747,6 +1747,19 @@ def invulnerable_clients(folder: Path) -> list[str]:
             if isinstance(p, dict) and INVULNERABLE_ARG in (p.get("command") or [])]
 
 
+def launch_relay_head(folder: Path) -> list[str]:
+    """W36: whether the run relayed a launch pad's ride (--online_launch_relay=true on H, which Host forwards to S)."""
+    try:
+        r = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    h = next((p for p in r.get("peers", []) or [] if isinstance(p, dict) and p.get("peer") == "H"), None)
+    if h is None or not h.get("command"):
+        return []
+    on = "--online_launch_relay=true" in h.get("command")
+    return [f"launch pad relay: {'on' if on else 'off'} (online_launch_relay; off: a ride carries the presser only)"]
+
+
 def invulnerable_head(folder: Path) -> list[str]:
     who = invulnerable_clients(folder)
     return [f"heroes invulnerable in this run ({', '.join(who)}): enemy damage not tested"] if who else []
@@ -2596,6 +2609,7 @@ def run_head(folder: Path, levelpass: Path | None = None) -> list[str]:
             *figures_head(folder),
             *gates_line,
             *invulnerable_head(folder),
+            *launch_relay_head(folder),
             *skipped_head(read_log(folder, "H/game.log", "H")),
             *route_head(folder)]
 

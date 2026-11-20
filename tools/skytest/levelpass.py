@@ -1548,6 +1548,9 @@ def plan_pieces(content: Content, forbidden: set[str], left_out: list[str]) -> t
 # islands are shared only with online_island_spawns: skytest passes it on a level with pieces (PIECES_SETTING).
 WALK_INTO = False
 PIECES_SETTING = "--online_island_spawns=true"
+# W36: a level with a launch pad microgame runs with its ride relayed to every player's game (online_launch_relay,
+# online/6-rail-launch-everyone) where the build knows the setting; skytest adds it.
+LAUNCH_RELAY_SETTING = "--online_launch_relay=true"
 
 
 def pieces_lines(plan: Plan) -> list[str]:
