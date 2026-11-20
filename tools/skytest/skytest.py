@@ -195,6 +195,17 @@ def server_stall_reasons(folder: Path) -> list[str]:
     return [f"{f.what}: " + "; ".join(f.lines) for f in fs]
 
 
+def scene_repeat_reasons(folder: Path) -> list[str]:
+    """W38: the hard rule on every case with a game log: a cutscene started more than once on one game in one level
+    generation (levelcheck.scene_repeats), as a case's reasons."""
+    import levelcheck as lc
+    try:
+        _counts, fs = lc.scene_repeats(lc.load_run(folder))
+    except (OSError, ValueError):
+        return []
+    return [f"cutscene played more than once: {f.what}: " + "; ".join(f.lines) for f in fs]
+
+
 def server_notes(folder: Path) -> list[str]:
     """W40: every case with a server log: how many of each player's attack presses S started."""
     import levelcheck as lc
@@ -8388,6 +8399,13 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 for why in server_stall_reasons(Path(r.folder)):
                     if nothing:  # W41: the case tested nothing; its server rule is not tested, not failed
                         r.notes.append(f"server game alive: NOT TESTED ({nothing}): {why}")
+                        continue
+                    r.reasons.append(why)
+                    if r.status == "pass":
+                        r.status = "fail"
+                for why in scene_repeat_reasons(Path(r.folder)):  # W38: a cutscene played twice fails every case
+                    if nothing:
+                        r.notes.append(f"cutscenes once: NOT TESTED ({nothing}): {why}")
                         continue
                     r.reasons.append(why)
                     if r.status == "pass":

@@ -891,6 +891,52 @@ def grade_coins(run: Run) -> Verdict:
     return Verdict("coins", FAIL if findings else PASS, counts, first.cite(), findings)
 
 
+# --- cutscenes: each scene played once per game (W38) -----------------------------------------------------
+#
+# The owner's third session: "cutscenes play multiple times". Each game's own scene lines (`scene local <g>/L<n>
+# start cutscene <name> recipient <who> from <how>`: <g> the level's generation, L<n> this game's play number) and S's
+# reports (`scene report cutscene run start from peer <p> (generation <g>, name <id>, play <k>)`): a cutscene that
+# starts more than once on one game within one level generation (a level loaded again is a new generation) is a
+# FAIL naming the scene, the game and each start's time. Conversations are left out: their scene name is always
+# `conversation`, and a player may talk to the same character again. A hard rule on every case (skytest).
+SCENE_START = re.compile(r"Online: scene local (\d+)/L(\d+) start cutscene (\S+)")
+SCENE_REPORT = re.compile(r"Online: scene report cutscene run start from peer (\d+) \(generation (\d+), name (\S+), "
+                          r"play (\d+)\)")
+
+
+def scene_repeats(run: Run) -> tuple[list[str], list["Finding"]]:
+    """Per game, its cutscene starts (counts) and the cutscenes started more than once in one generation."""
+    counts: list[str] = []
+    findings: list[Finding] = []
+    games = ([("S", run.server)] if run.server is not None else []) + sorted(
+        run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    for who, log in games:
+        starts: dict[tuple[str, str], list[Line]] = {}
+        for line, m in log.find(SCENE_START):
+            starts.setdefault((m.group(1), m.group(3)), []).append(line)
+        if who == "S":
+            for line, m in log.find(SCENE_REPORT):
+                starts.setdefault((m.group(2), f"peer {m.group(1)}'s {m.group(3)} play {m.group(4)}"), []).append(line)
+        if not starts:
+            continue
+        n = sum(len(x) for x in starts.values())
+        counts.append(f"{who}: {n} cutscene start(s), {len(starts)} distinct")
+        for (gen, name), lines in sorted(starts.items(), key=lambda kv: kv[1][0].no):
+            if len(lines) > 1:
+                findings.append(Finding(
+                    f"{who}: {name} started {len(lines)} times in level generation {gen} (at "
+                    + ", ".join(when(l) for l in lines) + ")", [l.cite() for l in lines[:4]]))
+    return counts, findings
+
+
+def grade_scenes_once(run: Run) -> Verdict:
+    name = "cutscenes once"
+    counts, findings = scene_repeats(run)
+    if not counts:
+        return Verdict(name, NOT_TESTED, "no game logged a cutscene start (`scene local <g>/L<n> start cutscene`)")
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), "", findings)
+
+
 # --- coins shared: every coin paid once to every player (W38) --------------------------------------------
 #
 # The owner's third session: "coins from broken stuff still doesnt collect for both players". Per coin key K (its
@@ -2766,7 +2812,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     together = grade_together(run)
     rows = [grade_server_alive(run), grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run),
-            grade_coins_shared(run), grade_loot(run),
+            grade_coins_shared(run), grade_scenes_once(run), grade_loot(run),
             grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
             grade_fight_gates(run, data)]
     # The enemies and the loot are read where both players stand only when D followed H: each says which.

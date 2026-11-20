@@ -780,6 +780,48 @@ class Together(unittest.TestCase):
         self.assertIn("D stayed where it entered", v.counts)
 
 
+class ScenesOnce(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+    OWNER_2 = Path(r"D:/SwapForceOnline-data/play/20261119-211901")
+
+    def test_a_cutscene_started_twice_in_one_generation_fails(self) -> None:
+        h = H_JOIN + [(50, "Online: scene local 1/L3 start cutscene TA_ChompyIntro recipient Event_ChompyIntro#2132 from "
+                           "script CutscenePlay"),
+                      (61, "Online: scene local 1/L4 start cutscene TA_ChompyIntro recipient Event_ChompyIntro#2132 from "
+                           "script CutscenePlay"),
+                      (90, "Online: scene local 2/L1 start cutscene TA_ChompyIntro recipient - from the level load"),
+                      (95, "Online: scene local 2/L2 start conversation conversation recipient Tessa#3811 from x"),
+                      (99, "Online: scene local 2/L3 start conversation conversation recipient Tessa#3811 from x")]
+        v = lc.grade_scenes_once(lc.load_run(RunFolder([], h, D_JOIN).path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.counts, "H: 3 cutscene start(s), 2 distinct")
+        self.assertEqual([f.what.split(" (at")[0] for f in v.findings],
+                         ["H: TA_ChompyIntro started 2 times in level generation 1"])
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session_repeats(self) -> None:
+        # His complaint "cutscenes play multiple times", from his own logs: in tutorial_a (generation 1) TA_ChompyIntro
+        # started twice on H (23:54:49, 23:55:00) and on D (23:54:49, 23:55:08); D also played TA_CoreFlyThrough and
+        # TA_GreebleMeleeIntro twice (23:55:30 and 23:55:53; 23:55:43 and 23:56:00).
+        v = lc.grade_scenes_once(lc.load_run(self.OWNER_3))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(sorted(f.what.split(" (at")[0] for f in v.findings), [
+            "D: TA_ChompyIntro started 2 times in level generation 1",
+            "D: TA_CoreFlyThrough started 2 times in level generation 1",
+            "D: TA_GreebleMeleeIntro started 2 times in level generation 1",
+            "H: TA_ChompyIntro started 2 times in level generation 1",
+            "S: peer 1's 0x00000854 play 0 started 2 times in level generation 1",
+            "S: peer 2's 0x00000845 play 0 started 2 times in level generation 1",
+            "S: peer 2's 0x00000854 play 0 started 2 times in level generation 1",
+            "S: peer 2's 0x00000866 play 0 started 2 times in level generation 1"])
+
+    @unittest.skipUnless(OWNER_2.is_dir(), "the owner's second session is not here")
+    def test_the_owners_second_session(self) -> None:
+        # No cutscene repeated there: 7 starts on H and on D, 8 reports on S, each once.
+        v = lc.grade_scenes_once(lc.load_run(self.OWNER_2))
+        self.assertEqual(v.status, lc.PASS, v)
+
+
 class CoinsShared(unittest.TestCase):
     # W38: each coin taken once, granted once, paid once with the same amount on the other client and removed there
     # (the coins branch's line forms, online/8-all-coins-shared 033f2274).
