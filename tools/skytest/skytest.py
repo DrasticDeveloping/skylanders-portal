@@ -184,6 +184,16 @@ GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_t
 LEVEL_CHECK_ROWS = ("enemies hurt players", "other player's moves", "fight gates")
 
 
+def server_stall_reasons(folder: Path) -> list[str]:
+    """W37: the hard rule on every run with a server log (levelcheck.server_stalled), as a case's reasons."""
+    import levelcheck as lc
+    try:
+        f = lc.server_stalled(lc.load_run(folder))
+    except (OSError, ValueError):
+        return []
+    return [f"{f.what}: " + "; ".join(f.lines)] if f is not None else []
+
+
 def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None) -> list[str]:
     """The reasons the named level check rows give against this run folder (empty: every row passed); `levelpass`:
     the level's data for the rows that need it (fight gates)."""
@@ -8224,6 +8234,13 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 breaker.record(spec.name, r.folder, r.signature)
                 if (t := breaker.tripped()) is not None:
                     tell_breaker(t)
+            # W37: every case with a server log: S's game must not have stopped while its frames went on with a client
+            # connected (levelcheck.server_stalled).
+            if r.folder and Path(r.folder).is_dir():
+                for why in server_stall_reasons(Path(r.folder)):
+                    r.reasons.append(why)
+                    if r.status == "pass":
+                        r.status = "fail"
             # W34: the spec's level check rows ([grade.level_check]) on the finished run.
             if "level_check" in spec.grades and r.folder and Path(r.folder).is_dir():
                 for why in level_check_reasons(Path(r.folder), spec.grades["level_check"],

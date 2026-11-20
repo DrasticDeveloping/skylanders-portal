@@ -344,6 +344,27 @@ class LaunchRelayHead(unittest.TestCase):
         (f.path / "result.json").write_text(json.dumps(res), encoding="utf-8")
         self.assertTrue(lc.launch_relay_head(f.path)[0].startswith("launch pad relay: off"))
 
+
+class ServerAlive(unittest.TestCase):
+    OWNER_2 = Path(r"D:/SwapForceOnline-data/play/20261119-211901")
+    GATE_RUN = Path(r"D:/SwapForceOnline-data/tests/int2/runs/20261119-202440-fight-gate-tb")
+
+    @unittest.skipUnless(OWNER_2.is_dir(), "the owner's second session of 19 November is not here")
+    def test_the_owners_second_session_stopped_at_21_46_16(self) -> None:
+        f = lc.server_stalled(lc.load_run(self.OWNER_2))
+        self.assertIsNotNone(f)
+        self.assertTrue(f.what.startswith("the server's game stopped at 21:46:16"), f.what)
+        self.assertEqual(len(f.lines), 3)
+
+    @unittest.skipUnless(GATE_RUN.is_dir(), "batch 16's fight-gate-tb run is not here")
+    def test_the_batch_16_gate_run_has_no_finding(self) -> None:
+        self.assertIsNone(lc.server_stalled(lc.load_run(self.GATE_RUN)))
+
+    def test_a_server_that_works_to_the_end_passes(self) -> None:
+        s = [(10, "Online: world 2 a00000000.0629f659.00012836@2 written"), (19, "Online: frames 599 fps 59.9 p50 16"),
+             (20, "Online: traffic peer 1 gameplay 1/1 state 1/1 fast 1/1 bytes")]
+        self.assertIsNone(lc.server_stalled(lc.load_run(RunFolder(s, H_JOIN, D_JOIN).path)))
+
 class Windows(unittest.TestCase):
     def test_a_clients_time_in_each_level(self) -> None:
         f = RunFolder([], H_JOIN + LEVEL_END, D_JOIN + LEVEL_END)

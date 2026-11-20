@@ -1855,6 +1855,65 @@ def grade_player_damage(run: Run) -> Verdict:
     return Verdict(name, FAIL if findings else PASS, "; ".join(counts), example, findings)
 
 
+# --- the server's game stopped (W37) ------------------------------------------------------------------------
+#
+# The owner's second session (play\20261119-211901): S's game thread logged nothing after 21:46:16 (four seconds after
+# a refused collect and a save), while its frames and traffic lines went on to 22:01; nothing on the page said so.
+# The hard rule: S's game work (every line of the thread that logs `Online: world`, `enemy` and `backend memory`: the
+# game's own thread) must not end more than SERVER_STALL_S before S's last `frames` line while a client was connected
+# (S's `traffic peer <p>` lines). FAIL "the server's game stopped at <time>" with its last three game-work lines. The
+# fixing agent's [error] line on S for the same thing fails it too (SERVER_STALL_ERROR, once its text is known).
+SERVER_STALL_S = 5.0
+GAME_WORK = re.compile(r"\[t(\d+)\] Online: (?:world|enemy|backend memory)\b")
+THREAD_OF = re.compile(r"\[t(\d+)\] ")
+FRAMES_LINE = re.compile(r"\] Online: frames \d+ ")
+TRAFFIC_LINE = re.compile(r"\] Online: traffic peer \d+ ")
+SERVER_STALL_ERROR: "re.Pattern | None" = None   # the fix's [error] line on S; set when its text is known
+
+
+def server_stalled(run: Run) -> "Finding | None":
+    """The finding when S's game thread stopped while its frames went on with a client connected; else None."""
+    s = run.server
+    if s is None:
+        return None
+    if SERVER_STALL_ERROR is not None:
+        hit = s.find(SERVER_STALL_ERROR)
+        if hit:
+            return Finding(f"the server's game stopped (its own line) at {when(hit[0][0])}", [hit[0][0].cite()])
+    counts: dict[str, int] = {}
+    for raw in s.lines:
+        m = GAME_WORK.search(raw)
+        if m:
+            counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+    if not counts:
+        return None
+    game = max(counts, key=counts.get)
+    work = [i for i, raw in enumerate(s.lines) if (m := THREAD_OF.search(raw)) and m.group(1) == game]
+    frames = [i for i, raw in enumerate(s.lines) if FRAMES_LINE.search(raw)]
+    traffic = [i for i, raw in enumerate(s.lines) if TRAFFIC_LINE.search(raw)]
+    if not work or not frames or not traffic:
+        return None
+    last_work, last_frames, last_traffic = s.line(work[-1]), s.line(frames[-1]), s.line(traffic[-1])
+    if not (last_work.t and last_frames.t and last_traffic.t):
+        return None
+    end = min(last_frames.t, last_traffic.t)  # S still drawing frames and a client still connected
+    if (end - last_work.t).total_seconds() <= SERVER_STALL_S:
+        return None
+    return Finding(f"the server's game stopped at {when(last_work)} (its frames and a client's traffic went on to "
+                   f"{end.strftime('%H:%M:%S')})", [s.line(i).cite() for i in work[-3:]])
+
+
+def grade_server_alive(run: Run) -> Verdict:
+    """The page's row for the hard rule above."""
+    name = "server game alive"
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    f = server_stalled(run)
+    if f is not None:
+        return Verdict(name, FAIL, f.what, f.lines[-1] if f.lines else "", [f])
+    return Verdict(name, PASS, "the server's game thread worked to the end of its frames while a client was connected")
+
+
 # --- what no grader covers yet -------------------------------------------------------------------------------
 #
 # Said at the bottom of every page so the gaps are seen without asking. From the placeholder audit's CLASS 1
@@ -2547,7 +2606,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     run = load_run(folder)
     data = level_data(levelpass, run_level(run))
     together = grade_together(run)
-    rows = [grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
+    rows = [grade_server_alive(run), grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run),
             grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
             grade_fight_gates(run, data)]
