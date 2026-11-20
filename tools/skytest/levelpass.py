@@ -45,6 +45,7 @@ from pathlib import Path
 import levelpass_end as le
 import levelpass_holds as lh
 import levelpass_pieces as lpc
+import preflight as pf
 
 # --- content ------------------------------------------------------------------------------------------
 
@@ -3438,6 +3439,19 @@ INVULNERABLE_ARGS = ("--dev_hero_invulnerable=true", "--dev_damage_multiplier=-1
 # swap. Not built.
 
 
+def script_settings(args: list[str], script: str) -> list[str]:
+    """A peer's arguments with every setting its script's commands need (preflight.FATAL_OFF: a command whose
+    setting is off is refused, and its refusal is a fatal line of the runner). The two-player tutorial_a check of
+    20 November did not start: D's script had a fight step and D_ARGS had no --dev_defeat_commands. A peer gets
+    each setting from its own script, whatever the generator gives it."""
+    out = list(args)
+    for line in pf.lines_of(script or ""):
+        need = pf.FATAL_OFF.get(line.split()[0])
+        if need and not pf.setting_on(out, need[0]):
+            out.append(f"--{need[0]}=true")
+    return out
+
+
 def probe_args(args: list[str], probe: bool, extra: list[str] | None = None) -> list[str]:
     """A peer's arguments, without the authored probe for a --no-probe pass, plus the pass's --game-arg
     settings (after the defaults, so a later value wins); with VULNERABLE without INVULNERABLE_ARGS."""
@@ -3481,9 +3495,10 @@ def spec_from_scripts(level: str, h: str, d: str | None, d_args: list[str] | Non
            'server = "host"', f'description = "The level pass of {level} (skytest levelpass; generated, not committed)"',
            f"timeout = {CASE_TIMEOUT_S}", 'scenes = "skip"',
            f"show_server_window = {'false' if server_hidden else 'true'}", 'shader_cache = "snapshot"',
-           "", "[peer.H]", f"args = {_toml_list(H_ARGS)}", "script = '''\n" + h + "'''"]
+           "", "[peer.H]", f"args = {_toml_list(script_settings(H_ARGS, h))}", "script = '''\n" + h + "'''"]
     if d:
-        out += ["", "[peer.D]", f"args = {_toml_list(D_ARGS + (d_args or []))}", f"start_after = '{LATE_JOIN_MARK}'",
+        out += ["", "[peer.D]", f"args = {_toml_list(script_settings(D_ARGS + (d_args or []), d))}",
+                f"start_after = '{LATE_JOIN_MARK}'",
                 "script = '''\n" + d + "'''"]
     return "\n".join(out) + "\n"
 
@@ -3500,6 +3515,7 @@ def spec_toml(plan: Plan) -> str:
     h_args = probe_args(H_ARGS, plan.probe, plan.game_args)
     if lobby:  # the join by code with the host's let in: the server's Hello gate on (the party flow's)
         h_args = [x for x in h_args if x not in LOBBY_H_ARGS_DROP] + [x for x in LOBBY_H_ARGS_ADD if x not in h_args]
+    h_args = script_settings(h_args, h)
     forbid = exit_forbid(h) + [PAUSE_FATAL, MADE_COPY_LEFT] + \
         ([REQUIRED_GATE_FATAL] if plan.pass_gates and any(not r.why_not for r in plan.required) else [])
     out = [f'name = "{case_name(plan.level, plan.no_end)}"',
@@ -3519,12 +3535,15 @@ def spec_toml(plan: Plan) -> str:
            *([f"forbid = {_toml_list(forbid)}"] if forbid else []),
            "script = \'\'\'\n" + h + "\'\'\'",
            ]
+    if lobby or late:
+        d = script_d(plan)
+        d_args = script_settings(probe_args(D_ARGS, plan.probe, plan.game_args), d)
     if lobby:
-        out += ["", "[peer.D]", f"args = {_toml_list(probe_args(D_ARGS, plan.probe, plan.game_args))}",
+        out += ["", "[peer.D]", f"args = {_toml_list(d_args)}",
                 *([f"wait_needs = {D_WAIT_NEEDS}"] if d_through_end(plan) else []),
-                "script = \'\'\'\n" + script_d(plan) + "\'\'\'"]
+                "script = \'\'\'\n" + d + "\'\'\'"]
     elif late:
-        out += ["", "[peer.D]", f"args = {_toml_list(probe_args(D_ARGS, plan.probe, plan.game_args))}", f"start_after = '{LATE_JOIN_MARK}'",
+        out += ["", "[peer.D]", f"args = {_toml_list(d_args)}", f"start_after = '{LATE_JOIN_MARK}'",
                 *([f"wait_needs = {D_WAIT_NEEDS}"] if d_through_end(plan) else []),
-                "script = \'\'\'\n" + script_d(plan) + "\'\'\'"]
+                "script = \'\'\'\n" + d + "\'\'\'"]
     return "\n".join(out) + "\n"
