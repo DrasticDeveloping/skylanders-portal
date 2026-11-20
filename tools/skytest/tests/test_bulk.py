@@ -20,6 +20,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 import skytest  # noqa: E402
 import test_skytest as base  # noqa: E402  (its throwaway game repository; its tests run from their own module)
+import temp_sweep  # noqa: E402
 
 _REAL = {}
 
@@ -34,10 +35,14 @@ def setUpModule() -> None:
     skytest.build_holders = lambda: []
     # preflight_gate.py: the throwaway game has no source or level data to check a spec against.
     skytest.preflight_check = lambda cfg, spec, cache: []
-    os.environ["SFO_BUILD_SLOT_DIR"] = tempfile.mkdtemp(prefix="skytest-no-builds-")
+    # The suite's own temp folders (temp_sweep.py): last runs' leftovers older than a day go first; this module's
+    # empty slot folder is removed again in tearDownModule.
+    temp_sweep.sweep()
+    os.environ["SFO_BUILD_SLOT_DIR"] = temp_sweep.make("skytest-no-builds-")
 
 
 def tearDownModule() -> None:
+    temp_sweep.remove(os.environ.pop("SFO_BUILD_SLOT_DIR", None))
     skytest.token_restriction = _REAL["token"]
     skytest.CPU_SAMPLE_S = _REAL["cpu"]
     skytest.GB_PER_GAME = _REAL["gb"]

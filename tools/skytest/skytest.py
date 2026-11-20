@@ -104,6 +104,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+from datetime import datetime
 import fnmatch
 import getpass
 import hashlib
@@ -182,7 +183,10 @@ GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_t
 # W34: a spec's [grade.level_check] `rows = [...]` grades its run with those rows of the level check's page
 # (levelcheck.py): a row's FAIL fails the case with the row's findings as the reason; `must_test = true` fails a row
 # that says NOT TESTED too (a spec written to show it). LEVEL_CHECK_ROWS: the rows a spec may name.
-LEVEL_CHECK_ROWS = ("enemies hurt players", "other player's moves", "fight gates")
+LEVEL_CHECK_ROWS = ("enemies hurt players", "other player's moves", "fight gates", "coins shared",
+                    "cutscenes once", "level changes", "enemies can be killed", "elemental gates and Swap Zones",
+                    "dialogs skipped", "enemy states and damage from S", "world events",
+                    "level events in step", "reward gold and food")
 
 
 def server_stall_reasons(folder: Path) -> list[str]:
@@ -195,6 +199,27 @@ def server_stall_reasons(folder: Path) -> list[str]:
     return [f"{f.what}: " + "; ".join(f.lines) for f in fs]
 
 
+def scene_repeat_reasons(folder: Path) -> list[str]:
+    """W38: the hard rule on every case with a game log: a cutscene started more than once on one game in one level
+    generation (levelcheck.scene_repeats), as a case's reasons."""
+    import levelcheck as lc
+    try:
+        _counts, fs = lc.scene_repeats(lc.load_run(folder))
+    except (OSError, ValueError):
+        return []
+    return [f"cutscene played more than once: {f.what}: " + "; ".join(f.lines) for f in fs]
+
+
+def server_notes(folder: Path) -> list[str]:
+    """W40: every case with a server log: how many of each player's attack presses S started."""
+    import levelcheck as lc
+    try:
+        line = lc.attacks_started_line(lc.load_run(folder))
+    except (OSError, ValueError):
+        return []
+    return [line] if line else []
+
+
 def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None) -> list[str]:
     """The reasons the named level check rows give against this run folder (empty: every row passed); `levelpass`:
     the level's data for the rows that need it (fight gates)."""
@@ -202,7 +227,13 @@ def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None) ->
     run = lc.load_run(folder)
     data = lc.level_data(levelpass, lc.run_level(run)) if levelpass is not None else None
     graders = {"enemies hurt players": lc.grade_player_damage, "other player's moves": lc.grade_moves,
-               "fight gates": lambda r: lc.grade_fight_gates(r, data)}
+               "fight gates": lambda r: lc.grade_fight_gates(r, data), "coins shared": lc.grade_coins_shared,
+               "cutscenes once": lc.grade_scenes_once, "level changes": lc.grade_level_changes,
+               "enemies can be killed": lc.grade_enemy_kills,
+               "elemental gates and Swap Zones": lambda r: lc.grade_gate_kinds(r, data),
+               "dialogs skipped": lc.grade_dialog_skip, "enemy states and damage from S": lc.grade_enemy_server_damage,
+               "world events": lambda r: lc.grade_world_events(r, data), "level events in step": lc.grade_level_events,
+               "reward gold and food": lc.grade_rewards_food}
     out = []
     for name in g.get("rows", []):
         v = graders[name](run)
@@ -930,6 +961,11 @@ class PeerSpec:
     # and patterns whose first matches come in this order (each after the one before).
     expect_count: dict[str, int] = field(default_factory=dict)
     expect_order: list[str] = field(default_factory=list)
+    # within = [{ after = '<rx>', want = '<rx>', seconds = <s>, why = '<text>' }] (W41): once a line matches `after`, a
+    # line matching `want` must follow within `seconds`, or the case fails with `why` (fail fast stops the run then).
+    # A `why` ending in NOTHING_TESTED marks the case as having tested nothing: the server's hard rule then says
+    # NOT TESTED instead of failing it (soul-gem-tb: the collectible was never picked up).
+    within: list[dict] = field(default_factory=list)
     # save_slots = { "<slot>" = <fixture slot> } (stage 3 item 7): this peer's copy of the fixture saves
     # gets the save of `fixture slot` once more in `slot` (both one-based, as the save menu counts them),
     # before the game starts (fill_save_slots). {} leaves the copy as the fixture store has it.
@@ -1388,6 +1424,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             forbid=list(common.get("forbid", [])) + list(own.get("forbid", [])),
             expect_count={**common.get("expect_count", {}), **own.get("expect_count", {})},
             expect_order=list(own.get("expect_order", common.get("expect_order", []))),
+            within=parse_within(path.name, n, own.get("within", common.get("within", []))),
             save_slots=parse_save_slots(path.name, n, own.get("save_slots", common.get("save_slots", {}))),
             kind=kind,
             settings_file=peer_settings_file(path.name, n, own, common, d.get("server", "standin"), kind),
@@ -2968,6 +3005,9 @@ class CaseResult:
     scenes: str = ""
     # PS15: the machine slots it held (Lease.summary: slots, of, all, waited_s, waited_for).
     machine: dict = field(default_factory=dict)
+    # W40: lines that inform without grading (levelcheck: `attacks started on the server: H 4 of 9`), shown under
+    # the status line, in report.md and in result.json.
+    notes: list[str] = field(default_factory=list)
     # C7: a failed case's fatal signature (case_signature: signature, peer, line, kind); {} otherwise.
     signature: dict = field(default_factory=dict)
     # "bulk" for a case of a `test --bulk` run (hidden games: BulkMode), '' for the default mode. The
@@ -3048,8 +3088,11 @@ class FailFast:
     goes on."""
 
     def __init__(self, logs: dict[str, Path], patterns: dict[str, list[str]],
-                 needs: dict[str, dict[str, list[str]]] | None = None, scripts: dict[str, str] | None = None) -> None:
+                 needs: dict[str, dict[str, list[str]]] | None = None, scripts: dict[str, str] | None = None,
+                 within: dict[str, list[dict]] | None = None) -> None:
         self.tails = {n: LogTail(p) for n, p in logs.items()}
+        # within (PeerSpec.within): per peer, each rule with the time its `after` line was read and whether `want` came.
+        self.within = {n: [{**r, "at": None, "met": False} for r in rs] for n, rs in (within or {}).items() if rs}
         self.patterns = {n: [re.compile(rx, re.M) for rx in patterns.get(n, [])] for n in logs}
         # wait_needs (script_checks.needed_peer_gone): each waiting peer's planned waits and the ends seen.
         self.needs = {n: c for n, c in (needs or {}).items() if c}
@@ -3078,6 +3121,16 @@ class FailFast:
                     self.done[n][cond] = self.done[n].get(cond, 0) + 1
                 if any(rx.search(line) for rx in self.patterns[n]):
                     return self._found((n, line.strip()[:200]), tail.generation)
+                for r in self.within.get(n, []):
+                    if r["at"] is None and re.search(r["after"], line):
+                        r["at"] = time.monotonic()
+                    elif r["at"] is not None and not r["met"] and re.search(r["want"], line):
+                        r["met"] = True
+        for n, rules in self.within.items():
+            for r in rules:
+                if r["at"] is not None and not r["met"] and time.monotonic() - r["at"] > r["seconds"]:
+                    return self._found((n, f"{r['why']} (no /{r['want']}/ within {r['seconds']:g} s)"),
+                                       self.tails[n].generation)
         for n, p in (procs or {}).items():
             if crash_exit_code(code := p.poll()):
                 return self._found((n, f"exit code 0x{code & 0xFFFFFFFF:08X}"), None)
@@ -3119,6 +3172,58 @@ def peer_fatal_lines(spec: Spec, peer: str) -> list[tuple[str, str]]:
 def fail_fast_patterns(spec: Spec, peer: str) -> list[str]:
     """A peer's fatal lines for fail fast: exactly the forbidden lines grade_peer fails it on."""
     return [rx for rx, _ in peer_fatal_lines(spec, peer)]
+
+
+NOTHING_TESTED = ": nothing tested"
+STAMP = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})\]")
+
+
+def parse_within(spec_name: str, peer: str, raw: object) -> list[dict]:
+    """A peer's `within` rules (PeerSpec.within): each a table with after, want, seconds and why."""
+    if not isinstance(raw, list):
+        raise SpecError(f"{spec_name}: peer {peer}: within is a list of tables (after, want, seconds, why)")
+    out = []
+    for t in raw:
+        if not isinstance(t, dict) or set(t) != {"after", "want", "seconds", "why"}:
+            raise SpecError(f"{spec_name}: peer {peer}: each within rule has exactly after, want, seconds and why")
+        if not isinstance(t["seconds"], (int, float)) or isinstance(t["seconds"], bool) or t["seconds"] <= 0:
+            raise SpecError(f"{spec_name}: peer {peer}: within seconds must be a number > 0")
+        for k in ("after", "want"):
+            try:
+                re.compile(str(t[k]))
+            except re.error as e:
+                raise SpecError(f"{spec_name}: peer {peer}: bad within {k} {t[k]!r}: {e}") from e
+        out.append({"after": str(t["after"]), "want": str(t["want"]), "seconds": float(t["seconds"]),
+                    "why": str(t["why"])})
+    return out
+
+
+def within_reasons(text: str, rules: list[dict]) -> list[str]:
+    """The `within` rules a log broke, by its own line times: the first `after` line, then the first `want` line after
+    it no later than `seconds`. A log that never reached `after` breaks none (its other expectations say so)."""
+    out = []
+    lines = text.splitlines()
+    for r in rules:
+        at = next((k for k, line in enumerate(lines) if re.search(r["after"], line)), None)
+        if at is None:
+            continue
+        m = STAMP.search(lines[at])
+        t0 = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f") if m else None
+        ok = False
+        for line in lines[at + 1:]:
+            if re.search(r["want"], line):
+                w = STAMP.search(line)
+                ok = t0 is None or w is None or (
+                    datetime.strptime(w.group(1), "%Y-%m-%d %H:%M:%S.%f") - t0).total_seconds() <= r["seconds"]
+                break
+        if not ok:
+            out.append(f"{r['why']} (no /{r['want']}/ within {r['seconds']:g} s of /{r['after']}/)")
+    return out
+
+
+def tested_nothing(peers: list["PeerResult"]) -> str:
+    """The first peer reason that says the case tested nothing (a `within` rule's why), or ''."""
+    return next((f"{p.peer}: {w}" for p in peers for w in p.reasons if NOTHING_TESTED in w), "")
 
 
 def parse_wait_needs(spec_name: str, peer: str, raw: object, names: list[str], script: str) -> dict[str, list[str]]:
@@ -4958,18 +5063,69 @@ def measure(lines: list[tuple[float | None, str]], start: str | None, end: str) 
     return None
 
 
-def check_count_and_order(text: str, ps: PeerSpec) -> list[str]:
+# A pattern's `{puppet:<p>}` (W40): peer <p>'s driven puppet on S, tied by S's own `puppet <n> for peer <p> spawned`
+# lines. S numbers its puppets by spawn order, not by peer (batch 17's moves-attack-tb: `puppet 1 for peer 2 spawned`
+# came first, and H's presses were replayed on PeerPuppet_2), and the numbers change hands at a level change, so a
+# spec writes `PeerPuppet_{puppet:1}` for H's puppet. Such a pattern is matched against S's log with each
+# `PeerPuppet_<n>` named by the peer that puppet <n> belonged to at that line (`PeerPuppet_2@peer1`); a pattern
+# without the placeholder sees the log as written.
+PUPPET_SPAWNED = re.compile(r"Online: puppet (\d+) for peer (\d+) spawned ")
+PUPPET_PLACEHOLDER = re.compile(r"\{puppet:(\d+)\}")
+PEER_PUPPET_NAME = re.compile(r"\bPeerPuppet_(\d+)")
+
+
+def tie_puppets(text: str) -> tuple[str, set[str]]:
+    """S's log with each `PeerPuppet_<n>` written `PeerPuppet_<n>@peer<p>` (<p>: puppet <n>'s peer by the last spawn
+    line before it; a name before any is left as it is), and the peers that had a puppet spawned."""
+    owner: dict[str, str] = {}
+    out = []
+    for line in text.splitlines(keepends=True):
+        m = PUPPET_SPAWNED.search(line)
+        if m:
+            owner[m.group(1)] = m.group(2)
+        out.append(PEER_PUPPET_NAME.sub(
+            lambda k: k.group(0) + (f"@peer{owner[k.group(1)]}" if k.group(1) in owner else ""), line))
+    return "".join(out), set(owner.values())
+
+
+def puppet_view(rx: str, text: str, tied: str | None) -> tuple[str, str]:
+    """The pattern and the text it is matched against: a `{puppet:<p>}` pattern against the tied log."""
+    if tied is None or not PUPPET_PLACEHOLDER.search(rx):
+        return rx, text
+    return PUPPET_PLACEHOLDER.sub(lambda m: rf"\d+@peer{m.group(1)}(?!\d)", rx), tied
+
+
+def puppet_reasons(ps: PeerSpec, text: str) -> tuple[str | None, list[str]]:
+    """The tied log when any of the peer's patterns names `{puppet:<p>}` (else None), and a reason for each peer an
+    expectation names whose puppet S never spawned."""
+    pats = ps.expect + ps.expect_order + list(ps.expect_count) + ps.forbid
+    if not any(PUPPET_PLACEHOLDER.search(rx) for rx in pats):
+        return None, []
+    tied, peers = tie_puppets(text)
+    expects = ps.expect + ps.expect_order + [rx for rx, n in ps.expect_count.items() if n > 0]
+    missing = sorted({p for rx in expects for p in PUPPET_PLACEHOLDER.findall(rx) if p not in peers})
+    return tied, [f"log has no `puppet <n> for peer {p} spawned` line: its {{puppet:{p}}} matches nothing"
+                  for p in missing]
+
+
+def check_count_and_order(text: str, ps: PeerSpec, tied: str | None = None) -> list[str]:
     """expect_count: the number of log lines matching each pattern; expect_order: each pattern's
-    first match after the previous pattern's (so `[a, b, a]` wants an a, a later b, a later a)."""
+    first match after the previous pattern's (so `[a, b, a]` wants an a, a later b, a later a).
+    `tied`: S's log with its puppets tied to their peers (tie_puppets), for the `{puppet:<p>}` patterns."""
     reasons = []
-    lines = text.splitlines()
+    views = {text: text.splitlines()}
+    if tied is not None:
+        views[tied] = tied.splitlines()
     for rx, want in ps.expect_count.items():
-        got = sum(1 for line in lines if re.search(rx, line))
+        pat, src = puppet_view(rx, text, tied)
+        got = sum(1 for line in views[src] if re.search(pat, line))
         if got != want:
             reasons.append(f"log has /{rx}/ {got} time(s), expected {want}")
     i, prev = 0, None
     for rx in ps.expect_order:
-        at = next((k for k in range(i, len(lines)) if re.search(rx, lines[k])), None)
+        pat, src = puppet_view(rx, text, tied)
+        lines = views[src]
+        at = next((k for k in range(i, len(lines)) if re.search(pat, lines[k])), None)
         if at is None:
             reasons.append(f"log lacks /{rx}/" + (f" after /{prev}/" if prev else "") + " (expect_order)")
             break
@@ -4988,15 +5144,21 @@ def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
     if not text:
         reasons.append("no log written")
     ps = spec.peers.get(r.peer)
+    tied = None
+    if ps is not None:
+        tied, why = puppet_reasons(ps, text)
+        reasons += why
     expect = ps.expect if ps else []
     for rx in expect:
-        if not re.search(rx, text, re.M):
+        if not re.search(*puppet_view(rx, text, tied), re.M):
             reasons.append(f"log lacks /{rx}/")
-    reasons += check_count_and_order(text, ps) if ps else []
+    reasons += check_count_and_order(text, ps, tied) if ps else []
+    reasons += within_reasons(text, ps.within) if ps and ps.within else []
     if any(f == 0.0 for f in parsed["fps"]):
         reasons.append("presented no frame during an fps window (frozen, or not booted yet)")
     for rx, shown in peer_fatal_lines(spec, r.peer):
-        if m := re.search(rx, text, re.M):
+        pat, src = puppet_view(rx, text, tied)
+        if m := re.search(pat, src, re.M):
             start = text.rfind("\n", 0, m.start()) + 1
             end = text.find("\n", m.end())
             whole = text[start:end if end != -1 else len(text)].strip()
@@ -5197,7 +5359,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                              {**{n: fail_fast_patterns(spec, n) for n in names},
                               **{n: s.forbid + SYNTHETIC_FATAL for n, s in spec.synthetic.items()}},
                              needs={n: spec.peers[n].wait_needs for n in names if n in spec.peers},
-                             scripts={n: spec.peers[n].script for n in names if n in spec.peers}) \
+                             scripts={n: spec.peers[n].script for n in names if n in spec.peers},
+                             within={n: spec.peers[n].within for n in names if n in spec.peers}) \
                 if spec.fail_fast else None
             stop_at, next_check, early = deadline, 0.0, False
             while len(ended) < len(procs) and time.monotonic() < stop_at:
@@ -6112,6 +6275,8 @@ def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: di
             lines += [f"Fatal signature ({r.signature['peer']}, {r.signature['kind']}): `{r.signature['signature']}`", ""]
         if r.scenes:
             lines += [f"Scenes: {r.scenes}", ""]
+        for note in r.notes:
+            lines += [note, ""]
         lines += [
                   "| Peer | Status | Exit | Time | Startup stall | Levels | FPS | Longest frame | Peak private MB "
                   "| Errors | Measures |",
@@ -6808,6 +6973,8 @@ def schedule_cases(specs: list[Spec], jobs: int, max_games: int, run_one, say=No
                             r.ran_with = overlapped(i, *spans[i])
                         why = f": {'; '.join(r.reasons)}" if r.reasons else ""
                         tell(f"  {r.status.upper()}{why}" if jobs == 1 else f"{spec.name}: {r.status.upper()}{why}")
+                        for note in r.notes:
+                            tell(f"  {note}" if jobs == 1 else f"{spec.name}: {note}")
                         if done is not None:
                             try:
                                 done(spec, r)
@@ -7831,6 +7998,20 @@ def levelcheck_exit(lc, verdicts) -> int:
     return EXIT_INCOMPLETE if any(v.status == lc.INCOMPLETE for v in verdicts) else 0
 
 
+def cmd_acceptance(cfg: Config, a: argparse.Namespace) -> int:
+    """W39 item 6: the acceptance list (acceptance.py), its estimate first."""
+    import acceptance
+    cases = [c for c in (a.cases.split(",") if a.cases else acceptance.CASES) if c]
+    levels = [lv for lv in (a.levels.split(",") if a.levels else acceptance.LEVELS) if lv]
+    heads = []
+    for repo in (cfg.repo, cfg.repo / "thirdparty" / "skylanders-portal"):
+        r = subprocess.run(["git", "-C", str(repo), "log", "-1", "--format=%h %s"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        heads.append(f"{repo.name} {r.stdout.strip() or '?'}")
+    return acceptance.run(Path(__file__).resolve(), cfg.repo, cfg.store, levelpass_folder(cfg, None), cases, levels,
+                          a.run_not_ready, a.dry_run, "; ".join(heads), [Path(x) for x in (a.history or [])])
+
+
 def cmd_prune(cfg: Config, a: argparse.Namespace) -> int:
     """`prune --older-than <hours>`: the store's run and session folders older than that, through the
     janitor (never through a directory link); it prints what it removed and what that freed."""
@@ -8247,10 +8428,22 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             # W37: every case with a server log: S's game must not have stopped while its frames went on with a client
             # connected (levelcheck.server_stalled).
             if r.folder and Path(r.folder).is_dir():
+                nothing = tested_nothing(r.peers)
                 for why in server_stall_reasons(Path(r.folder)):
+                    if nothing:  # W41: the case tested nothing; its server rule is not tested, not failed
+                        r.notes.append(f"server game alive: NOT TESTED ({nothing}): {why}")
+                        continue
                     r.reasons.append(why)
                     if r.status == "pass":
                         r.status = "fail"
+                for why in scene_repeat_reasons(Path(r.folder)):  # W38: a cutscene played twice fails every case
+                    if nothing:
+                        r.notes.append(f"cutscenes once: NOT TESTED ({nothing}): {why}")
+                        continue
+                    r.reasons.append(why)
+                    if r.status == "pass":
+                        r.status = "fail"
+                r.notes += server_notes(Path(r.folder))
             # W34: the spec's level check rows ([grade.level_check]) on the finished run.
             if "level_check" in spec.grades and r.folder and Path(r.folder).is_dir():
                 for why in level_check_reasons(Path(r.folder), spec.grades["level_check"],
@@ -10103,6 +10296,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="a run or session folder whose newest file is older than this many hours goes")
     pr.add_argument("--dry-run", action="store_true", help="say what would go, remove nothing")
     pr.set_defaults(fn=cmd_prune)
+    ac = sub.add_parser("acceptance", help="the acceptance list on one build: each case once, one session at a time,"
+                        " then the level checks with two players, one page (acceptance.py)")
+    ac.add_argument("--cases", default=None, help="comma-separated case names instead of the list")
+    ac.add_argument("--levels", default=None, help="comma-separated levels instead of tutorial_a,tutorial_b,ww1")
+    ac.add_argument("--run-not-ready", action="store_true", help="pass --run-not-ready to every case")
+    ac.add_argument("--dry-run", action="store_true", help="print the list and its estimate only, start no game")
+    ac.add_argument("--history", action="append", default=None, metavar="DIR", help="one more store's runs folder whose"
+                    " earlier runs count for the estimate (repeatable)")
+    ac.set_defaults(fn=cmd_acceptance)
     pf = sub.add_parser("preflight", help="a spec's mistakes before any game runs (preflight.py)")
     pf.add_argument("cases", nargs="*", help="case names (tests/runtime/<case>.toml)")
     pf.add_argument("--all-ready", action="store_true", help="every spec that is ready")

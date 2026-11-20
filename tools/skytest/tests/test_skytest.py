@@ -25,6 +25,8 @@ import launch_args  # noqa: E402
 import remote_agent  # noqa: E402
 import skytest  # noqa: E402
 import winjob  # noqa: E402
+sys.path.insert(0, str(HERE))
+import temp_sweep  # noqa: E402
 
 FAKE = HERE / "fake_game.py"
 _REAL_TOKEN_RESTRICTION = skytest.token_restriction
@@ -44,10 +46,14 @@ def setUpModule() -> None:
     skytest.build_holders = lambda: []
     # preflight_gate.py: the throwaway game has no source or level data to check a spec against.
     skytest.preflight_check = lambda cfg, spec, cache: []
-    os.environ["SFO_BUILD_SLOT_DIR"] = tempfile.mkdtemp(prefix="skytest-no-builds-")
+    # The suite's own temp folders (temp_sweep.py): last runs' leftovers older than a day go first; this module's
+    # empty slot folder is removed again in tearDownModule.
+    temp_sweep.sweep()
+    os.environ["SFO_BUILD_SLOT_DIR"] = temp_sweep.make("skytest-no-builds-")
 
 
 def tearDownModule() -> None:
+    temp_sweep.remove(os.environ.pop("SFO_BUILD_SLOT_DIR", None))
     skytest.token_restriction = _REAL_TOKEN_RESTRICTION
 
 
@@ -2891,6 +2897,72 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(skytest.check_count_and_order(text, ps), [
             r"log has /Online: barrier \d+ released/ 1 time(s), expected 2",
             r"log lacks /level 2 \S+: open/ after /barrier 2 released/ (expect_order)"])
+
+    def test_a_puppet_is_tied_to_its_peer_by_the_servers_spawn_line(self) -> None:
+        # W40: S numbers puppets by spawn order (batch 17: peer 2's came first), and the numbers change hands at a
+        # level change; {puppet:<p>} is peer <p>'s puppet at that line.
+        text = ("[t] Online: puppet 1 for peer 2 spawned at (0, 0, 0) (generation 1)\n"
+                "[t] Online: puppet 2 for peer 1 spawned at (0, 0, 0) (generation 1)\n"
+                "[t] Online: press 1:3 replayed slot 0 on PeerPuppet_2\n"
+                "[t] Online: puppet 1 for peer 1 spawned at (0, 0, 0) (generation 2)\n"
+                "[t] Online: puppet 2 for peer 2 spawned at (0, 0, 0) (generation 2)\n"
+                "[t] Online: press 1:4 replayed slot 0 on PeerPuppet_1\n")
+        tied, peers = skytest.tie_puppets(text)
+        self.assertEqual(peers, {"1", "2"})
+        self.assertIn("on PeerPuppet_2@peer1\n", tied)
+        self.assertIn("on PeerPuppet_1@peer1\n", tied)
+        ps = skytest.PeerSpec(name="S", expect=[r"press 1:\d+ replayed slot \d+ on PeerPuppet_{puppet:1}\b"],
+                              expect_count={r"replayed slot \d+ on PeerPuppet_{puppet:1}\b": 2},
+                              expect_order=[r"press 1:3 replayed .* PeerPuppet_{puppet:1}\b",
+                                            r"press 1:4 replayed .* PeerPuppet_{puppet:1}\b"],
+                              forbid=[r"replayed slot \d+ on PeerPuppet_{puppet:2}\b"])
+        spec = skytest.Spec(name="x", path=Path("x.toml"), layout="server+1", stage="8", description="", timeout=60,
+                            peers={"S": ps}, measures={}, standin_seconds=0)
+        r = skytest.PeerResult(peer="S", exit_code=0)
+        skytest.grade_peer(spec, r, text, skytest.parse_log(text))
+        self.assertEqual(r.status, "pass", r.reasons)
+        # H's presses replayed on peer 2's puppet: the count fails and the forbid hits.
+        bad = text.replace("on PeerPuppet_2", "on PeerPuppet_1")
+        skytest.grade_peer(spec, r, bad, skytest.parse_log(bad))
+        self.assertEqual(r.status, "fail")
+        self.assertIn(r"log has /replayed slot \d+ on PeerPuppet_{puppet:1}\b/ 1 time(s), expected 2", r.reasons)
+        self.assertTrue(any(w.startswith("log has forbidden /replayed slot") for w in r.reasons), r.reasons)
+        # A plain pattern still sees the log as written.
+        plain = skytest.PeerSpec(name="S", expect_count={r"on PeerPuppet_2$": 1})
+        self.assertEqual(skytest.check_count_and_order(text, plain), [])
+        # No spawn line for the peer: said so.
+        _t, why = skytest.puppet_reasons(ps, "[t] Online: puppet 1 for peer 2 spawned at (0, 0, 0)\n")
+        self.assertEqual(why, ["log has no `puppet <n> for peer 1 spawned` line: its {puppet:1} matches nothing"])
+
+    def test_within_a_line_must_follow_in_time(self) -> None:
+        # W41 (soul-gem-tb): the pick-up's collect line must come within 20 s, else the case tested nothing.
+        rule = skytest.parse_within("x.toml", "D", [{"after": "GEM_D_PICKUP", "want": "collect native 000b0018 ",
+                                                    "seconds": 20, "why": "not picked up: nothing tested"}])
+        ok = ("[2026-11-19 23:45:32.681] [info] Input script: GEM_D_PICKUP\n"
+              "[2026-11-19 23:45:40.000] [info] Online: collect native 000b0018 script (reported to S) (827513a0)\n")
+        self.assertEqual(skytest.within_reasons(ok, rule), [])
+        late = ok.replace("23:45:40.000", "23:45:53.000")
+        never = ok.splitlines()[0] + "\n"
+        for text in (late, never):
+            self.assertEqual(skytest.within_reasons(text, rule),
+                             ["not picked up: nothing tested (no /collect native 000b0018 / within 20 s of "
+                              "/GEM_D_PICKUP/)"])
+        self.assertEqual(skytest.within_reasons("[2026-11-19 23:45:32.681] x\n", rule), [])
+        with self.assertRaises(skytest.SpecError):
+            skytest.parse_within("x.toml", "D", [{"after": "a", "want": "b", "seconds": 0, "why": "c"}])
+        p = skytest.PeerResult(peer="D", exit_code=0)
+        p.reasons = skytest.within_reasons(never, rule)
+        self.assertTrue(skytest.tested_nothing([p]).startswith("D: not picked up: nothing tested"))
+        # Fail fast stops at the missed deadline.
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "game.log"
+            log.write_text(never, encoding="utf-8")
+            watch = skytest.FailFast({"D": log}, {"D": []}, within={"D": [{**rule[0], "seconds": 0.01}]})
+            self.assertIsNone(watch.check())
+            time.sleep(0.05)
+            hit = watch.check()
+            self.assertEqual(hit[0], "D")
+            self.assertTrue(hit[1].startswith("not picked up: nothing tested"), hit)
 
 
 THRESHOLDS = {"press_to_reaction": {"fixed_ms": 250.0, "plus": ["send_interval", "rtt"]},

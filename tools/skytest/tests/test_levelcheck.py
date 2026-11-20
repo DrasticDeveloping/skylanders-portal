@@ -239,15 +239,38 @@ class Moves(unittest.TestCase):
         whats = [x.what for x in v.findings]
         self.assertIn("D: 1 of H's attack presses never taken by its body", whats)
         self.assertIn("D: 1 `input expired` while H's button was held", whats)
+        self.assertNotIn("NOT TESTED: block", v.counts)
+        # W40: no body showed a block (no `input block`, no held 0x800): the page says block is not tested.
+        f = RunFolder([], H_JOIN + h, D_JOIN + d[:3])
+        v = lc.grade_moves(lc.load_run(f.path))
+        self.assertTrue(v.counts.endswith(lc.BLOCK_NOT_TESTED), v.counts)
+
+
+class AttacksStarted(unittest.TestCase):
+    def test_counts_each_players_presses_by_the_servers_done_lines(self) -> None:
+        # W40: S's `press <p>:<n> done: ... started yes|no (...)`, one per press; H is peer 1, D peer 2.
+        s = [(30, "Online: press 1:1 done: 0 landed, 0 without damage, 0 kills, started yes (missed)"),
+             (31, "Online: press 1:2 done: 0 landed, 0 without damage, 0 kills, started no (missed)"),
+             (32, "Online: press 1:3 done: 1 landed, 0 without damage, 1 kills, started yes (landed)"),
+             (33, "Online: press 2:1 done: 0 landed, 0 without damage, 0 kills, started no (missed)")]
+        run = lc.load_run(RunFolder(s, H_JOIN, D_JOIN).path)
+        self.assertEqual(lc.attacks_started_line(run),
+                         "attacks started on the server: H (peer 1) 2 of 3, D (peer 2) 0 of 1")
+        run = lc.load_run(RunFolder([(30, "Online: frames 60 fps 60.0 p50 16")], H_JOIN, D_JOIN).path)
+        self.assertEqual(lc.attacks_started_line(run),
+                         "attacks started on the server: no press done (no `press <p>:<n> done` line)")
 
 
 class PlayerDamage(unittest.TestCase):
     def test_one_to_one_and_the_health_read_back(self) -> None:
         # W33: S's two hits on H's puppet, H's one hit by that enemy: one unmatched; H's drop read back by S.
-        s = [(70, "Online: sentinel guard refused a hit on sentinel/puppet entry 0 PeerPuppet_1#3829 force 0 damage "
+        # W40: H (peer 1) has puppet 2 on S (peer 2's came first).
+        s = [(20, "Online: puppet 1 for peer 2 spawned at 0,0,0 (generation 1)"),
+             (21, "Online: puppet 2 for peer 1 spawned at 0,0,0 (generation 1)"),
+             (70, "Online: sentinel guard refused a hit on sentinel/puppet entry 0 PeerPuppet_2#3829 force 0 damage "
                   "0x41200000 by Chompy#2201 a00000efb.930d1f89.79d73383@2 (sweep) (#1)"),
              (71, "Online: peer 1 vitals 190/200"),
-             (90, "Online: sentinel guard refused a hit on sentinel/puppet entry 0 PeerPuppet_1#3829 force 0 damage "
+             (90, "Online: sentinel guard refused a hit on sentinel/puppet entry 0 PeerPuppet_2#3829 force 0 damage "
                   "0x41200000 by Chompy#2201 a00000efb.930d1f89.79d73383@2 (sweep) (#2)")]
         h = [(70, "Online: hero hit by Chompy#2102 a00000efb.930d1f89.79d73383@2 (sweep, 10) (S's attack, played here) (#1)"),
              (71, "Online: own vitals 190/200 (was 200; hit by Chompy#2102 a00000efb.930d1f89.79d73383@2)")]
@@ -755,6 +778,397 @@ class Together(unittest.TestCase):
         v = lc.grade_together(RunFolder(self.S, H_JOIN + self.H + LEVEL_END, D_JOIN + LEVEL_END).run())
         self.assertEqual(v.status, lc.NOT_TESTED)
         self.assertIn("D stayed where it entered", v.counts)
+
+
+class FrameRate(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+
+    def test_mean_and_lowest_minute_in_play(self) -> None:
+        h = H_JOIN + [(5, "FXAA: frame 1280x720 scaled by 2x2"), (8, "Online: frames 600 fps 60.0 p50 16 p95 17 max 20"),
+                      (30, "Online: barrier 2 released at tick 900")]
+        h += [(30 + 10 * i, f"Online: frames {200 if i < 6 else 100} fps {20.0 if i < 6 else 10.0} p50 50 p95 60 max 70")
+              for i in range(1, 13)]
+        parts = lc.frame_rate_parts(lc.load_run(RunFolder([], h, D_JOIN).path))
+        self.assertEqual(parts, ["H mean 14.2, lowest minute 10.0 (scale 2, frame 1280x720)"])  # 1700 frames in 120 s
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session(self) -> None:
+        # 19 to 20 on both clients at scale 2 (his settings: resolution 1920x1080, resolution_scale 2).
+        parts = lc.frame_rate_parts(lc.load_run(self.OWNER_3))
+        self.assertEqual(parts[1:], ["H mean 20.2, lowest minute 17.9 (scale 2, frame 1280x720, window 1920x1080 "
+                                     "(settings))", "D mean 20.2, lowest minute 18.2 (scale 2, frame 1280x720, window "
+                                     "1920x1080 (settings))"])
+
+
+class RewardsFood(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+
+    def test_flynns_gold_once_everywhere_and_one_bite(self) -> None:
+        # The coins branch's forms (online/8-all-coins-shared e2011447).
+        s = [(10, "Online: food walked 0629f659 6 placed food mapped (40 CCollectibles in the walk; keys 1a2b3c4d; 6 food "
+                  "items picked by their place, the same on every game; 0 kept an earlier item)"),
+             (50, "Online: reward 000b0042 settled (evidence): 50.00 gold to each hero (limit 50.00), owed to peers 2")]
+        h = H_JOIN + [(10, "Online: food walked 0629f659 6 placed food mapped (40 CCollectibles in the walk; keys 1a2b3c4d; "
+                           "6 food items picked by their place, the same on every game; 0 kept an earlier item)"),
+                      (50, "Online: reward 000b0042: this game's run of its script gave 50.00 gold to each hero (limit "
+                           "50.00); S is told with the collect"),
+                      (60, "Online: food taken here 0629f659.15667 (player 8a000001; S is told)")]
+        d = D_JOIN + [(10, "Online: food walked 0629f659 6 placed food mapped (40 CCollectibles in the walk; keys 1a2b3c4d; "
+                           "6 food items picked by their place, the same on every game; 0 kept an earlier item)"),
+                      (51, "Online: reward 000b0042 paid here (another player's pick-up; player 8b000001 slot 0, 50.00 "
+                           "gold: gold 10 -> 60, +50)"),
+                      (60, "Online: food removed here 0629f659.15667 (taken by another player: not eaten here)")]
+        s_food = s + [(60, "Online: food removed on S 0629f659.15667 (granted to a client: S's copy goes)")]
+        v = lc.grade_rewards_food(lc.load_run(RunFolder(s_food, h, d).path))
+        self.assertEqual(v.status, lc.PASS, v)
+        self.assertIn("place 0629f659.15667 eaten", v.counts)
+        # Both touched at once: D's own run too, and D's copy healed its hero.
+        d2 = d[:-1] + [(51, "Online: reward 000b0042: this game's run of its script gave 50.00 gold to each hero (limit "
+                            "50.00); S is told with the collect"),
+                       (60, "Online: food removed here 0629f659.15667 (taken by another player; this game's collect "
+                            "healed its hero 8b000001: online_shared_food_heals everyone)")]
+        v = lc.grade_rewards_food(lc.load_run(RunFolder(s_food, h, d2).path))
+        self.assertEqual([f.what for f in v.findings], ["reward 000b0042: paid 2 time(s) on D",
+                                                        "food 0629f659.15667: D healed its own hero for another player's "
+                                                        "bite"])
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session(self) -> None:
+        v = lc.grade_rewards_food(lc.load_run(self.OWNER_3))
+        # No reward line yet (a build before the coins branch); its three bites removed once on S and D, none healed.
+        self.assertEqual(v.status, lc.PASS, v)
+        self.assertIn("food zones walked 1, bites 3; place 0629f659.15667 eaten", v.counts)
+
+
+class LevelEvents(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+
+    def test_a_step_early_on_one_game_and_twice_on_another(self) -> None:
+        # The scenes' author's line form (online/6-owner-session3-scenes, written ahead of the build).
+        s = [(50, "Online: level event Level_EventManager#2150 step 3 white fade at shared tick 3000 (S's step at 3000)"),
+             (60, "Online: level event Level_EventManager#2150 step 4 fly-through at shared tick 3600 (S's step at 3600)")]
+        h = H_JOIN + [(44, "Online: level event Level_EventManager#2150 step 3 white fade at shared tick 2640 (S's step at "
+                           "3000)"),
+                      (60, "Online: level event Level_EventManager#2150 step 4 fly-through at shared tick 3602 (S's step "
+                           "at 3600)")]
+        d = D_JOIN + [(50, "Online: level event Level_EventManager#2151 step 3 white fade at shared tick 3004 (S's step at "
+                           "3000)"),
+                      (60, "Online: level event Level_EventManager#2151 step 4 fly-through at shared tick 3601 (S's step "
+                           "at 3600)"),
+                      (61, "Online: level event Level_EventManager#2151 step 4 fly-through at shared tick 3660 (S's step "
+                           "at 3600)")]
+        v = lc.grade_level_events(lc.load_run(RunFolder(s, h, d).path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual([f.what for f in v.findings], [
+            "Level_EventManager step 3 white fade: H -360 shared ticks from S's step",
+            "Level_EventManager step 4 fly-through: 2 times on D (S 1); D +60 shared ticks from S's step"])
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session_predates_the_lines(self) -> None:
+        self.assertEqual(lc.grade_level_events(lc.load_run(self.OWNER_3)).status, lc.NOT_TESTED)
+
+
+class WorldEvents(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+    LP = Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass")
+
+    @unittest.skipUnless(LP.is_dir(), "the level data is not here")
+    def test_the_cage_step_lowered_on_h_applied_late_on_d(self) -> None:
+        # The world rows' author's line forms (online/6-owner-session3-world, written ahead of the build).
+        data = lc.level_data(self.LP, "tutorial_b")
+        self.assertIn("A2_CageStep_Hanging", [n for n, _u, _k in data.world_objects])
+        h = H_JOIN + [(50, "Online: world event A2_CageStep_Hanging#2653 lowered by H (state up -> down)")]
+        d = D_JOIN + [(53, "Online: world event A2_CageStep_Hanging#2701 lowered applied here (state down)")]
+        s = [(50, "Online: world event A2_CageStep_Hanging#3001 lowered applied here (state down)")]
+        v = lc.grade_world_events(lc.load_run(RunFolder(s, h, d).path), data)
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertTrue(v.findings[0].what.startswith("A2_CageStep_Hanging lowered by H on H at "), v.findings[0].what)
+        self.assertIn("not applied on D within 1 s (later: ", v.findings[0].what)
+        self.assertIn(", 1 changed in this run; untested: ", v.counts)
+        d_ok = D_JOIN + [(50, "Online: world event A2_CageStep_Hanging#2701 lowered applied here (state down)")]
+        self.assertEqual(lc.grade_world_events(lc.load_run(RunFolder(s, h, d_ok).path), data).status, lc.PASS)
+
+    @unittest.skipUnless(OWNER_3.is_dir() and LP.is_dir(), "the owner's third session or the level data is not here")
+    def test_the_owners_third_session_predates_the_lines(self) -> None:
+        r = lc.load_run(self.OWNER_3)
+        v = lc.grade_world_events(r, lc.level_data(self.LP, lc.run_level(r)))
+        self.assertEqual(v.status, lc.NOT_TESTED)
+        self.assertIn("0 changed in this run", v.counts)
+
+
+class EnemyServerDamage(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+
+    def test_states_and_hits_from_s(self) -> None:
+        # The enemies author's line forms (online/5-replica-attacks-land-2 4b9ae45d).
+        s = [(50, "Online: enemy hit a1@2 on peer 1 #1 damage 10 occurrence 3 tick 900 (S's hit, sent) (#1)"),
+             (51, "Online: enemy hit a1@2 on peer 2 #2 damage 10 occurrence 3 tick 905 (S's hit, sent) (#2)"),
+             (52, "Online: enemy hit a1@2 on peer 2 #3 damage 10 occurrence 3 tick 910 (S's hit, sent) (#3)")]
+        h = H_JOIN + [(45, "Online: enemy state a1@2 converged 1a2b3c4d Spawn_Cannon -> Idle lag 12 ticks (within 1 s)"),
+                      (50, "Online: enemy hit a1@2 #1 damage 10 force 0 occurrence 3 applied here: applied hp 200 -> 190 "
+                           "(S tick 900, here 902) (#1)")]
+        d = D_JOIN + [(46, "Online: enemy state a1@2 converged 1a2b3c4d Spawn_Cannon -> Idle lag 75 ticks (late)"),
+                      (51, "Online: enemy hit a1@2 #2 damage 10 force 0 occurrence 3 applied here: applied hp 200 -> 190 "
+                           "(S tick 905, here 906) (#1)"),
+                      (51, "Online: enemy hit a1@2 #2 damage 10 force 0 occurrence 3 applied here: applied hp 190 -> 180 "
+                           "(S tick 905, here 907) (#2)"),
+                      (53, "Online: hero hit by Chompy#2102 a1@2 (sweep, 10) (S's attack, played here) (#1)")]
+        v = lc.grade_enemy_server_damage(lc.load_run(RunFolder(s, h, d).path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual([f.what.split(" (")[0] for f in v.findings], [
+            "D: 1 copy state(s) converged late", "1 S hit(s) applied more than once on the player's game",
+            "1 S hit(s) lost: no applied or refused line on the player's game",
+            "1 hero hit(s) by a copy's own hit while the damage is S's"])
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session_predates_the_lines(self) -> None:
+        self.assertEqual(lc.grade_enemy_server_damage(lc.load_run(self.OWNER_3)).status, lc.NOT_TESTED)
+
+
+class DialogSkip(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+    ON = (1, "Dev: skip scenes on (test-only): dialogs only: conversations are skipped through the game's own skip path")
+
+    def test_a_skipped_conversation_ends_soon_after_its_skip(self) -> None:
+        d = D_JOIN + [self.ON,
+                      (60, "Online: scene local 2/L2 start conversation conversation recipient Tessa#3811 from x"),
+                      (63, "Dev: skip conversation Tessa#3811 line 0 of 2 handed to the server's skip request"),
+                      (63, "Online: scene skip conversation (generation 2, name 0x37E6CA06, no recipient, play 1) turn 0 "
+                           "echoed here (line 0 -> 3 of 2; the server's line 2)"),
+                      (64, "Online: scene local 2/L2 end by natural after 4.0 s (2/2.w1)"),
+                      (70, "Online: scene local 2/L3 start conversation conversation recipient Pit#3881 from x"),
+                      (70, "Dev: skip conversation Pit#3881 line 0 of 2: the server plays it too, left to its skip"),
+                      (79, "Online: scene local 2/L3 end by natural after 9.4 s (2/3.w1)"),
+                      (80, "Online: scene local 2/L4 start conversation conversation recipient Pit#2147483648 from x"),
+                      (80, "Dev: skip conversation Pit#2147483648 line 0 of 3 is unskippable: waits it out"),
+                      (95, "Online: scene local 2/L4 end by natural after 15.8 s (no server scene)")]
+        v = lc.grade_dialog_skip(lc.load_run(RunFolder([], H_JOIN, d).path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.counts, "D: 3 conversation(s), 2 skippable, 1 skipped in time")
+        self.assertEqual([f.what for f in v.findings], [
+            "D: Pit#3881 (2/L3): never skipped here (the skip said: the server plays it too, left to its skip)"])
+        self.assertEqual(lc.grade_dialog_skip(lc.load_run(RunFolder([], H_JOIN, D_JOIN).path)).status, lc.NOT_TESTED)
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session_fails(self) -> None:
+        # Tessa's two lines: the server's skip came 3 s in and the conversation went on 9.9 s (D) / 9.4 s (H) more;
+        # the pit's and Tessa's second talk were never skipped (`the server plays it too, left to its skip`).
+        v = lc.grade_dialog_skip(lc.load_run(self.OWNER_3))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.counts, "D: 8 conversation(s), 7 skippable, 3 skipped in time; H: 8 conversation(s), 7 "
+                                   "skippable, 3 skipped in time")
+        self.assertIn("D: Tessa#3811 (2/L2): it ended 9.9 s after its last skip (13.6 s in all) (the skip said: handed "
+                      "to the server's skip request; the server plays it too, left to its skip)",
+                      [f.what for f in v.findings])
+
+
+class GateKinds(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+    LP = Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass")
+
+    @unittest.skipUnless(LP.is_dir(), "the level data is not here")
+    def test_tutorial_b_has_three_elemental_gates_and_three_swap_zones(self) -> None:
+        d = lc.level_data(self.LP, "tutorial_b")
+        self.assertEqual(sorted((g.unit, g.lock) for g in d.gates if g.lock), [
+            ("tutorial_b_zone_elemental_01", "dual"), ("tutorial_b_zone_elemental_02", "single"),
+            ("tutorial_b_zone_elemental_03", "single")])
+        self.assertEqual(sorted(u for _n, u in d.swap_zones), ["tb_climber", "tb_digger", "tb_flyer"])
+        self.assertEqual(len([g for g in lc.level_data(self.LP, "ww1").gates if g.lock]), 3)
+        v = lc.grade_gate_kinds(lc.load_run(RunFolder([], H_JOIN, D_JOIN).path), d)
+        self.assertEqual(v.status, lc.NOT_TESTED)
+        self.assertIn("NOT TESTED: LockedElementalGate tutorial_b_zone_elemental_01 (dual element)", v.counts)
+
+    @unittest.skipUnless(OWNER_3.is_dir() and LP.is_dir(), "the owner's third session or the level data is not here")
+    def test_the_owners_third_session(self) -> None:
+        # "elemental gates dont work": H stood at the dual gate (00:05:41) and at the Life gate (00:06:00), neither
+        # opened; "swap force gates dont work": H's press of the Rocket Swap Zone was refused (online_swap_zones off).
+        r = lc.load_run(self.OWNER_3)
+        v = lc.grade_gate_kinds(r, lc.level_data(self.LP, lc.run_level(r)))
+        self.assertEqual([f.what.split(":")[0] for f in v.findings], [
+            "LockedElementalGate tutorial_b_zone_elemental_01 (dual element)",
+            "LockedElementalGate tutorial_b_zone_elemental_02 (single element)", "H"])
+        self.assertIn("Swap Zones are not available in online play yet", v.findings[2].what)
+
+
+class EnemyKills(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+    OWNER_2 = Path(r"D:/SwapForceOnline-data/play/20261119-211901")
+
+    def test_hits_that_take_no_health_on_s_and_a_kill_s_did_not_take(self) -> None:
+        s = [(10, "Online: enemy placed a00000000.0629f659.00013531@2 as EB_Lobber#3996 hp 75 pose 31 (S)"),
+             (11, "Online: enemy placed a00000000.0629f659.0001330d@2 as Chompy#4792 hp 1 pose 63 (S)"),
+             (12, "Online: enemy placed a00000000.0629f659.00013290@2 as Chompy#4793 hp 1 pose 64 (S)"),
+             (20, "Online: hit 1:3 PeerPuppet_1 -> Chompy#4793 hp 1 -> 0 killed (landed, victim w1, team 28)"),
+             (21, "Online: enemy a00000000.0629f659.00013290@2 dead by 1 (S, placed; attacker PeerPuppet_1#3844)"),
+             (40, "Online: enemy a00000000.0629f659.0001330d@2 dead by 2 (S, placed; attacker PeerPuppet_2#3844)")]
+        h = H_JOIN + [(19, "Online: enemy local health held a00000000.0629f659.00013290@2 (1 -> -20, 8298e4bc)"),
+                      (30, "Online: enemy local health held a00000000.0629f659.00013531@2 (75 -> 54, 8298e4bc)")]
+        d = D_JOIN + [(41, "Online: enemy kill a00000000.0629f659.0001330d@2 failed (pending, the replica stays bound)"),
+                      (75, "Online: enemy life a00000000.0629f659.0001330d@2 alive -> dead")]
+        v = lc.grade_enemy_kills(lc.load_run(RunFolder(s, h, d).path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertTrue(v.counts.startswith("2 enemy row(s) hit by the players (2 landed hit(s) on their own games); S "
+                                            "took health off 1 row(s), 2 died on S"), v.counts)
+        self.assertEqual([f.what for f in v.findings], [
+            "H: a00000000.0629f659.00013531@2 took 1 landed hit(s) here and lost no health on S (S applied 0 hit(s) to "
+            "it): immortal",
+            "D: its kill of a00000000.0629f659.0001330d@2 was not taken (pending, the replica stays bound): S's death of "
+            "it -1.0 s from it; its copy here died 34 s later"])
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session(self) -> None:
+        # "immortal enemies": 4 kills on the clients S had already taken, whose copies stayed alive (D's for 34-36 s,
+        # H's to the end), and enemies hit on a client that S never took health off (most presses never started on S).
+        v = lc.grade_enemy_kills(lc.load_run(self.OWNER_3))
+        kills = [f.what for f in v.findings if "its kill of" in f.what]
+        self.assertEqual(len(kills), 4, kills)
+        self.assertIn("D: its kill of a00000000.0629f659.0001330d@2 was not taken (pending, the replica stays bound): "
+                      "S's death of it -0.1 s from it; its copy here died 34 s later", kills)
+        self.assertGreater(len(v.findings), 20)
+        self.assertIn("attacks started on the server: H (peer 1) 62 of 490, D (peer 2) 1 of 98", v.counts)
+
+    @unittest.skipUnless(OWNER_2.is_dir(), "the owner's second session is not here")
+    def test_the_owners_second_session(self) -> None:
+        v = lc.grade_enemy_kills(lc.load_run(self.OWNER_2))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(len(v.findings), 7)
+
+
+class LevelChanges(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+    OWNER_2 = Path(r"D:/SwapForceOnline-data/play/20261119-211901")
+
+    def test_each_change_loaded_in_play_present_and_quiet(self) -> None:
+        s = [(4, "Online: level 1 town/town_state10/town_state10: open"),
+             (19, "Online: level 2 tutorial/tutorial_b/tutorial_b: open"),
+             (30, "Online: barrier 2 released at tick 900 (2 clients)"),
+             (31, "Online: puppet 1 for peer 2 spawned at 0,0,0 (generation 2)"),
+             (31, "Online: puppet 2 for peer 1 spawned at 0,0,0 (generation 2)")]
+        h = H_JOIN + [(30, "Online: barrier 2 released at tick 900"),
+                      (31, "Online: puppet 2 spawned Scorp at 1,2,3 (epoch 1 gen 2, real)"),
+                      (32, "Where: tutorial_b at 1 2 100"), (34, "Where: tutorial_b at 1 2 101")]
+        d = [(20, "Online: level 2 tutorial/tutorial_b/tutorial_b: load"), (30, "Online: barrier 2 released at tick 900"),
+             (31, "Online: puppet 1 spawned Roller at 1,2,3 (epoch 1 gen 2, real)"),
+             (32, "Where: tutorial_b at 1 2 100"), (34, "Where: tutorial_b at 1 2 100")] + D_JOIN
+        v = lc.grade_level_changes(lc.load_run(RunFolder(s, h, sorted(d)).path))
+        self.assertEqual(v.status, lc.PASS, v)
+        self.assertIn("tutorial_b (g2) by S [request to in play: S 11.0 s, H 11.0 s, D 11.0 s; longest frames stopped: "
+                      "H 0 s, D 0 s]; H loaded", v.counts)
+        # A fall, an [error] after the load, and no body of the other player on D.
+        d2 = [(20, "Online: level 2 tutorial/tutorial_b/tutorial_b: load"), (30, "Online: barrier 2 released at tick 900"),
+              (32, "Where: tutorial_b at 1 2 100"), (34, "Where: tutorial_b at 1 2 -400"),
+              (40, "Online: stand-in RemotePuppet_1 0xB8A2DD00 still in the entity table before pool 57 is freed")] + D_JOIN
+        f = RunFolder(s, h, sorted(d2))
+        text = (f.path / "D" / "game.log").read_text(encoding="utf-8").replace(
+            "] [info] [core] [t1] Online: stand-in", "] [error] [core] [t1] Online: stand-in")
+        (f.path / "D" / "game.log").write_text(text, encoding="utf-8")
+        v = lc.grade_level_changes(lc.load_run(f.path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.findings[0].what,
+                         "tutorial_b (g2): D: 1 [error] line(s) between its load and 30 s after the barrier; D: the other "
+                         "player's body not shown within 60 s of the barrier; D: its hero never stood within 60 s of the "
+                         "barrier (z 100 -> -400)")
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session(self) -> None:
+        # "Map changes are bugged": tutorial_a's entry took 67 s to the barrier, and S's own [error] lines say its level
+        # entry made no progress for 30 s and its world had not run for 40 s (23:54:00, 23:54:11).
+        v = lc.grade_level_changes(lc.load_run(self.OWNER_3))
+        # W39 item 4, numbers: tutorial_b's change took 29 s to the barrier, frames stopped 27.9 s on H, 27.8 s on D.
+        self.assertIn("tutorial_b (g2) by S's own change (the level's script) [request to in play: S 29.0 s, H 29.0 s, "
+                      "D 29.0 s; longest frames stopped: H 27.9 s, D 27.8 s]", v.counts)
+        self.assertEqual([x.what for x in v.findings],
+                         ["tutorial_a (g1): S: 2 [error] line(s) between its open and 30 s after the barrier"])
+
+    @unittest.skipUnless(OWNER_2.is_dir(), "the owner's second session is not here")
+    def test_the_owners_second_session(self) -> None:
+        # tutorial_b's change: H 14 and D 6 `stand-in ... still in the entity table before pool <n> is freed` errors.
+        v = lc.grade_level_changes(lc.load_run(self.OWNER_2))
+        self.assertIn("[request to in play: S 22.0 s, H 22.0 s, D 22.0 s; longest frames stopped: H 20.7 s, D 20.7 s]",
+                      v.counts)
+        self.assertEqual([x.what for x in v.findings],
+                         ["tutorial_b (g2): H: 14 [error] line(s) between its load and 30 s after the barrier; D: 6 "
+                          "[error] line(s) between its load and 30 s after the barrier"])
+
+
+class ScenesOnce(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+    OWNER_2 = Path(r"D:/SwapForceOnline-data/play/20261119-211901")
+
+    def test_a_cutscene_started_twice_in_one_generation_fails(self) -> None:
+        h = H_JOIN + [(50, "Online: scene local 1/L3 start cutscene TA_ChompyIntro recipient Event_ChompyIntro#2132 from "
+                           "script CutscenePlay"),
+                      (61, "Online: scene local 1/L4 start cutscene TA_ChompyIntro recipient Event_ChompyIntro#2132 from "
+                           "script CutscenePlay"),
+                      (90, "Online: scene local 2/L1 start cutscene TA_ChompyIntro recipient - from the level load"),
+                      (95, "Online: scene local 2/L2 start conversation conversation recipient Tessa#3811 from x"),
+                      (99, "Online: scene local 2/L3 start conversation conversation recipient Tessa#3811 from x")]
+        v = lc.grade_scenes_once(lc.load_run(RunFolder([], h, D_JOIN).path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.counts, "H: 3 cutscene start(s), 2 distinct")
+        self.assertEqual([f.what.split(" (at")[0] for f in v.findings],
+                         ["H: TA_ChompyIntro started 2 times in level generation 1"])
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session_repeats(self) -> None:
+        # His complaint "cutscenes play multiple times", from his own logs: in tutorial_a (generation 1) TA_ChompyIntro
+        # started twice on H (23:54:49, 23:55:00) and on D (23:54:49, 23:55:08); D also played TA_CoreFlyThrough and
+        # TA_GreebleMeleeIntro twice (23:55:30 and 23:55:53; 23:55:43 and 23:56:00).
+        v = lc.grade_scenes_once(lc.load_run(self.OWNER_3))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(sorted(f.what.split(" (at")[0] for f in v.findings), [
+            "D: TA_ChompyIntro started 2 times in level generation 1",
+            "D: TA_CoreFlyThrough started 2 times in level generation 1",
+            "D: TA_GreebleMeleeIntro started 2 times in level generation 1",
+            "H: TA_ChompyIntro started 2 times in level generation 1",
+            "S: peer 1's 0x00000854 play 0 started 2 times in level generation 1",
+            "S: peer 2's 0x00000845 play 0 started 2 times in level generation 1",
+            "S: peer 2's 0x00000854 play 0 started 2 times in level generation 1",
+            "S: peer 2's 0x00000866 play 0 started 2 times in level generation 1"])
+
+    @unittest.skipUnless(OWNER_2.is_dir(), "the owner's second session is not here")
+    def test_the_owners_second_session(self) -> None:
+        # No cutscene repeated there: 7 starts on H and on D, 8 reports on S, each once.
+        v = lc.grade_scenes_once(lc.load_run(self.OWNER_2))
+        self.assertEqual(v.status, lc.PASS, v)
+
+
+class CoinsShared(unittest.TestCase):
+    # W38: each coin taken once, granted once, paid once with the same amount on the other client and removed there
+    # (the coins branch's line forms, online/8-all-coins-shared 033f2274).
+    S = [(50, "Online: coin claim s1a2b3c4.00000001#0 peer 2 granted (S's base 5.00, its toucher's base 5.00 and factor "
+              "1.00: 5.00 to every player; 2 clients told, its toucher's game among them)")]
+    D = D_JOIN + [(50, "Online: coin taken here s1a2b3c4.00000001#0 (player 8a001234, base 5.00, factor 1.00: 5.00; gold "
+                       "100 -> 105, +5; S is told)")]
+    H = H_JOIN + [(51, "Online: coin paid here s1a2b3c4.00000001#0 (taken by another player; player 8b001234 slot 0, "
+                       "S's amount 5.00: gold 30 -> 35, +5)"),
+                  (51, "Online: coin removed here s1a2b3c4.00000001#0 (taken by another player and paid here: its copy "
+                       "here without pay)")]
+
+    def test_a_coin_taken_by_one_is_paid_once_to_the_other(self) -> None:
+        v = lc.grade_coins_shared(lc.load_run(RunFolder(self.S, self.H, self.D).path))
+        self.assertEqual(v.status, lc.PASS, v)
+        self.assertIn("1 coin(s) taken (H 0, D 1); 1 paid once to every player with the same amount; coin money: "
+                      "H +5, D +5", v.counts)
+        # The coins row's patterns read the new forms too.
+        self.assertEqual(lc.COIN_TAKEN.search(self.D[-1][1]).group(1, 2, 3), ("s1a2b3c4.00000001#0", "100", "105"))
+        self.assertEqual(lc.COIN_PAID.search(self.H[-2][1]).group(1, 2, 3), ("s1a2b3c4.00000001#0", "30", "35"))
+
+    def test_unpaid_different_or_twice_fail_by_name(self) -> None:
+        h = H_JOIN + [(51, "Online: coin paid here s1a2b3c4.00000001#0 (taken by another player; player 8b001234 slot "
+                           "0, S's amount 5.00: gold 30 -> 34, +4)")]
+        v = lc.grade_coins_shared(lc.load_run(RunFolder(self.S, h, self.D).path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.findings[0].what, "coin s1a2b3c4.00000001#0: paid +4 on H, taken +5 on D; its copy on H not "
+                                             "removed")
+        self.assertIn("the players' coin money differs: H +4, D +5", [f.what for f in v.findings])
+        v = lc.grade_coins_shared(lc.load_run(RunFolder(self.S, H_JOIN, self.D + [
+            (52, "Online: coin taken here s1a2b3c4.00000001#0 (player 8a001234, base 5.00, factor 1.00: 5.00; gold 105 "
+                 "-> 110, +5; S is told)")]).path))
+        self.assertTrue(v.findings[0].what.startswith("coin s1a2b3c4.00000001#0: taken on 2 games (D, D); paid 0 "
+                                                      "time(s) on H"), v.findings[0].what)
+        self.assertEqual(lc.grade_coins_shared(lc.load_run(RunFolder(self.S, H_JOIN, D_JOIN).path)).status,
+                         lc.NOT_TESTED)
 
 
 class Coins(unittest.TestCase):
