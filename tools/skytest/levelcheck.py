@@ -3172,7 +3172,20 @@ def invulnerable_clients(folder: Path) -> list[str]:
     except (OSError, ValueError):
         return []
     return [str(p.get("peer")) for p in r.get("peers", []) or []
-            if isinstance(p, dict) and INVULNERABLE_ARG in (p.get("command") or [])]
+            if isinstance(p, dict) and INVULNERABLE_ARG in (p.get("command") or [])
+            and damage_floor(p.get("command") or []) <= 0]
+
+
+def damage_floor(command: list) -> float:
+    """Batch 18d: a client's damage window (`--dev_hero_damage_floor=<f>`): with it the invulnerable hero still takes
+    the hits while its health is above f, so the row judges that client's hits as for a vulnerable one."""
+    for a in command:
+        if isinstance(a, str) and a.startswith("--dev_hero_damage_floor="):
+            try:
+                return float(a.split("=", 1)[1])
+            except ValueError:
+                return 0.0
+    return 0.0
 
 
 def launch_relay_head(folder: Path) -> list[str]:

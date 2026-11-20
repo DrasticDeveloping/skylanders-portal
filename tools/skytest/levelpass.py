@@ -432,6 +432,17 @@ LAUNCH_RIDES = False
 # fight's reference while a plan's scripts are written (d_fight_ref).
 D_FIGHT = False
 D_FIGHT_AT = ""
+# Batch 18d (the first two-player level checks with the owner's session settings): no player's hit reached S, D fought
+# tutorial_a's ship fight before its enemies came (fight_near ends after 10 s with no enemy), and H stood by. With the
+# build's fight_when (skytest sets FIGHT_WHEN from the command table) EVERY fight of the sweep and every fight gate is
+# fought by both players, each with `fight_when <ref> <radius> <wait> <seconds>` (the fight's first enemy waited for,
+# FIGHT_WAIT_S at most); H no longer stands by. Without it: as before.
+FIGHT_WHEN = False
+FIGHT_WAIT_S = 60
+# The damage window (the build's dev_hero_damage_floor; skytest sets DAMAGE_FLOOR from the launch allow list): with
+# the heroes invulnerable, each still takes the enemies' hits while its health is above this fraction, so "enemies
+# hurt players" is judged per player and nobody is knocked out. 0: invulnerable all along, as before.
+DAMAGE_FLOOR = 0.0
 D_FIGHT_WAIT_S = 900
 LAUNCH_PADS: dict[str, tuple[str, int]] = {}   # obj key -> (button, presses)
 LAUNCH_EXTRA_PRESSES = 3
@@ -1316,6 +1327,8 @@ def gates_words(content: Content) -> list[str]:
 #   when the build's command table has lock_solve, lock_move and the condition lock_ready; otherwise not performed,
 #   said so.
 # D, not following H, comes to each gate (d_come_lines). The level check grades each gate's opening on S, H and D.
+LOCK_PARTNER_NEAR = 600   # the second player beside a Spark Lock's gate before the press (batch 18d)
+LOCK_PARTNER_WAIT_S = 120
 REQ_KEY_S = 30.0          # pickup (a navto to its key), back to the gate, the press
 REQ_BATTLE_S = 20.0       # the releases and the approach; the fight's own seconds (gate_fight_seconds) are added
 REQ_SPARK_S = 70.0        # the press, the board, its solve
@@ -1446,16 +1459,22 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                 step.why_not = ("needs a lock opened: this build has no lock_solve / lock_ready (online/6-spark-lock "
                                 "is not in it)")
             else:
-                step.h = [f"{head} (solve its lock puzzle)", f"goto_entity {ref}", f"interact {ref} 20",
-                          "waitfor lock_ready 30", "lock_solve 120", f"online_audit {label}"]
+                # Batch 18d (ww1): H pressed while D was far; S seated D, D was never pulled in and the solo
+                # fallback ended the lock. The level check tests the two-seat lock: H presses only once D is beside
+                # the gate (a far partner is a case of its own, spark-lock specs).
+                step.h = [f"{head} (solve its lock puzzle)", f"goto_entity {ref}",
+                          f"online_wait_peer_near_entity {ref} {LOCK_PARTNER_NEAR} {LOCK_PARTNER_WAIT_S}",
+                          f"interact {ref} 20", "waitfor lock_ready 30", "lock_solve 120", f"online_audit {label}"]
                 step.d = [f"interact {ref} 20", "waitfor lock_ready 30", "lock_solve 120"]
                 step.est_s = REQ_SPARK_S
         elif g.kind in lh.FIGHT_GATES:
             releases: list[str] = []
+            started_by_trigger: set[str] = set()
             blocked: list[str] = []
             fight = ""
             fights: list[str] = []
             fight_s = gate_fight_seconds(content.manifest, g.openers)
+            d_fights: list[str] = []
             for k in g.openers:
                 h = holds.get(k)
                 if h is not None and not h.ambient:
@@ -1476,6 +1495,7 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                                 line = f"enter_trigger {trig.ref}"
                                 if line not in releases:
                                     releases.append(line)
+                                started_by_trigger.add(k)
                                 break
                 ob = by_key.get(k)
                 is_encounter = n is not None and n.group == "encounter"
@@ -1484,17 +1504,27 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                 if ob is not None and ob.ref and (is_encounter or not fight):
                     line = (f"encounter_clear {ob.ref} 1500 {fight_s} exact" if is_encounter
                             else f"fight_near {ob.ref} 1500 {fight_s}")
+                    if is_encounter and k not in started_by_trigger:
+                        # Batch 18d: to the manager before its fight (the arena step began 33000 away, where the
+                        # sweep ended, and fought a placed enemy there), unless its start trigger took H there.
+                        fights.append(f"goto_entity {ob.ref}")
                     fights.append(line)
                     fight = fight or line
+                    if FIGHT_WHEN:
+                        d_fights.append(f"fight_when {ob.ref} {FIGHT_RADIUS} {FIGHT_WAIT_S} {fight_s}")
                     # W16: an encounter nothing toggles starts when a player comes within its activation radius of
                     # the manager (the data's `activationRadius`): the step goes to the manager first, so
                     # encounter_clear waits there for it to run and fights its spawnees. Batch 12 case 7's r2
                     # (EncounterManager001_002, radius 2000) fought a placed enemy 2990 away instead and the encounter
                     # never started (`spawned 0/6` for 61 s).
                     radius = encounter_radius(manifest_entity(content.manifest, k)) if is_encounter else None
-                    toggled = any(tg.receiver == k and tg.message == TOGGLE for tg in tels)
+                    # A manager's own messenger toggling itself (EA_Manager_W1's UnleashTheChompies) needs it running
+                    # first: only another sender toggles it on (batch 18d).
+                    toggled = any(tg.receiver == k and tg.message == TOGGLE and tg.sender != k for tg in tels)
                     if radius is not None and not toggled:
                         releases.append(f"goto_entity {ob.ref}")
+            # The manager's move once: W16's (in the releases) or the fight's own (batch 18d).
+            fights = [f for f in fights if not (f.startswith("goto_entity ") and f in releases)]
             if not fight:
                 step.why_not = "no live reference to any of its fight's enemies or encounters"
             elif blocked and len(blocked) == len([k for k in g.openers if k in holds]) and \
@@ -1503,7 +1533,8 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
             else:
                 names = ", ".join(_safe(k.split(".")[-1]) for k in g.openers[:4])
                 step.h = [f"{head} (win its fight: {names})", *releases, *fights, f"online_audit {label}"]
-                step.est_s = REQ_BATTLE_S + fight_s * len(fights)
+                step.d = d_fights  # batch 18d: D fights the gate's fight too (d_come_lines, d_gate_lines)
+                step.est_s = REQ_BATTLE_S + fight_s * len([f for f in fights if not f.startswith("goto_entity")])
         else:
             step.why_not = f"no rule for a {g.kind} yet ({g.opener})"
     return out
@@ -1515,6 +1546,19 @@ GATES_SKIPPED = "LEVELPASS gates not attempted (--no-gates)"
 def pass_line(r: ReqStep, seconds: float) -> str:
     """`pass_gate` for a required gate (W23), with the data's yaw when it has one."""
     return f"pass_gate {r.gate_ref} {PASS_DISTANCE} {int(seconds)}" + (f" yaw {r.yaw:.4f}" if r.yaw is not None else "")
+
+
+def d_gate_lines(plan: Plan, r: ReqStep) -> list[str]:
+    """Batch 18d: D, following H, comes to a gate whose step has D's own part (a Spark Lock's seat, a fight gate's
+    fight) and does it beside H; nothing for a gate without one."""
+    if not r.d:
+        return []
+    follow = plan.d_follow
+    return [f"log LEVELPASS D at required {r.label} {_safe(r.gate.name)}",
+            f"online_wait_peer_near_entity {r.gate_ref} {D_NEAR} {int(D_COME_WAIT_S + sweep_share(plan, plan_budget(plan)))}",
+            *(["online_auto_follow off"] if follow else []),
+            f"goto_entity {r.gate_ref} {LOCK_PARTNER_NEAR // 2}", *r.d,
+            *(["online_auto_follow on"] if follow else [])]
 
 
 def d_pass_lines(plan: Plan, r: ReqStep) -> list[str]:
@@ -2050,7 +2094,10 @@ def action_lines(a: Action, label: str, after: str = "", cap: int = 0, long_paus
         # The helpers find a live object; goto_entity first wakes an asleep one (its area streamed in).
         out.append(f"goto_entity {ref}")
         out += dismiss_after(o)
-    if a.action == FIGHT and D_FIGHT_AT and ref == D_FIGHT_AT:
+    if a.action == FIGHT and FIGHT_WHEN:
+        # Batch 18d: H fights every fight (D fights it too: d_fight_lines), after the fight's first enemy came.
+        out.append(f"fight_when {ref} {FIGHT_RADIUS} {FIGHT_WAIT_S} {ACTION_TIMEOUT[FIGHT]}")
+    elif a.action == FIGHT and D_FIGHT_AT and ref == D_FIGHT_AT:
         # W32 (c): D fights this one (d_fight_lines); H waits for D beside it and attacks nothing.
         out += [f"log LEVELPASS fight by D at {ref}: H stands by",
                 f"online_wait_peer_near_entity {ref} {FIGHT_RADIUS} 60",
@@ -2132,8 +2179,26 @@ def d_fight_ref(plan: Plan) -> str:
     return ""
 
 
+def d_sweep_fight_refs(plan: Plan) -> list[str]:
+    """The refs of the sweep's fights, in the order H meets them."""
+    out = []
+    for s in plan.stops:
+        for a in s.actions:
+            if a.action == FIGHT and a.obj.ref and a.obj.ref not in out:
+                out.append(a.obj.ref)
+    return out
+
+
 def d_fight_lines(plan: Plan) -> list[str]:
-    """D's part of the fight by D: once H is beside it, D stops following, goes there and fights; then follows again."""
+    """D's part of the fight by D: once H is beside it, D stops following, goes there and fights; then follows again.
+    With FIGHT_WHEN (batch 18d) D fights every fight of the sweep, each after its first enemy came."""
+    if FIGHT_WHEN:
+        out = []
+        for ref in d_sweep_fight_refs(plan):
+            out += [f"log LEVELPASS D fights at {ref}", "online_auto_follow off", f"goto_entity {ref} 300",
+                    f"fight_when {ref} {FIGHT_RADIUS} {D_FIGHT_WAIT_S} {3 * ACTION_TIMEOUT[FIGHT]}",
+                    "online_auto_follow on", f"log LEVELPASS D fought at {ref}"]
+        return out
     ref = d_fight_ref(plan)
     if not ref:
         return []
@@ -2145,7 +2210,7 @@ def d_fight_lines(plan: Plan) -> list[str]:
 def script_h(plan: Plan, late_join_after: str | None) -> str:
     """H's script: boot, Host, the level, the sweep, the late join's wait, the exit."""
     global D_FIGHT_AT
-    D_FIGHT_AT = d_fight_ref(plan)
+    D_FIGHT_AT = "" if FIGHT_WHEN else d_fight_ref(plan)
     # The one boot (party_boot_h): the lobby (with D) or the host alone (D joins late, or no D).
     lines = party_boot_h(plan.late_join and plan.d_lobby and late_join_after is None, plan.new_slot, plan.figures_h)
     lines += ["online_mark_level", f"level {plan.level}",
@@ -2638,7 +2703,11 @@ def script_d(plan: Plan) -> str:
         elif plan.pass_gates and d_through_end(plan):
             for r in plan.required:  # W23: D, following H, walks through each gate H opened
                 if not r.why_not:
-                    lines += d_pass_lines(plan, r)
+                    lines += d_gate_lines(plan, r) + d_pass_lines(plan, r)
+        else:
+            for r in plan.required:
+                if not r.why_not:
+                    lines += d_gate_lines(plan, r)
         if d_through_end(plan):
             lines += ["log LEVELPASS D stays for the level end", f"waitfor {NEXT_LEVEL} {D_LEVEL_END_WAIT_S}",
                       "wait_free 120", "log LEVELPASS D next level", "online_audit d-next"]
@@ -3177,10 +3246,14 @@ LATE_JOIN_MARK = r"Input script: LEVELPASS late-join start"
 # god mode to keep fights short and the hero alive (dev_damage_multiplier is forwarded to S, which
 # scales the puppets' hits), the fight helpers' lowering setting (refused in a session in its own
 # words, never "is off"), the encounter lines, logs large enough for the whole pass.
-H_ARGS = ["--dev_authored_probe=true", "--dev_backend_commands=true", "--dev_hello_ungated_loopback=true", "--dev_damage_multiplier=-1",
+# Batch 18d: no --dev_damage_multiplier=-1 any more. With the owner's session settings the players' own hits decide the
+# damage on S, and the level check's host sent no hit at all where hits-that-count (the same build, without the
+# multiplier) had 91 counted (logs/levelcheck/levelcheck-vs-hits-that-count.txt; the cause INFERRED). The fights take
+# the game's own damage.
+H_ARGS = ["--dev_authored_probe=true", "--dev_backend_commands=true", "--dev_hello_ungated_loopback=true",
           "--dev_hero_invulnerable=true", "--dev_defeat_commands=true", "--dev_trigger_commands=true",
           "--log_max_file_size_mb=64", "--log_max_files=4"]
-D_ARGS = ["--dev_authored_probe=true", "--dev_backend_commands=true", "--dev_damage_multiplier=-1", "--dev_hero_invulnerable=true",
+D_ARGS = ["--dev_authored_probe=true", "--dev_backend_commands=true", "--dev_hero_invulnerable=true",
           "--log_max_file_size_mb=64", "--log_max_files=4"]
 # The case's stop (R3): the owner's 10 minutes and a minute's grace, no longer twice the budget (a sweep that
 # ran 20 minutes, 18 November). A pass the runner stops there, or one with steps skipped at the sweep's
@@ -3430,7 +3503,7 @@ def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan, d_tex
 # "place a Skylander" screen and the pass's route steps fail as held until it ends (what a pass needs to go on, a
 # figure swap at a knock-out, is written in levelpass's KO_SURVIVAL note).
 VULNERABLE = False
-INVULNERABLE_ARGS = ("--dev_hero_invulnerable=true", "--dev_damage_multiplier=-1")
+INVULNERABLE_ARGS = ("--dev_hero_invulnerable=true",)
 # KO_SURVIVAL: for a pass to go on after a knock-out the swap must come at the moment it happens, which a script
 # cannot wait for in the middle of a route step. It needs (1) a dev setting in the game (dev_ko_figure=<file>): at
 # the game's figure prompt of a knock-out (swap_hooks.cpp's `swap placement none reason <r> (KO; player 0`) the
@@ -3458,6 +3531,8 @@ def probe_args(args: list[str], probe: bool, extra: list[str] | None = None) -> 
     out = list(args) if probe else [a for a in args if not a.startswith("--dev_authored_probe")]
     if VULNERABLE:
         out = [a for a in out if a not in INVULNERABLE_ARGS]
+    elif DAMAGE_FLOOR > 0 and "--dev_hero_invulnerable=true" in out:
+        out.append(f"--dev_hero_damage_floor={DAMAGE_FLOOR:g}")  # batch 18d: each hero takes hits down to the floor
     return out + list(extra or [])
 
 

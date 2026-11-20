@@ -803,6 +803,21 @@ class Case(unittest.TestCase):
             self.assertTrue(pf.setting_on(s.peers["D"].args, setting), setting)
         self.assertEqual(lp.script_settings(["--dev_defeat_commands=true"], d).count("--dev_defeat_commands=true"), 1)
 
+    def test_batch_18d_no_one_hit_multiplier_and_the_damage_window(self):
+        """No --dev_damage_multiplier=-1 (the level check's hits never reached S with it); with the build's
+        dev_hero_damage_floor each hero takes hits down to the floor."""
+        text = lp.spec_toml(lp.make_plan(content()))
+        self.assertNotIn("dev_damage_multiplier", text)
+        self.assertNotIn("dev_hero_damage_floor", text)
+        old = lp.DAMAGE_FLOOR
+        lp.DAMAGE_FLOOR = 0.5
+        try:
+            s = self.load(lp.spec_toml(lp.make_plan(content())))
+            for peer in ("H", "D"):
+                self.assertIn("--dev_hero_damage_floor=0.5", s.peers[peer].args, peer)
+        finally:
+            lp.DAMAGE_FLOOR = old
+
     def test_every_generated_case_runs_with_the_owners_session_settings(self):
         """2026-11-20: the two-player tutorial_b check ran without them (`hit session off`, a stand-in for the
         other player): each generated case asks the runner for the list on every game."""
@@ -1216,6 +1231,29 @@ class RequiredStepsPlan(unittest.TestCase):
         self.assertIn(f"gates phase {2 * lp.REQ_KEY_S + arena.est_s:.0f} s of its own (3 of 3 required gate(s) performed)",
                       lp.budget_words(gated))
 
+    def test_batch_18d_the_arena_is_fought_where_its_manager_is_by_both_players(self) -> None:
+        # tutorial_b's arena: EA_Manager_W1 starts by its activation radius; its own UnleashTheChompies messenger
+        # toggles itself, which is no start: the step goes to the manager before its fight (the run began 33000 away).
+        arena = next(r for r in self.plan("tutorial_b").required if r.kind == "arena gate")
+        first = arena.h.index(next(l for l in arena.h if l.startswith("encounter_clear ")))
+        self.assertTrue(arena.h[first - 1].startswith("goto_entity "), arena.h)
+        self.assertEqual(arena.d, [])  # without the build's fight_when: D has no part, as before
+        old = lp.FIGHT_WHEN
+        lp.FIGHT_WHEN = True
+        try:
+            arena = next(r for r in self.plan("tutorial_b").required if r.kind == "arena gate")
+            self.assertTrue(arena.d and all(l.startswith("fight_when ") for l in arena.d), arena.d)
+            p = self.plan("tutorial_a")
+            p.d_follow = True  # the level checks' lobby flow: D follows H
+            h, d = lp.script_h(p, None), lp.script_d(p)
+            self.assertNotIn("stand_by ", h)  # H fights every fight too
+            fights = [l for l in h.splitlines() if l.startswith("fight_when ")]
+            self.assertTrue(fights, h)
+            self.assertEqual(len([l for l in d.splitlines() if l.startswith("fight_when ")]),
+                             len(lp.d_sweep_fight_refs(p)))
+        finally:
+            lp.FIGHT_WHEN = old
+
     def test_ww1_fights_its_battle_gates_and_waits_for_the_lock_commands(self) -> None:
         p = self.plan("ww1")
         kinds = [(r.kind, bool(r.why_not)) for r in p.required]
@@ -1240,7 +1278,10 @@ class RequiredStepsPlan(unittest.TestCase):
         for r in p.required + self.plan("tutorial_b").required + self.plan("ww1", lock_commands=True).required:
             self.assertFalse([l for l in r.h if l.startswith("wait_moved")], r.h)
         spark = self.plan("ww1", lock_commands=True).required[0]
-        self.assertEqual(spark.h[2:5], [f"interact {spark.gate_ref} 20", "waitfor lock_ready 30", "lock_solve 120"])
+        # Batch 18d: H presses only once D is beside the gate (the two-seat lock).
+        self.assertEqual(spark.h[2], f"online_wait_peer_near_entity {spark.gate_ref} {lp.LOCK_PARTNER_NEAR} "
+                                     f"{lp.LOCK_PARTNER_WAIT_S}")
+        self.assertEqual(spark.h[3:6], [f"interact {spark.gate_ref} 20", "waitfor lock_ready 30", "lock_solve 120"])
         self.assertEqual(spark.d, [f"interact {spark.gate_ref} 20", "waitfor lock_ready 30", "lock_solve 120"])
 
 

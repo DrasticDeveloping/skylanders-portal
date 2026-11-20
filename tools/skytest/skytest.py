@@ -10244,6 +10244,13 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     lp.LAUNCH_RIDES = launch_pad_known(cfg) and not getattr(a, "no_launch_rides", False)
     # W32 (c): D fights one fight a level where the build registers stand_by.
     lp.D_FIGHT = command_known(cfg, "stand_by")
+    # Batch 18d: both players fight every fight where the build has fight_when; the damage window where the launch
+    # allow list has dev_hero_damage_floor (half the hero's health).
+    lp.FIGHT_WHEN = command_known(cfg, "fight_when")
+    try:
+        lp.DAMAGE_FLOOR = 0.5 if "dev_hero_damage_floor" in la.AllowList.load(cfg.launch_allow).rules else 0.0
+    except (OSError, ValueError, la.LaunchError):
+        lp.DAMAGE_FLOOR = 0.0
     # W31: the pieces step enters its trigger on foot where the build has walk_into.
     lp.WALK_INTO = command_known(cfg, "walk_into")
     # W33: --vulnerable leaves out --dev_hero_invulnerable and --dev_damage_multiplier.
