@@ -1871,8 +1871,13 @@ TRAFFIC_LINE = re.compile(r"\] Online: traffic peer \d+ ")
 # The fix's lines (online/5-server-never-paused: online.cpp, backend/stage5_hits.cpp): S's own [error] when its world
 # has not run with clients connected, and when a player's presses are refused for a while (its attacks never reach
 # S's hit path). Either fails every grade.
-SERVER_STALL_ERROR = re.compile(r"Online: the server's world has not run for [\d.]+ s with \d+ client\(s\) connected")
+SERVER_STALL_ERROR = re.compile(r"Online: the server's (?:world has not run for [\d.]+ s|world still has not run: "
+                                r"[\d.]+ s|level entry has made no progress for [\d.]+ s) with \d+ client\(s\) connected")
 PRESSES_REFUSED = re.compile(r"Online: presses of peer (\d+) refused for [\d.]+ s")
+# The world watch's recovery press (online_server_unstick, off by default; no spec passes it): a press of A on S's
+# own screen is a fault in any run that did not ask for it (online/5-server-never-paused 362a3652).
+UNSTICK_PRESS = re.compile(r"Online: the server's world is paused: pressed A ")
+UNSTICK_ARG = "--online_server_unstick=true"
 
 
 def server_stalled(run: Run) -> "Finding | None":
@@ -1915,6 +1920,12 @@ def server_hard_findings(run: Run) -> list["Finding"]:
     if f is not None:
         out.append(f)
     if run.server is not None:
+        pressed = run.server.find(UNSTICK_PRESS)
+        asked = any(UNSTICK_ARG in (p.get("command") or []) for p in run.result.get("peers", []) or []
+                    if isinstance(p, dict))
+        if pressed and not asked:
+            out.append(Finding("the server pressed A on its own screen without --online_server_unstick=true (its "
+                               "world was paused by a screen of its own game)", [line.cite() for line, _m in pressed[:3]]))
         refused = run.server.find(PRESSES_REFUSED)
         if refused:
             peers = sorted({m.group(1) for _l, m in refused})
