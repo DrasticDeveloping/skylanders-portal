@@ -8293,6 +8293,9 @@ def cmd_levelcheck(cfg: Config, a: argparse.Namespace) -> int:
 def levelcheck_exit(lc, verdicts) -> int:
     """1 when a grader failed, EXIT_INCOMPLETE when the pass did not cover its plan, else 0 (NOT TESTED rows
     are said on the page, never counted as passed)."""
+    # The owner's central points not exercised (levelcheck.central_verdict): INCOMPLETE, whatever else failed.
+    if any(v.name == lc.CENTRAL and v.status == lc.INCOMPLETE for v in verdicts):
+        return EXIT_INCOMPLETE
     if any(v.status == lc.FAIL for v in verdicts):
         return 1
     return EXIT_INCOMPLETE if any(v.status == lc.INCOMPLETE for v in verdicts) else 0

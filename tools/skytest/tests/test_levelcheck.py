@@ -70,6 +70,24 @@ class RunFolder:
 
 
 
+class CentralRows(unittest.TestCase):
+    """Batch 18d: a level check that exercised neither the players' kills nor the enemies' damage is INCOMPLETE."""
+
+    def test_untested_central_rows_make_the_level_incomplete(self) -> None:
+        s = [(10, "Online: enemy placed a00000001.0629f659.00010001@2 as Chompy#3001 hp 10 pose 1 (S)")]
+        run = lc.load_run(RunFolder(s, H_JOIN, D_JOIN).path)
+        rows = [lc.Verdict("enemies can be killed", lc.NOT_TESTED, "no hit"),
+                lc.Verdict("enemies hurt players", lc.NOT_TESTED, "heroes invulnerable"),
+                lc.Verdict("coins shared", lc.NOT_TESTED, "no coin"),
+                lc.Verdict("loot", lc.FAIL, "short")]
+        c = lc.central_verdict(run, rows)
+        self.assertEqual(c.status, lc.INCOMPLETE)
+        self.assertNotIn("coins shared", c.counts)  # no coin line in this level's run: not required
+        self.assertTrue(lc.overall([c, *rows]).startswith("INCOMPLETE: not exercised"))
+        self.assertIn("; FAIL: loot", lc.overall([c, *rows]))
+        self.assertIsNone(lc.central_verdict(lc.load_run(RunFolder([], H_JOIN, D_JOIN).path), rows))  # no enemies
+
+
 class RotatedLog(unittest.TestCase):
     """W14: S's log rotated in a long run (`game.1.log` older, `game.log` newest); its early lines are read too, and
     each line is cited in its own file."""
@@ -1184,9 +1202,11 @@ class GateKinds(unittest.TestCase):
         r = lc.load_run(self.OWNER_3)
         v = lc.grade_gate_kinds(r, lc.level_data(self.LP, lc.run_level(r)))
         # W40: the Swap Zone refusal is the off state there (online_swap_zones off in his session): said, not failed.
-        self.assertEqual([f.what.split(":")[0] for f in v.findings], [
+        self.assertEqual([f.what.split(":")[0].split(" [authored")[0] for f in v.findings], [
             "LockedElementalGate tutorial_b_zone_elemental_01 (dual element)",
             "LockedElementalGate tutorial_b_zone_elemental_02 (single element)"])
+        # Batch 18d's reading: the gates' own lines say they stayed shut on every game (not "no line").
+        self.assertTrue(all("opened on no game (closed on S, H, D)" in f.what for f in v.findings))
         self.assertIn("refused 1 (Swap Zones off in this run", v.counts)
 
     @unittest.skipUnless(LP.is_dir(), "the level data is not here")

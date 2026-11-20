@@ -169,7 +169,7 @@ def level_row(level: str, run: Path | None, page: str | None, code: int, seconds
         return row
     row.result = lc.overall(verdicts)
     row.lines = [f"{v.name}: {v.findings[0].what}" if v.findings else f"{v.name}: {v.counts[:160]}"
-                 for v in verdicts if v.status == lc.FAIL][:8]
+                 for v in verdicts if v.status == lc.FAIL or (v.name == lc.CENTRAL and v.status == lc.INCOMPLETE)][:8]
     row.logs = ([page] if page else []) + [str(run)]
     return row
 

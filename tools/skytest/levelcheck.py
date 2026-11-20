@@ -812,11 +812,33 @@ C_COINS = re.compile(r"Online: coins (\d+): (\d+) placed money coins mapped, (\d
                      r"paid here, (\d+) pending, (\d+) unpaid, (\d+) collected without pay, (\d+) claims not sent yet")
 S_COINS = re.compile(r"Online: coins (\d+): (\d+) claims granted, (\d+) refused, (\d+) placed money coins mapped here "
                      r"\((\d+) this level\)")
-COIN_TAKEN = re.compile(r"Online: coin taken here (\S+) \(player \S+, (?:base [^;]*; )?gold (\d+) -> (\d+)")
-COIN_PAID = re.compile(r"Online: coin paid here (\S+) \(taken by another player; player \S+(?: slot \d+, S's amount "
+# A coin's key is one word (`0629f659.15372`, a placed coin) or two (`w00000000 00000001/<n>`, a coin a broken thing
+# dropped: batch 18d's tutorial_a check, whose coins rows read none of S's seven grants): COIN_KEY takes both.
+COIN_KEY = r"(\S+(?: [0-9a-f]{8}/\d+)?)"
+COIN_TAKEN = re.compile(r"Online: coin taken here " + COIN_KEY + r" \(player \S+, (?:base [^;]*; )?gold (\d+) -> (\d+)")
+COIN_PAID = re.compile(r"Online: coin paid here " + COIN_KEY + r" \(taken by another player; player \S+(?: slot \d+, S's amount "
                        r"[\d.]+:)?,? gold (\d+) -> (\d+)")
-COIN_HANDLED = re.compile(r"Online: coin claim (\S+) peer (\d+) (granted|refused)")
-COIN_BAD = re.compile(r"Online: coin (?:unpaid|collected without pay) \S+ .*|Online: coin claim \S+ peer \d+ refused .*")
+COIN_HANDLED = re.compile(r"Online: coin claim " + COIN_KEY + r" peer (\d+) (granted|refused)")
+COIN_BAD = re.compile(r"Online: coin (?:unpaid|collected without pay) \S+ .*|Online: coin claim " + COIN_KEY
+                      + r" peer \d+ refused .*")
+
+
+def coin_episode(key: str, line: "Line", grants: dict[str, list["Line"]]) -> str:
+    """A coin's key made unique when S granted the same key more than once: a broken thing's coins under the zero
+    carrier (`w00000000 00000001/<n>`, batch 18d tutorial_a: two pots' coins share keys) are told apart by S's grant
+    nearest in time (`<key>#<k>`). A key S granted once (or never) is itself."""
+    g = grants.get(key, [])
+    if len(g) <= 1 or line.t is None:
+        return key
+    near = min(range(len(g)), key=lambda j: abs((g[j].t - line.t).total_seconds()) if g[j].t else 1e9)
+    return f"{key}#{near + 1}"
+
+
+def coin_grants(server: "Log | None") -> dict[str, list["Line"]]:
+    out: dict[str, list[Line]] = {}
+    for line, m in (server.find(COIN_GRANTED) if server is not None else []):
+        out.setdefault(m.group(1), []).append(line)
+    return out
 
 
 def grade_coins(run: Run) -> Verdict:
@@ -870,7 +892,9 @@ def grade_coins(run: Run) -> Verdict:
     # second round (ww1 20261119-111305) took 3 coins on H and 7 on D, and S handled no claim; the row had said
     # "no coin was taken" (the player field is a hex hero, which the old pattern refused).
     order = sorted(run.clients, key=lambda w: (w != "H", w))
-    takes = {who: {m.group(1): line for line, m in run.clients[who].find(COIN_TAKEN)} for who in order}
+    granted = coin_grants(run.server)
+    takes = {who: {coin_episode(m.group(1), line, granted): line for line, m in run.clients[who].find(COIN_TAKEN)}
+             for who in order}
     paid = [(who, l) for who, log in run.clients.items() for l, _m in log.find(COIN_PAID)]
     handled = run.server.find(COIN_HANDLED)
     n_taken = sum(len(v) for v in takes.values())
@@ -1979,6 +2003,13 @@ ARRIVAL_LINE = re.compile(r"Online: arrival: (?!armed)(.*)")
 BODY_SPAWNED_GEN = re.compile(r"Online: puppet (\d+) spawned (\S+) at .*\((?:epoch \d+ )?gen (\d+)")
 WHERE_LINE = re.compile(r"(?:Where:|Online: where) (\S+) at (-?[\d.]+)[ ,](-?[\d.]+)[ ,](-?[\d.]+)")
 ERROR_LINE = re.compile(r"\] \[error\] ")
+# Known [error] lines that never fail a level (each with whose fix it waits for): the lead names them.
+#   the bombers have no body to place (ECI_BomberA / ECI_BomberB in tutorial_a, batch 18d; the movers' fix is coming)
+KNOWN_ERRORS = [re.compile(r"Online: world piece \S+ body not at its place after \d+ tries \(no body\)")]
+
+
+def known_error(raw: str) -> bool:
+    return any(k.search(raw) for k in KNOWN_ERRORS)
 LEVEL_PRESENT_S = 60.0
 LEVEL_ERROR_S = 30.0
 LEVEL_STAND_DZ = 10.0
@@ -2060,7 +2091,7 @@ def grade_level_changes(run: Run) -> Verdict:
                 stop = min(stop, nxt.t)
             out = []
             for i, raw in enumerate(log.lines):
-                if ERROR_LINE.search(raw):
+                if ERROR_LINE.search(raw) and not known_error(raw):
                     e = log.line(i)
                     if e.t is not None and since.t <= e.t <= stop:
                         out.append(e)
@@ -2186,8 +2217,8 @@ def grade_scenes_once(run: Run) -> Verdict:
 # Not tested with one client, or when no coin was taken; a K taken on two games, paid twice or not at all, paid a
 # different amount, not removed, or granted other than once fails, naming the coin and its lines.
 COIN_GOLD = re.compile(r"gold (\d+) -> (\d+), ([+-]\d+)")
-COIN_REMOVED_PAID = re.compile(r"Online: coin removed here (\S+) \(taken by another player and paid here")
-COIN_GRANTED = re.compile(r"Online: coin claim (\S+) peer (\d+) granted")
+COIN_REMOVED_PAID = re.compile(r"Online: coin removed here " + COIN_KEY + r" \(taken by another player and paid here")
+COIN_GRANTED = re.compile(r"Online: coin claim " + COIN_KEY + r" peer (\d+) granted")
 
 
 def coin_amount(line: Line) -> int | None:
@@ -2207,16 +2238,17 @@ def grade_coins_shared(run: Run) -> Verdict:
     takes: dict[str, list[tuple[str, Line]]] = {}
     pays: dict[str, list[tuple[str, Line]]] = {}
     removed: dict[str, set[str]] = {w: set() for w in order}
+    granted = coin_grants(run.server)
     for w in order:
         log = run.clients[w]
         for line, m in log.find(COIN_TAKEN):
-            takes.setdefault(m.group(1), []).append((w, line))
+            takes.setdefault(coin_episode(m.group(1), line, granted), []).append((w, line))
         for line, m in log.find(COIN_PAID):
-            pays.setdefault(m.group(1), []).append((w, line))
-        removed[w] = {m.group(1) for _l, m in log.find(COIN_REMOVED_PAID)}
+            pays.setdefault(coin_episode(m.group(1), line, granted), []).append((w, line))
+        removed[w] = {coin_episode(m.group(1), l, granted) for l, m in log.find(COIN_REMOVED_PAID)}
     grants: dict[str, list[tuple[int, Line]]] = {}
     for line, m in run.server.find(COIN_GRANTED):
-        grants.setdefault(m.group(1), []).append((int(m.group(2)), line))
+        grants.setdefault(coin_episode(m.group(1), line, granted), []).append((int(m.group(2)), line))
     if not takes:
         return Verdict(name, NOT_TESTED, f"no coin was taken on any client (S granted {len(grants)} claim(s))")
     peer_of = {w: p for p, w in peer_numbers(run).items()}
@@ -4052,6 +4084,31 @@ def grade_completable(run: Run, data: LevelData | None = None) -> Verdict:
 # --- the page ------------------------------------------------------------------------------------------
 
 
+# The owner's definition of working (2026-11-18): two players complete the level with enemies shared, attacking,
+# hurting and killable, and coins shared. A level check that could not exercise one of these rows in a level that has
+# enemies (or coins) did not check the level: its result is INCOMPLETE (never PASS, and not FAIL either: a FAIL row
+# beside it is named), with the rows and why. Batch 18d's tutorial_a check: the heroes invulnerable and no player
+# fought, and its page read like a checked level.
+CENTRAL_ENEMY_ROWS = ("enemies can be killed", "enemies hurt players")
+CENTRAL_COIN_ROWS = ("coins shared",)
+CENTRAL = "the owner's central points"
+COIN_ANY = re.compile(r"Online: coin (?:claim|taken here|paid here|removed here)|Online: coins: ")
+
+
+def central_verdict(run: Run, rows: list[Verdict]) -> Verdict | None:
+    """INCOMPLETE when a central row is NOT TESTED in a level that has what it needs: enemies (S placed or spawned
+    one) for the enemy rows, coins (a coin line on any game) for the coins row; None otherwise."""
+    games = ([run.server] if run.server is not None else []) + list(run.clients.values())
+    enemies = run.server is not None and bool(run.server.find(ENEMY_NAMED))
+    coins = any(lg.find(COIN_ANY) for lg in games)
+    missing = [v for v in rows if v.status == NOT_TESTED and (
+        (v.name in CENTRAL_ENEMY_ROWS and enemies) or (v.name in CENTRAL_COIN_ROWS and coins))]
+    if not missing:
+        return None
+    return Verdict(CENTRAL, INCOMPLETE, "not exercised in a level that has them: " + "; ".join(
+        f"{v.name} ({v.counts[:160]})" for v in missing))
+
+
 def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> list[Verdict]:
     """Every row of the page; `levelpass` (the [levelpass] folder) gives the level's own data: its required
     gates (completable) and its held enemies (a fight that lands nothing)."""
@@ -4090,6 +4147,9 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
             v.notes.insert(0, f"not tested partly for time: the sweep's deadline skipped {len(mine)} step(s) that "
                               f"test it: " + ", ".join(f"{label} {kind} {name}" for label, kind, name, _l in mine[:6])
                            + f" ({mine[0][3].cite()})")
+    central = central_verdict(run, rows)
+    if central is not None:
+        rows.insert(0, central)
     return rows
 
 
@@ -4347,6 +4407,11 @@ def overall(verdicts: list[Verdict]) -> str:
     teleport = [v.name for v in verdicts if v.status == BY_TELEPORT]
     tail = (f"; NOT TESTED: {', '.join(untested)}" if untested else "") + \
         (f"; BY TELEPORT: {', '.join(teleport)}" if teleport else "")
+    central = next((v for v in verdicts if v.name == CENTRAL and v.status == INCOMPLETE), None)
+    if central is not None:
+        # Not a checked level: INCOMPLETE first, whatever else failed.
+        failed = [v.name for v in verdicts if v.status == FAIL]
+        return (f"INCOMPLETE: {central.counts}" + (f"; FAIL: {', '.join(failed)}" if failed else "") + tail)
     if any(v.status == FAIL for v in verdicts):
         return "FAIL: " + ", ".join(v.name for v in verdicts if v.status == FAIL) + \
             ("; INCOMPLETE" if any(v.status == INCOMPLETE for v in verdicts) else "") + tail
