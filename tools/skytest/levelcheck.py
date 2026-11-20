@@ -891,6 +891,85 @@ def grade_coins(run: Run) -> Verdict:
     return Verdict("coins", FAIL if findings else PASS, counts, first.cite(), findings)
 
 
+# --- elemental gates and Swap Zones by play (W38) -------------------------------------------------------------
+#
+# The owner's third session: "elemental gates dont work", "swap force gates dont work". The level's own elemental
+# gates (a Scripts.LockedObjectComponent whose LockDatas is ElementalLockSingleElementData or ...DualElementData:
+# tutorial_b 3, ww1 3, tutorial_a none) and Swap Zone pads (a TurboZone component: tutorial_b 3, ww1 2) are their
+# own kind here. An elemental gate opens in the game's script (common.cs Scripts.ElementalLock) when a hero whose
+# primary or secondary element is the lock's (each side's, for a dual gate) is within its UnlockRadius (300 in these
+# levels) and an actor touches that sphere: no button. Per gate: opened on S and every client (the gate lines
+# gate_open_ids reads), on some only (FAIL), or NOT TESTED by name (no step walks a figure of its element up to it
+# yet). Swap Zones: a refusal (`swap zone <Name#id> refused: <why>`) FAILs with its reason; a zone that ran
+# (`swap zone lease <n> running here`, S's `swap zone <n> won|failed`) is counted; none: NOT TESTED by name.
+SWAP_REFUSED = re.compile(r"Online: swap zone (\S+) refused: (.*)")
+ELEMENTAL_UNLOCK_R = 300.0  # the UnlockRadius of every elemental gate of tutorial_b and ww1 (their LockDatas)
+SWAP_RAN = re.compile(r"Online: swap zone lease \d+ running here")
+SWAP_ENDED_S = re.compile(r"Online: swap zone (\d+) (won|failed)\b")
+
+
+def grade_gate_kinds(run: Run, data: "LevelData | None") -> Verdict:
+    name = "elemental gates and Swap Zones"
+    if data is None:
+        return Verdict(name, NOT_TESTED, "no level data for this run's level")
+    games = [("S", run.server)] if run.server is not None else []
+    games += sorted(run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    elemental = [g for g in data.gates if getattr(g, "lock", "")]
+    counts: list[str] = []
+    findings: list[Finding] = []
+    untested: list[str] = []
+    tested = opened_n = 0
+    if elemental:
+        opened = {w: gate_open_ids(lg, elemental[0].name, run=run) for w, lg in games}
+        n_open = {w: len(ids) for w, ids in opened.items()}
+        poses = peer_poses(run.server) if run.server is not None else {}
+        for i, g in enumerate(elemental):
+            where = [w for w in n_open if n_open[w] > i]
+            label = f"{g.name} {g.unit} ({g.lock} element)"
+            near = []
+            if g.pos is not None:
+                for peer, ps in sorted(poses.items()):
+                    hit = next(((tt, line) for tt, pos, line in ps if math.dist(pos, g.pos) <= ELEMENTAL_UNLOCK_R), None)
+                    if hit is not None:
+                        near.append((peer, hit))
+            if where:
+                opened_n += 1
+            if not where and near:
+                findings.append(Finding(
+                    f"{label}: " + ", ".join(f"peer {p}'s hero stood within {ELEMENTAL_UNLOCK_R:.0f} of it at "
+                                             f"{hit[0].strftime('%H:%M:%S')}" for p, hit in near)
+                    + " and it opened on no game (the hero's element and the lock's are not logged)",
+                    [hit[1].cite() for _p, hit in near[:2]]))
+                tested += 1
+            elif not where:
+                untested.append(label)
+            elif len(where) < len(games):
+                findings.append(Finding(f"{label}: opened on {', '.join(where)}, not on "
+                                        + ", ".join(w for w, _l in games if w not in where),
+                                        [opened[w][i].cite() for w in where]))
+                tested += 1
+            else:
+                tested += 1
+        counts.append(f"elemental gates: {len(elemental)} ({sum(g.lock == 'dual' for g in elemental)} dual), "
+                      f"{tested} tried by play, {opened_n} opened")
+    refusals = [(w, l, m) for w, lg in games for l, m in lg.find(SWAP_REFUSED)]
+    ran = sum(len(lg.find(SWAP_RAN)) for _w, lg in games if _w != "S")
+    ended = len(run.server.find(SWAP_ENDED_S)) if run.server is not None else 0
+    if data.swap_zones:
+        counts.append(f"Swap Zone pads: {len(data.swap_zones)}; zones run here {ran}, ended on S {ended}, refused "
+                      f"{len(refusals)}")
+        for w, l, m in refusals[:4]:
+            findings.append(Finding(f"{w}: Swap Zone {m.group(1)} refused: {m.group(2)[:120]}", [l.cite()]))
+        if not ran and not ended:
+            untested += [f"Swap Zone {n} ({u})" for n, u in data.swap_zones]
+    if not counts:
+        return Verdict(name, NOT_TESTED, f"{data.level} has no elemental gate and no Swap Zone pad")
+    if untested:
+        counts.append("NOT TESTED: " + ", ".join(untested))
+    status = FAIL if findings else (PASS if not untested else NOT_TESTED)
+    return Verdict(name, status, "; ".join(counts), "", findings)
+
+
 # --- enemies can be killed (W38) -----------------------------------------------------------------------------
 #
 # The owner's third session: "immortal enemies". Per enemy row K (S's key: `a<...>@<g>` placed, `s<...>` spawned):
@@ -2386,6 +2465,7 @@ class LevelData:
     gates: list
     authored: dict = field(default_factory=dict)   # authored index -> (name, position): <level>-manifest.txt
     movers: list = field(default_factory=list)     # the level's re-arming mover spawners' names (levelpass_pieces)
+    swap_zones: list = field(default_factory=list)  # W38: (name, unit) of each Swap Zone pad (a TurboZone component)
 
 
 def run_level(run: Run) -> str:
@@ -2429,7 +2509,10 @@ def level_data(levelpass: Path | None, level: str) -> LevelData | None:
             authored = {}
     import levelpass_pieces as lpc
     movers = sorted(k.split(".")[-1] for k, period in lpc.mover_spawners(logic, level).items() if period > 0)
-    return LevelData(level, lh.holds_of(logic, disabled), lh.required_gates(manifest, logic, level), authored, movers)
+    zones = [(str(e.get("name") or ""), str(e.get("unit") or "")) for e in manifest.get("entities", []) or []
+             if isinstance(e, dict) and any("TurboZone" in str(k) for k in (e.get("components") or []))]
+    return LevelData(level, lh.holds_of(logic, disabled), lh.required_gates(manifest, logic, level), authored, movers,
+                     zones)
 
 
 # --- held enemies in a run (levelpass_holds: what the generator reads) -------------------------------------
@@ -3039,6 +3122,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     rows = [grade_server_alive(run), grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run),
             grade_coins_shared(run), grade_scenes_once(run), grade_level_changes(run), grade_enemy_kills(run),
+            grade_gate_kinds(run, data),
             grade_loot(run),
             grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
             grade_fight_gates(run, data)]

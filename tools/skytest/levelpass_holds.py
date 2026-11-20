@@ -180,6 +180,7 @@ class Gate:
     pos: tuple[float, float, float] | None = None
     openers: list[str] = field(default_factory=list)   # the node keys whose telegrams open it (not itself)
     key_data: str = ""                                 # a key gate's KeyData
+    lock: str = ""                                     # W38: an elemental gate's "single" or "dual" element lock
 
 
 FIGHT_GROUPS = ("enemy", "encounter")
@@ -233,7 +234,8 @@ def required_gates(manifest: dict, logic: dict | None, level: str) -> list[Gate]
         elif "Scripts.MicrogameComponentData" in comps or e.get("group") == "chest":
             out.append(Gate(name, unit, "a chest", False, "", pos))
         elif "ElementalLock" in lock:
-            out.append(Gate(name, unit, "an elemental gate (needs a Skylander of its element)", False, "", pos))
+            out.append(Gate(name, unit, "an elemental gate (needs a Skylander of its element)", False, "", pos,
+                            lock="dual" if "DualElement" in lock else "single"))
         elif unit in elemental_units:
             out.append(Gate(name, unit, f"behind an elemental gate (its unit {unit})", False, "", pos))
         elif "StartsOpen: true" in lock:

@@ -780,6 +780,34 @@ class Together(unittest.TestCase):
         self.assertIn("D stayed where it entered", v.counts)
 
 
+class GateKinds(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+    LP = Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass")
+
+    @unittest.skipUnless(LP.is_dir(), "the level data is not here")
+    def test_tutorial_b_has_three_elemental_gates_and_three_swap_zones(self) -> None:
+        d = lc.level_data(self.LP, "tutorial_b")
+        self.assertEqual(sorted((g.unit, g.lock) for g in d.gates if g.lock), [
+            ("tutorial_b_zone_elemental_01", "dual"), ("tutorial_b_zone_elemental_02", "single"),
+            ("tutorial_b_zone_elemental_03", "single")])
+        self.assertEqual(sorted(u for _n, u in d.swap_zones), ["tb_climber", "tb_digger", "tb_flyer"])
+        self.assertEqual(len([g for g in lc.level_data(self.LP, "ww1").gates if g.lock]), 3)
+        v = lc.grade_gate_kinds(lc.load_run(RunFolder([], H_JOIN, D_JOIN).path), d)
+        self.assertEqual(v.status, lc.NOT_TESTED)
+        self.assertIn("NOT TESTED: LockedElementalGate tutorial_b_zone_elemental_01 (dual element)", v.counts)
+
+    @unittest.skipUnless(OWNER_3.is_dir() and LP.is_dir(), "the owner's third session or the level data is not here")
+    def test_the_owners_third_session(self) -> None:
+        # "elemental gates dont work": H stood at the dual gate (00:05:41) and at the Life gate (00:06:00), neither
+        # opened; "swap force gates dont work": H's press of the Rocket Swap Zone was refused (online_swap_zones off).
+        r = lc.load_run(self.OWNER_3)
+        v = lc.grade_gate_kinds(r, lc.level_data(self.LP, lc.run_level(r)))
+        self.assertEqual([f.what.split(":")[0] for f in v.findings], [
+            "LockedElementalGate tutorial_b_zone_elemental_01 (dual element)",
+            "LockedElementalGate tutorial_b_zone_elemental_02 (single element)", "H"])
+        self.assertIn("Swap Zones are not available in online play yet", v.findings[2].what)
+
+
 class EnemyKills(unittest.TestCase):
     OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
     OWNER_2 = Path(r"D:/SwapForceOnline-data/play/20261119-211901")
