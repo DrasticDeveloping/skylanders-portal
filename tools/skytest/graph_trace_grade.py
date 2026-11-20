@@ -7,8 +7,9 @@ The game logs, with dev_enemy_graph_trace on (src/online/backend/graph_trace.h):
     a client: Online: graph trace copy <row> tick <t> states ...
     the server: Online: graph trace enemy <row> tick <t> states ...
 
-The grade takes the client's rows from `row_from` (a pattern with one group: the row id, e.g. the client's
-`enemy spawn <row> as ECI_Manager_actor_N#<addr> (live)`), the window from the client's lines matching
+The grade takes ONE row: the first `row_from` line (a pattern with one group: the row id, e.g. the client's
+`enemy spawn <row> as ECI_Manager_actor_N#<addr> (live)`) after the first `rows_after` line (the spec's start line,
+so the row the spec's expect_order matched), the window from the client's lines matching
 `window_from` and `window_to` (by each line's own timestamp; the server's lines are filtered by the same times, one
 machine's clock), and counts per row the samples inside the window with a tick above 0. It passes when at least one
 row has `min_samples` (2) samples on both sides and the two sides' tick ranges overlap. No row, no window, or no such
@@ -24,7 +25,7 @@ from datetime import datetime
 STAMP_RE = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?:\.\d+)?)\]")
 COPY_RE = re.compile(r"Online: graph trace copy (\S+) tick (\d+) ")
 ENEMY_RE = re.compile(r"Online: graph trace enemy (\S+) tick (\d+) ")
-SPEC_KEYS = {"row_from", "window_from", "window_to", "client", "server", "min_samples"}
+SPEC_KEYS = {"row_from", "rows_after", "window_from", "window_to", "client", "server", "min_samples"}
 
 
 def _stamp(line: str) -> datetime | None:
@@ -38,13 +39,14 @@ def _stamp(line: str) -> datetime | None:
 
 
 def check_spec(g: object, names: list[str]) -> str:
-    """The grade's options; returns why they are wrong, or "". `row_from` (a pattern with one group), `window_from`
-    and `window_to` (patterns) are required; `client` (H) and `server` (S) name peers; `min_samples` (2) >= 1."""
+    """The grade's options; returns why they are wrong, or "". `row_from` (a pattern with one group), `rows_after`,
+    `window_from` and `window_to` (patterns) are required; `client` (H) and `server` (S) name peers; `min_samples`
+    (2) >= 1."""
     if not isinstance(g, dict):
         return "must be a table"
     if unknown := set(g) - SPEC_KEYS:
         return f"unknown keys {sorted(unknown)} ({', '.join(sorted(SPEC_KEYS))})"
-    for key in ("row_from", "window_from", "window_to"):
+    for key in ("row_from", "rows_after", "window_from", "window_to"):
         if not isinstance(g.get(key), str) or not g[key]:
             return f"`{key}` (a pattern) is required"
         try:
@@ -90,13 +92,29 @@ def _samples(text: str, rx: re.Pattern, rows: set[str], window: tuple[datetime, 
     return out
 
 
-def grade(client_text: str, server_text: str, row_from: str, window_from: str, window_to: str,
+def _first_row_after(text: str, row_from: str, rows_after: str) -> str | None:
+    """The row of the first `row_from` line after the first `rows_after` line (the spawn line a spec's expect_order
+    matches after its own start line), or None."""
+    after = False
+    for line in text.splitlines():
+        if not after:
+            after = re.search(rows_after, line) is not None
+            continue
+        m = re.search(row_from, line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def grade(client_text: str, server_text: str, row_from: str, rows_after: str, window_from: str, window_to: str,
           min_samples: int = 2) -> tuple[dict, str, str]:
-    """Returns (record, not_reached, failure)."""
-    rows = {m.group(1) for m in re.finditer(row_from, client_text)}
-    record: dict = {"rows": len(rows), "tied": []}
+    """Returns (record, not_reached, failure). Review B10 (round 2): the one row graded is the first `row_from` spawn
+    after `rows_after`, never a row from earlier in the log."""
+    row = _first_row_after(client_text, row_from, rows_after)
+    rows = {row} if row else set()
+    record: dict = {"row": row or "", "tied": []}
     if not rows:
-        return record, "no row matched `row_from` on the client", ""
+        return record, "no `row_from` line after `rows_after` on the client", ""
     window = _window(client_text, window_from, window_to)
     if window is None:
         return record, "the client's window (window_from .. window_to) was not found", ""
@@ -112,8 +130,9 @@ def grade(client_text: str, server_text: str, row_from: str, window_from: str, w
     record["client_rows_sampled"] = len(copies)
     record["server_rows_sampled"] = len(enemies)
     if not record["tied"]:
-        return record, (f"no row of `row_from` had {min_samples} samples on both sides with overlapping ticks inside "
-                        f"the window (client rows sampled {len(copies)}, server {len(enemies)})"), ""
+        return record, (f"the row {row} did not have {min_samples} samples on both sides with overlapping ticks "
+                        f"inside the window (client samples {len(copies.get(row, []))}, server "
+                        f"{len(enemies.get(row, []))})"), ""
     return record, "", ""
 
 
@@ -121,7 +140,8 @@ def grade_spec(texts: dict[str, str], g: dict, names: list[str]) -> tuple[dict, 
     """Runs the grade once, on the client's and the server's logs."""
     del names
     record, not_reached, failure = grade(texts.get(g.get("client", "H"), ""), texts.get(g.get("server", "S"), ""),
-                                         g["row_from"], g["window_from"], g["window_to"], g.get("min_samples", 2))
+                                         g["row_from"], g["rows_after"], g["window_from"], g["window_to"],
+                                         g.get("min_samples", 2))
     record["not_reached"] = not_reached
     reasons = []
     if not_reached:
