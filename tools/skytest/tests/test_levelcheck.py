@@ -213,6 +213,32 @@ class FollowRescue(unittest.TestCase):
         self.assertTrue(any(x.startswith("D put back by the game 2 times (`Stuck falling: player put back`; the first "
                                          "D/game.log:") for x in head), head)
 
+
+class Moves(unittest.TestCase):
+    def test_off_is_not_tested(self) -> None:
+        f = RunFolder([], H_JOIN, D_JOIN)
+        self.assertEqual(lc.grade_moves(lc.load_run(f.path)).status, lc.NOT_TESTED)
+
+    def test_attacks_states_and_a_held_block(self) -> None:
+        # W32 (b): H's presses against D's body; one press never taken, an `input expired` during the held block.
+        h = [(50, "Online: moves: capture on (hero 0x8a000000#2055)"),
+             (51, "Online: press 1:1 slot 2 tick 3120 (announced)"),
+             (52, "Online: hero states entered 0x8248A06D,0x11111111 (pose 100)"),
+             (53, "Online: press 1:2 slot 2 tick 3130 (announced)")]
+        d = [(60, "Online: moves: capture on (hero 0x8b000000#2084)"),
+             (61, "Online: puppet 1 attack 1 taken at pose 101 (waited 40 ms)"),
+             (62, "Online: puppet 1 states entered 0x11111111 (pose 104)"),
+             (63, "Online: puppet 1 held 0x0 -> 0x800 (pose 110)"),
+             (64, "Online: puppet 1 input expired (its last command arrived 600 ms ago)"),
+             (65, "Online: puppet 1 held 0x800 -> 0x0 (pose 140)")]
+        f = RunFolder([], H_JOIN + h, D_JOIN + d)
+        v = lc.grade_moves(lc.load_run(f.path))
+        self.assertEqual(v.status, lc.FAIL, v)
+        self.assertIn("D shows H: attacks taken 1 of 2 pressed; states 1 of 1 matching", v.counts)
+        whats = [x.what for x in v.findings]
+        self.assertIn("D: 1 of H's attack presses never taken by its body", whats)
+        self.assertIn("D: 1 `input expired` while H's button was held", whats)
+
 class Windows(unittest.TestCase):
     def test_a_clients_time_in_each_level(self) -> None:
         f = RunFolder([], H_JOIN + LEVEL_END, D_JOIN + LEVEL_END)

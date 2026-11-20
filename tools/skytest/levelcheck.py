@@ -1565,18 +1565,124 @@ def grade_bodies(run: Run) -> Verdict:
                    "; ".join(counts) + f"; stand-ins over {STANDIN_MAX_S:.0f} s: {standins}", example, findings)
 
 
+# --- the other player's moves (online_remote_moves; online/4-other-moves) -----------------------------------
+#
+# W32 (b). With online_remote_moves each client sends its hero's command with its poses (`moves: capture on`) and the
+# other clients feed it to that player's real body: attacks (`puppet <p> attack <seq> taken at pose <s> (waited
+# <ms>[, its pose not reached])` against the sender's presses `press <p>:<seq> slot <k> tick <t> (announced)`),
+# jumps, the special and the block (`puppet <p> input <jump|power|block> at pose <s>`, `puppet <p> held 0x<a> ->
+# 0x<b>`), the walk (the body steers itself; `puppet <p> drift <d> corrected (#<n>, pose <s>)` when it strays), the
+# behaviour states (`puppet <p> states entered 0x..` against the sender's `hero states entered 0x..` near the same
+# pose), shots (`puppet shot made`, their effects dropped: `puppet shot drop <what>`) and the knock-out (`puppet <p>
+# down (ko, pose <s>)`, `back as <character> after <ms>`). Off (no `moves: capture on`): not tested.
+MOVES_ON = re.compile(r"Online: moves: capture on ")
+SENDER_PRESS = re.compile(r"Online: press (\d+):(\d+) slot \d+ tick \d+ \(announced\)")
+BODY_ATTACK = re.compile(r"Online: puppet (\d+) attack (\d+) taken at pose (\d+) \(waited (\d+) ms(, its pose not reached)?")
+HERO_STATES = re.compile(r"Online: hero states entered (0x[0-9A-F,x]+) \(pose (\d+)\)")
+BODY_STATES = re.compile(r"Online: puppet (\d+) states entered (0x[0-9A-F,x]+) \(pose (\d+)\)")
+BODY_DRIFT = re.compile(r"Online: puppet (\d+) drift (\d+) corrected \(#(\d+), pose (\d+)\)")
+BODY_HELD = re.compile(r"Online: puppet (\d+) held 0x([0-9A-F]+) -> 0x([0-9A-F]+)")
+BODY_EXPIRED = re.compile(r"Online: puppet (\d+) input expired")
+BODY_INPUT = re.compile(r"Online: puppet (\d+) input (jump|power|block) at pose (\d+)")
+SHOT_MADE = re.compile(r"Online: puppet shot made ")
+SHOT_DROP = re.compile(r"Online: puppet shot drop (\S+)")
+BODY_DOWN = re.compile(r"Online: puppet (\d+) down \(ko, pose (\d+)\)(?!:)")
+BODY_BACK = re.compile(r"Online: puppet (\d+) back as (\S+) after (\d+) ms")
+MOVES_STATE_POSES = 20      # a body's state set matches the sender's within this many poses (1 s at 20 Hz)
+MOVES_DRIFT_PER_S = 1.0     # walking: under one correction a second (in any 10 s)
+
+
+def grade_moves(run: Run) -> Verdict:
+    """Each client's view of the other player's moves against what that player sent."""
+    if not any(log.find(MOVES_ON) for log in run.clients.values()):
+        return Verdict("other player's moves", NOT_TESTED, "online_remote_moves off: no client sent its moves (no "
+                       "`moves: capture on`); the other player's body only slides to its poses")
+    peers = peer_numbers(run)
+    counts: list[str] = []
+    findings: list[Finding] = []
+    example = ""
+    for who, log in sorted(run.clients.items()):
+        for peer, sender in sorted(peers.items()):
+            if sender == who or sender not in run.clients:
+                continue
+            slog = run.clients[sender]
+            pressed = {int(m.group(2)): line for line, m in slog.find(SENDER_PRESS) if int(m.group(1)) == peer}
+            taken = {int(m.group(2)): (line, m) for line, m in log.find(BODY_ATTACK) if int(m.group(1)) == peer}
+            not_reached = [line for line, m in taken.values() if m.group(5)]
+            missing = sorted(set(pressed) - set(taken))
+            sent = [(int(m.group(2)), set(m.group(1).split(","))) for _l, m in slog.find(HERO_STATES)]
+            shown = [(line, int(m.group(3)), set(m.group(2).split(","))) for line, m in log.find(BODY_STATES)
+                     if int(m.group(1)) == peer]
+            matched = sum(1 for _l, pose, hs in shown
+                          if any(abs(pose - sp) <= MOVES_STATE_POSES and hs & shs for sp, shs in sent))
+            drifts = [line for line, m in log.find(BODY_DRIFT) if int(m.group(1)) == peer]
+            worst = 0
+            for i, line in enumerate(drifts):
+                if line.t is None:
+                    continue
+                n = sum(1 for other in drifts[i:] if other.t is not None and (other.t - line.t).total_seconds() < 10)
+                worst = max(worst, n)
+            inputs = [m.group(2) for _l, m in log.find(BODY_INPUT) if int(m.group(1)) == peer]
+            # an `input expired` while a held button (non-zero held bits) was fed
+            held_now, expired_held = False, []
+            for i, raw in enumerate(log.lines):
+                m = BODY_HELD.search(raw)
+                if m and int(m.group(1)) == peer:
+                    held_now = m.group(3) != "0"
+                    continue
+                m = BODY_EXPIRED.search(raw)
+                if m and int(m.group(1)) == peer and held_now:
+                    expired_held.append(log.line(i))
+            downs = [line for line, m in log.find(BODY_DOWN) if int(m.group(1)) == peer]
+            backs = [(line, m) for line, m in log.find(BODY_BACK) if int(m.group(1)) == peer]
+            shots = log.find(SHOT_MADE)
+            drops: dict[str, int] = {}
+            for _l, m in log.find(SHOT_DROP):
+                drops[m.group(1)] = drops.get(m.group(1), 0) + 1
+            counts.append(
+                f"{who} shows {sender}: attacks taken {len(taken)} of {len(pressed)} pressed"
+                + (f" ({len(not_reached)} before their pose)" if not_reached else "")
+                + f"; states {matched} of {len(shown)} matching {sender}'s within {MOVES_STATE_POSES} poses"
+                + f"; inputs {', '.join(f'{k} {inputs.count(k)}' for k in ('jump', 'power', 'block') if k in inputs) or '0'}"
+                + f"; drift corrections {len(drifts)} (at most {worst} in 10 s)"
+                + f"; shots made {len(shots)}, drops {', '.join(f'{k} {n}' for k, n in sorted(drops.items())) or '0'}"
+                + (f"; knock-outs {len(downs)}, back {len(backs)}" if downs or backs else ""))
+            if not example and (taken or shown):
+                example = (next(iter(taken.values()))[0] if taken else shown[0][0]).cite()
+            if missing:
+                findings.append(Finding(f"{who}: {len(missing)} of {sender}'s attack presses never taken by its body",
+                                        [pressed[s].cite() for s in missing[:4]] +
+                                        [absent(log, f"`puppet {peer} attack {missing[0]} taken`")]))
+            if shown and sent and not matched:
+                findings.append(Finding(f"{who}: none of {sender}'s body's {len(shown)} state sets matches a state "
+                                        f"{sender} entered within {MOVES_STATE_POSES} poses",
+                                        [shown[0][0].cite()]))
+            if worst > MOVES_DRIFT_PER_S * 10:
+                findings.append(Finding(f"{who}: {sender}'s body corrected {worst} times in 10 s (over one a second)",
+                                        [drifts[0].cite()]))
+            if expired_held:
+                findings.append(Finding(f"{who}: {len(expired_held)} `input expired` while {sender}'s button was held",
+                                        [x.cite() for x in expired_held[:4]]))
+            if downs and len(backs) < len(downs):
+                findings.append(Finding(f"{who}: {sender}'s body went down {len(downs)} time(s), back {len(backs)}",
+                                        [downs[-1].cite(), absent(log, f"`puppet {peer} back as` after it")]))
+    if not counts:
+        return Verdict("other player's moves", NOT_TESTED, "no two clients with peer numbers to compare")
+    return Verdict("other player's moves", FAIL if findings else PASS, "; ".join(counts), example, findings)
+
+
 # --- what no grader covers yet -------------------------------------------------------------------------------
 #
 # Said at the bottom of every page so the gaps are seen without asking. From the placeholder audit's CLASS 1
 # (logs/placeholder-audit.txt, two players in tutorial_a, tutorial_b and ww1 with the session's defaults) and the
 # owner's own list; a line goes when a grader covers it.
 NOT_COVERED = (
-    "the other player's animations, attacks, specials, projectiles, sounds and effects (only its body is read)",
+    "the other player's sounds and effects (the moves row reads its commands, states and shots, not what plays)",
     "which skylander's attack lands on the server (it replays the presses on its own hero: reach and damage may "
     "differ), player hits and damage numbers as the other player sees them",
     "the HUD and party panel: portraits (a number today), health bars, names, level, hat, lives",
     "food and the wallet beyond the coins' gold lines",
-    "the other player's knock-out, death and revive, jumps and falls as seen on the screen",
+    "the other player's revive (a resurrection) and its falls as seen on the screen",
     "enemy movement, animation and attack timing, enemies aiming at the partner, enemy missiles, freezes and "
     "other victim states",
     "the save: whether the session's progress reaches the host's real slot",
@@ -2090,7 +2196,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     together = grade_together(run)
     rows = [grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run),
-            grade_objectives(run), grade_pieces(run, data)]
+            grade_objectives(run), grade_pieces(run, data), grade_moves(run)]
     # The enemies and the loot are read where both players stand only when D followed H: each says which.
     followed = bool(run.clients.get("D") and run.clients["D"].find(FOLLOW_ON))
     if together.status in (PASS, FAIL):
