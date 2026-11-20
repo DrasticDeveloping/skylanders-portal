@@ -186,7 +186,7 @@ GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_t
 LEVEL_CHECK_ROWS = ("enemies hurt players", "other player's moves", "fight gates", "coins shared",
                     "cutscenes once", "level changes", "enemies can be killed", "elemental gates and Swap Zones",
                     "dialogs skipped", "enemy states and damage from S", "world events",
-                    "level events in step", "reward gold and food")
+                    "level events in step", "reward gold and food", "the server's world advances")
 
 
 def server_stall_reasons(folder: Path) -> list[str]:
@@ -220,7 +220,8 @@ def server_notes(folder: Path) -> list[str]:
     return [line] if line else []
 
 
-def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None) -> list[str]:
+def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None,
+                        run_repo: Path | None = None) -> list[str]:
     """The reasons the named level check rows give against this run folder (empty: every row passed); `levelpass`:
     the level's data for the rows that need it (fight gates)."""
     import levelcheck as lc
@@ -233,7 +234,8 @@ def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None) ->
                "elemental gates and Swap Zones": lambda r: lc.grade_gate_kinds(r, data),
                "dialogs skipped": lc.grade_dialog_skip, "enemy states and damage from S": lc.grade_enemy_server_damage,
                "world events": lambda r: lc.grade_world_events(r, data), "level events in step": lc.grade_level_events,
-               "reward gold and food": lc.grade_rewards_food}
+               "reward gold and food": lc.grade_rewards_food,
+               "the server's world advances": lambda r: lc.grade_server_world(r, run_repo)}
     out = []
     for name in g.get("rows", []):
         v = graders[name](run)
@@ -8447,7 +8449,7 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             # W34: the spec's level check rows ([grade.level_check]) on the finished run.
             if "level_check" in spec.grades and r.folder and Path(r.folder).is_dir():
                 for why in level_check_reasons(Path(r.folder), spec.grades["level_check"],
-                                               levelpass_folder(cfg, None)):
+                                               levelpass_folder(cfg, None), cfg.repo):
                     r.reasons.append(why)
                     if r.status == "pass":
                         r.status = "fail"

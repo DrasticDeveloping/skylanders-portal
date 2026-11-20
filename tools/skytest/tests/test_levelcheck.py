@@ -920,6 +920,11 @@ class AuthorsFinalLines(unittest.TestCase):
                            "fullyPowered/fullyPowered: no unlock")]
         v = lc.grade_gate_kinds(lc.load_run(RunFolder([], h, D_JOIN).path), lc.level_data(self.LP, "tutorial_b"))
         self.assertIn("gate elements read: LockedElementalGate single Life", v.counts)
+        h2 = H_JOIN + [(40, "Online: door CaveDoor#1201: this game's hero goes through with peer 2 (220 from it): its "
+                            "entry replayed here, at once (2/2/enter/9/w1)"),
+                       (50, "Online: door CaveDoor#1201: this game's hero stays for peer 2's entry (2400 from it) (x)")]
+        v2 = lc.grade_gate_kinds(lc.load_run(RunFolder([], h2, D_JOIN).path), lc.level_data(self.LP, "tutorial_b"))
+        self.assertIn("doors: went through with another player 1 (1 at once, 0 queued), stayed 1", v2.counts)
         self.assertTrue(any("touched by NinjaStealthElf#3800 (elements life/none, the lock wants Life)" in f.what
                             for f in v.findings), [f.what for f in v.findings])
 
@@ -935,9 +940,41 @@ class AuthorsFinalLines(unittest.TestCase):
         d = D_JOIN + [(45, "Online: scene local 2/L2 start conversation conversation recipient Tessa#3999 from x"),
                       (50, "Online: scene local 2/L2 end by natural after 5.0 s (2/2.w1)")]
         v = lc.grade_level_events(lc.load_run(RunFolder(s, h, d).path))
+        # W41: the conversations part only with its own setting (online_scene_lines): said not tested without it.
+        self.assertEqual([f.what.split(":")[0] for f in v.findings], ["1 effect(es) end in another state than S's"])
+        self.assertIn("in step NOT TESTED", v.counts)
+        peers = [{"peer": "H", "command": ["x.exe", "--online_scene_lines=true"]}]
+        v = lc.grade_level_events(lc.load_run(RunFolder(s, h, d, peers=peers).path))
         self.assertEqual([f.what.split(":")[0] for f in v.findings], [
             "1 effect(es) end in another state than S's", "1 conversation end(s) not within 1 s of S's"])
         self.assertIn("D Tessa +30.0 s", v.findings[1].what)
+        # Lines (af0864a4): S's line 1 of turn 0 at tick 1000; H steps there at 1005 (in step), D jumps at 1100.
+        s2 = s + [(16, "Online: conversation Tessa#3811 turn 0 line 1 of 2 at shared tick 1000 (S's line)")]
+        h2 = h + [(16, "Online: conversation Tessa#3811 turn 0 line 0 -> next here at shared tick 1005 (S's line moved)")]
+        d2 = d + [(17, "Online: conversation Tessa#3999 turn 0 line 0 -> next here at shared tick 1100 (behind S, at turn 0 "
+                       "line 1: jumped)")]
+        v = lc.grade_level_events(lc.load_run(RunFolder(s2, h2, d2, peers=peers).path))
+        self.assertIn("1 conversation line(s) not started in step with S's: D Tessa turn 0 line 1: +100 ticks (jumped)",
+                      [f.what for f in v.findings])
+
+    def test_the_servers_world_advances(self) -> None:
+        # online/5-server-silent-notice 2b14fc0d: the clients' watch of S's world.
+        d = D_JOIN + [(60, "Online: the server's world advances again after 9.0 s (shared tick 900)")]
+        f = RunFolder([], H_JOIN, d)
+        text = (f.path / "H" / "game.log").read_text(encoding="utf-8") + \
+            "[2026-11-19 00:00:50.000] [error] [core] [t1] Online: the server's world has not advanced for 8 s (last " \
+            "shared tick 400)\n"
+        (f.path / "H" / "game.log").write_text(text, encoding="utf-8")
+        v = lc.grade_server_world(lc.load_run(f.path), None)
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertTrue(v.findings[0].what.startswith("H: S's world had not advanced for 8 s"), v.findings[0].what)
+        with tempfile.TemporaryDirectory() as repo:
+            self.assertEqual(lc.grade_server_world(lc.load_run(RunFolder([], H_JOIN, D_JOIN).path), Path(repo)).status,
+                             lc.NOT_TESTED)
+            (Path(repo) / lc.SERVER_WATCH_SOURCE).parent.mkdir(parents=True)
+            (Path(repo) / lc.SERVER_WATCH_SOURCE).write_text("//", encoding="utf-8")
+            self.assertEqual(lc.grade_server_world(lc.load_run(RunFolder([], H_JOIN, D_JOIN).path), Path(repo)).status,
+                             lc.PASS)
 
 
 class WorldEvents(unittest.TestCase):

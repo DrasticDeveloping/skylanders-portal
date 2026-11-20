@@ -1139,6 +1139,35 @@ def grade_rewards_food(run: Run) -> Verdict:
     return Verdict(name, FAIL if findings else PASS, "; ".join(counts), "", findings)
 
 
+# --- the server's world advances (W41) ---------------------------------------------------------------------------
+#
+# A client's own watch of S's world (online/5-server-silent-notice 2b14fc0d, client/server_silence.cpp): `[error]
+# Online: the server's world has not advanced for <n> s (last shared tick <t>)` when S's shared tick stood still while
+# this client expected it to move (its level loaded and its barrier released, no join held, S on its level), and
+# `the server's world advances again after <s> s` when it moved again. Any such [error] on any client fails. The watch
+# exists when the source tree the grade runs from has it (src/online/client/server_silence.cpp): without it, a run
+# with no such line is NOT TESTED, not passed.
+SERVER_NOT_ADVANCED = re.compile(r"\[error\] .*Online: the server's world has not advanced for ([\d.]+) s")
+SERVER_ADVANCES_AGAIN = re.compile(r"Online: the server's world advances again after ([\d.]+) s")
+SERVER_WATCH_SOURCE = Path("src") / "online" / "client" / "server_silence.cpp"
+
+
+def grade_server_world(run: Run, repo: Path | None = None) -> Verdict:
+    name = "the server's world advances"
+    stops = [(w, l, m) for w, lg in sorted(run.clients.items()) for l, m in lg.find(SERVER_NOT_ADVANCED)]
+    again = sum(len(lg.find(SERVER_ADVANCES_AGAIN)) for lg in run.clients.values())
+    if stops:
+        return Verdict(name, FAIL, f"{len(stops)} stop(s) of S's world seen by a client, {again} advance(s) again",
+                       stops[0][1].cite(), [Finding(
+                           f"{w}: S's world had not advanced for {m.group(1)} s at {when(l)}", [l.cite()])
+                           for w, l, m in stops[:6]])
+    built = repo is not None and (Path(repo) / SERVER_WATCH_SOURCE).is_file()
+    if not built:
+        return Verdict(name, NOT_TESTED, "the clients' watch of S's world is not in this source tree "
+                       "(online/5-server-silent-notice not merged): no stop line is no proof")
+    return Verdict(name, PASS, f"no client saw S's world stand still ({len(run.clients)} client(s) watched)")
+
+
 # --- level events in step (W39 item 8) ---------------------------------------------------------------------------
 #
 # The owner's third session ("tutorial_a is like completely chopped", in his words: "map visuals didnt line up with the
@@ -1168,6 +1197,18 @@ EFFECT_S = re.compile(r"Online: level effect (\S+?)(?:#\d+)? component (\d+) (on
 EFFECT_C = re.compile(r"Online: level effect (\S+?)(?:#\d+)? component (\d+) (on|off) here \(S's at shared tick")
 CONV_ENDED_S = re.compile(r"Online: conversation (\S+?)(?:#\d+)? ended on S at shared tick")
 CONV_END_S = 1.0
+# W41: the scenes author puts the conversation-lines sync (his item 9) behind its own setting, off by default:
+# online_scene_lines (online/6-owner-session3-scenes af0864a4; forwarded from Host to S like online_scene_hold and
+# needing it on). The conversations-in-step part is checked only in a run that passes it (a peer's command holds
+# `--online_scene_lines=true`), else said "not tested": each S line `conversation <Name#id> turn <t> line <l> of <n> at
+# shared tick <k> (S's line)` (l >= 1) wants on every client `conversation <Name#id> turn <t> line <l-1> -> next here at
+# shared tick <k'> (<why>)` with |k' - k| <= CONV_LINE_TICKS (300 ms), never `(behind S, at <pos>: jumped)`; and each
+# conversation S ends ends on every client within CONV_END_S. A turn's line 0 is the turn's start (no client line to
+# pair): not checked.
+CONV_SYNC_SETTING: str | None = "online_scene_lines"
+CONV_LINE_TICKS = 18
+CONV_LINE_S = re.compile(r"Online: conversation (\S+?)(?:#\d+)? turn (\d+) line (\d+) of \d+ at shared tick (\d+) \(S's line\)")
+CONV_LINE_C = re.compile(r"Online: conversation (\S+?)(?:#\d+)? turn (\d+) line (\d+) -> next here at shared tick (\d+) \((.*)\)")
 
 
 def grade_level_events(run: Run) -> Verdict:
@@ -1250,7 +1291,13 @@ def level_states_findings(run: Run, games: list) -> "tuple[list[str], list[Findi
             findings.append(Finding(f"{len(differ)} {what}(es) end in another state than S's: " + ", ".join(
                 f"{w} {k[0]} #{k[1]} {g[1]} (S {s})" for w, k, s, g in differ[:4]),
                 [f"{w}: {g[0].cite()}" for w, _k, _s, g in differ[:3]]))
-    if s_conv:
+    conv_on = CONV_SYNC_SETTING is not None and any(
+        f"--{CONV_SYNC_SETTING}=true" in (p.get("command") or []) for p in run.result.get("peers", []) or []
+        if isinstance(p, dict))
+    if s_conv and not conv_on:
+        counts.append(f"conversations ended on S {len(s_conv)}: in step NOT TESTED (the conversation-lines sync's "
+                      f"setting {CONV_SYNC_SETTING or '(not named yet)'} not passed in this run)")
+    elif s_conv:
         late = []
         for w, lg in clients:
             ends = conversation_ends(lg)
@@ -1261,6 +1308,26 @@ def level_states_findings(run: Run, games: list) -> "tuple[list[str], list[Findi
                     later = [l for n, l in ends if n == nm and l.t and sl.t and l.t > sl.t]
                     late.append((w, nm, sl, later[0] if later else None))
         counts.append(f"conversations ended on S {len(s_conv)}")
+        s_lines = [(l, m) for l, m in run.server.find(CONV_LINE_S) if int(m.group(3)) >= 1]
+        bad_lines = []
+        for w, lg in clients:
+            mine: dict[tuple[str, str, int], list[tuple[Line, int, str]]] = {}
+            for l, m in lg.find(CONV_LINE_C):
+                mine.setdefault((m.group(1), m.group(2), int(m.group(3))), []).append((l, int(m.group(4)), m.group(5)))
+            for sl, m in s_lines:
+                key = (m.group(1), m.group(2), int(m.group(3)) - 1)
+                got = mine.get(key, [])
+                ok = [g for g in got if abs(g[1] - int(m.group(4))) <= CONV_LINE_TICKS and "jumped" not in g[2]]
+                if not ok:
+                    why = (f"{got[0][1] - int(m.group(4)):+d} ticks" + (" (jumped)" if "jumped" in got[0][2] else "")
+                           if got else "no line")
+                    bad_lines.append((w, m.group(1), m.group(2), m.group(3), why, sl))
+        counts.append(f"conversation lines on S {len(s_lines)} (each wanted on every client within "
+                      f"{CONV_LINE_TICKS} shared ticks)")
+        if bad_lines:
+            findings.append(Finding(f"{len(bad_lines)} conversation line(s) not started in step with S's: " + ", ".join(
+                f"{w} {nm} turn {t} line {ln}: {why}" for w, nm, t, ln, why, _sl in bad_lines[:5]),
+                [sl.cite() for *_x, sl in bad_lines[:3]]))
         if late:
             findings.append(Finding(f"{len(late)} conversation end(s) not within {CONV_END_S:.0f} s of S's: " + ", ".join(
                 f"{w} {nm}" + (f" {(x.t - sl.t).total_seconds():+.1f} s" if x is not None and x.t else " never")
@@ -1499,7 +1566,15 @@ ELEMENTAL_UNLOCK_R = 300.0
 # <p>/<s>`. A touch with `no unlock` by a hero of a lock element fails (the game would open it).
 GATE_LOCK = re.compile(r"Online: elemental gate (\S+) (single|dual) lock: element\(s\) (\S+), unlock radius")
 GATE_TOUCH = re.compile(r"Online: elemental gate (\S+) touched by (\S+): sides (\S+)/(\S+): (unlocks|no unlock)")
-HERO_ELEMENTS = re.compile(r"Online: hero (\S+) elements (\S+)/(\S+)")  # the UnlockRadius of every elemental gate of tutorial_b and ww1 (their LockDatas)
+HERO_ELEMENTS = re.compile(r"Online: hero (\S+) elements (\S+)/(\S+)")
+# Doors (the gates author, 380b3362): a follower's game takes its hero through a door another player entered
+# (`door <Name#id>: this game's hero goes through with peer <p> (<d> from it): its entry replayed here, at once|queued`)
+# or keeps it (`door <Name#id>: this game's hero stays for peer <p>'s entry (<d> from it|busy: <why>)` and the other
+# stay reasons). Counted on the page; a partner left behind going through alone afterwards has no line of its own (its
+# own entry is an ordinary request): the specs that use a door check it.
+DOOR_GOES = re.compile(r"Online: door (\S+): this game's hero goes through with peer (\d+) .*its entry replayed here, "
+                       r"(at once|queued)")
+DOOR_STAYS = re.compile(r"Online: door (\S+): this game's hero stays for peer (\d+)'s entry")  # the UnlockRadius of every elemental gate of tutorial_b and ww1 (their LockDatas)
 SWAP_RAN = re.compile(r"Online: swap zone lease \d+ running here")
 SWAP_ENDED_S = re.compile(r"Online: swap zone (\d+) (won|failed)\b")
 SWAP_PARKED = re.compile(r"Online: swap zone (\S+) parked at ")
@@ -1605,6 +1680,12 @@ def grade_gate_kinds(run: Run, data: "LevelData | None") -> Verdict:
                                     [l.cite()]))
         if not ran and not ended:
             untested += [f"Swap Zone {n} ({u})" for n, u in data.swap_zones]
+    goes = [(w, m) for w, lg in games for _l, m in lg.find(DOOR_GOES)]
+    stays = [(w, m) for w, lg in games for _l, m in lg.find(DOOR_STAYS)]
+    if goes or stays:
+        counts.append(f"doors: went through with another player {len(goes)} ("
+                      f"{sum(m.group(3) == 'at once' for _w, m in goes)} at once, "
+                      f"{sum(m.group(3) == 'queued' for _w, m in goes)} queued), stayed {len(stays)}")
     if not counts:
         return Verdict(name, NOT_TESTED, f"{data.level} has no elemental gate and no Swap Zone pad")
     if untested:
@@ -3816,6 +3897,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
             grade_coins_shared(run), grade_scenes_once(run), grade_level_changes(run), grade_enemy_kills(run),
             grade_gate_kinds(run, data), grade_dialog_skip(run), grade_enemy_server_damage(run),
             grade_world_events(run, data), grade_level_events(run), grade_rewards_food(run),
+            grade_server_world(run, repo),
             grade_loot(run),
             grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
             grade_fight_gates(run, data)]

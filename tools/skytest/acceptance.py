@@ -26,10 +26,14 @@ from pathlib import Path
 # the rest. A case with no spec in the tree it runs from (one that arrives with its branch) gets a "no run" row.
 CASES = ["offline-plain", "party-continue", "soul-gem-tb", "enemy-attack-ta", "hits-that-count",
          "moves-figure-mid-tb", "moves-swapper-tb", "moves-block-probe-tb", "moves-shot-tb", "moves-ko-tb",
-         "world-event-cage-tb", "element-gate-tb", "gpu-pipeline-drops", "gpu-pipeline-drops-fixed",
+         "world-event-cage-tb", "element-gate-tb", "door-alone-tb", "door-together-tb", "element-gate-dual-tb",
+         "element-gate-dual-swapper-tb", "scene-lines-tb",
+         "gpu-pipeline-drops", "gpu-pipeline-drops-fixed",
          "gpu-pipeline-drops-sync", "swap-zone-tb", "spark-lock-ww1", "rail-launch-tb", "fight-gate-tb",
          "enemy-damage-tb", "coins-broken-both"]
 LEVELS = ["tutorial_a", "tutorial_b", "ww1"]
+# Cases owed by an author who has not written (or named) their spec yet: their rows say so, never "absent".
+OWED: dict[str, str] = {}
 LEVEL_DEFAULT_S = 900.0      # a level check with no earlier run: the level pass's own bound
 PAGE_LINE = re.compile(r"levelcheck \S+: page (.+)$", re.M)
 
@@ -82,7 +86,7 @@ def estimate(repo: Path, runs: Path, cases: list[str], levels: list[str],
             out.append((c, statistics.median(h), f"median of {len(h)} earlier run(s)"))
         else:
             t = spec_timeout(repo, c)
-            out.append((c, t, "its spec's timeout (no earlier run)" if t else "no spec in this tree"))
+            out.append((c, t, "its spec's timeout (no earlier run)" if t else OWED.get(c, "no spec in this tree")))
     for lv in levels:
         h = hist(f"levelpass-{lv}")
         out.append((f"levelcheck {lv}", statistics.median(h) if h else LEVEL_DEFAULT_S,
@@ -168,6 +172,12 @@ def run(skytest_py: Path, repo: Path, store: Path, levelpass: Path, cases: list[
     work.mkdir(parents=True, exist_ok=True)
     rows: list[Row] = []
     for c in cases:
+        if not (repo / "tests" / "runtime" / f"{c}.toml").is_file():
+            # No spec in this tree: owed (named by OWED) or one that arrives with its branch; no runner is started.
+            rows.append(Row(c, "case", result="OWED" if c in OWED else "no spec",
+                            lines=[OWED.get(c, "no tests/runtime/" + c + ".toml in this tree")]))
+            print(f"acceptance: {c}: {rows[-1].result}", flush=True)
+            continue
         before = {d.name for d in runs.glob(f"*-{c}")}
         cmd = [sys.executable, "-I", str(skytest_py), "test", c, "--jobs", "1"] + (["--run-not-ready"] if run_not_ready
                                                                                   else [])
