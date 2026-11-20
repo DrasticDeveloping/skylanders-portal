@@ -984,10 +984,24 @@ class GateKinds(unittest.TestCase):
         # opened; "swap force gates dont work": H's press of the Rocket Swap Zone was refused (online_swap_zones off).
         r = lc.load_run(self.OWNER_3)
         v = lc.grade_gate_kinds(r, lc.level_data(self.LP, lc.run_level(r)))
+        # W40: the Swap Zone refusal is the off state there (online_swap_zones off in his session): said, not failed.
         self.assertEqual([f.what.split(":")[0] for f in v.findings], [
             "LockedElementalGate tutorial_b_zone_elemental_01 (dual element)",
-            "LockedElementalGate tutorial_b_zone_elemental_02 (single element)", "H"])
-        self.assertIn("Swap Zones are not available in online play yet", v.findings[2].what)
+            "LockedElementalGate tutorial_b_zone_elemental_02 (single element)"])
+        self.assertIn("refused 1 (Swap Zones off in this run", v.counts)
+
+    @unittest.skipUnless(LP.is_dir(), "the level data is not here")
+    def test_a_refusal_with_swap_zones_on_and_a_player_left_parked_fail(self) -> None:
+        d = lc.level_data(self.LP, "tutorial_b")
+        h = H_JOIN + [(50, "Online: swap zone CPhysicalEntity#3331 refused: Swap Zones are not available in online play "
+                           "yet (client, press)")]
+        dd = D_JOIN + [(60, "Online: swap zone #3364 parked at 20120,20963,1679 (OffPlayerLocation; x; presser 1, "
+                            "zone 1)")]
+        v = lc.grade_gate_kinds(lc.load_run(RunFolder([], h, dd).path), d)
+        self.assertEqual([f.what.split(" (")[0].split(":")[0] for f in v.findings[-2:]],
+                         ["D", "H"])
+        self.assertIn("left parked by Swap Zone #3364", v.findings[-2].what)
+        self.assertIn("refused with the feature on", v.findings[-1].what)
 
 
 class EnemyKills(unittest.TestCase):

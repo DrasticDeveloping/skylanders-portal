@@ -1354,12 +1354,19 @@ def grade_dialog_skip(run: Run) -> Verdict:
 # primary or secondary element is the lock's (each side's, for a dual gate) is within its UnlockRadius (300 in these
 # levels) and an actor touches that sphere: no button. Per gate: opened on S and every client (the gate lines
 # gate_open_ids reads), on some only (FAIL), or NOT TESTED by name (no step walks a figure of its element up to it
-# yet). Swap Zones: a refusal (`swap zone <Name#id> refused: <why>`) FAILs with its reason; a zone that ran
-# (`swap zone lease <n> running here`, S's `swap zone <n> won|failed`) is counted; none: NOT TESTED by name.
+# yet). Swap Zones: with the feature on (online_swap_zones in a peer's command, or a zone's lines in the run), a
+# refusal `swap zone <Name#id> refused: Swap Zones are not available in online play yet` FAILs (with it off it is
+# the off state, said); a zone that ran (`swap zone lease <n> running here`, S's `swap zone <n> won|failed`) is
+# counted; none: NOT TESTED by name. While a zone runs the other players are parked (couch co-op's off player, the
+# owner's choice): every `swap zone <label> parked at ...` on a game wants a later `swap zone <label> released (...)`
+# there, else that player was left parked: FAIL.
 SWAP_REFUSED = re.compile(r"Online: swap zone (\S+) refused: (.*)")
 ELEMENTAL_UNLOCK_R = 300.0  # the UnlockRadius of every elemental gate of tutorial_b and ww1 (their LockDatas)
 SWAP_RAN = re.compile(r"Online: swap zone lease \d+ running here")
 SWAP_ENDED_S = re.compile(r"Online: swap zone (\d+) (won|failed)\b")
+SWAP_PARKED = re.compile(r"Online: swap zone (\S+) parked at ")
+SWAP_RELEASED = re.compile(r"Online: swap zone (\S+) released \(")
+SWAP_ON_ARG = "--online_swap_zones=true"
 
 
 def grade_gate_kinds(run: Run, data: "LevelData | None") -> Verdict:
@@ -1406,14 +1413,36 @@ def grade_gate_kinds(run: Run, data: "LevelData | None") -> Verdict:
                 tested += 1
         counts.append(f"elemental gates: {len(elemental)} ({sum(g.lock == 'dual' for g in elemental)} dual), "
                       f"{tested} tried by play, {opened_n} opened")
-    refusals = [(w, l, m) for w, lg in games for l, m in lg.find(SWAP_REFUSED)]
+    refusals = [(w, l, m) for w, lg in games for l, m in lg.find(SWAP_REFUSED)
+                if "not available in online play" in m.group(2)]
     ran = sum(len(lg.find(SWAP_RAN)) for _w, lg in games if _w != "S")
     ended = len(run.server.find(SWAP_ENDED_S)) if run.server is not None else 0
+    parked_n = released_n = 0
+    for w, lg in games:
+        open_park: dict[str, Line] = {}
+        for i, raw in enumerate(lg.lines):
+            m = SWAP_PARKED.search(raw)
+            if m:
+                open_park[m.group(1)] = lg.line(i)
+                parked_n += 1
+                continue
+            m = SWAP_RELEASED.search(raw)
+            if m and m.group(1) in open_park:
+                open_park.pop(m.group(1))
+                released_n += 1
+        for label, line in open_park.items():
+            findings.append(Finding(f"{w}: left parked by Swap Zone {label} (no `swap zone {label} released` after "
+                                    f"{when(line)})", [line.cite()]))
+    on = ran or ended or parked_n or any(SWAP_ON_ARG in (p.get("command") or []) for p in
+                                         run.result.get("peers", []) or [] if isinstance(p, dict))
     if data.swap_zones:
         counts.append(f"Swap Zone pads: {len(data.swap_zones)}; zones run here {ran}, ended on S {ended}, refused "
-                      f"{len(refusals)}")
-        for w, l, m in refusals[:4]:
-            findings.append(Finding(f"{w}: Swap Zone {m.group(1)} refused: {m.group(2)[:120]}", [l.cite()]))
+                      f"{len(refusals)}" + ("" if on else " (Swap Zones off in this run: online_swap_zones; the "
+                                                           "refusal is the off state)")
+                      + (f"; other players parked {parked_n}, released {released_n}" if parked_n else ""))
+        for w, l, m in (refusals[:4] if on else []):
+            findings.append(Finding(f"{w}: Swap Zone {m.group(1)} refused with the feature on: {m.group(2)[:120]}",
+                                    [l.cite()]))
         if not ran and not ended:
             untested += [f"Swap Zone {n} ({u})" for n, u in data.swap_zones]
     if not counts:
