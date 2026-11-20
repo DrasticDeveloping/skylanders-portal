@@ -690,6 +690,36 @@ class Config:
     session_settings: bool = False
 
 
+# The test data drive (2026-11-20: the PC came back without the external drive; int2's .replication-tests is a
+# junction to D:\SwapForceOnline-data\tests\int2): `test`, `acceptance`, `levelcheck` and `levelpass` stop before
+# any game with one plain line when the store cannot be reached, instead of failing somewhere inside.
+DATA_DRIVE_MISSING = "the test data drive is not attached ({root})"
+
+
+def link_target(p: Path) -> Path | None:
+    """A junction's or symbolic link's target (without Windows' \\?\ prefix), None for anything else."""
+    try:
+        if not os.path.islink(p) and not (hasattr(os.path, "isjunction") and os.path.isjunction(p)):
+            return None
+        return plain_path(Path(os.readlink(p)))
+    except (OSError, ValueError):
+        return None
+
+
+def data_drive_missing(store: Path) -> str:
+    """'' when the test store can be reached (or will be made); else the line naming the missing drive's data folder:
+    a store that is a link whose target is gone, or a store on a drive that is not there."""
+    p = Path(store)
+    target = link_target(p) if os.path.lexists(p) else None
+    where = target if target is not None else p
+    drive_gone = bool(where.anchor) and not Path(where.anchor).exists()
+    if drive_gone or (target is not None and not target.exists()):
+        parts = where.parts
+        root = Path(parts[0], parts[1]) if len(parts) > 1 else Path(where.anchor or str(where))
+        return DATA_DRIVE_MISSING.format(root=root)
+    return ""
+
+
 def main_store(repo: Path) -> Path:
     """The main checkout's test store (its .replication-tests/), which every worktree of the repository
     shares for the machine's game slots (PS15): the folder above git's common dir. The checkout's own
@@ -10653,6 +10683,11 @@ def main(argv: list[str] | None = None) -> int:
     pf.set_defaults(fn=cmd_preflight)
     a = p.parse_args(argv)
     cfg = load_config(repo_root(Path(a.repo)))
+    if a.fn in (cmd_test, cmd_acceptance, cmd_levelcheck, cmd_levelpass):
+        missing = data_drive_missing(cfg.store)
+        if missing:
+            print(missing, flush=True)
+            return 2
     return a.fn(cfg, a)
 
 
