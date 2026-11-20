@@ -301,7 +301,35 @@ class FightGates(unittest.TestCase):
         self.assertTrue(whats[0].startswith("TutorialBattleGate_01 wave 3 (EA_Manager_W1_B_componentDataOverrides"), whats)
         self.assertIn("never complete on S; S refused 2 of its spawns (`not published`)", whats[0])
         self.assertIn("H's copy spawned 9/15 (not finished)", v.findings[0].lines[0])
-        self.assertIn("TutorialBattleGate_01: never opened on S", whats)
+        self.assertIn("TutorialBattleGate_01: never opened on S (its last wave never completed there)", whats)
+
+    BATCH_16 = Path(r"D:/SwapForceOnline-data/tests/int2/runs/20261119-202440-fight-gate-tb")
+    OWNER = Path(r"D:/SwapForceOnline-data/play/20261119-190053")
+
+    @unittest.skipUnless(BATCH_16.is_dir(), "batch 16's fight-gate-tb run is not here")
+    def test_batch_16_fight_gate_tb_passes_by_itself(self) -> None:
+        # W35: a spec run has no level pass case: its level is the one H loaded, and the spec's grade passes.
+        run = lc.load_run(self.BATCH_16)
+        self.assertEqual(lc.run_level(run), "tutorial_b")
+        v = lc.grade_fight_gates(run, lc.level_data(LEVELPASS_FOLDER, lc.run_level(run)))
+        self.assertEqual(v.status, lc.PASS, [x.what for x in v.findings])
+        self.assertIn("wave 3 (EA_Manager_W1_B_componentDataOverrides", v.counts)
+        self.assertIn("TutorialBattleGate_01 opened on S at ", v.counts)
+        import skytest
+        self.assertEqual(skytest.level_check_reasons(self.BATCH_16, {"rows": ["fight gates"], "must_test": True},
+                                                     LEVELPASS_FOLDER), [])
+
+    @unittest.skipUnless(OWNER.is_dir(), "the owner's session of 19 November is not here")
+    def test_the_owners_session_fails_on_wave_3(self) -> None:
+        # W35: the owner fought by hand (no pass step): S started the managers; the third never completed.
+        run = lc.load_run(self.OWNER)
+        self.assertEqual(sorted(run.clients), ["D", "H"])
+        v = lc.grade_fight_gates(run, lc.level_data(LEVELPASS_FOLDER, lc.run_level(run)))
+        self.assertEqual(v.status, lc.FAIL, v)
+        whats = [x.what for x in v.findings]
+        self.assertTrue(whats[0].startswith("TutorialBattleGate_01 wave 3 (EA_Manager_W1_B_componentDataOverrides"), whats)
+        self.assertIn("never complete on S", whats[0])
+        self.assertIn("wave 1 (EA_Manager_W1): complete on S ", v.counts)
 
 class Windows(unittest.TestCase):
     def test_a_clients_time_in_each_level(self) -> None:
