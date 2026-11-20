@@ -4948,18 +4948,69 @@ def measure(lines: list[tuple[float | None, str]], start: str | None, end: str) 
     return None
 
 
-def check_count_and_order(text: str, ps: PeerSpec) -> list[str]:
+# A pattern's `{puppet:<p>}` (W40): peer <p>'s driven puppet on S, tied by S's own `puppet <n> for peer <p> spawned`
+# lines. S numbers its puppets by spawn order, not by peer (batch 17's moves-attack-tb: `puppet 1 for peer 2 spawned`
+# came first, and H's presses were replayed on PeerPuppet_2), and the numbers change hands at a level change, so a
+# spec writes `PeerPuppet_{puppet:1}` for H's puppet. Such a pattern is matched against S's log with each
+# `PeerPuppet_<n>` named by the peer that puppet <n> belonged to at that line (`PeerPuppet_2@peer1`); a pattern
+# without the placeholder sees the log as written.
+PUPPET_SPAWNED = re.compile(r"Online: puppet (\d+) for peer (\d+) spawned ")
+PUPPET_PLACEHOLDER = re.compile(r"\{puppet:(\d+)\}")
+PEER_PUPPET_NAME = re.compile(r"\bPeerPuppet_(\d+)")
+
+
+def tie_puppets(text: str) -> tuple[str, set[str]]:
+    """S's log with each `PeerPuppet_<n>` written `PeerPuppet_<n>@peer<p>` (<p>: puppet <n>'s peer by the last spawn
+    line before it; a name before any is left as it is), and the peers that had a puppet spawned."""
+    owner: dict[str, str] = {}
+    out = []
+    for line in text.splitlines(keepends=True):
+        m = PUPPET_SPAWNED.search(line)
+        if m:
+            owner[m.group(1)] = m.group(2)
+        out.append(PEER_PUPPET_NAME.sub(
+            lambda k: k.group(0) + (f"@peer{owner[k.group(1)]}" if k.group(1) in owner else ""), line))
+    return "".join(out), set(owner.values())
+
+
+def puppet_view(rx: str, text: str, tied: str | None) -> tuple[str, str]:
+    """The pattern and the text it is matched against: a `{puppet:<p>}` pattern against the tied log."""
+    if tied is None or not PUPPET_PLACEHOLDER.search(rx):
+        return rx, text
+    return PUPPET_PLACEHOLDER.sub(lambda m: rf"\d+@peer{m.group(1)}(?!\d)", rx), tied
+
+
+def puppet_reasons(ps: PeerSpec, text: str) -> tuple[str | None, list[str]]:
+    """The tied log when any of the peer's patterns names `{puppet:<p>}` (else None), and a reason for each peer an
+    expectation names whose puppet S never spawned."""
+    pats = ps.expect + ps.expect_order + list(ps.expect_count) + ps.forbid
+    if not any(PUPPET_PLACEHOLDER.search(rx) for rx in pats):
+        return None, []
+    tied, peers = tie_puppets(text)
+    expects = ps.expect + ps.expect_order + [rx for rx, n in ps.expect_count.items() if n > 0]
+    missing = sorted({p for rx in expects for p in PUPPET_PLACEHOLDER.findall(rx) if p not in peers})
+    return tied, [f"log has no `puppet <n> for peer {p} spawned` line: its {{puppet:{p}}} matches nothing"
+                  for p in missing]
+
+
+def check_count_and_order(text: str, ps: PeerSpec, tied: str | None = None) -> list[str]:
     """expect_count: the number of log lines matching each pattern; expect_order: each pattern's
-    first match after the previous pattern's (so `[a, b, a]` wants an a, a later b, a later a)."""
+    first match after the previous pattern's (so `[a, b, a]` wants an a, a later b, a later a).
+    `tied`: S's log with its puppets tied to their peers (tie_puppets), for the `{puppet:<p>}` patterns."""
     reasons = []
-    lines = text.splitlines()
+    views = {text: text.splitlines()}
+    if tied is not None:
+        views[tied] = tied.splitlines()
     for rx, want in ps.expect_count.items():
-        got = sum(1 for line in lines if re.search(rx, line))
+        pat, src = puppet_view(rx, text, tied)
+        got = sum(1 for line in views[src] if re.search(pat, line))
         if got != want:
             reasons.append(f"log has /{rx}/ {got} time(s), expected {want}")
     i, prev = 0, None
     for rx in ps.expect_order:
-        at = next((k for k in range(i, len(lines)) if re.search(rx, lines[k])), None)
+        pat, src = puppet_view(rx, text, tied)
+        lines = views[src]
+        at = next((k for k in range(i, len(lines)) if re.search(pat, lines[k])), None)
         if at is None:
             reasons.append(f"log lacks /{rx}/" + (f" after /{prev}/" if prev else "") + " (expect_order)")
             break
@@ -4978,15 +5029,20 @@ def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
     if not text:
         reasons.append("no log written")
     ps = spec.peers.get(r.peer)
+    tied = None
+    if ps is not None:
+        tied, why = puppet_reasons(ps, text)
+        reasons += why
     expect = ps.expect if ps else []
     for rx in expect:
-        if not re.search(rx, text, re.M):
+        if not re.search(*puppet_view(rx, text, tied), re.M):
             reasons.append(f"log lacks /{rx}/")
-    reasons += check_count_and_order(text, ps) if ps else []
+    reasons += check_count_and_order(text, ps, tied) if ps else []
     if any(f == 0.0 for f in parsed["fps"]):
         reasons.append("presented no frame during an fps window (frozen, or not booted yet)")
     for rx, shown in peer_fatal_lines(spec, r.peer):
-        if m := re.search(rx, text, re.M):
+        pat, src = puppet_view(rx, text, tied)
+        if m := re.search(pat, src, re.M):
             start = text.rfind("\n", 0, m.start()) + 1
             end = text.find("\n", m.end())
             whole = text[start:end if end != -1 else len(text)].strip()

@@ -244,10 +244,13 @@ class Moves(unittest.TestCase):
 class PlayerDamage(unittest.TestCase):
     def test_one_to_one_and_the_health_read_back(self) -> None:
         # W33: S's two hits on H's puppet, H's one hit by that enemy: one unmatched; H's drop read back by S.
-        s = [(70, "Online: sentinel guard refused a hit on sentinel/puppet entry 0 PeerPuppet_1#3829 force 0 damage "
+        # W40: H (peer 1) has puppet 2 on S (peer 2's came first).
+        s = [(20, "Online: puppet 1 for peer 2 spawned at 0,0,0 (generation 1)"),
+             (21, "Online: puppet 2 for peer 1 spawned at 0,0,0 (generation 1)"),
+             (70, "Online: sentinel guard refused a hit on sentinel/puppet entry 0 PeerPuppet_2#3829 force 0 damage "
                   "0x41200000 by Chompy#2201 a00000efb.930d1f89.79d73383@2 (sweep) (#1)"),
              (71, "Online: peer 1 vitals 190/200"),
-             (90, "Online: sentinel guard refused a hit on sentinel/puppet entry 0 PeerPuppet_1#3829 force 0 damage "
+             (90, "Online: sentinel guard refused a hit on sentinel/puppet entry 0 PeerPuppet_2#3829 force 0 damage "
                   "0x41200000 by Chompy#2201 a00000efb.930d1f89.79d73383@2 (sweep) (#2)")]
         h = [(70, "Online: hero hit by Chompy#2102 a00000efb.930d1f89.79d73383@2 (sweep, 10) (S's attack, played here) (#1)"),
              (71, "Online: own vitals 190/200 (was 200; hit by Chompy#2102 a00000efb.930d1f89.79d73383@2)")]

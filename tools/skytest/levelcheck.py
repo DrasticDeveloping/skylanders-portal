@@ -1720,7 +1720,8 @@ def grade_moves(run: Run) -> Verdict:
 # player-damage lines (online/5-player-damage-lines): on a client, its copy of S's enemy hitting its own hero (`hero hit
 # by <Name#mID> <row> (<sweep|shot|other>, <dmg>)[ refused by this game's damage check] (S's attack, played here)`)
 # and its health's drop (`own vitals <h>/<max> (was <h0>; hit by ...)`); on S, the same hit on that player's puppet
-# (`sentinel guard refused a hit on sentinel/puppet entry <i> PeerPuppet_<p>#.. ... by <Name#mID> <row> (<kind>)`) and
+# (`sentinel guard refused a hit on sentinel/puppet entry <i> PeerPuppet_<n>#.. ... by <Name#mID> <row> (<kind>)`; puppet
+# <n>'s peer from S's `puppet <n> for peer <p> spawned` line) and
 # the health it reads back (`peer <p> vitals <h>/<max>`). Every hit S counted on a puppet wants one hit on that
 # player's hero by the same enemy row within PAIR_HIT_S (one to one: a client hit is used once), and every drop of
 # the own health wants S's `peer <p> vitals` with the same health within PAIR_VITALS_S.
@@ -1776,7 +1777,18 @@ def grade_player_damage(run: Run) -> Verdict:
     if run.server is None:
         return Verdict(name, NOT_TESTED, "no server log in this run folder")
     peers = peer_numbers(run)
-    s_hits = run.server.find(PUPPET_HIT)
+    # W40: PeerPuppet_<n> is puppet <n>, S's spawn order; its peer is the one S's last `puppet <n> for peer <p>
+    # spawned` line before the hit names (the numbers change hands at a level change).
+    owner: dict[int, int] = {}
+    s_hits = []
+    for i, raw in enumerate(run.server.lines):
+        m = PUPPET_FOR.search(raw)
+        if m:
+            owner[int(m.group(1))] = int(m.group(2))
+            continue
+        m = PUPPET_HIT.search(raw)
+        if m and int(m.group(1)) in owner:
+            s_hits.append((owner[int(m.group(1))], run.server.line(i), m))
     s_vitals = run.server.find(PEER_VITALS)
     counts, findings, example = [], [], ""
     any_hit = False
@@ -1786,7 +1798,7 @@ def grade_player_damage(run: Run) -> Verdict:
             continue
         hits = [(line, m) for line, m in log.find(HERO_HIT) if not m.group(5)]
         refused = [line for line, m in log.find(HERO_HIT) if m.group(5)]
-        mine = [(line, m) for line, m in s_hits if int(m.group(1)) == peer]
+        mine = [(line, m) for p, line, m in s_hits if p == peer]
         used: set[int] = set()
         unmatched = []
         for sl, sm in mine:
