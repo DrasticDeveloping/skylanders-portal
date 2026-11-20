@@ -132,6 +132,7 @@ import exclusive_grade  # noqa: E402  (stage 4's exclusive grade: a race exactly
 import swap_pairs  # noqa: E402
 import memory_growth  # noqa: E402  (stage 5's soak grade)
 import occurrence_outcomes  # noqa: E402  (stage 5's occurrence grade)
+import graph_trace_grade  # noqa: E402  (stage 5's shared enemies' evidence grade)
 import known_failures  # noqa: E402  (a pointless rerun refused: the last two results failed alike)
 import build_guard  # noqa: E402  (no session while a build holds its slot)
 import store_paths  # noqa: E402  (which folders a cleanup may touch; shared with the janitor)
@@ -176,7 +177,7 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
 GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
           "symmetry", "route", "bandwidth", "remote_swap", "exclusive", "occurrence_outcomes",
-          "memory_growth", "data_root_untouched") + backend_grades.NAMES
+          "memory_growth", "data_root_untouched", "graph_trace") + backend_grades.NAMES
 # The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
 # online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
 # for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
@@ -1452,6 +1453,11 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             except exclusive_grade.ExclusiveSpecError as e:
                 raise SpecError(str(e)) from e
             continue
+        if gname == "graph_trace":
+            # The shared enemies' evidence grade (graph_trace_grade.py: one row tied on both sides).
+            if why := graph_trace_grade.check_spec(g, names):
+                raise SpecError(f"{path.name}: grade graph_trace: {why}")
+            continue
         if gname in ("occurrence_outcomes", "memory_growth"):
             # Stage 5's grades, each in its own module (its check_spec says what it takes).
             module = occurrence_outcomes if gname == "occurrence_outcomes" else memory_growth
@@ -2546,6 +2552,10 @@ def grade_cross_peer(spec: Spec, r: PeerResult, texts: dict[str, str], repo: Pat
         elif gname == "occurrence_outcomes" and g.get("peer", "S") == r.peer:
             # Stage 5: one outcome per S occurrence on each client, S's claim lines (occurrence_outcomes.py).
             r.graded[gname], why = occurrence_outcomes.grade_spec(texts, g, list(spec.peers))
+            reasons += why
+        elif gname == "graph_trace" and g.get("client", "H") == r.peer:
+            # The shared enemies' evidence run: a spawned row's samples on the client and the server (graph_trace_grade.py).
+            r.graded[gname], why = graph_trace_grade.grade_spec(texts, g, list(spec.peers))
             reasons += why
         elif gname == "memory_growth" and g.get("anchor_peer", "H") == r.peer:
             # Stage 5's soak: private memory's slope on each graded peer (memory_growth.py), once per run.
