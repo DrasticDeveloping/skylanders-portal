@@ -1961,6 +1961,11 @@ def grade_server_alive(run: Run) -> Verdict:
     name = "server game alive"
     if run.server is None:
         return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    # W41: a case that tested nothing (a peer's `within` rule whose why ends ": nothing tested") is not graded here.
+    nothing = next((f"{p.get('peer')}: {w}" for p in run.result.get("peers", []) or [] if isinstance(p, dict)
+                    for w in p.get("reasons") or [] if ": nothing tested" in str(w)), "")
+    if nothing:
+        return Verdict(name, NOT_TESTED, f"the case tested nothing ({nothing})")
     fs = server_hard_findings(run)
     if fs:
         return Verdict(name, FAIL, "; ".join(f.what for f in fs), fs[0].lines[-1] if fs[0].lines else "", fs)

@@ -2928,6 +2928,36 @@ class CompareTest(unittest.TestCase):
         _t, why = skytest.puppet_reasons(ps, "[t] Online: puppet 1 for peer 2 spawned at (0, 0, 0)\n")
         self.assertEqual(why, ["log has no `puppet <n> for peer 1 spawned` line: its {puppet:1} matches nothing"])
 
+    def test_within_a_line_must_follow_in_time(self) -> None:
+        # W41 (soul-gem-tb): the pick-up's collect line must come within 20 s, else the case tested nothing.
+        rule = skytest.parse_within("x.toml", "D", [{"after": "GEM_D_PICKUP", "want": "collect native 000b0018 ",
+                                                    "seconds": 20, "why": "not picked up: nothing tested"}])
+        ok = ("[2026-11-19 23:45:32.681] [info] Input script: GEM_D_PICKUP\n"
+              "[2026-11-19 23:45:40.000] [info] Online: collect native 000b0018 script (reported to S) (827513a0)\n")
+        self.assertEqual(skytest.within_reasons(ok, rule), [])
+        late = ok.replace("23:45:40.000", "23:45:53.000")
+        never = ok.splitlines()[0] + "\n"
+        for text in (late, never):
+            self.assertEqual(skytest.within_reasons(text, rule),
+                             ["not picked up: nothing tested (no /collect native 000b0018 / within 20 s of "
+                              "/GEM_D_PICKUP/)"])
+        self.assertEqual(skytest.within_reasons("[2026-11-19 23:45:32.681] x\n", rule), [])
+        with self.assertRaises(skytest.SpecError):
+            skytest.parse_within("x.toml", "D", [{"after": "a", "want": "b", "seconds": 0, "why": "c"}])
+        p = skytest.PeerResult(peer="D", exit_code=0)
+        p.reasons = skytest.within_reasons(never, rule)
+        self.assertTrue(skytest.tested_nothing([p]).startswith("D: not picked up: nothing tested"))
+        # Fail fast stops at the missed deadline.
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "game.log"
+            log.write_text(never, encoding="utf-8")
+            watch = skytest.FailFast({"D": log}, {"D": []}, within={"D": [{**rule[0], "seconds": 0.01}]})
+            self.assertIsNone(watch.check())
+            time.sleep(0.05)
+            hit = watch.check()
+            self.assertEqual(hit[0], "D")
+            self.assertTrue(hit[1].startswith("not picked up: nothing tested"), hit)
+
 
 THRESHOLDS = {"press_to_reaction": {"fixed_ms": 250.0, "plus": ["send_interval", "rtt"]},
               "send_rates": {"players_hz": 20.0}}

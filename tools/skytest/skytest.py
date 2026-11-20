@@ -104,6 +104,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+from datetime import datetime
 import fnmatch
 import getpass
 import hashlib
@@ -939,6 +940,11 @@ class PeerSpec:
     # and patterns whose first matches come in this order (each after the one before).
     expect_count: dict[str, int] = field(default_factory=dict)
     expect_order: list[str] = field(default_factory=list)
+    # within = [{ after = '<rx>', want = '<rx>', seconds = <s>, why = '<text>' }] (W41): once a line matches `after`, a
+    # line matching `want` must follow within `seconds`, or the case fails with `why` (fail fast stops the run then).
+    # A `why` ending in NOTHING_TESTED marks the case as having tested nothing: the server's hard rule then says
+    # NOT TESTED instead of failing it (soul-gem-tb: the collectible was never picked up).
+    within: list[dict] = field(default_factory=list)
     # save_slots = { "<slot>" = <fixture slot> } (stage 3 item 7): this peer's copy of the fixture saves
     # gets the save of `fixture slot` once more in `slot` (both one-based, as the save menu counts them),
     # before the game starts (fill_save_slots). {} leaves the copy as the fixture store has it.
@@ -1397,6 +1403,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             forbid=list(common.get("forbid", [])) + list(own.get("forbid", [])),
             expect_count={**common.get("expect_count", {}), **own.get("expect_count", {})},
             expect_order=list(own.get("expect_order", common.get("expect_order", []))),
+            within=parse_within(path.name, n, own.get("within", common.get("within", []))),
             save_slots=parse_save_slots(path.name, n, own.get("save_slots", common.get("save_slots", {}))),
             kind=kind,
             settings_file=peer_settings_file(path.name, n, own, common, d.get("server", "standin"), kind),
@@ -3051,8 +3058,11 @@ class FailFast:
     goes on."""
 
     def __init__(self, logs: dict[str, Path], patterns: dict[str, list[str]],
-                 needs: dict[str, dict[str, list[str]]] | None = None, scripts: dict[str, str] | None = None) -> None:
+                 needs: dict[str, dict[str, list[str]]] | None = None, scripts: dict[str, str] | None = None,
+                 within: dict[str, list[dict]] | None = None) -> None:
         self.tails = {n: LogTail(p) for n, p in logs.items()}
+        # within (PeerSpec.within): per peer, each rule with the time its `after` line was read and whether `want` came.
+        self.within = {n: [{**r, "at": None, "met": False} for r in rs] for n, rs in (within or {}).items() if rs}
         self.patterns = {n: [re.compile(rx, re.M) for rx in patterns.get(n, [])] for n in logs}
         # wait_needs (script_checks.needed_peer_gone): each waiting peer's planned waits and the ends seen.
         self.needs = {n: c for n, c in (needs or {}).items() if c}
@@ -3081,6 +3091,16 @@ class FailFast:
                     self.done[n][cond] = self.done[n].get(cond, 0) + 1
                 if any(rx.search(line) for rx in self.patterns[n]):
                     return self._found((n, line.strip()[:200]), tail.generation)
+                for r in self.within.get(n, []):
+                    if r["at"] is None and re.search(r["after"], line):
+                        r["at"] = time.monotonic()
+                    elif r["at"] is not None and not r["met"] and re.search(r["want"], line):
+                        r["met"] = True
+        for n, rules in self.within.items():
+            for r in rules:
+                if r["at"] is not None and not r["met"] and time.monotonic() - r["at"] > r["seconds"]:
+                    return self._found((n, f"{r['why']} (no /{r['want']}/ within {r['seconds']:g} s)"),
+                                       self.tails[n].generation)
         for n, p in (procs or {}).items():
             if crash_exit_code(code := p.poll()):
                 return self._found((n, f"exit code 0x{code & 0xFFFFFFFF:08X}"), None)
@@ -3122,6 +3142,58 @@ def peer_fatal_lines(spec: Spec, peer: str) -> list[tuple[str, str]]:
 def fail_fast_patterns(spec: Spec, peer: str) -> list[str]:
     """A peer's fatal lines for fail fast: exactly the forbidden lines grade_peer fails it on."""
     return [rx for rx, _ in peer_fatal_lines(spec, peer)]
+
+
+NOTHING_TESTED = ": nothing tested"
+STAMP = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})\]")
+
+
+def parse_within(spec_name: str, peer: str, raw: object) -> list[dict]:
+    """A peer's `within` rules (PeerSpec.within): each a table with after, want, seconds and why."""
+    if not isinstance(raw, list):
+        raise SpecError(f"{spec_name}: peer {peer}: within is a list of tables (after, want, seconds, why)")
+    out = []
+    for t in raw:
+        if not isinstance(t, dict) or set(t) != {"after", "want", "seconds", "why"}:
+            raise SpecError(f"{spec_name}: peer {peer}: each within rule has exactly after, want, seconds and why")
+        if not isinstance(t["seconds"], (int, float)) or isinstance(t["seconds"], bool) or t["seconds"] <= 0:
+            raise SpecError(f"{spec_name}: peer {peer}: within seconds must be a number > 0")
+        for k in ("after", "want"):
+            try:
+                re.compile(str(t[k]))
+            except re.error as e:
+                raise SpecError(f"{spec_name}: peer {peer}: bad within {k} {t[k]!r}: {e}") from e
+        out.append({"after": str(t["after"]), "want": str(t["want"]), "seconds": float(t["seconds"]),
+                    "why": str(t["why"])})
+    return out
+
+
+def within_reasons(text: str, rules: list[dict]) -> list[str]:
+    """The `within` rules a log broke, by its own line times: the first `after` line, then the first `want` line after
+    it no later than `seconds`. A log that never reached `after` breaks none (its other expectations say so)."""
+    out = []
+    lines = text.splitlines()
+    for r in rules:
+        at = next((k for k, line in enumerate(lines) if re.search(r["after"], line)), None)
+        if at is None:
+            continue
+        m = STAMP.search(lines[at])
+        t0 = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f") if m else None
+        ok = False
+        for line in lines[at + 1:]:
+            if re.search(r["want"], line):
+                w = STAMP.search(line)
+                ok = t0 is None or w is None or (
+                    datetime.strptime(w.group(1), "%Y-%m-%d %H:%M:%S.%f") - t0).total_seconds() <= r["seconds"]
+                break
+        if not ok:
+            out.append(f"{r['why']} (no /{r['want']}/ within {r['seconds']:g} s of /{r['after']}/)")
+    return out
+
+
+def tested_nothing(peers: list["PeerResult"]) -> str:
+    """The first peer reason that says the case tested nothing (a `within` rule's why), or ''."""
+    return next((f"{p.peer}: {w}" for p in peers for w in p.reasons if NOTHING_TESTED in w), "")
 
 
 def parse_wait_needs(spec_name: str, peer: str, raw: object, names: list[str], script: str) -> dict[str, list[str]]:
@@ -5051,6 +5123,7 @@ def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
         if not re.search(*puppet_view(rx, text, tied), re.M):
             reasons.append(f"log lacks /{rx}/")
     reasons += check_count_and_order(text, ps, tied) if ps else []
+    reasons += within_reasons(text, ps.within) if ps and ps.within else []
     if any(f == 0.0 for f in parsed["fps"]):
         reasons.append("presented no frame during an fps window (frozen, or not booted yet)")
     for rx, shown in peer_fatal_lines(spec, r.peer):
@@ -5256,7 +5329,8 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                              {**{n: fail_fast_patterns(spec, n) for n in names},
                               **{n: s.forbid + SYNTHETIC_FATAL for n, s in spec.synthetic.items()}},
                              needs={n: spec.peers[n].wait_needs for n in names if n in spec.peers},
-                             scripts={n: spec.peers[n].script for n in names if n in spec.peers}) \
+                             scripts={n: spec.peers[n].script for n in names if n in spec.peers},
+                             within={n: spec.peers[n].within for n in names if n in spec.peers}) \
                 if spec.fail_fast else None
             stop_at, next_check, early = deadline, 0.0, False
             while len(ended) < len(procs) and time.monotonic() < stop_at:
@@ -8310,7 +8384,11 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             # W37: every case with a server log: S's game must not have stopped while its frames went on with a client
             # connected (levelcheck.server_stalled).
             if r.folder and Path(r.folder).is_dir():
+                nothing = tested_nothing(r.peers)
                 for why in server_stall_reasons(Path(r.folder)):
+                    if nothing:  # W41: the case tested nothing; its server rule is not tested, not failed
+                        r.notes.append(f"server game alive: NOT TESTED ({nothing}): {why}")
+                        continue
                     r.reasons.append(why)
                     if r.status == "pass":
                         r.status = "fail"
