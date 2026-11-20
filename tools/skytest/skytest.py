@@ -7738,6 +7738,166 @@ def folder_state(root: Path, skip: tuple[str, ...] = ()) -> tuple[int, float, st
     return count, newest, h.hexdigest()
 
 
+# --- the owner's data, by part, and the owner's own games (acceptance pass 1, 2026-11-20) -----------------------
+#
+# The first acceptance pass stopped on "changed during the run: owner data ...\Documents\Skylanders" while the case's
+# games ran on their own data folders: the owner's other game (imaginatorsrecompiled.exe, one of the six that share
+# Documents\Skylanders) was running. The guard now says which part changed, never a name inside it and never a file's
+# content: "Swap Force" and "Figures" (the folders this game writes on real data) by name, everything else as "only
+# other games' folders". The owner's own games are the processes named *recompiled.exe that are not this runner's
+# (not its descendants), by name and start time. A case is "untouched" when every game of it ran with its own data
+# folder (its command's --user_data_root and its log's `Data folder: <path> (--user_data_root)`, outside every owner
+# root); OWNER DATA AT RISK when one did not, or when "Swap Force" / "Figures" changed with no other owner game running.
+OWNER_PARTS = ("Swap Force", "Figures")
+OWNER_OTHER = "only other games' folders"
+OWNER_GAME_SUFFIX = "recompiled.exe"
+OWNER_AT_RISK = "OWNER DATA AT RISK"
+DATA_FOLDER_LINE = re.compile(r"Data folder: (.+?) \((--user_data_root|[^)]*)\)")
+
+
+def owner_parts_state(root: Path) -> dict[str, tuple[int, float, str]]:
+    """One owner root's state by part: its "Swap Force" and "Figures" folders each, the rest (every other top-level
+    entry) as one; nothing but counts, times and hashes is kept."""
+    out = {p: folder_state(root / p) for p in OWNER_PARTS}
+    count, newest = 0, 0.0
+    h = hashlib.sha256()
+    try:
+        tops = sorted(os.scandir(root), key=lambda e: e.name) if root.is_dir() else []
+    except OSError:
+        tops = []
+    for e in tops:
+        if e.name in OWNER_PARTS:
+            continue
+        if e.is_dir(follow_symlinks=False):
+            c, n, d = folder_state(Path(e.path))
+        else:
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            c, n, d = 1, st.st_mtime, f"{st.st_size}|{st.st_mtime_ns}"
+        count += c
+        newest = max(newest, n)
+        h.update(f"{e.name}|{d}\n".encode("utf-8", "surrogateescape"))
+    out[OWNER_OTHER] = (count, newest, h.hexdigest())
+    return out
+
+
+def owner_parts_changed(before: dict[str, dict], after: dict[str, dict]) -> list[str]:
+    """Which parts changed over every owner root: "Swap Force", "Figures" (in that order), and OWNER_OTHER last."""
+    changed = set()
+    for root in set(before) | set(after):
+        b, a = before.get(root, {}), after.get(root, {})
+        for part in set(b) | set(a):
+            if b.get(part) != a.get(part):
+                changed.add(part)
+    return [p for p in OWNER_PARTS if p in changed] + ([OWNER_OTHER] if OWNER_OTHER in changed else [])
+
+
+def owner_games_running(runner_pid: int | None = None, table: list | None = None,
+                        started: "dict[int, str] | None" = None) -> list[tuple[str, str]]:
+    """The owner's own games running now: (exe name, start time) of each process named *recompiled.exe that is not
+    runner_pid's descendant (this runner's games are); `table`/`started` for the unit cases (else read here)."""
+    table = process_table() if table is None else table
+    if not table:
+        return []
+    parent = {pid: ppid for pid, ppid, _ in table}
+
+    def ours(pid: int) -> bool:
+        seen = set()
+        while runner_pid and pid and pid not in seen and len(seen) < 64:
+            if pid == runner_pid:
+                return True
+            seen.add(pid)
+            pid = parent.get(pid, 0)
+        return False
+
+    games = [(pid, name) for pid, _pp, name in table if name.lower().endswith(OWNER_GAME_SUFFIX) and not ours(pid)]
+    starts = started if started is not None else process_start_times([pid for pid, _n in games])
+    return sorted({(name, starts.get(pid, "?")) for pid, name in games})
+
+
+def process_start_times(pids: list[int]) -> dict[int, str]:
+    """Each process's start time (HH:MM:SS, local) from GetProcessTimes; a process that cannot be opened is left out."""
+    if not WINDOWS or not pids:
+        return {}
+    out = {}
+    try:
+        ctypes, k32, _, _ = _load_api()
+        c, x, k, u_ = (ctypes.c_ulonglong() for _ in range(4))
+        for pid in pids:
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                continue
+            try:
+                if k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(x), ctypes.byref(k), ctypes.byref(u_)):
+                    secs = c.value / 1e7 - 11644473600.0  # FILETIME (1601, 100 ns) to the Unix epoch
+                    out[pid] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(secs))
+            finally:
+                k32.CloseHandle(h)
+    except (OSError, AttributeError):
+        return out
+    return out
+
+
+def under_owner_root(path: str, roots: list[Path]) -> bool:
+    p = str(path).replace("/", "\\").rstrip("\\").lower()
+    for r in roots:
+        rs = str(r).replace("/", "\\").rstrip("\\").lower()
+        if p == rs or p.startswith(rs + "\\"):
+            return True
+    return False
+
+
+def case_own_data_folders(peers: list, logs: dict[str, str], roots: list[Path],
+                          exe: str | None = None) -> tuple[bool, list[str]]:
+    """Whether every game of a case ran with its own data folder: each peer's command names --user_data_root outside
+    every owner root, and its log's `Data folder:` line (when the log has one) is outside too. (ok, evidence). With
+    `exe` (the game's file name), a peer whose command does not run it (a unit case's binary, a synthetic peer) is
+    no game and is left out."""
+    ok, ev = True, []
+    for p in peers:
+        name = p.get("peer") if isinstance(p, dict) else getattr(p, "peer", "?")
+        cmd = (p.get("command") if isinstance(p, dict) else getattr(p, "command", None)) or []
+        if exe and cmd and not any(str(x).lower().endswith(exe.lower()) for x in cmd[:3]):
+            continue
+        if not cmd:
+            pass  # a hosted server (S, or a compared run's `off1:S`): its owner's child, its data folder from its log
+        else:
+            root = next((a.split("=", 1)[1] for a in cmd if a.startswith("--user_data_root=")), None)
+            if root is None or under_owner_root(root, roots):
+                ok = False
+                ev.append(f"{name}: " + ("no --user_data_root in its command" if root is None
+                                         else "its --user_data_root is the owner's data"))
+                continue
+        m = DATA_FOLDER_LINE.search(logs.get(name, "") or "")
+        if m and under_owner_root(m.group(1), roots):
+            ok = False
+            ev.append(f"{name}: its log's Data folder is the owner's data")
+        elif m:
+            ev.append(f"{name} ok")
+        elif cmd:
+            ev.append(f"{name} ok (command)")
+    return ok, ev
+
+
+def owner_data_verdict(case_ok: bool, evidence: list[str], parts: list[str],
+                       other_games: list[tuple[str, str]]) -> tuple[str, bool]:
+    """The page's and result's line, and whether the owner's data is at risk."""
+    others = ", ".join(f"{n} (started {t})" for n, t in other_games)
+    if not case_ok:
+        return f"{OWNER_AT_RISK}: a game of this case did not run with its own data folder ({'; '.join(evidence)})", True
+    if any(p in OWNER_PARTS for p in parts) and not other_games:
+        return (f"{OWNER_AT_RISK}: owner data changed during the run: {', '.join(parts)}, and no other game of the "
+                "owner was running"), True
+    line = (f"owner data: untouched by this case (its games ran with their own data folders: {'; '.join(evidence)})")
+    if other_games:
+        line += f"; another game of the owner was running: {others}"
+    if parts:
+        line += f"; owner data changed during the run: {', '.join(parts)}"
+    return line, False
+
+
 def guarded_folders(cfg: Config) -> dict[str, tuple[Path, tuple[str, ...]]]:
     """What a run must leave alone: the owner's data folders and the disc (whose cachenonce.txt the
     game itself rewrites at every start)."""
@@ -8026,7 +8186,8 @@ def cmd_acceptance(cfg: Config, a: argparse.Namespace) -> int:
                            encoding="utf-8", errors="replace")
         heads.append(f"{repo.name} {r.stdout.strip() or '?'}")
     return acceptance.run(Path(__file__).resolve(), cfg.repo, cfg.store, levelpass_folder(cfg, None), cases, levels,
-                          a.run_not_ready, a.dry_run, "; ".join(heads), [Path(x) for x in (a.history or [])])
+                          a.run_not_ready, a.dry_run, "; ".join(heads), [Path(x) for x in (a.history or [])],
+                          a.while_owner_plays)
 
 
 def cmd_prune(cfg: Config, a: argparse.Namespace) -> int:
@@ -8293,6 +8454,9 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
 
         guarded = guarded_folders(cfg)
         before_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
+        owner_roots = owner_data_roots()
+        owner_before = {str(r): owner_parts_state(r) for r in owner_roots}
+        owner_games_seen: set[tuple[str, str]] = set(owner_games_running(os.getpid()))
         # The snapshot is chosen and the session folder that names it is written under the machine lock,
         # which every runner's after-run snapshot cleanup also holds: no cleanup runs between the two.
         session_out: list[Path] = []
@@ -8442,6 +8606,20 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 breaker.record(spec.name, r.folder, r.signature)
                 if (t := breaker.tripped()) is not None:
                     tell_breaker(t)
+            # The owner's data (acceptance pass 1): each game of the case ran with its own data folder, and the owner's
+            # own games running at the case's end; a game on the owner's data fails the case hard.
+            if r.folder and Path(r.folder).is_dir():
+                running = owner_games_running(os.getpid())
+                owner_games_seen.update(running)
+                logs = {p.peer: read_peer_log(Path(r.folder), p.peer, spec.server == "host") for p in r.peers}
+                ok, ev = case_own_data_folders(r.peers, logs, owner_roots, Path(cfg.exe).name)
+                if ev:  # a case that started no game (a unit case, synthetic peers only) has nothing to say
+                    line, risk = owner_data_verdict(ok, ev, [], running)
+                    r.notes.append(line)
+                    if risk:
+                        r.reasons.insert(0, line)
+                        if r.status not in ("fail", "error"):
+                            r.status = "fail"
             # W37: every case with a server log: S's game must not have stopped while its frames went on with a client
             # connected (levelcheck.server_stalled).
             if r.folder and Path(r.folder).is_dir():
@@ -8524,6 +8702,8 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             mode_info["run_load"] = run_load_summary
             print(run_load_line(run_load_summary), flush=True)
         after_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
+        owner_after = {str(r): owner_parts_state(r) for r in owner_roots}
+        owner_games_seen.update(owner_games_running(os.getpid()))
         tripped_now = breaker.tripped() if breaker is not None else None
         store_line = janitor.line()  # never started after the cases (PS1): their end waits for nothing new
     finally:
@@ -8539,6 +8719,21 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     if gate is not None:
         unwritten = list(gate["no_spec"])  # a gate run names its own spec-less cases, nothing else
     touched = [g["folder"] for g in guard if not g["unchanged"]]
+    # The owner's data by part (never a name inside an owner root but "Swap Force" and "Figures"): the run's verdict;
+    # a guarded owner folder that changed only in other games' parts while another owner game ran is not this run's.
+    parts = owner_parts_changed(owner_before, owner_after)
+    other_games = sorted(owner_games_seen)
+    owner_line, owner_risk = owner_data_verdict(True, ["each case's own check above"], parts, other_games)
+    if owner_risk:
+        for r in results:
+            if OWNER_AT_RISK not in " ".join(r.reasons):
+                r.reasons.insert(0, owner_line)
+            if r.status not in ("fail", "error"):
+                r.status = "fail"
+    # An owner folder that changed while another owner game ran (and not at risk) is that game's, not this run's;
+    # with none running, any change stays the run's warning (and its exit 1).
+    if other_games and not owner_risk:
+        touched = [k for k in touched if not k.startswith("owner data ")]
     # A gate run is a subset: never a checkpoint; nor is a queue's run (its cases are the lane's).
     full_run = a.cases in ([], ["all"]) and gate is None and queue is None
     # A bulk run never decides a checkpoint (its verdict is the watched default mode's).
@@ -8548,6 +8743,8 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                "machine": machine_info,
                "breaker": tripped_now, "stages": stages, "thresholds": thresholds,
                "guarded_folders": guard, "required_without_spec": unwritten, "checkpoint": checkpoint,
+               "owner_data": {"changed_parts": parts, "owner_games_running": [list(x) for x in other_games],
+                              "verdict": owner_line, "at_risk": owner_risk},
                "restricted_token": token["restricted"], "restricted_token_cause": token["cause"],
                "runner": runner_version(), "cases": [asdict(r) for r in results]}
     if queue is not None:
@@ -8566,6 +8763,12 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     write_report(cfg, out, results, manifest, thresholds, max_games, guard, unwritten, checkpoint, gate, token,
                  jobs=jobs, queue_unmatched=queue_unmatched, breaker=tripped_now, run_load=run_load_summary)
     write_findings(out, results, before)
+    if parts or other_games or owner_risk:
+        try:  # the run's owner-data verdict on the page (each case's own line is under it, in its notes)
+            with open(out / "report.md", "a", encoding="utf-8") as f:
+                f.write(f"\nOwner data: {owner_line}\n")
+        except OSError:
+            pass
     failed = [r for r in results if r.status not in ("pass", "capacity", NOT_IN_BULK)]
     left_out = [r for r in results if r.status == NOT_IN_BULK]
     if left_out:
@@ -8574,6 +8777,11 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     capacity = [r for r in results if r.status == "capacity"]
     not_ready = [r for r in results if r.status == "not ready"]
     stopped = [r for r in results if r.status == "breaker"]
+    if parts:
+        print((f"{OWNER_AT_RISK}: " if owner_risk else "") + (
+            f"owner data changed during the run: {', '.join(parts)}" if parts else "owner data unchanged")
+            + (f"; the owner's own game(s) running: {', '.join(f'{n} (started {t})' for n, t in other_games)}"
+               if other_games else ""))
     if touched:
         print(f"WARNING: changed during the run: {', '.join(touched)}")
     if capacity:
@@ -10318,7 +10526,10 @@ def main(argv: list[str] | None = None) -> int:
     ac.add_argument("--cases", default=None, help="comma-separated case names instead of the list")
     ac.add_argument("--levels", default=None, help="comma-separated levels instead of tutorial_a,tutorial_b,ww1")
     ac.add_argument("--run-not-ready", action="store_true", help="pass --run-not-ready to every case")
-    ac.add_argument("--dry-run", action="store_true", help="print the list and its estimate only, start no game")
+    ac.add_argument("--dry-run", action="store_true", help="print the list and its estimate only, start no game"
+                    " (and whether it would wait for the owner's own game)")
+    ac.add_argument("--while-owner-plays", action="store_true", help="start the cases even while one of the owner's"
+                    " own games (*recompiled.exe) runs (by default the list waits, a line a minute)")
     ac.add_argument("--history", action="append", default=None, metavar="DIR", help="one more store's runs folder whose"
                     " earlier runs count for the estimate (repeatable)")
     ac.set_defaults(fn=cmd_acceptance)
