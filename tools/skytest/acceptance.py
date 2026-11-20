@@ -26,12 +26,13 @@ from pathlib import Path
 # the rest. A case with no spec in the tree it runs from (one that arrives with its branch) gets a "no run" row.
 CASES = ["offline-plain", "party-continue", "soul-gem-tb", "enemy-attack-ta", "hits-that-count",
          "moves-figure-mid-tb", "moves-swapper-tb", "moves-block-probe-tb", "moves-shot-tb", "moves-ko-tb",
-         "world-event-cage-tb", "element-gate-tb", "element-gate-dual-tb", "gpu-pipeline-drops", "gpu-pipeline-drops-fixed",
+         "world-event-cage-tb", "element-gate-tb", "element-gate-dual-tb", "element-gate-dual-swapper-tb",
+         "gpu-pipeline-drops", "gpu-pipeline-drops-fixed",
          "gpu-pipeline-drops-sync", "swap-zone-tb", "spark-lock-ww1", "rail-launch-tb", "fight-gate-tb",
          "enemy-damage-tb", "coins-broken-both"]
 LEVELS = ["tutorial_a", "tutorial_b", "ww1"]
 # Cases owed by an author who has not written (or named) their spec yet: their rows say so, never "absent".
-OWED = {"element-gate-dual-tb": "no spec yet (the dual element gate's spec: the gates' author has not named it)"}
+OWED: dict[str, str] = {}
 LEVEL_DEFAULT_S = 900.0      # a level check with no earlier run: the level pass's own bound
 PAGE_LINE = re.compile(r"levelcheck \S+: page (.+)$", re.M)
 

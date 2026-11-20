@@ -920,6 +920,11 @@ class AuthorsFinalLines(unittest.TestCase):
                            "fullyPowered/fullyPowered: no unlock")]
         v = lc.grade_gate_kinds(lc.load_run(RunFolder([], h, D_JOIN).path), lc.level_data(self.LP, "tutorial_b"))
         self.assertIn("gate elements read: LockedElementalGate single Life", v.counts)
+        h2 = H_JOIN + [(40, "Online: door CaveDoor#1201: this game's hero goes through with peer 2 (220 from it): its "
+                            "entry replayed here, at once (2/2/enter/9/w1)"),
+                       (50, "Online: door CaveDoor#1201: this game's hero stays for peer 2's entry (2400 from it) (x)")]
+        v2 = lc.grade_gate_kinds(lc.load_run(RunFolder([], h2, D_JOIN).path), lc.level_data(self.LP, "tutorial_b"))
+        self.assertIn("doors: went through with another player 1 (1 at once, 0 queued), stayed 1", v2.counts)
         self.assertTrue(any("touched by NinjaStealthElf#3800 (elements life/none, the lock wants Life)" in f.what
                             for f in v.findings), [f.what for f in v.findings])
 

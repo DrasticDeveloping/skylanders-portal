@@ -1538,7 +1538,15 @@ ELEMENTAL_UNLOCK_R = 300.0
 # <p>/<s>`. A touch with `no unlock` by a hero of a lock element fails (the game would open it).
 GATE_LOCK = re.compile(r"Online: elemental gate (\S+) (single|dual) lock: element\(s\) (\S+), unlock radius")
 GATE_TOUCH = re.compile(r"Online: elemental gate (\S+) touched by (\S+): sides (\S+)/(\S+): (unlocks|no unlock)")
-HERO_ELEMENTS = re.compile(r"Online: hero (\S+) elements (\S+)/(\S+)")  # the UnlockRadius of every elemental gate of tutorial_b and ww1 (their LockDatas)
+HERO_ELEMENTS = re.compile(r"Online: hero (\S+) elements (\S+)/(\S+)")
+# Doors (the gates author, 380b3362): a follower's game takes its hero through a door another player entered
+# (`door <Name#id>: this game's hero goes through with peer <p> (<d> from it): its entry replayed here, at once|queued`)
+# or keeps it (`door <Name#id>: this game's hero stays for peer <p>'s entry (<d> from it|busy: <why>)` and the other
+# stay reasons). Counted on the page; a partner left behind going through alone afterwards has no line of its own (its
+# own entry is an ordinary request): the specs that use a door check it.
+DOOR_GOES = re.compile(r"Online: door (\S+): this game's hero goes through with peer (\d+) .*its entry replayed here, "
+                       r"(at once|queued)")
+DOOR_STAYS = re.compile(r"Online: door (\S+): this game's hero stays for peer (\d+)'s entry")  # the UnlockRadius of every elemental gate of tutorial_b and ww1 (their LockDatas)
 SWAP_RAN = re.compile(r"Online: swap zone lease \d+ running here")
 SWAP_ENDED_S = re.compile(r"Online: swap zone (\d+) (won|failed)\b")
 SWAP_PARKED = re.compile(r"Online: swap zone (\S+) parked at ")
@@ -1644,6 +1652,12 @@ def grade_gate_kinds(run: Run, data: "LevelData | None") -> Verdict:
                                     [l.cite()]))
         if not ran and not ended:
             untested += [f"Swap Zone {n} ({u})" for n, u in data.swap_zones]
+    goes = [(w, m) for w, lg in games for _l, m in lg.find(DOOR_GOES)]
+    stays = [(w, m) for w, lg in games for _l, m in lg.find(DOOR_STAYS)]
+    if goes or stays:
+        counts.append(f"doors: went through with another player {len(goes)} ("
+                      f"{sum(m.group(3) == 'at once' for _w, m in goes)} at once, "
+                      f"{sum(m.group(3) == 'queued' for _w, m in goes)} queued), stayed {len(stays)}")
     if not counts:
         return Verdict(name, NOT_TESTED, f"{data.level} has no elemental gate and no Swap Zone pad")
     if untested:
