@@ -780,6 +780,35 @@ class Together(unittest.TestCase):
         self.assertIn("D stayed where it entered", v.counts)
 
 
+class EnemyServerDamage(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+
+    def test_states_and_hits_from_s(self) -> None:
+        # The enemies author's line forms (online/5-replica-attacks-land-2 4b9ae45d).
+        s = [(50, "Online: enemy hit a1@2 on peer 1 #1 damage 10 occurrence 3 tick 900 (S's hit, sent) (#1)"),
+             (51, "Online: enemy hit a1@2 on peer 2 #2 damage 10 occurrence 3 tick 905 (S's hit, sent) (#2)"),
+             (52, "Online: enemy hit a1@2 on peer 2 #3 damage 10 occurrence 3 tick 910 (S's hit, sent) (#3)")]
+        h = H_JOIN + [(45, "Online: enemy state a1@2 converged 1a2b3c4d Spawn_Cannon -> Idle lag 12 ticks (within 1 s)"),
+                      (50, "Online: enemy hit a1@2 #1 damage 10 force 0 occurrence 3 applied here: applied hp 200 -> 190 "
+                           "(S tick 900, here 902) (#1)")]
+        d = D_JOIN + [(46, "Online: enemy state a1@2 converged 1a2b3c4d Spawn_Cannon -> Idle lag 75 ticks (late)"),
+                      (51, "Online: enemy hit a1@2 #2 damage 10 force 0 occurrence 3 applied here: applied hp 200 -> 190 "
+                           "(S tick 905, here 906) (#1)"),
+                      (51, "Online: enemy hit a1@2 #2 damage 10 force 0 occurrence 3 applied here: applied hp 190 -> 180 "
+                           "(S tick 905, here 907) (#2)"),
+                      (53, "Online: hero hit by Chompy#2102 a1@2 (sweep, 10) (S's attack, played here) (#1)")]
+        v = lc.grade_enemy_server_damage(lc.load_run(RunFolder(s, h, d).path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual([f.what.split(" (")[0] for f in v.findings], [
+            "D: 1 copy state(s) converged late", "1 S hit(s) applied more than once on the player's game",
+            "1 S hit(s) lost: no applied or refused line on the player's game",
+            "1 hero hit(s) by a copy's own hit while the damage is S's"])
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session_predates_the_lines(self) -> None:
+        self.assertEqual(lc.grade_enemy_server_damage(lc.load_run(self.OWNER_3)).status, lc.NOT_TESTED)
+
+
 class DialogSkip(unittest.TestCase):
     OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
     ON = (1, "Dev: skip scenes on (test-only): dialogs only: conversations are skipped through the game's own skip path")

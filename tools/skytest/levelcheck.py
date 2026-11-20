@@ -891,6 +891,96 @@ def grade_coins(run: Run) -> Verdict:
     return Verdict("coins", FAIL if findings else PASS, counts, first.cite(), findings)
 
 
+# --- enemy states and damage from S (W39) ---------------------------------------------------------------------
+#
+# The enemies author's lines (online/5-replica-attacks-land-2 4b9ae45d, S's online_enemy_state_convergence; his list
+# may still change: the patterns follow his branch). States: a client's `enemy state <row> converged <machine> <copy's
+# state|none> -> <S's state> lag <n> ticks (within 1 s|late)`; a convergence out of a spawn state (a state whose name
+# starts `Spawn`) later than STATE_LAG_TICKS shared ticks, any `(late)` and any `given up on this copy` fail. Damage
+# from S: each S `enemy hit <row> on peer <p> #<i> damage <d> occurrence <o> tick <t> (S's hit, sent)` wants exactly
+# one `enemy hit <row> #<i> damage <d> ... applied here: ...` on peer <p>'s game (none twice, none lost; `not applied
+# (<why>)` is lost); and while damage is S's (any such S line in the run), a client's `hero hit by ... (S's attack,
+# played here)` that its damage check let through is a copy's own hit hurting a hero: FAIL. A run with none of these
+# lines is NOT TESTED (a build before that branch).
+STATE_CONVERGED = re.compile(r"Online: enemy state (\S+) converged (\S+) (\S+) -> (\S+) lag (-?\d+) ticks \((within 1 s|late)\)")
+STATE_GIVEN_UP = re.compile(r"Online: enemy state (\S+) (\S+) given up on this copy")
+S_HIT_SENT = re.compile(r"Online: enemy hit (\S+) on peer (\d+) #(\d+) damage (\S+) occurrence \S+ tick \d+ \(S's hit, sent\)")
+C_HIT_APPLIED = re.compile(r"Online: enemy hit (\S+) #(\d+) damage (\S+) force \S+ occurrence \S+ applied here: (.*?) hp")
+C_HIT_NOT = re.compile(r"Online: enemy hit (\S+) #(\d+) damage (\S+) not applied \((.*)\)")
+OWN_COPY_HIT = re.compile(r"Online: hero hit by (\S+) (\S+) \(([a-z]+), ([^)]*)\) \(S's attack, played here\)")
+STATE_LAG_TICKS = 60
+
+
+def grade_enemy_server_damage(run: Run) -> Verdict:
+    name = "enemy states and damage from S"
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    sent = run.server.find(S_HIT_SENT)
+    conv = {w: lg.find(STATE_CONVERGED) for w, lg in run.clients.items()}
+    if not sent and not any(conv.values()):
+        return Verdict(name, NOT_TESTED, "no `enemy state ... converged` and no `enemy hit ... (S's hit, sent)` line "
+                       "(a build before online/5-replica-attacks-land-2, or S's online_enemy_state_convergence off)")
+    findings: list[Finding] = []
+    counts: list[str] = []
+    for w, lg in sorted(run.clients.items()):
+        rows = conv[w]
+        bad = [(l, m) for l, m in rows if m.group(6) == "late" or
+               (m.group(3).startswith("Spawn") and int(m.group(5)) > STATE_LAG_TICKS)]
+        spawn = [(l, m) for l, m in rows if m.group(3).startswith("Spawn")]
+        given = lg.find(STATE_GIVEN_UP)
+        counts.append(f"{w}: {len(rows)} convergence(s), {len(spawn)} out of a spawn state "
+                      f"(lag at most {max([int(m.group(5)) for _l, m in spawn] or [0])} ticks), {len(given)} given up")
+        if bad:
+            findings.append(Finding(f"{w}: {len(bad)} copy state(s) converged late (over {STATE_LAG_TICKS} shared ticks "
+                                    "after S, or `late`)", [l.cite() for l, _m in bad[:4]]))
+        if given:
+            findings.append(Finding(f"{w}: {len(given)} state(s) given up on a copy (the game's read-back missed)",
+                                    [l.cite() for l, _m in given[:4]]))
+    peers = peer_numbers(run)
+    if sent:
+        applied: dict[str, dict[tuple[str, str], list[Line]]] = {}
+        lost: dict[str, dict[tuple[str, str], tuple[Line, str]]] = {}
+        for w, lg in run.clients.items():
+            for l, m in lg.find(C_HIT_APPLIED):
+                applied.setdefault(w, {}).setdefault((m.group(1), m.group(2)), []).append(l)
+            for l, m in lg.find(C_HIT_NOT):
+                lost.setdefault(w, {})[(m.group(1), m.group(2))] = (l, m.group(4))
+        missing, twice, refused = [], [], []
+        for l, m in sent:
+            who = peers.get(int(m.group(2)))
+            key = (m.group(1), m.group(3))
+            if who is None:
+                continue
+            got = applied.get(who, {}).get(key, [])
+            if len(got) > 1:
+                twice.append((who, key, got))
+            elif not got:
+                nl = lost.get(who, {}).get(key)
+                (refused if nl else missing).append((who, key, l, nl))
+        counts.append(f"S's hits on players {len(sent)}: applied once "
+                      f"{len(sent) - len(missing) - len(twice) - len(refused)}, twice {len(twice)}, not applied "
+                      f"{len(refused)}, no line {len(missing)}")
+        if twice:
+            findings.append(Finding(f"{len(twice)} S hit(s) applied more than once on the player's game",
+                                    [f"{w}: {g[0].cite()}" for w, _k, g in twice[:3]]))
+        if refused:
+            findings.append(Finding(f"{len(refused)} S hit(s) not applied on the player's game ("
+                                    + ", ".join(sorted({nl[1][:40] for *_x, nl in refused})) + ")",
+                                    [f"{w}: {nl[0].cite()}" for w, _k, _l, nl in refused[:3]]))
+        if missing:
+            findings.append(Finding(f"{len(missing)} S hit(s) lost: no applied or refused line on the player's game",
+                                    [l.cite() for _w, _k, l, _n in missing[:3]]
+                                    + [absent(run.clients[w], f"`enemy hit {k[0]} #{k[1]} ... applied here`")
+                                       for w, k, _l, _n in missing[:1]]))
+        own = [(w, l) for w, lg in run.clients.items() for l, _m in lg.find(OWN_COPY_HIT)
+               if "refused by this game's damage check" not in l.text]
+        counts.append(f"copies' own hits let through while damage is S's: {len(own)}")
+        if own:
+            findings.append(Finding(f"{len(own)} hero hit(s) by a copy's own hit while the damage is S's",
+                                    [f"{w}: {l.cite()}" for w, l in own[:4]]))
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), "", findings)
+
+
 # --- dialogs skipped (W39) ---------------------------------------------------------------------------------------
 #
 # The owner's third session: both clients ran with the automatic dialog skip (`Dev: skip scenes on (test-only): dialogs
@@ -3219,7 +3309,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     rows = [grade_server_alive(run), grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run),
             grade_coins_shared(run), grade_scenes_once(run), grade_level_changes(run), grade_enemy_kills(run),
-            grade_gate_kinds(run, data), grade_dialog_skip(run),
+            grade_gate_kinds(run, data), grade_dialog_skip(run), grade_enemy_server_damage(run),
             grade_loot(run),
             grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
             grade_fight_gates(run, data)]
