@@ -891,6 +891,92 @@ def grade_coins(run: Run) -> Verdict:
     return Verdict("coins", FAIL if findings else PASS, counts, first.cite(), findings)
 
 
+# --- enemies can be killed (W38) -----------------------------------------------------------------------------
+#
+# The owner's third session: "immortal enemies". Per enemy row K (S's key: `a<...>@<g>` placed, `s<...>` spawned):
+# the hits the players landed on their own games (a client's `enemy local health held K (<a> -> <b>, ...)` with b < a:
+# its hit took health off its copy, which S's row holds; and `enemy kill K failed (pending, the replica stays bound)`:
+# its copy's death S did not take) against S's own health of K (S's `hit <p>:<n> <attacker> -> <Name#id> hp <a> ->
+# <b> ...`, the victim tied to K by S's `enemy placed K as <Name#id>`, `enemy K awake on the server as <Name#id>` or
+# `enemy run-time spawn K as <Name#id>`; and `enemy K dead by`). An enemy a client landed hits on that lost no health on
+# S and never died there is a FAIL ("immortal"), and so is each client kill S did not take (with when S's death came,
+# if it did). The page's `attacks started on the server` stays beside it.
+ENEMY_NAMED = re.compile(r"Online: enemy (?:placed (\S+) as (\S+#\d+)|(\S+) awake on the server as (\S+#\d+)|run-time "
+                         r"spawn (\S+) as (\S+#\d+))")
+S_HIT = re.compile(r"Online: hit (\d+):(\d+) \S+ -> (\S+#\d+) hp (-?[\d.]+) -> (-?[\d.]+)")
+S_ENEMY_DEAD = re.compile(r"Online: enemy (\S+) dead by (\S+)")
+LOCAL_HELD = re.compile(r"Online: enemy local health held (\S+) \((-?[\d.]+) -> (-?[\d.]+),")
+KILL_FAILED = re.compile(r"Online: enemy kill (\S+) failed \(pending")
+CLIENT_LIFE_DEAD = re.compile(r"Online: enemy life (\S+) alive -> dead")
+
+
+def grade_enemy_kills(run: Run) -> Verdict:
+    name = "enemies can be killed"
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    # S: each victim's key at the time of its hit, its health drops and its death
+    named: dict[str, str] = {}
+    lost: dict[str, int] = {}
+    s_hits: dict[str, int] = {}
+    for i, raw in enumerate(run.server.lines):
+        m = ENEMY_NAMED.search(raw)
+        if m:
+            k, nm = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4)) if m.group(3) else \
+                (m.group(5), m.group(6))
+            named[nm] = k
+            continue
+        m = S_HIT.search(raw)
+        if m and m.group(3) in named:
+            k = named[m.group(3)]
+            s_hits[k] = s_hits.get(k, 0) + 1
+            if float(m.group(5)) < float(m.group(4)):
+                lost[k] = lost.get(k, 0) + 1
+    dead = {}
+    for line, m in run.server.find(S_ENEMY_DEAD):
+        dead.setdefault(m.group(1), line)
+    order = sorted(run.clients, key=lambda w: (w != "H", w))
+    findings: list[Finding] = []
+    hit_keys: set[str] = set()
+    landed_total = 0
+    for w in order:
+        log = run.clients[w]
+        landed: dict[str, list[Line]] = {}
+        for line, m in log.find(LOCAL_HELD):
+            if float(m.group(3)) < float(m.group(2)):
+                landed.setdefault(m.group(1), []).append(line)
+        here_dead = {}
+        for line, m in log.find(CLIENT_LIFE_DEAD):
+            here_dead.setdefault(m.group(1), []).append(line)
+        for line, m in log.find(KILL_FAILED):
+            k = m.group(1)
+            d = dead.get(k)
+            if d is None or d.t is None or line.t is None:
+                s_part = "S never logged its death"
+            else:
+                s_part = f"S's death of it {(d.t - line.t).total_seconds():+.1f} s from it"
+            after = [l for l in here_dead.get(k, []) if l.t and line.t and l.t >= line.t]
+            h_part = (f"its copy here died {(after[0].t - line.t).total_seconds():.0f} s later" if after
+                      else "its copy here never died")
+            findings.append(Finding(f"{w}: its kill of {k} was not taken (pending, the replica stays bound): {s_part}; "
+                                    f"{h_part}", [line.cite()] + ([d.cite()] if d is not None else [])
+                                    + ([after[0].cite()] if after else [])))
+        for k, lines in landed.items():
+            hit_keys.add(k)
+            landed_total += len(lines)
+            if not lost.get(k) and k not in dead:
+                findings.append(Finding(f"{w}: {k} took {len(lines)} landed hit(s) here and lost no health on S "
+                                        f"(S applied {s_hits.get(k, 0)} hit(s) to it): immortal",
+                                        [l.cite() for l in lines[:3]] + [absent(run.server, f"`enemy {k} dead by`")]))
+    counts = (f"{len(hit_keys)} enemy row(s) hit by the players ({landed_total} landed hit(s) on their own games); "
+              f"S took health off {len(lost)} row(s), {len(dead)} died on S")
+    started = attacks_started_line(run)
+    if started:
+        counts += "; " + started
+    if not hit_keys and not findings:
+        return Verdict(name, NOT_TESTED, counts + " (no landed hit on any client's copy of an enemy)")
+    return Verdict(name, FAIL if findings else PASS, counts, "", findings)
+
+
 # --- level changes (W38) ------------------------------------------------------------------------------------
 #
 # The owner's third session: "Map changes are bugged". Per level S opens (`level <g> <path>: open[ (<cause>)]`): who
@@ -2952,7 +3038,8 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     together = grade_together(run)
     rows = [grade_server_alive(run), grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run),
-            grade_coins_shared(run), grade_scenes_once(run), grade_level_changes(run), grade_loot(run),
+            grade_coins_shared(run), grade_scenes_once(run), grade_level_changes(run), grade_enemy_kills(run),
+            grade_loot(run),
             grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
             grade_fight_gates(run, data)]
     # The enemies and the loot are read where both players stand only when D followed H: each says which.

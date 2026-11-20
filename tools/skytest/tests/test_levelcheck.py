@@ -780,6 +780,50 @@ class Together(unittest.TestCase):
         self.assertIn("D stayed where it entered", v.counts)
 
 
+class EnemyKills(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+    OWNER_2 = Path(r"D:/SwapForceOnline-data/play/20261119-211901")
+
+    def test_hits_that_take_no_health_on_s_and_a_kill_s_did_not_take(self) -> None:
+        s = [(10, "Online: enemy placed a00000000.0629f659.00013531@2 as EB_Lobber#3996 hp 75 pose 31 (S)"),
+             (11, "Online: enemy placed a00000000.0629f659.0001330d@2 as Chompy#4792 hp 1 pose 63 (S)"),
+             (12, "Online: enemy placed a00000000.0629f659.00013290@2 as Chompy#4793 hp 1 pose 64 (S)"),
+             (20, "Online: hit 1:3 PeerPuppet_1 -> Chompy#4793 hp 1 -> 0 killed (landed, victim w1, team 28)"),
+             (21, "Online: enemy a00000000.0629f659.00013290@2 dead by 1 (S, placed; attacker PeerPuppet_1#3844)"),
+             (40, "Online: enemy a00000000.0629f659.0001330d@2 dead by 2 (S, placed; attacker PeerPuppet_2#3844)")]
+        h = H_JOIN + [(19, "Online: enemy local health held a00000000.0629f659.00013290@2 (1 -> -20, 8298e4bc)"),
+                      (30, "Online: enemy local health held a00000000.0629f659.00013531@2 (75 -> 54, 8298e4bc)")]
+        d = D_JOIN + [(41, "Online: enemy kill a00000000.0629f659.0001330d@2 failed (pending, the replica stays bound)"),
+                      (75, "Online: enemy life a00000000.0629f659.0001330d@2 alive -> dead")]
+        v = lc.grade_enemy_kills(lc.load_run(RunFolder(s, h, d).path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertTrue(v.counts.startswith("2 enemy row(s) hit by the players (2 landed hit(s) on their own games); S "
+                                            "took health off 1 row(s), 2 died on S"), v.counts)
+        self.assertEqual([f.what for f in v.findings], [
+            "H: a00000000.0629f659.00013531@2 took 1 landed hit(s) here and lost no health on S (S applied 0 hit(s) to "
+            "it): immortal",
+            "D: its kill of a00000000.0629f659.0001330d@2 was not taken (pending, the replica stays bound): S's death of "
+            "it -1.0 s from it; its copy here died 34 s later"])
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session(self) -> None:
+        # "immortal enemies": 4 kills on the clients S had already taken, whose copies stayed alive (D's for 34-36 s,
+        # H's to the end), and enemies hit on a client that S never took health off (most presses never started on S).
+        v = lc.grade_enemy_kills(lc.load_run(self.OWNER_3))
+        kills = [f.what for f in v.findings if "its kill of" in f.what]
+        self.assertEqual(len(kills), 4, kills)
+        self.assertIn("D: its kill of a00000000.0629f659.0001330d@2 was not taken (pending, the replica stays bound): "
+                      "S's death of it -0.1 s from it; its copy here died 34 s later", kills)
+        self.assertGreater(len(v.findings), 20)
+        self.assertIn("attacks started on the server: H (peer 1) 62 of 490, D (peer 2) 1 of 98", v.counts)
+
+    @unittest.skipUnless(OWNER_2.is_dir(), "the owner's second session is not here")
+    def test_the_owners_second_session(self) -> None:
+        v = lc.grade_enemy_kills(lc.load_run(self.OWNER_2))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(len(v.findings), 7)
+
+
 class LevelChanges(unittest.TestCase):
     OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
     OWNER_2 = Path(r"D:/SwapForceOnline-data/play/20261119-211901")
