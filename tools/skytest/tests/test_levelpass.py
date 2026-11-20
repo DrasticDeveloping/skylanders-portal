@@ -1048,6 +1048,24 @@ class RequiredStepsPlan(unittest.TestCase):
         self.assertEqual(lp.d_fight_ref(p), "")
         self.assertNotIn("stand_by", lp.script_h(p, None))
 
+    def test_no_plan_enters_a_trigger_the_ground_check_refuses(self) -> None:
+        # W37: the three levels' plans enter no trigger that sends nothing in the level's logic, and none the route's
+        # ground check refuses (runs: tutorial_a's 1775, no ground within 1,728). tutorial_a's fight waits for the
+        # level's own spawns instead.
+        refused = {"auth:tutorial_a:1775"}
+        for level in ("tutorial_a", "tutorial_b", "ww1"):
+            content = lp.load_content(LEVELPASS_DATA, level)
+            p = self.plan(level)
+            silent = lp.silent_triggers(content)
+            h = lp.script_h(p, None).splitlines()
+            entered = {l.split()[1] for l in h if l.startswith("enter_trigger ")}
+            self.assertFalse(entered & refused, (level, entered & refused))
+            keys = {o.ref: lp.obj_key(o) for o in content.objects if o.ref}
+            self.assertFalse([r for r in entered if keys.get(r) in silent], level)
+        a = lp.script_h(self.plan("tutorial_a"), None).splitlines()
+        i = a.index(f"waitfor online_enemy_bound {lp.LEVEL_FIGHT_WAIT_S}")
+        self.assertTrue(a[i + 2].startswith("fight_near "), a[i:i + 3])
+
     def test_the_late_joiner_waits_for_its_arrival(self) -> None:
         # W30: the late joiner is placed only after its arrival move is over, where the build has the condition.
         old = lp.ARRIVAL_DONE
