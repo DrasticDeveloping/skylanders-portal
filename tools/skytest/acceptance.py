@@ -12,6 +12,7 @@ check's failed rows with their first finding), the log paths. Each case runs onc
 from __future__ import annotations
 
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -36,6 +37,29 @@ LEVELS = ["tutorial_a", "tutorial_b", "ww1"]
 OWED: dict[str, str] = {}
 LEVEL_DEFAULT_S = 900.0      # a level check with no earlier run: the level pass's own bound
 PAGE_LINE = re.compile(r"levelcheck \S+: page (.+)$", re.M)
+# The owner's standing rule: our test sessions wait while he plays one of his games (the six Skylanders games:
+# *recompiled.exe). Before each case the list waits while one runs, a line a minute; --while-owner-plays runs anyway.
+OWNER_WAIT_S = 60.0
+OWNER_AT_RISK = "OWNER DATA AT RISK"
+
+
+def wait_for_owner(games, sleep=time.sleep, say=print, while_owner_plays: bool = False,
+                   now=time.monotonic) -> float:
+    """Waits while games() names one of the owner's own games (exe name, start time), a line every OWNER_WAIT_S;
+    returns the seconds waited (0 at once, or with while_owner_plays: one line says it runs anyway)."""
+    running = games()
+    if not running:
+        return 0.0
+    names = ", ".join(n for n, _t in running)
+    if while_owner_plays:
+        say(f"acceptance: the owner's game {names} is running; --while-owner-plays: the case starts anyway")
+        return 0.0
+    t0 = now()
+    while running:
+        say(f"waiting: the owner's game {', '.join(n for n, _t in running)} is running")
+        sleep(OWNER_WAIT_S)
+        running = games()
+    return now() - t0
 
 
 @dataclass
@@ -118,6 +142,9 @@ def case_row(case: str, run: Path | None, out_tail: str, seconds: float) -> Row:
         return row
     row.result = str(r.get("status", "?")).upper()
     row.lines = [str(x) for x in r.get("reasons", []) or []][:4]
+    owner = [str(x) for x in r.get("notes", []) or [] if "owner data" in str(x) or OWNER_AT_RISK in str(x)]
+    if owner and not any(OWNER_AT_RISK in x for x in row.lines):
+        row.lines.append(owner[0])
     for p in r.get("peers", []) or []:
         if not isinstance(p, dict):
             continue
@@ -160,12 +187,24 @@ def page_text(rows: list[Row], est_text: str, build: str) -> str:
 
 
 def run(skytest_py: Path, repo: Path, store: Path, levelpass: Path, cases: list[str], levels: list[str],
-        run_not_ready: bool, dry_run: bool, build: str, history: list[Path] | None = None) -> int:
+        run_not_ready: bool, dry_run: bool, build: str, history: list[Path] | None = None,
+        while_owner_plays: bool = False, owner_games=None) -> int:
     runs = store / "runs"
     est = estimate(repo, runs, cases, levels, history)
     et = estimate_text(est)
     print(et, flush=True)
+    if owner_games is None:
+        import skytest
+        owner_games = lambda: skytest.owner_games_running(os.getpid())  # noqa: E731
     if dry_run:
+        playing = owner_games()
+        if playing:
+            names = ", ".join(f"{n} (started {s})" for n, s in playing)
+            print(f"acceptance: the owner's game {names} is running: "
+                  + ("--while-owner-plays: it would start anyway" if while_owner_plays
+                     else "it would wait before each case until it ends"), flush=True)
+        else:
+            print("acceptance: none of the owner's games is running: it would start at once", flush=True)
         return 0
     stamp = time.strftime("%Y%m%d-%H%M%S")
     work = store / f"acceptance-{stamp}"
@@ -178,6 +217,7 @@ def run(skytest_py: Path, repo: Path, store: Path, levelpass: Path, cases: list[
                             lines=[OWED.get(c, "no tests/runtime/" + c + ".toml in this tree")]))
             print(f"acceptance: {c}: {rows[-1].result}", flush=True)
             continue
+        wait_for_owner(owner_games, say=lambda s: print(s, flush=True), while_owner_plays=while_owner_plays)
         before = {d.name for d in runs.glob(f"*-{c}")}
         cmd = [sys.executable, "-I", str(skytest_py), "test", c, "--jobs", "1"] + (["--run-not-ready"] if run_not_ready
                                                                                   else [])
@@ -188,7 +228,13 @@ def run(skytest_py: Path, repo: Path, store: Path, levelpass: Path, cases: list[
         got = new_runs(runs, c, before)
         rows.append(case_row(c, got[-1] if got else None, p.stdout[-2000:], time.monotonic() - t0))
         print(f"acceptance: {c}: {rows[-1].result}", flush=True)
+        if any(OWNER_AT_RISK in x for x in rows[-1].lines) or OWNER_AT_RISK in p.stdout:
+            print(f"acceptance: {OWNER_AT_RISK} in {c}: the list stops here", flush=True)
+            rows[-1].lines.insert(0, f"{OWNER_AT_RISK}: the acceptance run stopped after this case")
+            levels = []
+            break
     for lv in levels:
+        wait_for_owner(owner_games, say=lambda s: print(s, flush=True), while_owner_plays=while_owner_plays)
         before = {d.name for d in runs.glob(f"*-levelpass-{lv}")}
         cmd = [sys.executable, "-I", str(skytest_py), "levelcheck", lv]
         print(f"acceptance: levelcheck {lv} ...", flush=True)

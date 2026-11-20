@@ -30,6 +30,7 @@ import temp_sweep  # noqa: E402
 
 FAKE = HERE / "fake_game.py"
 _REAL_TOKEN_RESTRICTION = skytest.token_restriction
+_REAL_OWNER_GAMES = skytest.owner_games_running
 
 
 def setUpModule() -> None:
@@ -50,11 +51,15 @@ def setUpModule() -> None:
     # empty slot folder is removed again in tearDownModule.
     temp_sweep.sweep()
     os.environ["SFO_BUILD_SLOT_DIR"] = temp_sweep.make("skytest-no-builds-")
+    # The owner's own games on this machine (*recompiled.exe) are not these tests' business: none runs for them
+    # (a real one would excuse an owner-folder change); test_owner_guard.py tests the reader.
+    skytest.owner_games_running = lambda *a, **k: []
 
 
 def tearDownModule() -> None:
     temp_sweep.remove(os.environ.pop("SFO_BUILD_SLOT_DIR", None))
     skytest.token_restriction = _REAL_TOKEN_RESTRICTION
+    skytest.owner_games_running = _REAL_OWNER_GAMES
 
 
 def toml_str(p: Path | str) -> str:

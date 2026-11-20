@@ -51,6 +51,21 @@ class Acceptance(unittest.TestCase):
             self.assertIn("| b-case | no run | 0.0 min |   NOT READY: waits | - |", text)
             self.assertIn("0 of 2 passed; each case ran once.", text)
 
+    def test_the_list_waits_while_the_owner_plays(self) -> None:
+        said, slept = [], []
+        seq = [[("imaginatorsrecompiled.exe", "2026-11-20 03:39:00")]] * 3 + [[]]
+        games = lambda: seq.pop(0)  # noqa: E731
+        clock = iter([0.0, 180.0])
+        waited = acceptance.wait_for_owner(games, sleep=slept.append, say=said.append, now=lambda: next(clock))
+        self.assertEqual(waited, 180.0)
+        self.assertEqual(said, ["waiting: the owner's game imaginatorsrecompiled.exe is running"] * 3)
+        self.assertEqual(slept, [acceptance.OWNER_WAIT_S] * 3)
+        said.clear()
+        self.assertEqual(acceptance.wait_for_owner(lambda: [("x_recompiled.exe", "t")], sleep=slept.append,
+                                                   say=said.append, while_owner_plays=True), 0.0)
+        self.assertIn("--while-owner-plays: the case starts anyway", said[0])
+        self.assertEqual(acceptance.wait_for_owner(lambda: [], sleep=slept.append, say=said.append), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
