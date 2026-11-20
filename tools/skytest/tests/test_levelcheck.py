@@ -780,6 +780,43 @@ class Together(unittest.TestCase):
         self.assertIn("D stayed where it entered", v.counts)
 
 
+class DialogSkip(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+    ON = (1, "Dev: skip scenes on (test-only): dialogs only: conversations are skipped through the game's own skip path")
+
+    def test_a_skipped_conversation_ends_soon_after_its_skip(self) -> None:
+        d = D_JOIN + [self.ON,
+                      (60, "Online: scene local 2/L2 start conversation conversation recipient Tessa#3811 from x"),
+                      (63, "Dev: skip conversation Tessa#3811 line 0 of 2 handed to the server's skip request"),
+                      (63, "Online: scene skip conversation (generation 2, name 0x37E6CA06, no recipient, play 1) turn 0 "
+                           "echoed here (line 0 -> 3 of 2; the server's line 2)"),
+                      (64, "Online: scene local 2/L2 end by natural after 4.0 s (2/2.w1)"),
+                      (70, "Online: scene local 2/L3 start conversation conversation recipient Pit#3881 from x"),
+                      (70, "Dev: skip conversation Pit#3881 line 0 of 2: the server plays it too, left to its skip"),
+                      (79, "Online: scene local 2/L3 end by natural after 9.4 s (2/3.w1)"),
+                      (80, "Online: scene local 2/L4 start conversation conversation recipient Pit#2147483648 from x"),
+                      (80, "Dev: skip conversation Pit#2147483648 line 0 of 3 is unskippable: waits it out"),
+                      (95, "Online: scene local 2/L4 end by natural after 15.8 s (no server scene)")]
+        v = lc.grade_dialog_skip(lc.load_run(RunFolder([], H_JOIN, d).path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.counts, "D: 3 conversation(s), 2 skippable, 1 skipped in time")
+        self.assertEqual([f.what for f in v.findings], [
+            "D: Pit#3881 (2/L3): never skipped here (the skip said: the server plays it too, left to its skip)"])
+        self.assertEqual(lc.grade_dialog_skip(lc.load_run(RunFolder([], H_JOIN, D_JOIN).path)).status, lc.NOT_TESTED)
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session_fails(self) -> None:
+        # Tessa's two lines: the server's skip came 3 s in and the conversation went on 9.9 s (D) / 9.4 s (H) more;
+        # the pit's and Tessa's second talk were never skipped (`the server plays it too, left to its skip`).
+        v = lc.grade_dialog_skip(lc.load_run(self.OWNER_3))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.counts, "D: 8 conversation(s), 7 skippable, 3 skipped in time; H: 8 conversation(s), 7 "
+                                   "skippable, 3 skipped in time")
+        self.assertIn("D: Tessa#3811 (2/L2): it ended 9.9 s after its last skip (13.6 s in all) (the skip said: handed "
+                      "to the server's skip request; the server plays it too, left to its skip)",
+                      [f.what for f in v.findings])
+
+
 class GateKinds(unittest.TestCase):
     OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
     LP = Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass")

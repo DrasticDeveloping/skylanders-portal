@@ -891,6 +891,103 @@ def grade_coins(run: Run) -> Verdict:
     return Verdict("coins", FAIL if findings else PASS, counts, first.cite(), findings)
 
 
+# --- dialogs skipped (W39) ---------------------------------------------------------------------------------------
+#
+# The owner's third session: both clients ran with the automatic dialog skip (`Dev: skip scenes on (test-only): dialogs
+# only: ...`) and the conversations played on. Every conversation ends `by natural`, skipped or not (the game's own end
+# after its last line: no run in the store has another end for a conversation), so the row reads the skips and their
+# times. On a client with the skip on (dialogs only, or cutscenes, conversations and ...), each conversation with a
+# skippable line (a `Dev: skip conversation <who> line <i> of <n> ...` that is not `is unskippable`) must be skipped
+# here (this game's `handed to the server's skip request`, or the server's skip `scene skip conversation (...) turn <k>
+# echoed here`), its first skip no later than CONV_UNSKIPPABLE_S + DIALOG_SKIP_S after its start (every hand-over in
+# the store came 3.0 s in: the game's own unskippable start), and its end no later than DIALOG_SKIP_S after its last
+# skip. A conversation whose lines are all unskippable is left out. With trace_scenes, `skips 0` fails too.
+SKIP_ON = re.compile(r"Dev: skip scenes on \(test-only\): (?:dialogs only|.*conversations)")
+CONV_START = re.compile(r"Online: scene local (\d+/L\d+) start conversation \S+ recipient (\S+)")
+CONV_END = re.compile(r"Online: scene local (\d+/L\d+) end by (.+?) after ([\d.]+) s")
+CONV_SKIP = re.compile(r"Dev: skip conversation (\S+) line (\d+) of (\d+)(.*)")
+CONV_ECHO = re.compile(r"Online: scene skip conversation \(.*\) turn \d+ echoed here")
+CONV_TRACE_END = re.compile(r"Dev: conversation end key \S+ after [\d.]+ s .* skips (\d+)")
+DIALOG_SKIP_S = 2.0
+CONV_UNSKIPPABLE_S = 3.0
+
+
+def grade_dialog_skip(run: Run) -> Verdict:
+    name = "dialogs skipped"
+    on = [w for w, log in sorted(run.clients.items()) if log.find(SKIP_ON)]
+    if not on:
+        return Verdict(name, NOT_TESTED, "no client ran with the dialog skip (no `Dev: skip scenes on ... dialogs` or "
+                       "`... conversations` line)")
+    findings: list[Finding] = []
+    counts: list[str] = []
+    n_skippable = 0
+    for w in on:
+        log = run.clients[w]
+        open_by_key: dict[str, dict] = {}
+        current: dict | None = None
+        convs: list[dict] = []
+        for i, raw in enumerate(log.lines):
+            m = CONV_START.search(raw)
+            if m:
+                current = {"key": m.group(1), "who": m.group(2), "start": log.line(i), "skips": [], "acts": [],
+                           "end": None, "how": "", "secs": 0.0, "trace_skips": None}
+                open_by_key[m.group(1)] = current
+                convs.append(current)
+                continue
+            if current is None:
+                continue
+            m = CONV_SKIP.search(raw)
+            if m and m.group(1) == current["who"]:
+                current["skips"].append((m.group(4), log.line(i)))
+                if "handed to the server's skip request" in m.group(4):
+                    current["acts"].append(log.line(i))
+                continue
+            if CONV_ECHO.search(raw):
+                current["acts"].append(log.line(i))
+                continue
+            m = CONV_TRACE_END.search(raw)
+            if m and current["end"] is not None and current["trace_skips"] is None:
+                current["trace_skips"] = int(m.group(1))
+                continue
+            m = CONV_END.search(raw)
+            if m and m.group(1) in open_by_key:
+                cv = open_by_key.pop(m.group(1))
+                cv["end"], cv["how"], cv["secs"] = log.line(i), m.group(2), float(m.group(3))
+        skippable = [cv for cv in convs if any("is unskippable" not in s[0] for s in cv["skips"])]
+        n_skippable += len(skippable)
+        late = 0
+        for cv in skippable:
+            why = []
+            st = cv["start"].t
+            acts = [a for a in cv["acts"] if a.t is not None]
+            if not acts:
+                why.append("never skipped here")
+            else:
+                first = (acts[0].t - st).total_seconds() if st else 0.0
+                if first > CONV_UNSKIPPABLE_S + DIALOG_SKIP_S:
+                    why.append(f"its first skip came {first:.1f} s after its start")
+                if cv["end"] is not None and cv["end"].t is not None:
+                    after = (cv["end"].t - acts[-1].t).total_seconds()
+                    if after > DIALOG_SKIP_S:
+                        why.append(f"it ended {after:.1f} s after its last skip ({cv['secs']:.1f} s in all)")
+            if cv["end"] is None:
+                why.append("never ended")
+            if cv["trace_skips"] == 0:
+                why.append("its trace says skips 0")
+            if why:
+                late += 1
+                outcomes = sorted({s[0].strip(": ").split(" (")[0][:60] for s in cv["skips"]})
+                findings.append(Finding(f"{w}: {cv['who']} ({cv['key']}): " + "; ".join(why) + " (the skip said: "
+                                        + "; ".join(outcomes) + ")",
+                                        [cv["start"].cite()] + [a.cite() for a in acts[:1]]
+                                        + ([cv["end"].cite()] if cv["end"] else [])))
+        counts.append(f"{w}: {len(convs)} conversation(s), {len(skippable)} skippable, {len(skippable) - late} "
+                      "skipped in time")
+    if not n_skippable:
+        return Verdict(name, NOT_TESTED, "; ".join(counts) + " (no skippable conversation)")
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), "", findings)
+
+
 # --- elemental gates and Swap Zones by play (W38) -------------------------------------------------------------
 #
 # The owner's third session: "elemental gates dont work", "swap force gates dont work". The level's own elemental
@@ -3122,7 +3219,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     rows = [grade_server_alive(run), grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run),
             grade_coins_shared(run), grade_scenes_once(run), grade_level_changes(run), grade_enemy_kills(run),
-            grade_gate_kinds(run, data),
+            grade_gate_kinds(run, data), grade_dialog_skip(run),
             grade_loot(run),
             grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
             grade_fight_gates(run, data)]
