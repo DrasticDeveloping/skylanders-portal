@@ -1868,7 +1868,11 @@ GAME_WORK = re.compile(r"\[t(\d+)\] Online: (?:world|enemy|backend memory)\b")
 THREAD_OF = re.compile(r"\[t(\d+)\] ")
 FRAMES_LINE = re.compile(r"\] Online: frames \d+ ")
 TRAFFIC_LINE = re.compile(r"\] Online: traffic peer \d+ ")
-SERVER_STALL_ERROR: "re.Pattern | None" = None   # the fix's [error] line on S; set when its text is known
+# The fix's lines (online/5-server-never-paused: online.cpp, backend/stage5_hits.cpp): S's own [error] when its world
+# has not run with clients connected, and when a player's presses are refused for a while (its attacks never reach
+# S's hit path). Either fails every grade.
+SERVER_STALL_ERROR = re.compile(r"Online: the server's world has not run for [\d.]+ s with \d+ client\(s\) connected")
+PRESSES_REFUSED = re.compile(r"Online: presses of peer (\d+) refused for [\d.]+ s")
 
 
 def server_stalled(run: Run) -> "Finding | None":
@@ -1903,14 +1907,30 @@ def server_stalled(run: Run) -> "Finding | None":
                    f"{end.strftime('%H:%M:%S')})", [s.line(i).cite() for i in work[-3:]])
 
 
+def server_hard_findings(run: Run) -> list["Finding"]:
+    """The hard rules on S: its game stopped (server_stalled), and a player's presses refused for a while (S's own
+    [error] line `presses of peer <p> refused for <s> s`)."""
+    out = []
+    f = server_stalled(run)
+    if f is not None:
+        out.append(f)
+    if run.server is not None:
+        refused = run.server.find(PRESSES_REFUSED)
+        if refused:
+            peers = sorted({m.group(1) for _l, m in refused})
+            out.append(Finding(f"the server refused the presses of peer {', '.join(peers)} for a while: their attacks "
+                               "never reached its hit path", [line.cite() for line, _m in refused[:3]]))
+    return out
+
+
 def grade_server_alive(run: Run) -> Verdict:
-    """The page's row for the hard rule above."""
+    """The page's row for the hard rules above."""
     name = "server game alive"
     if run.server is None:
         return Verdict(name, NOT_TESTED, "no server log in this run folder")
-    f = server_stalled(run)
-    if f is not None:
-        return Verdict(name, FAIL, f.what, f.lines[-1] if f.lines else "", [f])
+    fs = server_hard_findings(run)
+    if fs:
+        return Verdict(name, FAIL, "; ".join(f.what for f in fs), fs[0].lines[-1] if fs[0].lines else "", fs)
     return Verdict(name, PASS, "the server's game thread worked to the end of its frames while a client was connected")
 
 

@@ -188,10 +188,10 @@ def server_stall_reasons(folder: Path) -> list[str]:
     """W37: the hard rule on every run with a server log (levelcheck.server_stalled), as a case's reasons."""
     import levelcheck as lc
     try:
-        f = lc.server_stalled(lc.load_run(folder))
+        fs = lc.server_hard_findings(lc.load_run(folder))
     except (OSError, ValueError):
         return []
-    return [f"{f.what}: " + "; ".join(f.lines)] if f is not None else []
+    return [f"{f.what}: " + "; ".join(f.lines) for f in fs]
 
 
 def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None) -> list[str]:

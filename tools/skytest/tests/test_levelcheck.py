@@ -360,6 +360,16 @@ class ServerAlive(unittest.TestCase):
     def test_the_batch_16_gate_run_has_no_finding(self) -> None:
         self.assertIsNone(lc.server_stalled(lc.load_run(self.GATE_RUN)))
 
+    def test_the_fixs_own_lines_fail_it(self) -> None:
+        # W38: S's own [error] lines (online/5-server-never-paused) fail the row whatever the threads did.
+        s = [(10, "Online: the server's world has not run for 5.2 s with 2 client(s) connected: no player frame and no "
+                  "held or results service frame"),
+             (12, "Online: presses of peer 2 refused for 6.0 s (4 refused, the last 9: stale generation); none of its "
+                  "attacks reaches the server's hit path")]
+        fs = lc.server_hard_findings(lc.load_run(RunFolder(s, H_JOIN, D_JOIN).path))
+        self.assertEqual([f.what.split(" (")[0].split(":")[0] for f in fs],
+                         ["the server's game stopped", "the server refused the presses of peer 2 for a while"])
+
     def test_a_server_that_works_to_the_end_passes(self) -> None:
         s = [(10, "Online: world 2 a00000000.0629f659.00012836@2 written"), (19, "Online: frames 599 fps 59.9 p50 16"),
              (20, "Online: traffic peer 1 gameplay 1/1 state 1/1 fast 1/1 bytes")]
