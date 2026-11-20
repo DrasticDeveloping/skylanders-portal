@@ -1031,7 +1031,7 @@ class RequiredStepsPlan(unittest.TestCase):
         old = lp.D_FIGHT
         self.addCleanup(setattr, lp, "D_FIGHT", old)
         lp.D_FIGHT = True
-        p = self.plan("tutorial_b", no_gates=True)
+        p = self.plan("tutorial_a")  # tutorial_b's sampled sweep has no fight action (its fights are sampled out)
         p.d_follow = True
         ref = lp.d_fight_ref(p)
         self.assertTrue(ref.startswith("auth:"), ref)

@@ -840,7 +840,7 @@ class Pieces(unittest.TestCase):
         v = lc.grade_pieces(lc.load_run(PROBE))
         self.assertEqual(v.status, lc.PASS, v.findings)
         self.assertTrue(v.counts.startswith("S fired 18 island(s) of 5 spawner(s); H: tracked 5 spawner(s); made 18 of 18 "
-                                            "within 1 s; places 210 pair(s), 0 over 64 (median 1.6"), v.counts)
+                                            "within 1 s; places 210 pair(s), 0 over 12 (median 1.6"), v.counts)
 
 
 
