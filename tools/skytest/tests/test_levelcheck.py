@@ -239,6 +239,25 @@ class Moves(unittest.TestCase):
         self.assertIn("D: 1 of H's attack presses never taken by its body", whats)
         self.assertIn("D: 1 `input expired` while H's button was held", whats)
 
+
+class PlayerDamage(unittest.TestCase):
+    def test_one_to_one_and_the_health_read_back(self) -> None:
+        # W33: S's two hits on H's puppet, H's one hit by that enemy: one unmatched; H's drop read back by S.
+        s = [(70, "Online: sentinel guard refused a hit on sentinel/puppet entry 0 PeerPuppet_1#3829 force 0 damage "
+                  "0x41200000 by Chompy#2201 a00000efb.930d1f89.79d73383@2 (sweep) (#1)"),
+             (71, "Online: peer 1 vitals 190/200"),
+             (90, "Online: sentinel guard refused a hit on sentinel/puppet entry 0 PeerPuppet_1#3829 force 0 damage "
+                  "0x41200000 by Chompy#2201 a00000efb.930d1f89.79d73383@2 (sweep) (#2)")]
+        h = [(70, "Online: hero hit by Chompy#2102 a00000efb.930d1f89.79d73383@2 (sweep, 10) (S's attack, played here) (#1)"),
+             (71, "Online: own vitals 190/200 (was 200; hit by Chompy#2102 a00000efb.930d1f89.79d73383@2)")]
+        f = RunFolder(s, H_JOIN + h, D_JOIN)
+        v = lc.grade_player_damage(lc.load_run(f.path))
+        self.assertEqual(v.status, lc.FAIL, v)
+        self.assertIn("H: hit 1 time(s) (sweep 1); S counted 2 on its puppet, 1 matched one to one; health drops 1",
+                      v.counts)
+        self.assertEqual([x.what for x in v.findings],
+                         ["H: 1 hit(s) S counted on its puppet with no hit on its hero by the same enemy within 1 s"])
+
 class Windows(unittest.TestCase):
     def test_a_clients_time_in_each_level(self) -> None:
         f = RunFolder([], H_JOIN + LEVEL_END, D_JOIN + LEVEL_END)

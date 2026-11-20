@@ -1671,6 +1671,107 @@ def grade_moves(run: Run) -> Verdict:
     return Verdict("other player's moves", FAIL if findings else PASS, "; ".join(counts), example, findings)
 
 
+# --- enemies hurt players (W33) ------------------------------------------------------------------------------
+#
+# The level pass starts both heroes invulnerable (--dev_hero_invulnerable; its job is the level), so there the row is
+# not tested and the page's head says so; enemy-damage-tb and enemy-knockout-tb run without it. Graded from the
+# player-damage lines (online/5-player-damage-lines): on a client, its copy of S's enemy hitting its own hero (`hero hit
+# by <Name#mID> <row> (<sweep|shot|other>, <dmg>)[ refused by this game's damage check] (S's attack, played here)`)
+# and its health's drop (`own vitals <h>/<max> (was <h0>; hit by ...)`); on S, the same hit on that player's puppet
+# (`sentinel guard refused a hit on sentinel/puppet entry <i> PeerPuppet_<p>#.. ... by <Name#mID> <row> (<kind>)`) and
+# the health it reads back (`peer <p> vitals <h>/<max>`). Every hit S counted on a puppet wants one hit on that
+# player's hero by the same enemy row within PAIR_HIT_S (one to one: a client hit is used once), and every drop of
+# the own health wants S's `peer <p> vitals` with the same health within PAIR_VITALS_S.
+INVULNERABLE_ARG = "--dev_hero_invulnerable=true"
+HERO_HIT = re.compile(r"Online: hero hit by (\S+) (\S+) \((sweep|shot|other), ([^)]*)\)( refused by this game.s damage check)?")
+PUPPET_HIT = re.compile(r"Online: sentinel guard refused a hit on sentinel/puppet entry \d+ PeerPuppet_(\d+)\S* .* by (\S+) "
+                        r"(\S+) \((sweep|shot|other)\)")
+OWN_VITALS = re.compile(r"Online: own vitals (-?[\d.]+)/(-?[\d.]+) \(was (-?[\d.]+); hit by ")
+PEER_VITALS = re.compile(r"Online: peer (\d+) vitals (-?[\d.]+)/(-?[\d.]+)")
+PAIR_HIT_S = 1.0
+PAIR_VITALS_S = 1.5
+
+
+def invulnerable_clients(folder: Path) -> list[str]:
+    """The clients the runner started with --dev_hero_invulnerable=true (result.json's commands)."""
+    try:
+        r = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [str(p.get("peer")) for p in r.get("peers", []) or []
+            if isinstance(p, dict) and INVULNERABLE_ARG in (p.get("command") or [])]
+
+
+def invulnerable_head(folder: Path) -> list[str]:
+    who = invulnerable_clients(folder)
+    return [f"heroes invulnerable in this run ({', '.join(who)}): enemy damage not tested"] if who else []
+
+
+def grade_player_damage(run: Run) -> Verdict:
+    """S's hits on each player's puppet against that player's own hits and health."""
+    name = "enemies hurt players"
+    invulnerable = invulnerable_clients(run.folder)
+    if invulnerable:
+        return Verdict(name, NOT_TESTED, f"heroes invulnerable in this run ({', '.join(invulnerable)}): "
+                       "enemy-damage-tb and enemy-knockout-tb test it")
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    peers = peer_numbers(run)
+    s_hits = run.server.find(PUPPET_HIT)
+    s_vitals = run.server.find(PEER_VITALS)
+    counts, findings, example = [], [], ""
+    any_hit = False
+    for peer, who in sorted(peers.items()):
+        log = run.clients.get(who)
+        if log is None:
+            continue
+        hits = [(line, m) for line, m in log.find(HERO_HIT) if not m.group(5)]
+        refused = [line for line, m in log.find(HERO_HIT) if m.group(5)]
+        mine = [(line, m) for line, m in s_hits if int(m.group(1)) == peer]
+        used: set[int] = set()
+        unmatched = []
+        for sl, sm in mine:
+            best = None
+            for k, (cl, cm) in enumerate(hits):
+                if k in used or cm.group(2) != sm.group(3) or cl.t is None or sl.t is None:
+                    continue
+                d = abs((cl.t - sl.t).total_seconds())
+                if d <= PAIR_HIT_S and (best is None or d < best[0]):
+                    best = (d, k)
+            if best is None:
+                unmatched.append(sl)
+            else:
+                used.add(best[1])
+        extra = [hits[k][0] for k in range(len(hits)) if k not in used]
+        drops = [(line, m) for line, m in log.find(OWN_VITALS) if float(m.group(1)) < float(m.group(3))]
+        late = []
+        for line, m in drops:
+            ok = any(int(sm.group(1)) == peer and abs(float(sm.group(2)) - float(m.group(1))) < 0.5 and sl.t
+                     and line.t and abs((sl.t - line.t).total_seconds()) <= PAIR_VITALS_S for sl, sm in s_vitals)
+            if not ok:
+                late.append(line)
+        kinds = {k: sum(1 for _l, m in hits if m.group(3) == k) for k in ("sweep", "shot", "other")}
+        any_hit = any_hit or bool(hits or mine)
+        counts.append(f"{who}: hit {len(hits)} time(s) ({', '.join(f'{k} {n}' for k, n in kinds.items() if n) or '-'}"
+                      f"{f', {len(refused)} refused here' if refused else ''}); S counted {len(mine)} on its puppet, "
+                      f"{len(mine) - len(unmatched)} matched one to one; health drops {len(drops)}")
+        if not example and hits:
+            example = hits[0][0].cite()
+        if unmatched:
+            findings.append(Finding(f"{who}: {len(unmatched)} hit(s) S counted on its puppet with no hit on its hero by "
+                                    f"the same enemy within {PAIR_HIT_S:.0f} s", [x.cite() for x in unmatched[:4]]))
+        if extra and mine:
+            findings.append(Finding(f"{who}: {len(extra)} hit(s) on its hero S did not count on its puppet (doubled "
+                                    "or S's copy missed them)", [x.cite() for x in extra[:4]]))
+        if late:
+            findings.append(Finding(f"{who}: {len(late)} health drop(s) S never read back (`peer {peer} vitals` with "
+                                    f"that health within {PAIR_VITALS_S} s)", [x.cite() for x in late[:4]]))
+    if not any_hit:
+        return Verdict(name, NOT_TESTED, "no player was hit in this run (no `hero hit by` on a client, no hit S counted "
+                       "on a puppet): " + "; ".join(counts))
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), example, findings)
+
+
 # --- what no grader covers yet -------------------------------------------------------------------------------
 #
 # Said at the bottom of every page so the gaps are seen without asking. From the placeholder audit's CLASS 1
@@ -2196,7 +2297,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     together = grade_together(run)
     rows = [grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run),
-            grade_objectives(run), grade_pieces(run, data), grade_moves(run)]
+            grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run)]
     # The enemies and the loot are read where both players stand only when D followed H: each says which.
     followed = bool(run.clients.get("D") and run.clients["D"].find(FOLLOW_ON))
     if together.status in (PASS, FAIL):
@@ -2245,6 +2346,7 @@ def run_head(folder: Path) -> list[str]:
             f"{(secs / 60):.1f} min" if isinstance(secs, (int, float)) else f"case {r.get('case', '?')}",
             f"build snapshot {prov.get('build') or '?'}, runner {prov.get('runner') or '?'}",
             *figures_head(folder),
+            *invulnerable_head(folder),
             *skipped_head(read_log(folder, "H/game.log", "H")),
             *route_head(folder)]
 
