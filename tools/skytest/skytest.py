@@ -176,7 +176,29 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
 GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
           "symmetry", "route", "bandwidth", "remote_swap", "exclusive", "occurrence_outcomes",
-          "memory_growth", "data_root_untouched") + backend_grades.NAMES
+          "memory_growth", "data_root_untouched", "level_check") + backend_grades.NAMES
+# W34: a spec's [grade.level_check] `rows = [...]` grades its run with those rows of the level check's page
+# (levelcheck.py): a row's FAIL fails the case with the row's findings as the reason; `must_test = true` fails a row
+# that says NOT TESTED too (a spec written to show it). LEVEL_CHECK_ROWS: the rows a spec may name.
+LEVEL_CHECK_ROWS = ("enemies hurt players", "other player's moves", "fight gates")
+
+
+def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None) -> list[str]:
+    """The reasons the named level check rows give against this run folder (empty: every row passed); `levelpass`:
+    the level's data for the rows that need it (fight gates)."""
+    import levelcheck as lc
+    run = lc.load_run(folder)
+    data = lc.level_data(levelpass, lc.run_level(run)) if levelpass is not None else None
+    graders = {"enemies hurt players": lc.grade_player_damage, "other player's moves": lc.grade_moves,
+               "fight gates": lambda r: lc.grade_fight_gates(r, data)}
+    out = []
+    for name in g.get("rows", []):
+        v = graders[name](run)
+        if v.status == lc.FAIL:
+            out.append(f"grade level_check {name}: " + "; ".join(f.what for f in v.findings))
+        elif v.status == lc.NOT_TESTED and g.get("must_test"):
+            out.append(f"grade level_check {name}: not tested: {v.counts}")
+    return out
 # The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
 # online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
 # for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
@@ -1418,6 +1440,11 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             continue
         if gname == "save_copy":
             check_save_copy(path.name, g, names, server)
+            continue
+        if gname == "level_check":
+            rows = g.get("rows") if isinstance(g, dict) else None
+            if not isinstance(rows, list) or not rows or any(x not in LEVEL_CHECK_ROWS for x in rows):
+                raise SpecError(f"{path.name}: grade level_check: `rows` names rows of {', '.join(LEVEL_CHECK_ROWS)}")
             continue
         if gname == DATA_ROOT_GRADE:
             check_data_root(path.name, g, names, server)
@@ -4462,7 +4489,7 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
     reasons = []
     for gname, g in spec.grades.items():
         if gname in ("requests_answered", "symmetry", "save_copy", "route", "bandwidth", "remote_swap", "exclusive",
-                     DATA_ROOT_GRADE):
+                     DATA_ROOT_GRADE, "level_check"):
             continue  # graded across peers (grade_cross_peer, grade_save_copy, grade_data_root)
         if g.get("peer", "S" if gname == "server_frame_time" else "H") != r.peer:
             continue
@@ -7744,7 +7771,7 @@ def cmd_levelcheck(cfg: Config, a: argparse.Namespace) -> int:
         if not folder.is_dir():
             raise SystemExit(f"levelcheck: no run folder {folder}")
         verdicts = lc.grade(folder, cfg.repo, levelpass_folder(cfg, getattr(a, "folder", None)))
-        print(lc.page(folder, verdicts, lc.run_head(folder)))
+        print(lc.page(folder, verdicts, lc.run_head(folder, levelpass_folder(cfg, getattr(a, "folder", None)))))
         return levelcheck_exit(lc, verdicts)
     if a.predictions:
         raise SystemExit("levelcheck: --predictions is levelpass's own mode; the check grades the generated pass")
@@ -7758,7 +7785,8 @@ def cmd_levelcheck(cfg: Config, a: argparse.Namespace) -> int:
             print(f"levelcheck {a.level}: no run to grade (levelpass exit {code})", flush=True)
         return code
     verdicts = lc.grade(run, cfg.repo, levelpass_folder(cfg, getattr(a, "folder", None)))
-    head = lc.run_head(run) + [f"level pass report: {a.check.get('report', '-')}"]
+    head = lc.run_head(run, levelpass_folder(cfg, getattr(a, "folder", None))) + [
+        f"level pass report: {a.check.get('report', '-')}"]
     text = lc.page(run, verdicts, head)
     out = levelpass_folder(cfg, getattr(a, "folder", None)) / f"{a.level}-check-{time.strftime('%Y%m%d-%H%M%S')}.txt"
     out.write_text(text + "\n", encoding="utf-8")
@@ -8188,6 +8216,13 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 breaker.record(spec.name, r.folder, r.signature)
                 if (t := breaker.tripped()) is not None:
                     tell_breaker(t)
+            # W34: the spec's level check rows ([grade.level_check]) on the finished run.
+            if "level_check" in spec.grades and r.folder and Path(r.folder).is_dir():
+                for why in level_check_reasons(Path(r.folder), spec.grades["level_check"],
+                                               levelpass_folder(cfg, None)):
+                    r.reasons.append(why)
+                    if r.status == "pass":
+                        r.status = "fail"
             # A caller's own verdict of the case (the level pass: W15), decided before the case's status line is
             # printed and its result.json, report.md and results.json are written, so all of them carry one verdict.
             if (case_verdict := getattr(a, "case_verdict", None)) is not None:
@@ -9519,6 +9554,16 @@ def lock_commands_known(cfg: Config) -> bool:
         "lock_ready" in table.conditions
 
 
+def command_known(cfg: Config, name: str) -> bool:
+    """The game registers the script command `name` (the checkout's tests/script_commands.toml)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        return name in la.CommandTable.load(path).registered
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+
+
 def launch_pad_known(cfg: Config) -> bool:
     """The game registers `launch_pad` (W27b; the checkout's tests/script_commands.toml)."""
     import launch_args as la
@@ -9600,6 +9645,15 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         raise SystemExit("levelpass: --no-end is for the generated pass, not --predictions")
     # W27b: the launch pads ridden only with the build's launch_pad and without --no-launch-rides.
     lp.LAUNCH_RIDES = launch_pad_known(cfg) and not getattr(a, "no_launch_rides", False)
+    # W32 (c): D fights one fight a level where the build registers stand_by.
+    lp.D_FIGHT = command_known(cfg, "stand_by")
+    # W31: the pieces step enters its trigger on foot where the build has walk_into.
+    lp.WALK_INTO = command_known(cfg, "walk_into")
+    # W33: --vulnerable leaves out --dev_hero_invulnerable and --dev_damage_multiplier.
+    lp.VULNERABLE = bool(getattr(a, "vulnerable", False))
+    # W30: the late joiner waits for its arrival move before it is placed, where the build has the condition.
+    conds = table_conditions(cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml"))
+    lp.ARRIVAL_DONE = conds is not None and "online_arrival_done" in conds
     plan = lp.make_plan(content, full=a.full, late_join=not a.no_late_join, provoke=a.provoke or "",
                         no_end=a.no_end, d_stays=not a.d_leaves_before_end,
                         d_lobby=not getattr(a, "d_joins_late", False), new_slot=getattr(a, "new_slot", False),
@@ -9639,6 +9693,10 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         notices.append("D stays where it entered: this game does not register online_auto_follow yet")
     try:
         plan.game_args = [lp.check_game_arg(g) for g in (a.game_arg or [])]
+        # W31: a level with run-time movers (Cascade Glade's islands) runs with the islands shared, unless the pass
+        # names the setting itself (--game-arg=--online_island_spawns=false keeps each game's own).
+        if plan.pieces and not any(g.startswith("--online_island_spawns=") for g in plan.game_args):
+            plan.game_args.append(lp.PIECES_SETTING)
     except ValueError as e:
         raise SystemExit(f"levelpass: {e}") from None
     if plan.game_args and a.predictions:
@@ -9844,6 +9902,9 @@ def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
                      " dismisses a pause screen within seconds")
     lp_.add_argument("--long-pause-at", default="", metavar="NAME", help="the object whose pickup takes the long"
                      " pause (default: the plan's first pickup of a collectible)")
+    lp_.add_argument("--vulnerable", action="store_true", help="the heroes can be hurt: --dev_hero_invulnerable and "
+                     "--dev_damage_multiplier are left out (the page's row \"enemies hurt players\" is then graded); a "
+                     "knock-out stops the pass's route until the hero is back (no swap at a knock-out yet)")
     lp_.add_argument("--no-launch-rides", action="store_true", help="the launch pad microgames are only visited, not "
                      "pressed and ridden (launch_pad), even where the build has the command: for runs that must not "
                      "depend on a ride rail-launch-tb has not shown yet")

@@ -393,6 +393,36 @@ def slept_before_made(k: "EnemyKey", c: "ClientEnemy | None") -> bool:
             and c.retired_streamed is not None and not (c.bound or c.waits or c.pending or c.skipped or c.seen_dead))
 
 
+# W34: S's enemy writer refused to publish spawns (server/enemy_writer.cpp): `enemy spawn of <id> not published: the
+# new entry is "<name>", not "<expected>"` (tutorial_b's arena: the nested manager's name cut at 96 characters, so its
+# nine spawns were never shared and each client fought its own) and `enemy <Name>#<id> not published as placed: a
+# run-time spawn`. Any of them fails the enemies row in any run, with the managers named (the author's coming [error]
+# line per manager is read the same way: it names `not published`).
+UNPUBLISHED_SPAWN = re.compile(r'Online: enemy spawn of \S+ not published: the new entry is "([^"]*)", not "([^"]*)"')
+UNPUBLISHED_PLACED = re.compile(r"Online: enemy (\S+?)#\d+ not published as placed: a run-time spawn")
+UNPUBLISHED_ANY = re.compile(r"Online: .*\bnot published\b")
+
+
+def unpublished_finding(run: Run) -> "Finding | None":
+    """One finding for every enemy spawn S did not publish, the managers or names it names; None when there is none."""
+    if run.server is None:
+        return None
+    lines = run.server.find(UNPUBLISHED_ANY)
+    if not lines:
+        return None
+    names: list[str] = []
+    for _l, m in run.server.find(UNPUBLISHED_SPAWN):
+        expected = re.sub(r"_actor_\d+$", "", m.group(2)) or m.group(1)
+        if expected not in names:
+            names.append(expected)
+    for _l, m in run.server.find(UNPUBLISHED_PLACED):
+        if m.group(1) not in names:
+            names.append(m.group(1))
+    return Finding(f"S did not publish {len(lines)} enemy spawn line(s) (each client then fights its own copy and S's "
+                   f"stay alive): {', '.join(n[:80] for n in names[:6]) or 'names not read'}",
+                   [line.cite() for line, _m in lines[:6]])
+
+
 def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
     """Every enemy S had, per client: bound there, waiting asleep (its copy asleep far from that player: no
     fault by itself), or never there; and each death S logged: seen on a bound copy, or dead before bind. PASS
@@ -534,6 +564,16 @@ def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
     first = next(iter(keys.values())).placed.cite()
     fights, fight_findings = fight_findings_of(run, by_player, len(unrecorded), data)
     counts.append(fights)
+    # W32 (c): the fight by D (D's own fight_area lines): its kills on S, and a fight that killed nothing by D.
+    d_log = run.clients.get("D")
+    d_fights = d_log.find(FIGHT_START) if d_log is not None else []
+    if d_fights:
+        counts.append(f"killed by D: {by_player.get('D', 0)} (D fought {len(d_fights)} time(s))")
+        if not by_player.get("D"):
+            fight_findings.append(Finding(
+                f"D fought {len(d_fights)} time(s) and no enemy died by D on S: the second player's hits never landed "
+                "on the server", [d_fights[0][0].cite(),
+                                  absent(run.server, "`enemy ... dead by <D's peer>`") if run.server else "no S log"]))
     if scenery or unreleased:
         counts.append(f"set apart: {len(scenery)} scenery, {len(unreleased)} held and not released in this run")
     gone_early = [k for k in slept if k not in expected]
@@ -542,6 +582,8 @@ def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
         held_notes.append("gone to sleep on the server before any player's game made it (not graded): " + "; ".join(
             f"{keys[k].name} ({k}): {keys[k].streamed.cite()}" for k in gone_early[:6]))
     findings = fight_findings + findings  # the fights first: the most telling
+    if (unpub := unpublished_finding(run)) is not None:
+        findings.insert(0, unpub)
     if not expected and not findings:
         # Nothing a client should have had (every key set apart, made too late or gone before it came): not a pass.
         return Verdict("enemies", NOT_TESTED, "; ".join(counts) + "; no enemy any client should have had", first,
@@ -1068,7 +1110,7 @@ def grade_objectives(run: Run) -> Verdict:
 # data has them): not tested, each game runs its own islands.
 PIECE_MADE_S = timedelta(seconds=1)
 PIECE_PAIR_S = timedelta(seconds=0.5)
-PIECE_NEAR = 64.0
+PIECE_NEAR = 12.0           # W31: about 10 (the probe run: 1.6 typically, 10.1 at most); was 64
 PIECE_TRACKED = re.compile(r"Online: world tracked spawner_fires ([^#\s]+)#")
 PIECE_FIRED = re.compile(r"Online: world island spawner ([^#\s]+)#\S* fired (\d+) \(tick")
 PIECE_MADE = re.compile(r"Online: world island spawner ([^#\s]+)#\S* made (\d+) here")
@@ -1121,6 +1163,10 @@ def grade_pieces(run: Run, data: "LevelData | None" = None) -> Verdict:
                 ok += 1
         c_at = log.find(PIECE_AT)
         dists, far = [], []
+        # Each client place against S's nearest line of the same island in time (within PIECE_PAIR_S). Interpolating
+        # between S's once-a-second lines was tried (W31) and is worse on the probe run (median 6.5, max 13.9 against
+        # 1.6 and 10.1): an island bobs and curves between two lines, and S's and the client's lines are written at
+        # nearly the same moment anyway.
         for sl, sm in s_at:
             pair = [(cl, cm) for cl, cm in c_at if cm.group(1) == sm.group(1) and cm.group(2) == sm.group(2) and
                     cl.t and sl.t and abs(cl.t - sl.t) <= PIECE_PAIR_S]
@@ -1555,18 +1601,253 @@ def grade_bodies(run: Run) -> Verdict:
                    "; ".join(counts) + f"; stand-ins over {STANDIN_MAX_S:.0f} s: {standins}", example, findings)
 
 
+# --- the other player's moves (online_remote_moves; online/4-other-moves) -----------------------------------
+#
+# W32 (b). With online_remote_moves each client sends its hero's command with its poses (`moves: capture on`) and the
+# other clients feed it to that player's real body: attacks (`puppet <p> attack <seq> taken at pose <s> (waited
+# <ms>[, its pose not reached])` against the sender's presses `press <p>:<seq> slot <k> tick <t> (announced)`),
+# jumps, the special and the block (`puppet <p> input <jump|power|block> at pose <s>`, `puppet <p> held 0x<a> ->
+# 0x<b>`), the walk (the body steers itself; `puppet <p> drift <d> corrected (#<n>, pose <s>)` when it strays), the
+# behaviour states (`puppet <p> states entered 0x..` against the sender's `hero states entered 0x..` near the same
+# pose), shots (`puppet shot made`, their effects dropped: `puppet shot drop <what>`) and the knock-out (`puppet <p>
+# down (ko, pose <s>)`, `back as <character> after <ms>`). Off (no `moves: capture on`): not tested.
+MOVES_ON = re.compile(r"Online: moves: capture on ")
+SENDER_PRESS = re.compile(r"Online: press (\d+):(\d+) slot \d+ tick \d+ \(announced\)")
+BODY_ATTACK = re.compile(r"Online: puppet (\d+) attack (\d+) taken at pose (\d+) \(waited (\d+) ms(, its pose not reached)?")
+HERO_STATES = re.compile(r"Online: hero states entered (0x[0-9A-F,x]+) \(pose (\d+)\)")
+BODY_STATES = re.compile(r"Online: puppet (\d+) states entered (0x[0-9A-F,x]+) \(pose (\d+)\)")
+BODY_DRIFT = re.compile(r"Online: puppet (\d+) drift (\d+) corrected \(#(\d+), pose (\d+)\)")
+BODY_HELD = re.compile(r"Online: puppet (\d+) held 0x([0-9A-F]+) -> 0x([0-9A-F]+)")
+BODY_EXPIRED = re.compile(r"Online: puppet (\d+) input expired")
+BODY_INPUT = re.compile(r"Online: puppet (\d+) input (jump|power|block) at pose (\d+)")
+SHOT_MADE = re.compile(r"Online: puppet shot made ")
+SHOT_DROP = re.compile(r"Online: puppet shot drop (\S+)")
+BODY_DOWN = re.compile(r"Online: puppet (\d+) down \(ko, pose (\d+)\)(?!:)")
+BODY_BACK = re.compile(r"Online: puppet (\d+) back as (\S+) after (\d+) ms")
+MOVES_STATE_POSES = 20      # a body's state set matches the sender's within this many poses (1 s at 20 Hz)
+MOVES_DRIFT_PER_S = 1.0     # walking: under one correction a second (in any 10 s)
+
+
+def grade_moves(run: Run) -> Verdict:
+    """Each client's view of the other player's moves against what that player sent."""
+    if not any(log.find(MOVES_ON) for log in run.clients.values()):
+        return Verdict("other player's moves", NOT_TESTED, "online_remote_moves off: no client sent its moves (no "
+                       "`moves: capture on`); the other player's body only slides to its poses")
+    peers = peer_numbers(run)
+    counts: list[str] = []
+    findings: list[Finding] = []
+    example = ""
+    for who, log in sorted(run.clients.items()):
+        for peer, sender in sorted(peers.items()):
+            if sender == who or sender not in run.clients:
+                continue
+            slog = run.clients[sender]
+            pressed = {int(m.group(2)): line for line, m in slog.find(SENDER_PRESS) if int(m.group(1)) == peer}
+            taken = {int(m.group(2)): (line, m) for line, m in log.find(BODY_ATTACK) if int(m.group(1)) == peer}
+            not_reached = [line for line, m in taken.values() if m.group(5)]
+            missing = sorted(set(pressed) - set(taken))
+            sent = [(int(m.group(2)), set(m.group(1).split(","))) for _l, m in slog.find(HERO_STATES)]
+            shown = [(line, int(m.group(3)), set(m.group(2).split(","))) for line, m in log.find(BODY_STATES)
+                     if int(m.group(1)) == peer]
+            matched = sum(1 for _l, pose, hs in shown
+                          if any(abs(pose - sp) <= MOVES_STATE_POSES and hs & shs for sp, shs in sent))
+            drifts = [line for line, m in log.find(BODY_DRIFT) if int(m.group(1)) == peer]
+            worst = 0
+            for i, line in enumerate(drifts):
+                if line.t is None:
+                    continue
+                n = sum(1 for other in drifts[i:] if other.t is not None and (other.t - line.t).total_seconds() < 10)
+                worst = max(worst, n)
+            inputs = [m.group(2) for _l, m in log.find(BODY_INPUT) if int(m.group(1)) == peer]
+            # an `input expired` while a held button (non-zero held bits) was fed
+            held_now, expired_held = False, []
+            for i, raw in enumerate(log.lines):
+                m = BODY_HELD.search(raw)
+                if m and int(m.group(1)) == peer:
+                    held_now = m.group(3) != "0"
+                    continue
+                m = BODY_EXPIRED.search(raw)
+                if m and int(m.group(1)) == peer and held_now:
+                    expired_held.append(log.line(i))
+            downs = [line for line, m in log.find(BODY_DOWN) if int(m.group(1)) == peer]
+            backs = [(line, m) for line, m in log.find(BODY_BACK) if int(m.group(1)) == peer]
+            shots = log.find(SHOT_MADE)
+            drops: dict[str, int] = {}
+            for _l, m in log.find(SHOT_DROP):
+                drops[m.group(1)] = drops.get(m.group(1), 0) + 1
+            counts.append(
+                f"{who} shows {sender}: attacks taken {len(taken)} of {len(pressed)} pressed"
+                + (f" ({len(not_reached)} before their pose)" if not_reached else "")
+                + f"; states {matched} of {len(shown)} matching {sender}'s within {MOVES_STATE_POSES} poses"
+                + f"; inputs {', '.join(f'{k} {inputs.count(k)}' for k in ('jump', 'power', 'block') if k in inputs) or '0'}"
+                + f"; drift corrections {len(drifts)} (at most {worst} in 10 s)"
+                + f"; shots made {len(shots)}, drops {', '.join(f'{k} {n}' for k, n in sorted(drops.items())) or '0'}"
+                + (f"; knock-outs {len(downs)}, back {len(backs)}" if downs or backs else ""))
+            if not example and (taken or shown):
+                example = (next(iter(taken.values()))[0] if taken else shown[0][0]).cite()
+            if missing:
+                findings.append(Finding(f"{who}: {len(missing)} of {sender}'s attack presses never taken by its body",
+                                        [pressed[s].cite() for s in missing[:4]] +
+                                        [absent(log, f"`puppet {peer} attack {missing[0]} taken`")]))
+            if shown and sent and not matched:
+                findings.append(Finding(f"{who}: none of {sender}'s body's {len(shown)} state sets matches a state "
+                                        f"{sender} entered within {MOVES_STATE_POSES} poses",
+                                        [shown[0][0].cite()]))
+            if worst > MOVES_DRIFT_PER_S * 10:
+                findings.append(Finding(f"{who}: {sender}'s body corrected {worst} times in 10 s (over one a second)",
+                                        [drifts[0].cite()]))
+            if expired_held:
+                findings.append(Finding(f"{who}: {len(expired_held)} `input expired` while {sender}'s button was held",
+                                        [x.cite() for x in expired_held[:4]]))
+            if downs and len(backs) < len(downs):
+                findings.append(Finding(f"{who}: {sender}'s body went down {len(downs)} time(s), back {len(backs)}",
+                                        [downs[-1].cite(), absent(log, f"`puppet {peer} back as` after it")]))
+    if not counts:
+        return Verdict("other player's moves", NOT_TESTED, "no two clients with peer numbers to compare")
+    return Verdict("other player's moves", FAIL if findings else PASS, "; ".join(counts), example, findings)
+
+
+# --- enemies hurt players (W33) ------------------------------------------------------------------------------
+#
+# The level pass starts both heroes invulnerable (--dev_hero_invulnerable; its job is the level), so there the row is
+# not tested and the page's head says so; enemy-damage-tb and enemy-knockout-tb run without it. Graded from the
+# player-damage lines (online/5-player-damage-lines): on a client, its copy of S's enemy hitting its own hero (`hero hit
+# by <Name#mID> <row> (<sweep|shot|other>, <dmg>)[ refused by this game's damage check] (S's attack, played here)`)
+# and its health's drop (`own vitals <h>/<max> (was <h0>; hit by ...)`); on S, the same hit on that player's puppet
+# (`sentinel guard refused a hit on sentinel/puppet entry <i> PeerPuppet_<p>#.. ... by <Name#mID> <row> (<kind>)`) and
+# the health it reads back (`peer <p> vitals <h>/<max>`). Every hit S counted on a puppet wants one hit on that
+# player's hero by the same enemy row within PAIR_HIT_S (one to one: a client hit is used once), and every drop of
+# the own health wants S's `peer <p> vitals` with the same health within PAIR_VITALS_S.
+INVULNERABLE_ARG = "--dev_hero_invulnerable=true"
+HERO_HIT = re.compile(r"Online: hero hit by (\S+) (\S+) \((sweep|shot|other), ([^)]*)\)( refused by this game.s damage check)?")
+PUPPET_HIT = re.compile(r"Online: sentinel guard refused a hit on sentinel/puppet entry \d+ PeerPuppet_(\d+)\S* .* by (\S+) "
+                        r"(\S+) \((sweep|shot|other)\)")
+OWN_VITALS = re.compile(r"Online: own vitals (-?[\d.]+)/(-?[\d.]+) \(was (-?[\d.]+); hit by ")
+PEER_VITALS = re.compile(r"Online: peer (\d+) vitals (-?[\d.]+)/(-?[\d.]+)")
+PAIR_HIT_S = 1.0
+PAIR_VITALS_S = 1.5
+ANY_VITALS = re.compile(r"Online: own vitals (-?[\d.]+)/(-?[\d.]+) \(was ([^;]+); hit by (\S+)")
+KO_SCREEN = re.compile(r"Online: swap placement none reason \d+ \(KO; player 0")
+DEFERRED_SHOT = re.compile(r"its deferred projectile made here")
+
+
+def invulnerable_clients(folder: Path) -> list[str]:
+    """The clients the runner started with --dev_hero_invulnerable=true (result.json's commands)."""
+    try:
+        r = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [str(p.get("peer")) for p in r.get("peers", []) or []
+            if isinstance(p, dict) and INVULNERABLE_ARG in (p.get("command") or [])]
+
+
+def invulnerable_head(folder: Path) -> list[str]:
+    who = invulnerable_clients(folder)
+    return [f"heroes invulnerable in this run ({', '.join(who)}): enemy damage not tested"] if who else []
+
+
+def grade_player_damage(run: Run) -> Verdict:
+    """S's hits on each player's puppet against that player's own hits and health."""
+    name = "enemies hurt players"
+    invulnerable = invulnerable_clients(run.folder)
+    if invulnerable:
+        return Verdict(name, NOT_TESTED, f"heroes invulnerable in this run ({', '.join(invulnerable)}): enemy damage "
+                       "not tested; this is what hid it until 19 November (enemy-damage-tb and moves-ko-tb test it, "
+                       "and a level check with --vulnerable)")
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    peers = peer_numbers(run)
+    s_hits = run.server.find(PUPPET_HIT)
+    s_vitals = run.server.find(PEER_VITALS)
+    counts, findings, example = [], [], ""
+    any_hit = False
+    for peer, who in sorted(peers.items()):
+        log = run.clients.get(who)
+        if log is None:
+            continue
+        hits = [(line, m) for line, m in log.find(HERO_HIT) if not m.group(5)]
+        refused = [line for line, m in log.find(HERO_HIT) if m.group(5)]
+        mine = [(line, m) for line, m in s_hits if int(m.group(1)) == peer]
+        used: set[int] = set()
+        unmatched = []
+        for sl, sm in mine:
+            best = None
+            for k, (cl, cm) in enumerate(hits):
+                if k in used or cm.group(2) != sm.group(3) or cl.t is None or sl.t is None:
+                    continue
+                d = abs((cl.t - sl.t).total_seconds())
+                if d <= PAIR_HIT_S and (best is None or d < best[0]):
+                    best = (d, k)
+            if best is None:
+                unmatched.append(sl)
+            else:
+                used.add(best[1])
+        extra = [hits[k][0] for k in range(len(hits)) if k not in used]
+        drops = [(line, m) for line, m in log.find(OWN_VITALS) if float(m.group(1)) < float(m.group(3))]
+        late = []
+        for line, m in drops:
+            ok = any(int(sm.group(1)) == peer and abs(float(sm.group(2)) - float(m.group(1))) < 0.5 and sl.t
+                     and line.t and abs((sl.t - line.t).total_seconds()) <= PAIR_VITALS_S for sl, sm in s_vitals)
+            if not ok:
+                late.append(line)
+        kinds = {k: sum(1 for _l, m in hits if m.group(3) == k) for k in ("sweep", "shot", "other")}
+        any_hit = any_hit or bool(hits or mine)
+        vit = log.find(ANY_VITALS)
+        unknown = [line for line, m in vit if m.group(4) == "unknown" and m.group(3) != "-" and
+                   float(m.group(1)) < float(m.group(3))]
+        lowest = min((float(m.group(1)) for _l, m in vit), default=None)
+        top = max((float(m.group(2)) for _l, m in vit), default=None)
+        kos = log.find(KO_SCREEN)
+        counts.append(f"{who}: hit {len(hits)} time(s) ({', '.join(f'{k} {n}' for k, n in kinds.items() if n) or '-'}"
+                      f"{f', {len(refused)} refused here' if refused else ''}); S counted {len(mine)} on its puppet, "
+                      f"{len(mine) - len(unmatched)} matched one to one; health drops {len(drops)}"
+                      + (f", {len(unknown)} by unknown" if unknown else "")
+                      + (f"; lowest health {lowest:.0f}/{top:.0f}" if lowest is not None and top else "")
+                      + (f"; knocked out {len(kos)} time(s), shown the placement screen" if kos else ""))
+        if mine and not hits:
+            findings.append(Finding(f"{who}: S's enemies attacked the stand-in {len(mine)} times, no attack was played "
+                                    f"here (S refused {len(mine)} hit(s) on peer {peer}'s puppet; no `hero hit by` on "
+                                    f"{who})", [mine[0][0].cite(), absent(log, "`hero hit by`")]))
+        if unknown:
+            findings.append(Finding(f"{who}: its health fell {len(unknown)} time(s) with `hit by unknown` (no enemy "
+                                    "hit of S's within 3 s)", [x.cite() for x in unknown[:4]]))
+        if not example and hits:
+            example = hits[0][0].cite()
+        if unmatched:
+            findings.append(Finding(f"{who}: {len(unmatched)} hit(s) S counted on its puppet with no hit on its hero by "
+                                    f"the same enemy within {PAIR_HIT_S:.0f} s", [x.cite() for x in unmatched[:4]]))
+        if extra and mine:
+            findings.append(Finding(f"{who}: {len(extra)} hit(s) on its hero S did not count on its puppet (doubled "
+                                    "or S's copy missed them)", [x.cite() for x in extra[:4]]))
+        if late:
+            findings.append(Finding(f"{who}: {len(late)} health drop(s) S never read back (`peer {peer} vitals` with "
+                                    f"that health within {PAIR_VITALS_S} s)", [x.cite() for x in late[:4]]))
+    # Who was shown the placement screen of a knock-out (only the knocked-out player should be).
+    shown_ko = [who for who, log in run.clients.items() if log.find(KO_SCREEN)]
+    if shown_ko:
+        counts.append(f"the knock-out's placement screen shown on: {', '.join(sorted(shown_ko))}")
+    # Shots: graded only where the deferred-shot fix is in (`its deferred projectile made here`); else not tested.
+    if not any(log.find(DEFERRED_SHOT) for log in run.clients.values()):
+        counts.append("shots not tested: no client made a deferred projectile (the bomb throwers' shots are dropped "
+                      "on the clients without online/5-replica-deferred-shots)")
+    if not any_hit:
+        return Verdict(name, NOT_TESTED, "no enemy attacked: S counted no hit on any stand-in and no attack was played "
+                       "on any client (no `hero hit by`): " + "; ".join(counts))
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), example, findings)
+
+
 # --- what no grader covers yet -------------------------------------------------------------------------------
 #
 # Said at the bottom of every page so the gaps are seen without asking. From the placeholder audit's CLASS 1
 # (logs/placeholder-audit.txt, two players in tutorial_a, tutorial_b and ww1 with the session's defaults) and the
 # owner's own list; a line goes when a grader covers it.
 NOT_COVERED = (
-    "the other player's animations, attacks, specials, projectiles, sounds and effects (only its body is read)",
+    "the other player's sounds and effects (the moves row reads its commands, states and shots, not what plays)",
     "which skylander's attack lands on the server (it replays the presses on its own hero: reach and damage may "
     "differ), player hits and damage numbers as the other player sees them",
     "the HUD and party panel: portraits (a number today), health bars, names, level, hat, lives",
     "food and the wallet beyond the coins' gold lines",
-    "the other player's knock-out, death and revive, jumps and falls as seen on the screen",
+    "the other player's revive (a resurrection) and its falls as seen on the screen",
     "enemy movement, animation and attack timing, enemies aiming at the partner, enemy missiles, freezes and "
     "other victim states",
     "the save: whether the session's progress reaches the host's real slot",
@@ -1922,9 +2203,11 @@ def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[st
             where[who] = ids[k] if len(ids) > k else None
         missing = [w for w, line in where.items() if line is None]
         trail = key_gate_trail(run, g.name, k) if g.kind == "key gate" else []
-        if g.kind == "battle gate" and where.get("S") is None:
+        if g.kind in ("battle gate", "arena gate") and where.get("S") is None:
             trail.append(battle_gate_left(run, data, g))
+        fight_faults = fight_gate_managers(run, g) if g.kind in ("battle gate", "arena gate") else []
         passed, faults, unchecked = gate_passes(run, g.name, k, where)
+        faults = fight_faults + faults
         walk = ([f"passed on foot by {', '.join(passed)}"] if passed else []) + unchecked
         if missing:
             opened_on = [f"{w} at {when(where[w])}" for w in where if where[w] is not None]
@@ -1939,6 +2222,117 @@ def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[st
                         + "; ".join(f"{w} at {when(line)} {line.cite()}" for w, line in where.items())
                         + ("; " + "; ".join(walk + trail) if walk or trail else ""))
     return shut, done
+
+
+# W34: a fight gate's fight graded on S: each encounter manager that opens it (the data's openers) has its `encounter
+# complete <Name#id>` on S (dev/trigger_tools.cpp; on S with online_sentinel or dev_trigger_commands). One without it
+# is a fault of the gate, named.
+ENCOUNTER_COMPLETE = re.compile(r"Online: encounter complete (\S+)")
+
+
+def fight_gate_managers(run: Run, g) -> list[str]:
+    """The fight's managers with no `encounter complete` on S, in words (empty: every one completed, or no S log)."""
+    if run.server is None:
+        return []
+    done = [m.group(1) for _l, m in run.server.find(ENCOUNTER_COMPLETE)]
+    out = []
+    for k in getattr(g, "openers", []) or []:
+        name = k.split(".")[-1]
+        if "Manager" not in name and "manager" not in name and "_target" not in name:
+            continue  # a placed enemy: its death is in the enemies row
+        if not any(d.split("#")[0][:60] == name[:60] for d in done):
+            out.append(f"its fight's manager {name} never completed on S ({absent(run.server, f'`encounter complete {name[:60]}...`')})")
+    return out
+
+
+# W34: the row "fight gates": each required fight gate's waves (its managers in the data's order, upstream first:
+# tutorial_b's arena: EA_Manager_W1, EA_Manager_W1_B, then W1_B's nested manager, whose end opens the gate), each wave
+# graded on S (`encounter complete <Name#id>`), with how many of its spawns S refused (`enemy spawn of ... not
+# published` naming the manager) and how many H's own copy made (H's `encounter_clear <Name#id> ... spawned a/b`, its
+# last line), then the gate open on S and every client and walked through. A finding names the wave, the manager and
+# the counts. A fight gate the pass did not fight: NOT TESTED by name.
+ENC_CLEAR = re.compile(r"Dev: encounter_clear (\S+?)#\d+ (finished|time|start|started|progress [\d.]+ s): .*?spawned "
+                       r"(\d+)/(\d+)")
+
+
+def wave_lines(run: Run, g) -> list[tuple[str, str, list[str]]]:
+    """Per wave of a fight gate: (manager name, its words, its faults)."""
+    s_done = [(line, m.group(1)) for line, m in run.server.find(ENCOUNTER_COMPLETE)] if run.server else []
+    s_refused = [m.group(2) for _l, m in run.server.find(UNPUBLISHED_SPAWN)] if run.server else []
+    h = run.clients.get("H")
+    clears = h.find(ENC_CLEAR) if h is not None else []
+    out = []
+    for k in getattr(g, "openers", []) or []:
+        name = k.split(".")[-1]
+        if "Manager" not in name and "_target" not in name:
+            continue
+        key = name[:60]
+        done = next((line for line, n in s_done if n.split("#")[0][:60] == key), None)
+        refused = sum(1 for e in s_refused if e[:60] == key)
+        mine = [m for _l, m in clears if m.group(1)[:60] == key]
+        last = mine[-1] if mine else None
+        h_words = (f"H's copy spawned {last.group(3)}/{last.group(4)} ({'finished' if last.group(2) == 'finished' else 'not finished'})"
+                   if last else "H fought no actor of it (no `encounter_clear` line)")
+        words = (f"{'complete on S ' + done.cite() if done else 'never complete on S'}; S refused {refused} of its "
+                 f"spawns; {h_words}")
+        faults = []
+        if done is None:
+            faults.append("never complete on S")
+        if refused:
+            faults.append(f"S refused {refused} of its spawns (`not published`)")
+        out.append((name, words, faults))
+    return out
+
+
+def grade_fight_gates(run: Run, data: "LevelData | None" = None) -> Verdict:
+    """Each required fight gate: its waves on S and H, its opening and the walk through."""
+    name = "fight gates"
+    if data is None:
+        return Verdict(name, NOT_TESTED, "no level data (the [levelpass] folder) to name the fight gates")
+    gates = [g for g in data.gates if g.required and g.kind in ("battle gate", "arena gate")]
+    if not gates:
+        return Verdict(name, NOT_TESTED, "the level has no fight gate")
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    h = run.clients.get("H")
+    reqs = h.find(REQ_LINE) if h is not None else []
+    clears = [m.group(1)[:60] for _l, m in h.find(ENC_CLEAR)] if h is not None else []
+    counts, findings, untested = [], [], []
+    for g in gates:
+        managers = [k.split(".")[-1][:60] for k in getattr(g, "openers", []) or []]
+        fought = any(m.group(3) == g.name and not m.group(4) for _l, m in reqs) or any(n in clears for n in managers)
+        if not fought:
+            untested.append(g.name)
+            continue
+        waves = wave_lines(run, g)
+        lines = [f"wave {i + 1} ({n}): {w}" for i, (n, w, _f) in enumerate(waves)]
+        counts.append(f"{g.name}: " + "; ".join(lines) if lines else f"{g.name}: no wave in the data")
+        for i, (n, _w, faults) in enumerate(waves):
+            if faults:
+                findings.append(Finding(f"{g.name} wave {i + 1} ({n}): " + "; ".join(faults), [lines[i]]))
+        opened = gate_open_ids(run.server, g.name, mover=False, run=run)
+        if not opened:
+            findings.append(Finding(f"{g.name}: never opened on S", [absent(run.server, f"an opening of {g.name}")]))
+    if untested:
+        counts.append("not fought by this pass (NOT TESTED): " + ", ".join(untested))
+    if not counts or all(c.startswith("not fought") for c in counts):
+        return Verdict(name, NOT_TESTED, "; ".join(counts))
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), "", findings)
+
+
+def fight_gates_head(run: Run, data: "LevelData | None") -> list[str]:
+    """The page head's count of the level's fight gates the pass fought (W34), and the ones it did not, by name."""
+    if data is None:
+        return []
+    gates = [g for g in data.gates if g.required and g.kind in ("battle gate", "arena gate")]
+    if not gates:
+        return []
+    h = run.clients.get("H")
+    reqs = h.find(REQ_LINE) if h is not None else []
+    fought = [g for g in gates if any(m.group(3) == g.name and not m.group(4) for _l, m in reqs)]
+    missed = [g.name for g in gates if g not in fought]
+    return [f"fight gates: fought {len(fought)} of {len(gates)}"
+            + (f"; NOT TESTED: {', '.join(missed)}" if missed else "")]
 
 
 # W23: each client's walk through the gate (`Dev: pass_gate <Name#id> done (passed on foot: ...)` / `failed (not
@@ -2080,7 +2474,8 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     together = grade_together(run)
     rows = [grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run),
-            grade_objectives(run), grade_pieces(run, data)]
+            grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
+            grade_fight_gates(run, data)]
     # The enemies and the loot are read where both players stand only when D followed H: each says which.
     followed = bool(run.clients.get("D") and run.clients["D"].find(FOLLOW_ON))
     if together.status in (PASS, FAIL):
@@ -2117,8 +2512,16 @@ def skipped_head(h: Log | None) -> list[str]:
             f"{', '.join(rows)} (a NOT TESTED row among them says so)"]
 
 
-def run_head(folder: Path) -> list[str]:
-    """The page's head from the run's result.json: the case, its status, minutes, build snapshot, runner."""
+def run_head(folder: Path, levelpass: Path | None = None) -> list[str]:
+    """The page's head from the run's result.json: the case, its status, minutes, build snapshot, runner; with the
+    [levelpass] folder also the fight gates fought (W34)."""
+    gates_line: list[str] = []
+    if levelpass is not None:
+        try:
+            run = load_run(folder)
+            gates_line = fight_gates_head(run, level_data(levelpass, run_level(run)))
+        except (OSError, ValueError):
+            gates_line = []
     try:
         r = json.loads((folder / "result.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -2129,6 +2532,8 @@ def run_head(folder: Path) -> list[str]:
             f"{(secs / 60):.1f} min" if isinstance(secs, (int, float)) else f"case {r.get('case', '?')}",
             f"build snapshot {prov.get('build') or '?'}, runner {prov.get('runner') or '?'}",
             *figures_head(folder),
+            *gates_line,
+            *invulnerable_head(folder),
             *skipped_head(read_log(folder, "H/game.log", "H")),
             *route_head(folder)]
 
@@ -2170,6 +2575,13 @@ def ride_reached(log: Log | None) -> dict[str, tuple[str, Line]]:
     return out
 
 
+# W31: the follow's rescue (client/auto_follow.cpp): a follower the game put back twice after a move, taken back to
+# its own last ground; and the game's own put-backs (`Stuck falling: player put back`) on that client.
+FOLLOW_RESCUED = re.compile(r"Online: auto follow \d+: rescued: put back \d+ times since the move to (\S+); back to "
+                            r"its own last ground (\S+)")
+PUT_BACK = re.compile(r"Stuck falling: player put back after")
+
+
 def route_head(folder: Path) -> list[str]:
     """The page's lines for targets not visited (no floor) and heroes taken out of a stuck spot, per client."""
     out = []
@@ -2177,8 +2589,16 @@ def route_head(folder: Path) -> list[str]:
         log = read_log(folder, f"{who}/game.log", who)
         if log is None:
             continue
-        label, missed, taken = "", [], []
+        label, missed, taken, rescued, put_backs, first_put = "", [], [], [], 0, None
         for i, raw in enumerate(log.lines):
+            m = FOLLOW_RESCUED.search(raw)
+            if m:
+                rescued.append(f"from {m.group(1)} to {m.group(2)} ({log.line(i).cite()})")
+                continue
+            if PUT_BACK.search(raw):
+                put_backs += 1
+                first_put = first_put or log.line(i)
+                continue
             m = VISIT_OR_ACT.search(raw)
             if m:
                 label = m.group(1) or m.group(2)
@@ -2199,6 +2619,12 @@ def route_head(folder: Path) -> list[str]:
                        + (f"; and {len(missed) - 4} more" if len(missed) > 4 else ""))
         if taken:
             out.append(f"{who} held too long at the same spot twice, {len(taken)} time(s): " + "; ".join(taken[:3]))
+        if rescued:
+            out.append(f"{who} rescued by the follow (put back twice after a move, taken to its own last ground), "
+                       f"{len(rescued)} time(s): " + "; ".join(rescued[:3]))
+        if put_backs >= 2:
+            out.append(f"{who} put back by the game {put_backs} times (`Stuck falling: player put back`; the first "
+                       f"{first_put.cite()})")
     return out
 
 

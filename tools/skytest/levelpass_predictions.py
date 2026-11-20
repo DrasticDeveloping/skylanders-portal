@@ -342,7 +342,8 @@ def scripts(level: str, bugs: list[Bug], d_mode: str) -> tuple[str, str | None]:
     d = None
     if d_mode != "none":
         d = lp.boot_lines(False, lp.FIGURE_D)
-        d += ["waitfor online_in_play 300", "online_join {join}", "waitfor online_barrier 300", "wait_free 120",
+        d += ["waitfor online_in_play 300", "online_join {join}", "waitfor online_barrier 300", *lp.arrival_lines(),
+              "wait_free 120",
               "log LEVELPASS D in", "online_audit d-in"]
         if d_mode == "late":
             d += d_snap_lines(bugs) + ["online_end", "quit"]

@@ -409,12 +409,29 @@ OUTLIER_FLOOR = 8000.0
 FIGHT, ATTACK, INTERACT_A, PICKUP, ENTER, TALK, EXIT_A, VISIT = (
     "fight", "attack", "interact", "pickup", "enter", "talk", "exit", "visit")
 LAUNCH = "launch"
+# W30: a late joiner's first level of the session moves it to the host once the level start releases it (the game's
+# arrival move); D is placed only after `online_arrival_done` (made, dropped or not needed). On when the build lists
+# the condition (skytest sets it from the checkout's command table); otherwise the line is left out, as before.
+ARRIVAL_DONE = False
+ARRIVAL_WAIT = "waitfor online_arrival_done 120"
+
+
+def arrival_lines() -> list[str]:
+    return [ARRIVAL_WAIT] if ARRIVAL_DONE else []
 # W27b: a launch pad microgame from the level's data (Scripts.MicrogameComponentData with a button and a press count,
 # Scripts.LaunchPathComponentData, a SuccessTelegrams' LaunchPathComponentMessage with AddPlayers): pressed and ridden
 # (`interact`, then `launch_pad`: the presses and the ride to its landing); every player is carried by the game's own
 # launch. On only when the build has launch_pad (the checkout's command table) and the pass was not given
 # --no-launch-rides (skytest sets LAUNCH_RIDES); otherwise visited, as before. LAUNCH_PADS: the plan's pads.
 LAUNCH_RIDES = False
+# W32 (c): at one fight a level the SECOND player fights and the first stands by (stand_by), so the run shows D's own
+# hits and kills counting on S (S's `dead by <D's peer>`) and on H's screen; before, every fight was H's ("by a player:
+# H n, D 0" in every run). The fight: the plan's first fight action (a FIGHT stop of the sweep), when D follows H in
+# the lobby flow. On when the build registers stand_by (skytest sets D_FIGHT from the command table). D_FIGHT_AT: the
+# fight's reference while a plan's scripts are written (d_fight_ref).
+D_FIGHT = False
+D_FIGHT_AT = ""
+D_FIGHT_WAIT_S = 900
 LAUNCH_PADS: dict[str, tuple[str, int]] = {}   # obj key -> (button, presses)
 LAUNCH_EXTRA_PRESSES = 3
 LAUNCH_RIDE_S = 90
@@ -1403,10 +1420,11 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                           "waitfor lock_ready 30", "lock_solve 120", f"online_audit {label}"]
                 step.d = [f"interact {ref} 20", "waitfor lock_ready 30", "lock_solve 120"]
                 step.est_s = REQ_SPARK_S
-        elif g.kind == lh.BATTLE_GATE:
+        elif g.kind in lh.FIGHT_GATES:
             releases: list[str] = []
             blocked: list[str] = []
             fight = ""
+            fights: list[str] = []
             fight_s = gate_fight_seconds(content.manifest, g.openers)
             for k in g.openers:
                 h = holds.get(k)
@@ -1430,10 +1448,14 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                                     releases.append(line)
                                 break
                 ob = by_key.get(k)
-                if not fight and ob is not None and ob.ref:
-                    is_encounter = n is not None and n.group == "encounter"
-                    fight = (f"encounter_clear {ob.ref} 1500 {fight_s} exact" if is_encounter
-                             else f"fight_near {ob.ref} 1500 {fight_s}")
+                is_encounter = n is not None and n.group == "encounter"
+                # W34: every encounter manager of the fight is fought (tutorial_b's arena: three, chained); a gate
+                # opened by placed enemies keeps its one fight_near.
+                if ob is not None and ob.ref and (is_encounter or not fight):
+                    line = (f"encounter_clear {ob.ref} 1500 {fight_s} exact" if is_encounter
+                            else f"fight_near {ob.ref} 1500 {fight_s}")
+                    fights.append(line)
+                    fight = fight or line
                     # W16: an encounter nothing toggles starts when a player comes within its activation radius of
                     # the manager (the data's `activationRadius`): the step goes to the manager first, so
                     # encounter_clear waits there for it to run and fights its spawnees. Batch 12 case 7's r2
@@ -1450,8 +1472,8 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                 step.why_not = "its enemies are held: " + "; ".join(blocked[:2])
             else:
                 names = ", ".join(_safe(k.split(".")[-1]) for k in g.openers[:4])
-                step.h = [f"{head} (win its fight: {names})", *releases, fight, f"online_audit {label}"]
-                step.est_s = REQ_BATTLE_S + fight_s
+                step.h = [f"{head} (win its fight: {names})", *releases, *fights, f"online_audit {label}"]
+                step.est_s = REQ_BATTLE_S + fight_s * len(fights)
         else:
             step.why_not = f"no rule for a {g.kind} yet ({g.opener})"
     return out
@@ -1519,13 +1541,22 @@ def plan_pieces(content: Content, forbidden: set[str], left_out: list[str]) -> t
     return out, secs
 
 
+# W31: the pieces step goes to the trigger that starts the movers and waits on the ground there, never to a spawner
+# (batch 15 case 7: `goto_entity` of EZ3_IslandSpawner0 hopped H 1520 over the void, D's follow copied that point and
+# fell for four minutes). The start trigger of ww1's islands runs out over the void from a ledge, so it is entered
+# on foot from the ground nearest it (`walk_into`, where the build has it; else `enter_trigger` as before). The
+# islands are shared only with online_island_spawns: skytest passes it on a level with pieces (PIECES_SETTING).
+WALK_INTO = False
+PIECES_SETTING = "--online_island_spawns=true"
+
+
 def pieces_lines(plan: Plan) -> list[str]:
-    """Each pieces step: enter its trigger, stand where its movers go, stay three spawn periods, audit."""
+    """Each pieces step: enter its trigger from the ground, stay there three spawn periods, audit."""
     out = []
-    for k, (m, trig, spawner) in enumerate(plan.pieces, 1):
+    for k, (m, trig, _spawner) in enumerate(plan.pieces, 1):
+        enter = [f"walk_into {trig.ref} 1500 10", "wait_free 30"] if WALK_INTO else [f"enter_trigger {trig.ref}"]
         out += [f"log LEVELPASS pieces p{k} {_safe(m.name)} starts {', '.join(_safe(n) for n in m.spawner_names)} "
-                f"stay {m.stay_s:.0f} s", f"enter_trigger {trig.ref}", f"goto_entity {spawner.ref} {PIECES_STANDOFF}",
-                f"wait {int(round(m.stay_s))}", f"online_audit p{k}"]
+                f"stay {m.stay_s:.0f} s", *enter, f"wait {int(round(m.stay_s))}", f"online_audit p{k}"]
     return out
 
 
@@ -1854,7 +1885,7 @@ def party_boot_d(figures: list[str] | None = None) -> list[str]:
     level as soon as it is in play there, before that level's start is released (D_MARK_BEFORE_BARRIER)."""
     return ["waitfor online_title 300", "waitfor title_ready 240", *place_lines(figures or [FIGURE_D]),
             "online_join {joincode}", "waitfor online_in_play 300", "online_mark_level", "waitfor online_barrier 300",
-            "wait_free 120"]
+            *arrival_lines(), "wait_free 120"]
 
 
 # D's mark of its first level (the pick's) and H's `level` command raced: the barrier of the first level releases
@@ -1986,7 +2017,12 @@ def action_lines(a: Action, label: str, after: str = "", cap: int = 0, long_paus
         # The helpers find a live object; goto_entity first wakes an asleep one (its area streamed in).
         out.append(f"goto_entity {ref}")
         out += dismiss_after(o)
-    if a.action == FIGHT:
+    if a.action == FIGHT and D_FIGHT_AT and ref == D_FIGHT_AT:
+        # W32 (c): D fights this one (d_fight_lines); H waits for D beside it and attacks nothing.
+        out += [f"log LEVELPASS fight by D at {ref}: H stands by",
+                f"online_wait_peer_near_entity {ref} {FIGHT_RADIUS} 60",
+                f"stand_by {ref} {FIGHT_RADIUS} {4 * ACTION_TIMEOUT[FIGHT]}"]
+    elif a.action == FIGHT:
         out.append(f"fight_near {ref} {FIGHT_RADIUS} {ACTION_TIMEOUT[FIGHT]}")
     elif a.action == ATTACK:
         out.append(f"attack_until {ref} {ACTION_TIMEOUT[ATTACK]}")
@@ -2052,8 +2088,31 @@ PAUSE_FATAL = r"Dev: \S+ \S+ no player frame took a read for \d+ s \(paused"
 MADE_COPY_LEFT = r"Online: runtime spawn (?:made copy|twin) .* still in the entity table"
 
 
+def d_fight_ref(plan: Plan) -> str:
+    """W32 (c): the reference of the plan's fight by D (its first fight action), or "" (off, or no fight)."""
+    if not (D_FIGHT and plan.d_lobby and plan.d_follow):
+        return ""
+    for s in plan.stops:
+        for a in s.actions:
+            if a.action == FIGHT and a.obj.ref:
+                return a.obj.ref
+    return ""
+
+
+def d_fight_lines(plan: Plan) -> list[str]:
+    """D's part of the fight by D: once H is beside it, D stops following, goes there and fights; then follows again."""
+    ref = d_fight_ref(plan)
+    if not ref:
+        return []
+    return [f"log LEVELPASS D fights at {ref}", f"online_wait_peer_near_entity {ref} {FIGHT_RADIUS} {D_FIGHT_WAIT_S}",
+            "online_auto_follow off", f"goto_entity {ref} 300", f"fight_near {ref} {FIGHT_RADIUS} {3 * ACTION_TIMEOUT[FIGHT]}",
+            "online_auto_follow on", "log LEVELPASS D fought"]
+
+
 def script_h(plan: Plan, late_join_after: str | None) -> str:
     """H's script: boot, Host, the level, the sweep, the late join's wait, the exit."""
+    global D_FIGHT_AT
+    D_FIGHT_AT = d_fight_ref(plan)
     # The one boot (party_boot_h): the lobby (with D) or the host alone (D joins late, or no D).
     lines = party_boot_h(plan.late_join and plan.d_lobby and late_join_after is None, plan.new_slot, plan.figures_h)
     lines += ["online_mark_level", f"level {plan.level}",
@@ -2535,6 +2594,7 @@ def script_d(plan: Plan) -> str:
             # From here D's hero follows H's (the game's Auto follow: a move whenever it is farther than 400 and
             # free on the ground); D's script presses nothing more, it only waits for the level's end.
             lines += ["online_auto_follow on", "log LEVELPASS D follows H"]
+            lines += d_fight_lines(plan)
         if d_brought(plan):
             lines += d_come_lines(plan)
         elif plan.pass_gates and d_through_end(plan):
@@ -2547,8 +2607,8 @@ def script_d(plan: Plan) -> str:
         lines += ["log LEVELPASS D done", "online_end", "quit"]
         return "\n".join(lines) + "\n"
     lines = boot_lines(False, plan.figures_d or [FIGURE_D])
-    lines += ["waitfor online_in_play 300", "online_join {join}", "waitfor online_barrier 300", "wait_free 120",
-              "online_mark_level", f"hold_cap {HOLD_CAP_S}",
+    lines += ["waitfor online_in_play 300", "online_join {join}", "waitfor online_barrier 300", *arrival_lines(),
+              "wait_free 120", "online_mark_level", f"hold_cap {HOLD_CAP_S}",
               "log LEVELPASS D in", "online_audit d-in"]
     acted = [s for s in plan.stops if s.actions and s is not plan.exit_stop and visit_ref(s)
              and reachable(visit_obj(s), [])]
@@ -3327,10 +3387,27 @@ def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan, d_tex
     return (INCOMPLETE if missed else PASS), missed
 
 
+# W33: --vulnerable leaves out the two settings that keep the heroes from being hurt (VULNERABLE, skytest sets it),
+# for a full-level run where enemies may hurt the players. Not yet survivable: a knocked-out hero waits at the game's
+# "place a Skylander" screen and the pass's route steps fail as held until it ends (what a pass needs to go on, a
+# figure swap at a knock-out, is written in levelpass's KO_SURVIVAL note).
+VULNERABLE = False
+INVULNERABLE_ARGS = ("--dev_hero_invulnerable=true", "--dev_damage_multiplier=-1")
+# KO_SURVIVAL: for a pass to go on after a knock-out the swap must come at the moment it happens, which a script
+# cannot wait for in the middle of a route step. It needs (1) a dev setting in the game (dev_ko_figure=<file>): at
+# the game's figure prompt of a knock-out (swap_hooks.cpp's `swap placement none reason <r> (KO; player 0`) the
+# software portal lifts the hero's figure and places that file, as the script's `remove 0` / `place 0` do; (2) the
+# route steps to wait out the knock-out (its hold) instead of failing `held too long`; (3) the page to count each such
+# swap. Not built.
+
+
 def probe_args(args: list[str], probe: bool, extra: list[str] | None = None) -> list[str]:
     """A peer's arguments, without the authored probe for a --no-probe pass, plus the pass's --game-arg
-    settings (after the defaults, so a later value wins)."""
-    return (list(args) if probe else [a for a in args if not a.startswith("--dev_authored_probe")]) + list(extra or [])
+    settings (after the defaults, so a later value wins); with VULNERABLE without INVULNERABLE_ARGS."""
+    out = list(args) if probe else [a for a in args if not a.startswith("--dev_authored_probe")]
+    if VULNERABLE:
+        out = [a for a in out if a not in INVULNERABLE_ARGS]
+    return out + list(extra or [])
 
 
 def check_game_arg(arg: str) -> str:
