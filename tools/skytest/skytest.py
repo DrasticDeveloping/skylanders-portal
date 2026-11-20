@@ -151,6 +151,7 @@ SYNTHETIC = ["h1", "h2"]
 SYNTHETIC_START_AFTER = r"Online: the server is in its hub"
 SYNTHETIC_CONNECTED = re.compile(r"Online: synthetic peer (\d+) connected")
 SYNTHETIC_FATAL = [r"Online: synthetic peer (could not connect|script |refused|leaves: no player records)"]
+LEFTOVER_SETTLE_S = 3.0   # a job's count of an ended process settles within this (see run_case)
 SYNTHETIC_EXIT_GRACE = 20.0
 SYNTHETIC_ARG_PLACEHOLDERS = ("{port}", "{script}", "{digest}", "{server}", "{peer}")
 SYNTHETIC_KEYS = ("script", "start_after", "start_peer", "expect", "forbid", "expect_count", "expect_order")
@@ -5234,7 +5235,14 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                         pass
                 results[sn].exit_code = sp.returncode
                 results[sn].seconds = round(time.monotonic() - syn_started[sn], 1)
+            # A process whose wait returned can still be counted by its job for a moment while Windows tears it
+            # down (8 test chunks at once: the fail-fast test saw 1 for an S stand-in the runner had just ended and
+            # waited for): the count settles for up to LEFTOVER_SETTLE_S before it is a leftover.
+            settle_until = time.monotonic() + LEFTOVER_SETTLE_S
             res.leftover_processes = job.active()
+            while res.leftover_processes and time.monotonic() < settle_until:
+                time.sleep(0.1)
+                res.leftover_processes = job.active()
             if res.leftover_processes:
                 job.terminate()
             for n, hold in holds:  # every game ended: each token is free, its outcome known
