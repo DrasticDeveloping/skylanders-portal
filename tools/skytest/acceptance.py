@@ -20,10 +20,15 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# The cases the lead named for the next build (logs\integrate-notes.txt), in order.
-CASES = ["soul-gem-tb", "enemy-attack-ta", "enemy-damage-tb", "hits-that-count", "coins-broken-both",
-         "moves-attack-tb", "moves-jump-block-tb", "moves-walk-tb", "moves-shot-tb", "moves-ko-tb", "swap-zone-tb",
-         "spark-lock-ww1", "rail-launch-tb", "fight-gate-tb", "element-gate-tb", "gpu-pipeline-drops"]
+# The cases the next build is judged by (the lead's W40 list), the cheap ones that would stop everything first: the
+# plain game boots (offline-plain), two clients join through the lobby (party-continue), the owner's second session
+# (soul-gem-tb), S's enemies on the clients (enemy-attack-ta), the players' hits on them (hits-that-count); then
+# the rest. A case with no spec in the tree it runs from (one that arrives with its branch) gets a "no run" row.
+CASES = ["offline-plain", "party-continue", "soul-gem-tb", "enemy-attack-ta", "hits-that-count",
+         "moves-figure-mid-tb", "moves-swapper-tb", "moves-block-probe-tb", "moves-shot-tb", "moves-ko-tb",
+         "world-event-cage-tb", "element-gate-tb", "gpu-pipeline-drops", "gpu-pipeline-drops-fixed",
+         "gpu-pipeline-drops-sync", "swap-zone-tb", "spark-lock-ww1", "rail-launch-tb", "fight-gate-tb",
+         "enemy-damage-tb", "coins-broken-both"]
 LEVELS = ["tutorial_a", "tutorial_b", "ww1"]
 LEVEL_DEFAULT_S = 900.0      # a level check with no earlier run: the level pass's own bound
 PAGE_LINE = re.compile(r"levelcheck \S+: page (.+)$", re.M)

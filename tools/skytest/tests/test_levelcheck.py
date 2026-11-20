@@ -868,25 +868,110 @@ class LevelEvents(unittest.TestCase):
         self.assertEqual(lc.grade_level_events(lc.load_run(self.OWNER_3)).status, lc.NOT_TESTED)
 
 
+class AuthorsFinalLines(unittest.TestCase):
+    """W40: the rows read the authors' final texts (their branches' code)."""
+    LP = Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass")
+
+    def test_damage_from_s_final_forms(self) -> None:
+        # online/5-replica-attacks-land-2 2756bb27
+        s = [(50, "Online: enemy hit a1@2 on peer 1 #1 obligation 7 damage 10 occurrence 3 tick 900 (S's hit, sent) (#1)"),
+             (51, "Online: enemy hit a1@2 on peer 1 #2 obligation 8 damage 10 occurrence 3 tick 905 (S's hit, sent) (#2)")]
+        h = H_JOIN + [(40, "Online: hit session on (S's announcement: this game's hits on bound copies go to S; enemy "
+                           "damage to this player comes from S)"),
+                      (50, "Online: enemy hit a1@2 #1 damage 10 occurrence 3 applied here: applied hp 200 -> 190 (attacker "
+                           "its copy) (S tick 900) (#1)"),
+                      (51, "Online: enemy hit a1@2 #2 damage 10 refused here (another figure)")]
+        v = lc.grade_enemy_server_damage(lc.load_run(RunFolder(s, h, D_JOIN).path))
+        self.assertIn("S's hits on players 2: applied once 1, twice 0, not applied 1, no line 0", v.counts)
+
+    def test_hit_and_kill_reports_count_as_s_health(self) -> None:
+        # online/5-hits-that-count dd01982d
+        s = [(10, "Online: enemy placed a2@2 as Chompy#4792 hp 30 pose 63 (S)"),
+             (20, "Online: enemy hit report a2@2 from peer 1: applied hp 30 -> 10"),
+             (21, "Online: enemy hit report a3@2 from peer 1: refused (not bound on that client)")]
+        h = H_JOIN + [(19, "Online: enemy local health held a2@2 (30 -> 10, 8298e4bc)"),
+                      (21, "Online: enemy local health held a3@2 (30 -> 10, 8298e4bc)")]
+        v = lc.grade_enemy_kills(lc.load_run(RunFolder(s, h, D_JOIN).path))
+        self.assertEqual([f.what for f in v.findings], [
+            "H: a3@2 took 1 landed hit(s) here and lost no health on S (S applied 0 hit(s) to it; S refused 1 report(s): "
+            "not bound on that client): immortal"])
+
+    def test_reward_final_forms(self) -> None:
+        # online/8-all-coins-shared 6864569c
+        s = [(50, "Online: reward 000b0042 settled (evidence): 50.00 gold to each hero (limit 50.00), owed to players "
+                  "1a2b"),
+             (50, "Online: reward 000b0042 obliged to player 1a2b at peer 2 (obligation 3: 50.00 gold to each hero)")]
+        h = H_JOIN + [(50, "Online: reward 000b0042: this game's script gives 50.00 gold to each hero (limit 50.00); S is "
+                           "told")]
+        d = D_JOIN + [(51, "Online: reward 000b0042 paid here (another player's pick-up; player 8b000001 wallet 0, 50.00 "
+                           "gold: gold 10 -> 60, +50)")]
+        v = lc.grade_rewards_food(lc.load_run(RunFolder(s, h, d).path))
+        self.assertEqual([f.what for f in v.findings],
+                         ["1 reward obligation(s) S never counted paid (`reward <t> paid to player <id>`)"])
+        s2 = s + [(52, "Online: reward 000b0042 paid to player 1a2b (its game wrote its wallets)")]
+        self.assertEqual(lc.grade_rewards_food(lc.load_run(RunFolder(s2, h, d).path)).status, lc.PASS)
+
+    @unittest.skipUnless(LP.is_dir(), "the level data is not here")
+    def test_an_elemental_gate_touched_by_its_element_without_unlock_fails(self) -> None:
+        # online/6-owner-session3-triggers ab3f6776
+        h = H_JOIN + [(30, "Online: elemental gate LockedElementalGate#2072 single lock: element(s) Life, unlock radius 300"),
+                      (31, "Online: hero NinjaStealthElf#3800 elements Life/None"),
+                      (32, "Online: elemental gate LockedElementalGate#2072 touched by NinjaStealthElf#3800: sides "
+                           "fullyPowered/fullyPowered: no unlock")]
+        v = lc.grade_gate_kinds(lc.load_run(RunFolder([], h, D_JOIN).path), lc.level_data(self.LP, "tutorial_b"))
+        self.assertIn("gate elements read: LockedElementalGate single Life", v.counts)
+        self.assertTrue(any("touched by NinjaStealthElf#3800 (elements life/none, the lock wants Life)" in f.what
+                            for f in v.findings), [f.what for f in v.findings])
+
+    def test_look_boxes_effects_and_conversation_ends_against_s(self) -> None:
+        # online/6-owner-session3-scenes 2e901d2d
+        s = [(10, "Online: level look box 1a2b3c4d #2 at (1, 2, 3) state 1 -> 0 at shared tick 600 (S's look)"),
+             (11, "Online: level effect vfx_Embers#900 component 0 off at shared tick 660 (S's effect)"),
+             (20, "Online: conversation Tessa#3811 ended on S at shared tick 1200 (S's line)")]
+        h = H_JOIN + [(10, "Online: level look box 1a2b3c4d #2 at (1, 2, 3) state 1 -> 0 here (S's at shared tick 600)"),
+                      (11, "Online: level effect vfx_Embers#901 component 0 on here (S's at shared tick 600)"),
+                      (15, "Online: scene local 2/L2 start conversation conversation recipient Tessa#3811 from x"),
+                      (20, "Online: scene local 2/L2 end by natural after 5.0 s (2/2.w1)")]
+        d = D_JOIN + [(45, "Online: scene local 2/L2 start conversation conversation recipient Tessa#3999 from x"),
+                      (50, "Online: scene local 2/L2 end by natural after 5.0 s (2/2.w1)")]
+        v = lc.grade_level_events(lc.load_run(RunFolder(s, h, d).path))
+        self.assertEqual([f.what.split(":")[0] for f in v.findings], [
+            "1 effect(es) end in another state than S's", "1 conversation end(s) not within 1 s of S's"])
+        self.assertIn("D Tessa +30.0 s", v.findings[1].what)
+
+
 class WorldEvents(unittest.TestCase):
     OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
     LP = Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass")
 
     @unittest.skipUnless(LP.is_dir(), "the level data is not here")
-    def test_the_cage_step_lowered_on_h_applied_late_on_d(self) -> None:
-        # The world rows' author's line forms (online/6-owner-session3-world, written ahead of the build).
+    def test_the_cage_step_moved_on_s_applied_here_and_at_a_wake(self) -> None:
+        # The world rows author's final forms (online/6-owner-session3-world b9266c32): S logs the change, each client
+        # applies it (`moves` has no apply; an asleep copy applies at its wake, later: counted).
         data = lc.level_data(self.LP, "tutorial_b")
         self.assertIn("A2_CageStep_Hanging", [n for n, _u, _k in data.world_objects])
-        h = H_JOIN + [(50, "Online: world event A2_CageStep_Hanging#2653 lowered by H (state up -> down)")]
-        d = D_JOIN + [(53, "Online: world event A2_CageStep_Hanging#2701 lowered applied here (state down)")]
-        s = [(50, "Online: world event A2_CageStep_Hanging#3001 lowered applied here (state down)")]
-        v = lc.grade_world_events(lc.load_run(RunFolder(s, h, d).path), data)
+        s = [(50, "Online: world event A2_CageStep_Hanging#3001 moves by PeerPuppet_2#3844 (state still at (4308, 6928, "
+                  "1164) -> moving)"),
+             (51, "Online: world event A2_CageStep_Hanging#3001 moved by PeerPuppet_2#3844 (state moving -> still at "
+                  "(4308, 6928, 700))"),
+             (52, "Online: world event TutorialLockedGate#2601 gate by the level (state closed -> open)"),
+             (53, "Online: place draw FoxenMale#4001 Scripts.MaterialOverrideComponent.ApplyOverrides component 0 draw 1: "
+                  "3 of 0..5 (the game drew 2)")]
+        h = H_JOIN + [(51, "Online: world event A2_CageStep_Hanging#2653 moved applied here (state still at (4308, 6928, "
+                           "700))"),
+                      (52, "Online: world event TutorialLockedGate#2650 gate applied here (state open)"),
+                      (53, "Online: place draw FoxenMale#4100 Scripts.MaterialOverrideComponent.ApplyOverrides component 0 "
+                           "draw 1: 3 of 0..5 (the game drew 4)")]
+        d = D_JOIN + [(90, "Online: world event A2_CageStep_Hanging#2701 moved applied here (state still at (4308, 6928, "
+                           "700))"),
+                      (53, "Online: place draw FoxenMale#4200 Scripts.MaterialOverrideComponent.ApplyOverrides component 0 "
+                           "draw 1: 1 of 0..5 (the game drew 1)")]
+        v = lc.grade_world_events(lc.load_run(RunFolder(s, h, sorted(d)).path), data)
         self.assertEqual(v.status, lc.FAIL)
-        self.assertTrue(v.findings[0].what.startswith("A2_CageStep_Hanging lowered by H on H at "), v.findings[0].what)
-        self.assertIn("not applied on D within 1 s (later: ", v.findings[0].what)
-        self.assertIn(", 1 changed in this run; untested: ", v.counts)
-        d_ok = D_JOIN + [(50, "Online: world event A2_CageStep_Hanging#2701 lowered applied here (state down)")]
-        self.assertEqual(lc.grade_world_events(lc.load_run(RunFolder(s, h, d_ok).path), data).status, lc.PASS)
+        self.assertEqual([f.what.split(" at ")[0] for f in v.findings], [
+            "TutorialLockedGate gate by the level on S", "place draw FoxenMale Scripts.MaterialOverrideComponent.ApplyOverrides component 0 draw 1 differs: S 3, H 3, D 1"])
+        self.assertIn("not applied on D", v.findings[0].what)
+        self.assertIn("3 world event(s), 2 applied on every game (1 later, at a copy's wake)", v.counts)
 
     @unittest.skipUnless(OWNER_3.is_dir() and LP.is_dir(), "the owner's third session or the level data is not here")
     def test_the_owners_third_session_predates_the_lines(self) -> None:
@@ -984,10 +1069,24 @@ class GateKinds(unittest.TestCase):
         # opened; "swap force gates dont work": H's press of the Rocket Swap Zone was refused (online_swap_zones off).
         r = lc.load_run(self.OWNER_3)
         v = lc.grade_gate_kinds(r, lc.level_data(self.LP, lc.run_level(r)))
+        # W40: the Swap Zone refusal is the off state there (online_swap_zones off in his session): said, not failed.
         self.assertEqual([f.what.split(":")[0] for f in v.findings], [
             "LockedElementalGate tutorial_b_zone_elemental_01 (dual element)",
-            "LockedElementalGate tutorial_b_zone_elemental_02 (single element)", "H"])
-        self.assertIn("Swap Zones are not available in online play yet", v.findings[2].what)
+            "LockedElementalGate tutorial_b_zone_elemental_02 (single element)"])
+        self.assertIn("refused 1 (Swap Zones off in this run", v.counts)
+
+    @unittest.skipUnless(LP.is_dir(), "the level data is not here")
+    def test_a_refusal_with_swap_zones_on_and_a_player_left_parked_fail(self) -> None:
+        d = lc.level_data(self.LP, "tutorial_b")
+        h = H_JOIN + [(50, "Online: swap zone CPhysicalEntity#3331 refused: Swap Zones are not available in online play "
+                           "yet (client, press)")]
+        dd = D_JOIN + [(60, "Online: swap zone #3364 parked at 20120,20963,1679 (OffPlayerLocation; x; presser 1, "
+                            "zone 1)")]
+        v = lc.grade_gate_kinds(lc.load_run(RunFolder([], h, dd).path), d)
+        self.assertEqual([f.what.split(" (")[0].split(":")[0] for f in v.findings[-2:]],
+                         ["D", "H"])
+        self.assertIn("left parked by Swap Zone #3364", v.findings[-2].what)
+        self.assertIn("refused with the feature on", v.findings[-1].what)
 
 
 class EnemyKills(unittest.TestCase):
