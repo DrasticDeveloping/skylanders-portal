@@ -7988,6 +7988,20 @@ def levelcheck_exit(lc, verdicts) -> int:
     return EXIT_INCOMPLETE if any(v.status == lc.INCOMPLETE for v in verdicts) else 0
 
 
+def cmd_acceptance(cfg: Config, a: argparse.Namespace) -> int:
+    """W39 item 6: the acceptance list (acceptance.py), its estimate first."""
+    import acceptance
+    cases = [c for c in (a.cases.split(",") if a.cases else acceptance.CASES) if c]
+    levels = [lv for lv in (a.levels.split(",") if a.levels else acceptance.LEVELS) if lv]
+    heads = []
+    for repo in (cfg.repo, cfg.repo / "thirdparty" / "skylanders-portal"):
+        r = subprocess.run(["git", "-C", str(repo), "log", "-1", "--format=%h %s"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        heads.append(f"{repo.name} {r.stdout.strip() or '?'}")
+    return acceptance.run(Path(__file__).resolve(), cfg.repo, cfg.store, levelpass_folder(cfg, None), cases, levels,
+                          a.run_not_ready, a.dry_run, "; ".join(heads), [Path(x) for x in (a.history or [])])
+
+
 def cmd_prune(cfg: Config, a: argparse.Namespace) -> int:
     """`prune --older-than <hours>`: the store's run and session folders older than that, through the
     janitor (never through a directory link); it prints what it removed and what that freed."""
@@ -10272,6 +10286,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="a run or session folder whose newest file is older than this many hours goes")
     pr.add_argument("--dry-run", action="store_true", help="say what would go, remove nothing")
     pr.set_defaults(fn=cmd_prune)
+    ac = sub.add_parser("acceptance", help="the acceptance list on one build: each case once, one session at a time,"
+                        " then the level checks with two players, one page (acceptance.py)")
+    ac.add_argument("--cases", default=None, help="comma-separated case names instead of the list")
+    ac.add_argument("--levels", default=None, help="comma-separated levels instead of tutorial_a,tutorial_b,ww1")
+    ac.add_argument("--run-not-ready", action="store_true", help="pass --run-not-ready to every case")
+    ac.add_argument("--dry-run", action="store_true", help="print the list and its estimate only, start no game")
+    ac.add_argument("--history", action="append", default=None, metavar="DIR", help="one more store's runs folder whose"
+                    " earlier runs count for the estimate (repeatable)")
+    ac.set_defaults(fn=cmd_acceptance)
     pf = sub.add_parser("preflight", help="a spec's mistakes before any game runs (preflight.py)")
     pf.add_argument("cases", nargs="*", help="case names (tests/runtime/<case>.toml)")
     pf.add_argument("--all-ready", action="store_true", help="every spec that is ready")
