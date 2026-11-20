@@ -2170,6 +2170,13 @@ def ride_reached(log: Log | None) -> dict[str, tuple[str, Line]]:
     return out
 
 
+# W31: the follow's rescue (client/auto_follow.cpp): a follower the game put back twice after a move, taken back to
+# its own last ground; and the game's own put-backs (`Stuck falling: player put back`) on that client.
+FOLLOW_RESCUED = re.compile(r"Online: auto follow \d+: rescued: put back \d+ times since the move to (\S+); back to "
+                            r"its own last ground (\S+)")
+PUT_BACK = re.compile(r"Stuck falling: player put back after")
+
+
 def route_head(folder: Path) -> list[str]:
     """The page's lines for targets not visited (no floor) and heroes taken out of a stuck spot, per client."""
     out = []
@@ -2177,8 +2184,16 @@ def route_head(folder: Path) -> list[str]:
         log = read_log(folder, f"{who}/game.log", who)
         if log is None:
             continue
-        label, missed, taken = "", [], []
+        label, missed, taken, rescued, put_backs, first_put = "", [], [], [], 0, None
         for i, raw in enumerate(log.lines):
+            m = FOLLOW_RESCUED.search(raw)
+            if m:
+                rescued.append(f"from {m.group(1)} to {m.group(2)} ({log.line(i).cite()})")
+                continue
+            if PUT_BACK.search(raw):
+                put_backs += 1
+                first_put = first_put or log.line(i)
+                continue
             m = VISIT_OR_ACT.search(raw)
             if m:
                 label = m.group(1) or m.group(2)
@@ -2199,6 +2214,12 @@ def route_head(folder: Path) -> list[str]:
                        + (f"; and {len(missed) - 4} more" if len(missed) > 4 else ""))
         if taken:
             out.append(f"{who} held too long at the same spot twice, {len(taken)} time(s): " + "; ".join(taken[:3]))
+        if rescued:
+            out.append(f"{who} rescued by the follow (put back twice after a move, taken to its own last ground), "
+                       f"{len(rescued)} time(s): " + "; ".join(rescued[:3]))
+        if put_backs >= 2:
+            out.append(f"{who} put back by the game {put_backs} times (`Stuck falling: player put back`; the first "
+                       f"{first_put.cite()})")
     return out
 
 

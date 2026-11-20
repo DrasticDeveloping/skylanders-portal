@@ -195,6 +195,24 @@ class LaunchRide(unittest.TestCase):
         self.assertFalse([x for x in head if x.startswith("not visited")], head)
         self.assertNotIn("CScriptTriggerEntityData001: no ground", lc.page(f.path, [], []))
 
+
+class FollowRescue(unittest.TestCase):
+    def test_the_page_names_the_rescue_and_the_put_backs(self) -> None:
+        # W31, batch 15 case 7: D followed H over Cascade Glade's island spawner, the game put it back again and again.
+        d = [(70, "Online: auto follow 1 to -5521,-2859,1484 from 2844,-5706,-70 (8961, teleport 2)"),
+             (71, "Stuck falling: player put back after 3.03 s (limit 3.00 s)"),
+             (72, "Stuck falling: player put back after 3.03 s (limit 3.00 s)"),
+             (73, "Online: auto follow 1: rescued: put back 2 times since the move to -5521,-2859,1484; back to its "
+                  "own last ground 2844,-5706,-10 (teleport 3); the follow leaves that spot until the target is 400 "
+                  "away from it")]
+        f = RunFolder([], H_JOIN, D_JOIN + d)
+        head = lc.route_head(f.path)
+        self.assertTrue(any(x.startswith("D rescued by the follow (put back twice after a move, taken to its own last "
+                                         "ground), 1 time(s): from -5521,-2859,1484 to 2844,-5706,-10 (D/game.log:")
+                            for x in head), head)
+        self.assertTrue(any(x.startswith("D put back by the game 2 times (`Stuck falling: player put back`; the first "
+                                         "D/game.log:") for x in head), head)
+
 class Windows(unittest.TestCase):
     def test_a_clients_time_in_each_level(self) -> None:
         f = RunFolder([], H_JOIN + LEVEL_END, D_JOIN + LEVEL_END)
