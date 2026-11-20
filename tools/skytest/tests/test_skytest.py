@@ -115,6 +115,32 @@ TEST_COMMANDS = "[commands]\n" + "".join(f'{c} = "none"\n' for c in (
     "serverlog", "online_join", "savewrite"))
 
 
+class DataDriveTest(unittest.TestCase):
+    """2026-11-20: the store's drive gone (int2's .replication-tests a junction to D:): one plain line, no game."""
+
+    def test_a_store_whose_drive_or_link_target_is_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            here = Path(d) / "store"
+            self.assertEqual(skytest.data_drive_missing(here), "")  # not there yet: made by the runner
+            here.mkdir()
+            self.assertEqual(skytest.data_drive_missing(here), "")
+            free = next((c for c in "QRSTUVWXYZ" if not Path(f"{c}:/").exists()), None)
+            if free:
+                self.assertEqual(skytest.data_drive_missing(Path(f"{free}:/SwapForceOnline-data/tests/x")),
+                                 f"the test data drive is not attached ({Path(f'{free}:/SwapForceOnline-data')})")
+            if os.name == "nt":
+                target = Path(d) / "data" / "tests" / "int2"
+                target.mkdir(parents=True)
+                link = Path(d) / "wt" / ".replication-tests"
+                link.parent.mkdir()
+                r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True)
+                if r.returncode == 0:
+                    self.assertEqual(skytest.data_drive_missing(link), "")
+                    target.rmdir()
+                    self.assertTrue(skytest.data_drive_missing(link).startswith("the test data drive is not attached"))
+                    os.rmdir(link)  # the junction itself, never through it
+
+
 class SkytestTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

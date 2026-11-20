@@ -917,6 +917,28 @@ WORLD_EVENT_NO_APPLY = ("moves",)
 PLACE_DRAW = re.compile(r"Online: place draw (\S+?)#\S* (\S+) component (\d+) draw (\d+): (\S+) of ")
 WORLD_EVENT_APPLIED = re.compile(r"Online: world event (\S+?)(?:#\d+)? (.+?) applied here \(state (.*?)\)\s*$")
 WORLD_EVENT_S = 1.0
+# Batch 18d (run 20261120-064438 world-event-cage-tb): ten of S's events were "not applied" on H and D. A client logs
+# `applied here` only when it changes its copy to S's row: a copy that already reads S's state converges with nothing
+# to do and logs nothing (src/online/world/availability.cpp, after PlanRow: `row.converged`, no line). So a missing
+# line is no fault, only "cannot decide":
+# - a change S made while a client was still loading the level (before that client's `level <g>: loaded here`):
+#   the client's own load makes the level's start state (four level-start events at 06:45:53.399, H loaded .423,
+#   D .435): cannot decide, said as the level start;
+# - a removal by death shows on a client as `world breakable <Name#id> killed (live)` (S's row's kill applied there):
+#   read as its apply;
+# - any other change with no line on a client: cannot decide (its copy may have made the change itself: the player
+#   whose chain made it, or the level's own script).
+# Only lines that disagree are faults: a client's apply of another state.
+WORLD_BREAKABLE_KILLED = re.compile(r"Online: world breakable (\S+?)(?:#\d+)? killed \(live\)")
+LEVEL_LOAD_START = re.compile(r"Online: level (\d+) \S+: load$")
+LEVEL_LOADED_HERE = re.compile(r"Online: level (\d+): loaded here")
+
+
+def loading_spans(log: Log) -> list[tuple[datetime, datetime]]:
+    """This game's level loads: from `level <g> <path>: load` to its `level <g>: loaded here`."""
+    starts = {m.group(1): l.t for l, m in log.find(LEVEL_LOAD_START) if l.t is not None}
+    return [(starts[m.group(1)], l.t) for l, m in log.find(LEVEL_LOADED_HERE)
+            if l.t is not None and m.group(1) in starts and starts[m.group(1)] <= l.t]
 
 
 def world_event_objects(logic: dict | None) -> list[tuple[str, str, list[str]]]:
@@ -952,13 +974,18 @@ def grade_world_events(run: Run, data: "LevelData | None") -> Verdict:
         return Verdict(name, NOT_TESTED, f"no `world event ... by` line on any game (a build before "
                        f"online/6-owner-session3-world); {listed}, 0 changed in this run")
     applied = {w: [(l, m) for l, m in lg.find(WORLD_EVENT_APPLIED)] for w, lg in games}
+    killed = {w: [(l, m) for l, m in lg.find(WORLD_BREAKABLE_KILLED)] for w, lg in games}
+    loads = {w: loading_spans(lg) for w, lg in games}
     used: dict[str, set[int]] = {w: set() for w, _lg in games}
     findings: list[Finding] = []
     ok = 0
     late_n = 0
+    undecided: list[str] = []
+    level_start_n = 0
     for w, l, m in origins:
         nm, what, after = m.group(1), m.group(2), m.group(5)
         bad = []
+        blind: list[str] = []
         cites = [f"{w}: {l.cite()}"]
         for o, _lg in games:
             if o == w or what in WORLD_EVENT_NO_APPLY:
@@ -981,8 +1008,14 @@ def grade_world_events(run: Run, data: "LevelData | None") -> Verdict:
                         bad.append(f"{o} applied state {late[0][2].group(3)}, not {after}")
                         cites.append(f"{o}: {late[0][1].cite()}")
                     continue
-                bad.append(f"not applied on {o}")
-                cites.append(absent(dict(games)[o], f"`world event {nm}#.. {what} applied here`"))
+                if what == "removed" and l.t is not None and any(
+                        km.group(1) == nm and kl.t is not None and -0.5 <= (kl.t - l.t).total_seconds() <= WORLD_EVENT_S
+                        for kl, km in killed[o]):
+                    continue  # S's row's kill applied there: `world breakable <Name#id> killed (live)`
+                if l.t is not None and any(a <= l.t <= b for a, b in loads[o]):
+                    blind.append(f"{o} (still loading the level: its load makes the level's start state)")
+                    continue
+                blind.append(f"{o} (no line: its copy may have made the change itself)")
                 continue
             used[o].add(pick[0])
             if pick[2].group(3) != after:
@@ -990,6 +1023,10 @@ def grade_world_events(run: Run, data: "LevelData | None") -> Verdict:
                 cites.append(f"{o}: {pick[1].cite()}")
         if bad:
             findings.append(Finding(f"{nm} {what} by {m.group(3)} on {w} at {when(l)}: " + "; ".join(bad), cites[:5]))
+        elif blind:
+            if all("still loading" in b for b in blind):
+                level_start_n += 1
+            undecided.append(f"{nm} {what} at {when(l)}: cannot decide on " + ", ".join(blind))
         else:
             ok += 1
     changed = {m.group(1) for _w, _l, m in origins}
@@ -1003,12 +1040,17 @@ def grade_world_events(run: Run, data: "LevelData | None") -> Verdict:
         if len({x[0] for x in by.values()}) > 1:
             findings.append(Finding(f"place draw {k[0]} {k[1]} component {k[2]} draw {k[3]} differs: " + ", ".join(
                 f"{w} {x[0]}" for w, x in by.items()), [x[1].cite() for x in list(by.values())[:3]]))
-    counts = (f"{len(origins)} world event(s), {ok} applied on every game ({late_n} later, at a copy's wake); "
-              f"{listed}, {len(names & changed)} changed in this run"
+    counts = (f"{len(origins)} world event(s), {ok} applied on every game ({late_n} later, at a copy's wake)"
+              + (f", {len(undecided)} cannot decide ({level_start_n} at a client's level load)" if undecided else "")
+              + f"; {listed}, {len(names & changed)} changed in this run"
               + (f"; place draws {len(draws)}" if draws else ""))
+    if undecided:
+        counts += "; cannot decide: " + "; ".join(undecided[:6]) + (f" and {len(undecided) - 6} more"
+                                                                   if len(undecided) > 6 else "")
     if untested:
         counts += f"; untested: {', '.join(untested[:12])}" + (f" and {len(untested) - 12} more" if len(untested) > 12 else "")
-    return Verdict(name, FAIL if findings else PASS, counts, origins[0][1].cite(), findings)
+    status = FAIL if findings else (PASS if ok else NOT_TESTED)
+    return Verdict(name, status, counts, origins[0][1].cite(), findings)
 
 
 # --- reward gold and placed food (W39 item 3) -------------------------------------------------------------------
@@ -1582,6 +1624,91 @@ SWAP_RELEASED = re.compile(r"Online: swap zone (\S+) released \(")
 SWAP_ON_ARG = "--online_swap_zones=true"
 
 
+# Batch 18d (runs 20261120-064619 element-gate-tb and 20261120-065348 element-gate-dual-tb): the gates opened on all
+# three games, and the row said "opened on no game". It read openings by the name `LockedElementalGate#<id>`, which no
+# game prints: the gate has no run-time name, so S's and H's lines named its lock by address (`elemental gate
+# b82aa6f0 ...`, `backend gate.open applied b82aa6f0 key ...`) and D's world gate line `?#2107` (2429afb4 makes the
+# element gate lines say `?#<id>` too, as the world gate line does). With online_world_authored_keys (the owner's
+# session settings) a gate's row is `a00000000.<zone hash>.<0001xxxx>`: its low 16 bits are the gate's authored index
+# (0x10663 -> 1635, the probe manifest's [tutorial_b#1635] at tutorial_b_zone_elemental_02's place). So a gate is
+# found by its authored index (the probe manifest's object at the gate's data position) and read, per game, by:
+#   S: its row written again after the level start (`world 2 <row>@<g> written`), `backend gate.open applied <address>
+#      key`, or `world event <label> gate by ... -> open)` (label `Name#id` or `?#id`, id this game's own: the
+#      authored probe's `authored obj <zone> <k> <index> ... mid <id hex>`);
+#   a client: `backend key gate <row>@<g> watched <address> (unlocked ...)` or `world gate <label> open apply`;
+#   either: watched while locked, its elemental gate lines (address or label) or S's first write: a game that knows
+#   the gate (closed there unless an opening line follows).
+# The address is the one the clients' `watched <address>` lines give for that row. A game with none of these lines
+# cannot be judged: the row says "cannot decide" (and NOT TESTED), never "opened on no game". A touch is judged by its
+# latest line per gate and hero (`no unlock` while approaching, then `unlocks`, is one opening).
+AUTHORED_ANY = re.compile(r"Online: authored obj \S+ \d+ (\d+) class \S+ entity \S+ name \S+ name0 \S+ mid ([0-9a-f]+) ")
+ROW_KEY = re.compile(r"\ba0{8}\.([0-9a-f]{8})\.([0-9a-f]{8})@\d+")
+KEY_GATE_ANY = re.compile(r"Online: backend key gate (a0{8}\.[0-9a-f]{8}\.[0-9a-f]{8})@\d+ watched (\S+) "
+                          r"\((locked|unlocked) ")
+ROW_WRITTEN_ANY = re.compile(r"Online: world 2 (a0{8}\.[0-9a-f]{8}\.[0-9a-f]{8})@\d+ written")
+GATE_APPLIED_S = re.compile(r"Online: backend gate\.open applied (\S+) key")
+WORLD_GATE_OPEN = re.compile(r"Online: world gate (\S*)#(\d+) open apply")
+WORLD_EVENT_GATE_OPEN = re.compile(r"Online: world event (\S*)#(\d+) gate by .* -> open\)")
+GATE_LINE_LABEL = re.compile(r"Online: elemental gate (\S+) ")
+GATE_PLACE_R = 60.0   # the gate's data position and the probe's place of its object: the same object within this
+
+
+def row_index(ref: str) -> int:
+    """An authored row key's authored index (its last part's low 16 bits)."""
+    return int(ref.split(".")[-1].split("@")[0], 16) & 0xFFFF
+
+
+def gate_index(data: "LevelData", g) -> int | None:
+    """The authored index of a gate: the probe manifest's object nearest its data position (within GATE_PLACE_R)."""
+    if g.pos is None or not data.places:
+        return None
+    best = min(((math.dist(pos, g.pos), i) for i, (_n, pos) in data.places.items() if pos is not None), default=None)
+    return best[1] if best is not None and best[0] <= GATE_PLACE_R else None
+
+
+def own_ids(log: Log) -> dict[int, int]:
+    """This game's own id of each authored index (the authored probe's lines; the last walk's)."""
+    return {int(m.group(1)): int(m.group(2), 16) for _l, m in log.find(AUTHORED_ANY)}
+
+
+def gate_addresses(games: list, idx: int) -> set[str]:
+    """The lock's address the clients' `watched <address>` lines give for the gate's row."""
+    return {m.group(2) for _w, lg in games for _l, m in lg.find(KEY_GATE_ANY) if row_index(m.group(1)) == idx}
+
+
+def gate_state(w: str, lg: Log, idx: int, addrs: set[str]) -> tuple[str, "Line | None"]:
+    """("open", line), ("closed", line) or ("unknown", None): what this game's own lines say of the gate."""
+    gid = own_ids(lg).get(idx)
+    known: Line | None = None
+    opened: list[Line] = []
+    if w == "S":
+        writes = [l for l, m in lg.find(ROW_WRITTEN_ANY) if row_index(m.group(1)) == idx]
+        if writes:
+            known = writes[0]
+        if len(writes) >= 2:
+            opened.append(writes[1])
+        opened += [l for l, m in lg.find(GATE_APPLIED_S) if m.group(1) in addrs]
+        if gid is not None:
+            opened += [l for l, m in lg.find(WORLD_EVENT_GATE_OPEN) if int(m.group(2)) == gid]
+    else:
+        for l, m in lg.find(KEY_GATE_ANY):
+            if row_index(m.group(1)) == idx:
+                known = known or l
+                if m.group(3) == "unlocked":
+                    opened.append(l)
+        if gid is not None:
+            opened += [l for l, m in lg.find(WORLD_GATE_OPEN) if int(m.group(2)) == gid]
+    if known is None:
+        for l, m in lg.find(GATE_LINE_LABEL):
+            lab = m.group(1)
+            if lab in addrs or (gid is not None and lab.endswith(f"#{gid}")):
+                known = l
+                break
+    if opened:
+        return "open", min(opened, key=lambda l: (l.t or datetime.min, l.no))
+    return ("closed", known) if known is not None else ("unknown", None)
+
+
 def grade_gate_kinds(run: Run, data: "LevelData | None") -> Verdict:
     name = "elemental gates and Swap Zones"
     if data is None:
@@ -1592,14 +1719,28 @@ def grade_gate_kinds(run: Run, data: "LevelData | None") -> Verdict:
     counts: list[str] = []
     findings: list[Finding] = []
     untested: list[str] = []
+    undecided: list[str] = []
     tested = opened_n = 0
     if elemental:
+        # By name first (a build or a level whose gates have one), then by the gate's authored index (batch 18d).
         opened = {w: gate_open_ids(lg, elemental[0].name, run=run) for w, lg in games}
         n_open = {w: len(ids) for w, ids in opened.items()}
         poses = peer_poses(run.server) if run.server is not None else {}
         for i, g in enumerate(elemental):
-            where = [w for w in n_open if n_open[w] > i]
             label = f"{g.name} {g.unit} ({g.lock} element)"
+            idx = gate_index(data, g)
+            addrs = gate_addresses(games, idx) if idx is not None else set()
+            state: dict[str, tuple[str, "Line | None"]] = {}
+            for w, lg in games:
+                if n_open[w] > i:
+                    state[w] = ("open", opened[w][i])
+                else:
+                    state[w] = gate_state(w, lg, idx, addrs) if idx is not None else ("unknown", None)
+            where = [w for w, _lg in games if state[w][0] == "open"]
+            shut = [w for w, _lg in games if state[w][0] == "closed"]
+            blind = [w for w, _lg in games if state[w][0] == "unknown"]
+            if idx is not None:
+                label += f" [authored {idx}]"
             near = []
             if g.pos is not None:
                 for peer, ps in sorted(poses.items()):
@@ -1608,44 +1749,63 @@ def grade_gate_kinds(run: Run, data: "LevelData | None") -> Verdict:
                         near.append((peer, hit))
             if where:
                 opened_n += 1
-            if not where and near:
+            stood = ", ".join(f"peer {p}'s hero stood within {ELEMENTAL_UNLOCK_R:.0f} of it at "
+                              f"{hit[0].strftime('%H:%M:%S')}" for p, hit in near)
+            if not where and near and shut and "S" in shut:
                 findings.append(Finding(
-                    f"{label}: " + ", ".join(f"peer {p}'s hero stood within {ELEMENTAL_UNLOCK_R:.0f} of it at "
-                                             f"{hit[0].strftime('%H:%M:%S')}" for p, hit in near)
-                    + " and it opened on no game (the hero's element and the lock's are not logged)",
-                    [hit[1].cite() for _p, hit in near[:2]]))
+                    f"{label}: {stood}, and it opened on no game (closed on {', '.join(shut)}"
+                    + (f"; no line for it on {', '.join(blind)}" if blind else "") + ")",
+                    [hit[1].cite() for _p, hit in near[:2]] + [state[w][1].cite() for w in shut[:1] if state[w][1]]))
                 tested += 1
+            elif not where and near:
+                undecided.append(f"{label}: {stood}; cannot decide whether it opened (no line names this gate on "
+                                 + ", ".join(blind or shut) + ")")
             elif not where:
                 untested.append(label)
-            elif len(where) < len(games):
-                findings.append(Finding(f"{label}: opened on {', '.join(where)}, not on "
-                                        + ", ".join(w for w, _l in games if w not in where),
-                                        [opened[w][i].cite() for w in where]))
+            elif shut:
+                findings.append(Finding(f"{label}: opened on {', '.join(where)}, not on {', '.join(shut)}"
+                                        + (f" (cannot decide on {', '.join(blind)})" if blind else ""),
+                                        [state[w][1].cite() for w in where if state[w][1]]))
+                tested += 1
+            elif blind:
+                undecided.append(f"{label}: opened on {', '.join(where)}; cannot decide on {', '.join(blind)} (no line "
+                                 "names this gate there)")
                 tested += 1
             else:
                 tested += 1
         locks: dict[str, str] = {}
+        last_touch: dict[tuple[str, str, str], tuple] = {}
         for w, lg in games:
             elems: dict[str, set[str]] = {}
             for i, raw in enumerate(lg.lines):
                 m = GATE_LOCK.search(raw)
                 if m:
-                    locks[m.group(1).split("#")[0] + " " + m.group(2)] = m.group(3)
+                    locks[m.group(1) + " " + m.group(2)] = m.group(3)
                     continue
                 m = HERO_ELEMENTS.search(raw)
                 if m:
                     elems[m.group(1)] = {m.group(2).lower(), m.group(3).lower()}
                     continue
                 m = GATE_TOUCH.search(raw)
-                if m and m.group(5) == "no unlock":
-                    lock = next((v_ for k_, v_ in locks.items() if k_.startswith(m.group(1).split("#")[0])), "")
-                    need = {x.lower() for x in lock.split("/") if x}
-                    if need and elems.get(m.group(2), set()) & need:
-                        findings.append(Finding(f"{w}: {m.group(1)} touched by {m.group(2)} (elements "
-                                                f"{'/'.join(sorted(elems[m.group(2)]))}, the lock wants {lock}): "
-                                                f"sides {m.group(3)}/{m.group(4)}, no unlock", [lg.line(i).cite()]))
+                if m:
+                    # The latest touch per gate and hero decides (batch 18d: `approach/approach: no unlock`, then
+                    # `completed/completed: unlocks` is one opening).
+                    lock = next((v_ for k_, v_ in locks.items() if k_.split(" ")[0] == m.group(1)), "")
+                    last_touch[(w, m.group(1), m.group(2))] = (m, lg.line(i), set(elems.get(m.group(2), set())), lock)
+        for (w, _gate, _hero), (m, line, his, lock) in last_touch.items():
+            need = {x.lower() for x in lock.split("/") if x}
+            if m.group(5) == "no unlock" and need and his & need:
+                findings.append(Finding(f"{w}: {m.group(1)} touched by {m.group(2)} (elements {'/'.join(sorted(his))}, "
+                                        f"the lock wants {lock}): sides {m.group(3)}/{m.group(4)}, no unlock (its latest "
+                                        "touch)", [line.cite()]))
         if locks:
-            counts.append("gate elements read: " + ", ".join(f"{k} {e}" for k, e in sorted(locks.items())))
+            # A named gate by its name (`LockedElementalGate single`), an unnamed one by its label (`?#2107 single`,
+            # or its lock's address in a build before 2429afb4).
+            shown = {}
+            for k, e in locks.items():
+                lab, _sp, kind = k.rpartition(" ")
+                shown[(lab.split("#")[0] if "#" in lab and not lab.startswith("?") else lab) + " " + kind] = e
+            counts.append("gate elements read: " + ", ".join(f"{k} {e}" for k, e in sorted(shown.items())))
         counts.append(f"elemental gates: {len(elemental)} ({sum(g.lock == 'dual' for g in elemental)} dual), "
                       f"{tested} tried by play, {opened_n} opened")
     refusals = [(w, l, m) for w, lg in games for l, m in lg.find(SWAP_REFUSED)
@@ -1688,9 +1848,11 @@ def grade_gate_kinds(run: Run, data: "LevelData | None") -> Verdict:
                       f"{sum(m.group(3) == 'queued' for _w, m in goes)} queued), stayed {len(stays)}")
     if not counts:
         return Verdict(name, NOT_TESTED, f"{data.level} has no elemental gate and no Swap Zone pad")
+    if undecided:
+        counts.append("CANNOT DECIDE: " + "; ".join(undecided))
     if untested:
         counts.append("NOT TESTED: " + ", ".join(untested))
-    status = FAIL if findings else (PASS if not untested else NOT_TESTED)
+    status = FAIL if findings else (PASS if not untested and not undecided else NOT_TESTED)
     return Verdict(name, status, "; ".join(counts), "", findings)
 
 
@@ -3239,6 +3401,7 @@ class LevelData:
     movers: list = field(default_factory=list)     # the level's re-arming mover spawners' names (levelpass_pieces)
     swap_zones: list = field(default_factory=list)  # W38: (name, unit) of each Swap Zone pad (a TurboZone component)
     world_objects: list = field(default_factory=list)  # W39: (name, unit, kinds) the logic drops, lowers, opens, ...
+    places: dict = field(default_factory=dict)     # authored index -> (name or "", position), unnamed objects too
 
 
 def run_level(run: Run) -> str:
@@ -3270,22 +3433,25 @@ def level_data(levelpass: Path | None, level: str) -> LevelData | None:
                 for e in manifest.get("entities", []) or [] if isinstance(e, dict) and e.get("group") == "enemy"
                 and str((e.get("details") or {}).get("_isEnabled", "")).startswith("false")]
     authored: dict = {}
+    places: dict = {}
     probe = levelpass / f"{level}-manifest.txt"
     if probe.is_file():
         import levelpass as lp
         try:
             for o in lp.parse_probe_manifest(probe.read_text(encoding="utf-8", errors="replace"), level).objects:
                 zone, _, idx = o.ident.partition("#")
-                if zone.lower() == level.lower() and idx.isdigit() and o.name:
-                    authored[int(idx)] = (o.name, o.pos)
+                if zone.lower() == level.lower() and idx.isdigit():
+                    places[int(idx)] = (o.name, o.pos)
+                    if o.name:
+                        authored[int(idx)] = (o.name, o.pos)
         except (OSError, ValueError):
-            authored = {}
+            authored, places = {}, {}
     import levelpass_pieces as lpc
     movers = sorted(k.split(".")[-1] for k, period in lpc.mover_spawners(logic, level).items() if period > 0)
     zones = [(str(e.get("name") or ""), str(e.get("unit") or "")) for e in manifest.get("entities", []) or []
              if isinstance(e, dict) and any("TurboZone" in str(k) for k in (e.get("components") or []))]
     return LevelData(level, lh.holds_of(logic, disabled), lh.required_gates(manifest, logic, level), authored, movers,
-                     zones, world_event_objects(logic))
+                     zones, world_event_objects(logic), places)
 
 
 # --- held enemies in a run (levelpass_holds: what the generator reads) -------------------------------------
