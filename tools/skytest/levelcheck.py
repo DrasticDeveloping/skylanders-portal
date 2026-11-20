@@ -986,6 +986,121 @@ def grade_world_events(run: Run, data: "LevelData | None") -> Verdict:
     return Verdict(name, FAIL if findings else PASS, counts, origins[0][1].cite(), findings)
 
 
+# --- reward gold and placed food (W39 item 3) -------------------------------------------------------------------
+#
+# The coins branch (online/8-all-coins-shared e2011447; being reworked after its review: the patterns follow it).
+# Reward gold (a collectible's script gold, Flynn's Missing Stuff: 50): per tracker T, S settles it once (`reward T
+# settled (...): <a> gold to each hero ...`) and every client is paid once: its own run (`reward T: this game's run of
+# its script gave <a> gold to each hero` / `... this game's own script gave its gold`) or another's pick-up (`reward T
+# paid here (another player's pick-up; ... <a> gold: gold x -> y, +d)`); `reward T received: not paid here (this game's
+# own run of its script paid it)` is no second pay. Twice on one game (two players touching at once), none, a pay
+# other than S's amount, or `ended unanswered` with no later `completed` fails. Placed food: every game walks the same
+# food (`food walked <zone> <n> placed food mapped ... keys <digest>`: n and the digest equal on S and every client,
+# the item drawn by its place: the review's place 0629f659.15667 among them); per food K one game eats it (`food taken
+# here K`) and every other game removes it once (`food removed here K (taken by another player...`, on S `food
+# removed on S K (granted to a client...`); a removal whose
+# game healed its own hero (`... this game's collect healed its hero`), `food not removed`, `food touched without
+# taking` and `food moved without a heal` fail.
+REWARD_SETTLED = re.compile(r"Online: reward ([0-9a-f]{8}) settled \(.*?\): ([\d.]+) gold to each hero")
+REWARD_OWN = re.compile(r"Online: reward ([0-9a-f]{8}): this game's (?:run of its script gave ([\d.]+) gold|own script "
+                        r"gave its gold)")
+REWARD_PAID = re.compile(r"Online: reward ([0-9a-f]{8}) paid here \(another player's pick-up; .*?, ([\d.]+) gold: ")
+REWARD_UNANSWERED = re.compile(r"Online: reward obligation (\d+) to peer (\d+) ended unanswered")
+REWARD_COMPLETED = re.compile(r"Online: reward obligation (\d+) to peer (\d+) completed")
+FOOD_WALKED = re.compile(r"Online: food walked ([0-9a-f]{8}) (\d+) placed food mapped.*?keys ([0-9a-f]{8})")
+FOOD_TAKEN = re.compile(r"Online: food taken here (\S+) \(player")
+FOOD_REMOVED = re.compile(r"Online: food removed (?:here|on S) (\S+) \((?:taken by another player|granted to a client)(.*)")
+FOOD_BAD = re.compile(r"Online: food (?:not removed|touched without taking|moved without a heal) (\S+)")
+
+
+def grade_rewards_food(run: Run) -> Verdict:
+    name = "reward gold and food"
+    games = ([("S", run.server)] if run.server is not None else []) + sorted(
+        run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    clients = [w for w, _l in games if w != "S"]
+    findings: list[Finding] = []
+    counts: list[str] = []
+    settled = {m.group(1): (l, float(m.group(2))) for l, m in (run.server.find(REWARD_SETTLED) if run.server else [])}
+    pays: dict[str, dict[str, list[tuple[Line, float | None]]]] = {}
+    for w in clients:
+        lg = run.clients[w]
+        for l, m in lg.find(REWARD_OWN):
+            pays.setdefault(m.group(1), {}).setdefault(w, []).append((l, float(m.group(2)) if m.group(2) else None))
+        for l, m in lg.find(REWARD_PAID):
+            pays.setdefault(m.group(1), {}).setdefault(w, []).append((l, float(m.group(2))))
+    tested = bool(settled or pays)
+    for tr in sorted(set(settled) | set(pays)):
+        bad, cites = [], []
+        s = settled.get(tr)
+        if s is None:
+            bad.append("S never settled it")
+            cites.append(absent(run.server, f"`reward {tr} settled`") if run.server else "no S log")
+        else:
+            cites.append(s[0].cite())
+        for w in clients:
+            mine = pays.get(tr, {}).get(w, [])
+            if len(mine) != 1:
+                bad.append(f"paid {len(mine)} time(s) on {w}")
+                cites += [f"{w}: {l.cite()}" for l, _a in mine[:2]] or [absent(run.clients[w], f"`reward {tr} ... gold`")]
+            elif s is not None and mine[0][1] is not None and abs(mine[0][1] - s[1]) > 0.01:
+                bad.append(f"{w} paid {mine[0][1]:g}, S settled {s[1]:g}")
+                cites.append(f"{w}: {mine[0][0].cite()}")
+        if bad:
+            findings.append(Finding(f"reward {tr}: " + "; ".join(bad), cites[:5]))
+    if run.server is not None:
+        done = {(m.group(1), m.group(2)) for _l, m in run.server.find(REWARD_COMPLETED)}
+        lost = [(l, m) for l, m in run.server.find(REWARD_UNANSWERED) if (m.group(1), m.group(2)) not in done]
+        if lost:
+            findings.append(Finding(f"{len(lost)} reward obligation(s) ended unanswered and never completed",
+                                    [l.cite() for l, _m in lost[:3]]))
+    counts.append(f"rewards settled on S {len(settled)}, paid on the clients "
+                  + ", ".join(f"{w} {sum(len(p.get(w, [])) for p in pays.values())}" for w in clients)
+                  + ("" if settled or pays else " (rewards NOT TESTED: no `reward` line)"))
+    # placed food: the same walk on every game
+    walks = {w: {m.group(1): (int(m.group(2)), m.group(3), l) for l, m in lg.find(FOOD_WALKED)} for w, lg in games}
+    zones = sorted({z for v in walks.values() for z in v})
+    for z in zones:
+        seen = {w: walks[w].get(z) for w, _l in games}
+        vals = {(x[0], x[1]) for x in seen.values() if x is not None}
+        if len(vals) > 1 or any(x is None for x in seen.values()):
+            tested = True
+            findings.append(Finding(f"food of zone {z} differs between the games: " + ", ".join(
+                f"{w} " + (f"{x[0]} mapped, keys {x[1]}" if x else "not walked") for w, x in seen.items()),
+                [x[2].cite() for x in seen.values() if x is not None][:3]))
+        elif vals:
+            tested = True
+    taken = {w: {m.group(1): l for l, m in lg.find(FOOD_TAKEN)} for w, lg in games}
+    removed = {w: [(m.group(1), m.group(2), l) for l, m in lg.find(FOOD_REMOVED)] for w, lg in games}
+    eaten = sorted({k for v in taken.values() for k in v})
+    for k in eaten:
+        tested = True
+        eaters = [w for w in taken if k in taken[w]]
+        bad, cites = [], [f"{w}: {taken[w][k].cite()}" for w in eaters[:2]]
+        if len(eaters) > 1:
+            bad.append(f"eaten on {', '.join(eaters)}")
+        for w, _l in games:
+            if w in eaters:
+                continue
+            mine = [(rest, l) for kk, rest, l in removed[w] if kk == k]
+            if len(mine) != 1:
+                bad.append(f"removed {len(mine)} time(s) on {w}")
+                cites.append(absent(dict(games)[w], f"`food removed here {k}`") if not mine else f"{w}: {mine[1][1].cite()}")
+            elif "collect healed its hero" in mine[0][0] or " healed its hero" in mine[0][0]:
+                bad.append(f"{w} healed its own hero for another player's bite")
+                cites.append(f"{w}: {mine[0][1].cite()}")
+        if bad:
+            findings.append(Finding(f"food {k}: " + "; ".join(bad), cites[:5]))
+    for w, lg in games:
+        for l, m in lg.find(FOOD_BAD)[:3]:
+            findings.append(Finding(f"{w}: food {m.group(1)}: {l.text.split('Online: food ')[1][:80]}", [l.cite()]))
+    counts.append(f"food zones walked {len(zones)}, bites {len(eaten)}"
+                  + ("; place 0629f659.15667 eaten" if "0629f659.15667" in eaten else ""))
+    if not tested and not findings:
+        return Verdict(name, NOT_TESTED, "; ".join(counts) + " (no reward or food line: a build before "
+                       "online/8-all-coins-shared, or none picked up)")
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), "", findings)
+
+
 # --- level events in step (W39 item 8) ---------------------------------------------------------------------------
 #
 # The owner's third session ("tutorial_a is like completely chopped", in his words: "map visuals didnt line up with the
@@ -3463,7 +3578,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run),
             grade_coins_shared(run), grade_scenes_once(run), grade_level_changes(run), grade_enemy_kills(run),
             grade_gate_kinds(run, data), grade_dialog_skip(run), grade_enemy_server_damage(run),
-            grade_world_events(run, data), grade_level_events(run),
+            grade_world_events(run, data), grade_level_events(run), grade_rewards_food(run),
             grade_loot(run),
             grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
             grade_fight_gates(run, data)]

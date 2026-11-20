@@ -780,6 +780,46 @@ class Together(unittest.TestCase):
         self.assertIn("D stayed where it entered", v.counts)
 
 
+class RewardsFood(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+
+    def test_flynns_gold_once_everywhere_and_one_bite(self) -> None:
+        # The coins branch's forms (online/8-all-coins-shared e2011447).
+        s = [(10, "Online: food walked 0629f659 6 placed food mapped (40 CCollectibles in the walk; keys 1a2b3c4d; 6 food "
+                  "items picked by their place, the same on every game; 0 kept an earlier item)"),
+             (50, "Online: reward 000b0042 settled (evidence): 50.00 gold to each hero (limit 50.00), owed to peers 2")]
+        h = H_JOIN + [(10, "Online: food walked 0629f659 6 placed food mapped (40 CCollectibles in the walk; keys 1a2b3c4d; "
+                           "6 food items picked by their place, the same on every game; 0 kept an earlier item)"),
+                      (50, "Online: reward 000b0042: this game's run of its script gave 50.00 gold to each hero (limit "
+                           "50.00); S is told with the collect"),
+                      (60, "Online: food taken here 0629f659.15667 (player 8a000001; S is told)")]
+        d = D_JOIN + [(10, "Online: food walked 0629f659 6 placed food mapped (40 CCollectibles in the walk; keys 1a2b3c4d; "
+                           "6 food items picked by their place, the same on every game; 0 kept an earlier item)"),
+                      (51, "Online: reward 000b0042 paid here (another player's pick-up; player 8b000001 slot 0, 50.00 "
+                           "gold: gold 10 -> 60, +50)"),
+                      (60, "Online: food removed here 0629f659.15667 (taken by another player: not eaten here)")]
+        s_food = s + [(60, "Online: food removed on S 0629f659.15667 (granted to a client: S's copy goes)")]
+        v = lc.grade_rewards_food(lc.load_run(RunFolder(s_food, h, d).path))
+        self.assertEqual(v.status, lc.PASS, v)
+        self.assertIn("place 0629f659.15667 eaten", v.counts)
+        # Both touched at once: D's own run too, and D's copy healed its hero.
+        d2 = d[:-1] + [(51, "Online: reward 000b0042: this game's run of its script gave 50.00 gold to each hero (limit "
+                            "50.00); S is told with the collect"),
+                       (60, "Online: food removed here 0629f659.15667 (taken by another player; this game's collect "
+                            "healed its hero 8b000001: online_shared_food_heals everyone)")]
+        v = lc.grade_rewards_food(lc.load_run(RunFolder(s_food, h, d2).path))
+        self.assertEqual([f.what for f in v.findings], ["reward 000b0042: paid 2 time(s) on D",
+                                                        "food 0629f659.15667: D healed its own hero for another player's "
+                                                        "bite"])
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session(self) -> None:
+        v = lc.grade_rewards_food(lc.load_run(self.OWNER_3))
+        # No reward line yet (a build before the coins branch); its three bites removed once on S and D, none healed.
+        self.assertEqual(v.status, lc.PASS, v)
+        self.assertIn("food zones walked 1, bites 3; place 0629f659.15667 eaten", v.counts)
+
+
 class LevelEvents(unittest.TestCase):
     OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
 

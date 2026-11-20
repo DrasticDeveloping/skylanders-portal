@@ -185,7 +185,7 @@ GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_t
 LEVEL_CHECK_ROWS = ("enemies hurt players", "other player's moves", "fight gates", "coins shared",
                     "cutscenes once", "level changes", "enemies can be killed", "elemental gates and Swap Zones",
                     "dialogs skipped", "enemy states and damage from S", "world events",
-                    "level events in step")
+                    "level events in step", "reward gold and food")
 
 
 def server_stall_reasons(folder: Path) -> list[str]:
@@ -231,7 +231,8 @@ def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None) ->
                "enemies can be killed": lc.grade_enemy_kills,
                "elemental gates and Swap Zones": lambda r: lc.grade_gate_kinds(r, data),
                "dialogs skipped": lc.grade_dialog_skip, "enemy states and damage from S": lc.grade_enemy_server_damage,
-               "world events": lambda r: lc.grade_world_events(r, data), "level events in step": lc.grade_level_events}
+               "world events": lambda r: lc.grade_world_events(r, data), "level events in step": lc.grade_level_events,
+               "reward gold and food": lc.grade_rewards_food}
     out = []
     for name in g.get("rows", []):
         v = graders[name](run)
