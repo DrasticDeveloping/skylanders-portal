@@ -123,6 +123,29 @@ class Verdicts(unittest.TestCase):
             graded, why = dt.grade(Path(d), text, {"expect": "seen", "marker": "probe"})
             self.assertEqual((why, graded["verdict"], graded["seen"][0]["round"]), ([], "seen", 2))
 
+    def test_the_level_start_window_counts_when_asked(self) -> None:
+        # Batch 18d: with the fix off every hole-making drop came before round 1. Without level_start such a frame
+        # is not graded (INCONCLUSIVE); with it, the frame from the named line to round 1's marker is round 0.
+        with tempfile.TemporaryDirectory() as d:
+            png(Path(d) / "pipeline-drop-f5-030000-500.png", {(5, 5): (0, 0, 0)})
+            png(Path(d) / "pipeline-drop-f2-025959-000.png", {(4, 4): (0, 0, 0)})
+            lines = (("00.100", "[info] Dev: level tutorial_b: requested (request 1)"),
+                     self.saved("00.600", 5, "pipeline-drop-f5-030000-500.png", 290)) + ROUNDS
+            early = ("00.050", "[info] [gpu] Pipeline wait: frame 2 saved as pipeline-drop-f2-025959-000.png (9 "
+                     "overwriting, 0 depth-writing draws dropped in it; window 1; 1 of 200)")
+            text = log(early, *lines)
+            graded, why = dt.grade(Path(d), text, {"expect": "seen", "marker": "probe"})
+            self.assertTrue(why[0].startswith("grade drop_tiles: INCONCLUSIVE"), why)
+            g = {"expect": "seen", "marker": "probe", "level_start": r"Dev: level tutorial_b: requested"}
+            graded, why = dt.grade(Path(d), text, g)
+            self.assertEqual((why, graded["verdict"]), ([], "seen"))
+            self.assertEqual([(s["file"], s["round"]) for s in graded["seen"]],
+                             [("pipeline-drop-f5-030000-500.png", 0)])  # the frame before the line stays out
+            self.assertIn("round 0 is the level start", (Path(d) / "drop_tiles.md").read_text(encoding="utf-8"))
+            # A line that never comes before round 1: no window, as before.
+            graded, why = dt.grade(Path(d), text, {**g, "level_start": "never"})
+            self.assertTrue(why[0].startswith("grade drop_tiles: INCONCLUSIVE"), why)
+
     def test_seen_without_a_tile_is_not_seen(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             png(Path(d) / "pipeline-drop-f41-030002-000.png", {})
@@ -182,6 +205,8 @@ class Verdicts(unittest.TestCase):
         self.assertIn("expect", dt.check_spec({"expect": "maybe", "marker": "probe"}, ["H"]))
         self.assertIn("marker", dt.check_spec({"expect": "seen"}, ["H"]))
         self.assertIn("peer", dt.check_spec({"expect": "seen", "marker": "p", "peer": "D"}, ["H"]))
+        self.assertIn("level_start", dt.check_spec({"expect": "seen", "marker": "p", "level_start": "("}, ["H"]))
+        self.assertIsNone(dt.check_spec({"expect": "seen", "marker": "p", "level_start": "Dev: level x"}, ["H"]))
 
 
 if __name__ == "__main__":

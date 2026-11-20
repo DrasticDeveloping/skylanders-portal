@@ -7,6 +7,13 @@ flat black or cyan tile of 64x64 scene pixels.
     expect = "seen"            # "seen": the fix off; "none": the fix on, or the synchronous control
     marker = "gpu-pipeline-drops"
     # peer = "H"               # whose folder, log and script
+    # level_start = 'Dev: level tutorial_b: requested'   # also grade the level's start (below)
+
+`level_start` (batch 18d: with the fix off, every hole-making drop came in the level's first seconds, e.g.
+`frame 1605 saved ... (290 overwriting, 295 depth-writing draws dropped in it)`, none inside rounds 1-12, so the
+grade said INCONCLUSIVE): the frames captured from the first log line matching it up to round 1's marker are
+graded too, as "round 0" (the level start). They count for "seen" like a round's frames (a tile in a frame with
+its own overwriting drop). They are not attack frames, so the page names them apart.
 
 The attack rounds and their prescribed pictures come from the peer's own script (script.txt in its folder):
 the `shot <name>` commands after `log <marker> round <k>` belong to round k, up to the next marker or
@@ -68,6 +75,13 @@ def check_spec(g: object, names: list[str]) -> str | None:
         return "`marker` must name the script's round markers (`log <marker> round <k>`)"
     if g.get("peer", "H") not in names:
         return f"`peer` must be one of {names}"
+    if "level_start" in g:
+        if not isinstance(g["level_start"], str) or not g["level_start"].strip():
+            return "`level_start` must be a pattern of the log line that opens the level's start"
+        try:
+            re.compile(g["level_start"])
+        except re.error as e:
+            return f"`level_start` is not a pattern: {e}"
     return None
 
 
@@ -264,6 +278,20 @@ def round_spans(text: str, marker: str) -> list[tuple[int, datetime, datetime]]:
     return [(k, t, marks[i + 1][0]) for i, (t, k) in enumerate(marks) if k is not None and i + 1 < len(marks)]
 
 
+def level_start_span(text: str, pattern: str, spans: list[tuple[int, datetime, datetime]]
+                     ) -> tuple[int, datetime, datetime] | None:
+    """`level_start`'s window as round 0: from the first line matching the pattern to the first round's marker
+    (None without a match before it, or without rounds)."""
+    if not spans:
+        return None
+    rx = re.compile(pattern)
+    for line in text.splitlines():
+        t = _time(line)
+        if t is not None and t < spans[0][1] and rx.search(line):
+            return (0, t, spans[0][1])
+    return None
+
+
 def saved_frames(text: str, spans: list[tuple[int, datetime, datetime]]) -> list[dict]:
     """pipeline_drop_capture's frames with their capture time (the file's name, at the frame's readback) and
     the round that time falls into."""
@@ -298,9 +326,10 @@ def grade(folder: Path, text: str, g: dict) -> tuple[dict, list[str]]:
         script = ""
     shots = prescribed_shots(script, marker)
     spans = round_spans(text, marker)
-    frames = saved_frames(text, spans)
+    start = level_start_span(text, g["level_start"], spans) if g.get("level_start") else None
+    frames = saved_frames(text, ([start] if start else []) + spans)
     graded: dict = {"expect": g["expect"], "rounds": len(spans), "prescribed": sum(len(v) for v in shots.values()),
-                    "saved_frames": len(frames)}
+                    "saved_frames": len(frames), "level_start": bool(start)}
     page: list[str] = [f"# drop_tiles: {folder.name}", "", f"expect: {g['expect']}, marker: `{marker}`", ""]
     crops = folder / "drop_tiles"
     candidates: list[dict] = []
@@ -341,7 +370,8 @@ def grade(folder: Path, text: str, g: dict) -> tuple[dict, list[str]]:
     for f in frames:
         if f["round"] is None:
             continue
-        pic = look(f["file"], f"round {f['round']} frame {f['frame']}")
+        where = "the level start" if f["round"] == 0 else f"round {f['round']}"
+        pic = look(f["file"], f"{where} frame {f['frame']}")
         if pic is None or not pic.usable:
             continue
         before = len(candidates)
@@ -370,11 +400,13 @@ def grade(folder: Path, text: str, g: dict) -> tuple[dict, list[str]]:
         elif not usable_drop_frames:
             verdict = "inconclusive"
             reasons.append(f"grade {NAME}: INCONCLUSIVE: no usable picture of a frame with an overwriting drop "
-                           f"inside an attack round ({len(frames)} frame(s) saved in all)")
+                           f"inside an attack round{' or the level start' if start else ''} ({len(frames)} frame(s) "
+                           f"saved in all)")
         else:
             verdict = "none"
             reasons.append(f"grade {NAME}: NOT SEEN: {usable_drop_frames} frame(s) with overwriting drops inside "
-                           f"the attack rounds, no black or cyan 64x64 tile in any picture")
+                           f"the attack rounds{' and the level start' if start else ''}, no black or cyan 64x64 tile "
+                           f"in any picture")
     else:
         missing = graded["prescribed"] - usable_shots
         if not shots:
@@ -401,7 +433,8 @@ def grade(folder: Path, text: str, g: dict) -> tuple[dict, list[str]]:
         graded["note"] = f"{NAME}: {verdict.upper()} (drop_tiles.md)"
     page += [f"Verdict: **{verdict}**", "", graded["note"], "",
              f"Rounds {len(spans)}; prescribed pictures {graded['prescribed']}, usable {usable_shots}; saved frames "
-             f"{len(frames)}, usable with an overwriting drop in a round {usable_drop_frames}.", ""]
+             f"{len(frames)}, usable with an overwriting drop in a round {usable_drop_frames}"
+             + (f" (round 0 is the level start, from {start[1]:%H:%M:%S.%f}"[:-3] + ")" if start else "") + ".", ""]
     if candidates:
         page += ["| Picture | Source | Round | Cell | Kind | Frame | Window | Overwriting | Depth | Crop |",
                  "|---|---|---|---|---|---|---|---|---|---|"]

@@ -30,8 +30,33 @@ class OwnerGuard(unittest.TestCase):
     def test_the_owners_games_are_not_the_runners(self) -> None:
         table = [(10, 1, "explorer.exe"), (20, 10, "imaginatorsrecompiled.exe"), (30, 1, "python.exe"),
                  (40, 30, "swapforcerecompiled.exe"), (50, 40, "swapforcerecompiled.exe")]
-        got = skytest.owner_games_running(30, table=table, started={20: "2026-11-20 03:39:00"})
+        got = skytest.owner_games_running(30, table=table, started={20: "2026-11-20 03:39:00"},
+                                          is_test=lambda pid: False)
         self.assertEqual(got, [("imaginatorsrecompiled.exe", "2026-11-20 03:39:00")])
+        # Another runner's test game (its run copy) and the server it hosts are no game of the owner's.
+        table += [(60, 1, "python.exe"), (70, 60, "swapforcerecompiled.exe"), (80, 70, "swapforcerecompiled.exe")]
+        got = skytest.owner_games_running(30, table=table, started={20: "t20"}, is_test=lambda pid: pid == 70)
+        self.assertEqual(got, [("imaginatorsrecompiled.exe", "t20")])
+
+    def test_a_test_game_is_known_by_its_run_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            data = Path(d) / "run" / "H" / "data"
+            (data / "Online" / "session").mkdir(parents=True)
+            (data / skytest.RUN_COPY_MARKER).write_text("a skytest run copy\n", encoding="ascii")
+            other = Path(d) / "play" / "host"
+            other.mkdir(parents=True)
+            lines = {1: f'g.exe "--user_data_root={data}"', 2: f'g.exe "--user_data_root={data / "Online" / "session"}"',
+                     3: f'g.exe "--user_data_root={other}"', 4: "g.exe", 5: None}
+            old = skytest.store_paths.pid_command_line
+            skytest.store_paths.pid_command_line = lambda pid: lines[pid]
+            try:
+                got = {pid: skytest.test_game(pid, roots=[Path(d) / "owner"]) for pid in lines}
+                # under the owner's own folder: never looked into, his game
+                lines[6] = f'g.exe "--user_data_root={Path(d) / "owner" / "x"}"'
+                got[6] = skytest.test_game(6, roots=[Path(d) / "owner"])
+            finally:
+                skytest.store_paths.pid_command_line = old
+            self.assertEqual(got, {1: True, 2: True, 3: False, 4: False, 5: False, 6: False})
 
     def test_the_verdict(self) -> None:
         roots = [Path(r"C:\Users\x\Documents\Skylanders")]

@@ -785,6 +785,31 @@ class Case(unittest.TestCase):
         f.write_text(text, encoding="utf-8")
         return self.sk.load_spec(f, 300)
 
+    def test_every_peer_has_the_settings_its_commands_need(self):
+        """20 November: D's fight step without --dev_defeat_commands stopped the two-player check before it began.
+        Each peer of every generated case has the setting of every command in its own script."""
+        import preflight as pf
+        plans = [lp.make_plan(content(), d_lobby=True), lp.make_plan(content()), lp.make_plan(content(), d_stays=False)]
+        for plan in plans:
+            s = self.load(lp.spec_toml(plan))
+            for name, peer in s.peers.items():
+                for line in pf.lines_of(peer.script):
+                    need = pf.FATAL_OFF.get(line.split()[0])
+                    if need:
+                        self.assertTrue(pf.setting_on(peer.args, need[0]), f"{name}: `{line}` without --{need[0]}")
+        d = "fight_near auth:tutorial_a:290 1500 75\nencounter_clear auth:x 60\ndev_enemy x\nquit\n"
+        s = self.load(lp.spec_from_scripts("madeup", "quit\n", d))
+        for setting in ("dev_defeat_commands", "dev_enemy_commands"):
+            self.assertTrue(pf.setting_on(s.peers["D"].args, setting), setting)
+        self.assertEqual(lp.script_settings(["--dev_defeat_commands=true"], d).count("--dev_defeat_commands=true"), 1)
+
+    def test_every_generated_case_runs_with_the_owners_session_settings(self):
+        """2026-11-20: the two-player tutorial_b check ran without them (`hit session off`, a stand-in for the
+        other player): each generated case asks the runner for the list on every game."""
+        for text in (lp.spec_toml(lp.make_plan(content(), d_lobby=True)), lp.spec_toml(lp.make_plan(content())),
+                     lp.spec_from_scripts("madeup", "quit\n", "quit\n")):
+            self.assertIs(self.load(text).session_settings, True)
+
     def test_the_lobby_boot_is_the_owners_order(self):
         """Both clients join in the lobby (D by the join code, H lets it in), then H picks the slot (the
         save's continue, or a new game with --new-slot), the party enters the level together; D stays to the

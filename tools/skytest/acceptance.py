@@ -174,8 +174,18 @@ def level_row(level: str, run: Path | None, page: str | None, code: int, seconds
     return row
 
 
-def page_text(rows: list[Row], est_text: str, build: str) -> str:
-    out = [f"# Acceptance run {time.strftime('%Y-%m-%d %H:%M')}", "", f"Build: {build}", "", "```", est_text, "```", "",
+def session_line(repo: Path) -> str:
+    """The owner's session settings the list runs with (the game's tests/session_settings.toml), for the page and
+    the dry run; SessionSettingsError when the file does not read (the list then does not start)."""
+    import session_settings
+    ss = session_settings.load(repo)
+    return (f"Session settings: {ss.label()}, {len(ss.on)} settings on every game of every session case and level "
+            f"check ({session_settings.FILE.as_posix()})")
+
+
+def page_text(rows: list[Row], est_text: str, build: str, session: str = "") -> str:
+    out = [f"# Acceptance run {time.strftime('%Y-%m-%d %H:%M')}", "", f"Build: {build}", "",
+           *([session, ""] if session else []), "```", est_text, "```", "",
            "| Case | Result | Time | The lines that decided it | Logs |", "|---|---|---|---|---|"]
     for r in rows:
         dec = "<br>".join(x.replace("|", "\\|")[:300] for x in r.lines) or "-"
@@ -193,6 +203,13 @@ def run(skytest_py: Path, repo: Path, store: Path, levelpass: Path, cases: list[
     est = estimate(repo, runs, cases, levels, history)
     et = estimate_text(est)
     print(et, flush=True)
+    import session_settings
+    try:
+        session = session_line(repo)
+    except session_settings.SessionSettingsError as e:
+        print(f"acceptance: the owner's session settings do not read, the list does not start: {e}", flush=True)
+        return 2
+    print(f"acceptance: {session}", flush=True)
     if owner_games is None:
         import skytest
         owner_games = lambda: skytest.owner_games_running(os.getpid())  # noqa: E731
@@ -219,8 +236,9 @@ def run(skytest_py: Path, repo: Path, store: Path, levelpass: Path, cases: list[
             continue
         wait_for_owner(owner_games, say=lambda s: print(s, flush=True), while_owner_plays=while_owner_plays)
         before = {d.name for d in runs.glob(f"*-{c}")}
-        cmd = [sys.executable, "-I", str(skytest_py), "test", c, "--jobs", "1"] + (["--run-not-ready"] if run_not_ready
-                                                                                  else [])
+        # Every session case with the owner's session settings on every game (a spec may say false, on purpose).
+        cmd = [sys.executable, "-I", str(skytest_py), "test", c, "--jobs", "1", "--session-settings"] + (
+            ["--run-not-ready"] if run_not_ready else [])
         print(f"acceptance: {c} ...", flush=True)
         t0 = time.monotonic()
         p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(repo))
@@ -246,7 +264,7 @@ def run(skytest_py: Path, repo: Path, store: Path, levelpass: Path, cases: list[
         rows.append(level_row(lv, got[-1] if got else None, m.group(1).strip() if m else None, p.returncode,
                               time.monotonic() - t0, repo, levelpass))
         print(f"acceptance: levelcheck {lv}: {rows[-1].result}", flush=True)
-    text = page_text(rows, et, build)
+    text = page_text(rows, et, build, session)
     out = store / f"acceptance-{stamp}.md"
     out.write_text(text, encoding="utf-8")
     print(text, flush=True)
