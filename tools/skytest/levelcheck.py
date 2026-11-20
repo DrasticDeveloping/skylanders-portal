@@ -891,6 +891,101 @@ def grade_coins(run: Run) -> Verdict:
     return Verdict("coins", FAIL if findings else PASS, counts, first.cite(), findings)
 
 
+# --- world events (W39 item 7) --------------------------------------------------------------------------------
+#
+# The owner's third session ("Map changes are bugged", in his words: "events inside the map, like i dropped crates down
+# with an interaction and on one client they werent interactible"): H used the hanging gong post (tutorial_b's
+# Hanging_Base, about 00:02:08-25) and the cage step it lets down (A2_CageStep_Hanging) could not be used by D from
+# 00:02:56 to 00:03:14 (D's log has only `unclassified trigger A2_CageStep_Hanging_RespawnTrigger#2653` and its echoes).
+# The world rows' author's lines (online/6-owner-session3-world): on the game where it changes `world event
+# <Name#id> <what> by <who> (state <before> -> <after>)`, on each other game `world event <Name#id> <what> applied here
+# (state <after>)`. Every event is applied on every other game (S and the clients) within WORLD_EVENT_S with the same
+# state; ids differ per game, so events pair by name, what and time. From the level's logic, the objects such an event
+# can change (WORLD_EVENT_MSGS sent to them, or by them to themselves): each run counts how many it changed, the rest
+# are listed as untested, never passed.
+WORLD_EVENT_MSGS = ("CSplineMoverMessage", "Scripts.SetHideShowEntityMessage", "Scripts.AnimateEntityComponentMessage",
+                    "CEnableDisableComponentMessage", "CInteractionComponentMessage", "Scripts.BoltEntityUnboltMessage",
+                    "Scripts.DestructibleComponentMessage", "Scripts.RemoveEntitiesMessage")
+WORLD_EVENT = re.compile(r"Online: world event (\S+?)(?:#\d+)? (.+?) by (\S+) \(state (.*?) -> (.*?)\)\s*$")
+WORLD_EVENT_APPLIED = re.compile(r"Online: world event (\S+?)(?:#\d+)? (.+?) applied here \(state (.*?)\)\s*$")
+WORLD_EVENT_S = 1.0
+
+
+def world_event_objects(logic: dict | None) -> list[tuple[str, str, list[str]]]:
+    """The objects the level's logic drops, lowers, opens, switches or makes usable: (name, unit, message kinds)."""
+    if not logic:
+        return []
+    nodes = {str(n.get("key")): n for n in logic.get("nodes", []) or [] if isinstance(n, dict)}
+    kinds: dict[str, set[str]] = {}
+    for e in logic.get("edges", []) or []:
+        if not isinstance(e, dict):
+            continue
+        msg = str(e.get("message") or "").split(" {")[0]
+        if msg not in WORLD_EVENT_MSGS:
+            continue
+        to = list(e.get("to") or [])
+        if not to and "1" in str(e.get("roles") or ""):
+            to = [str(e.get("from"))]
+        for k in to:
+            if k in nodes and nodes[k].get("group") not in ("enemy", "encounter"):
+                kinds.setdefault(k, set()).add(msg.split(".")[-1])
+    return sorted((str(nodes[k].get("name")), str(nodes[k].get("unit")), sorted(v)) for k, v in kinds.items())
+
+
+def grade_world_events(run: Run, data: "LevelData | None") -> Verdict:
+    name = "world events"
+    games = ([("S", run.server)] if run.server is not None else []) + sorted(
+        run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    objs = data.world_objects if data is not None else []
+    listed = f"{len(objs)} object(s) in {data.level}'s logic an interaction or a script changes" if data else \
+        "no level data"
+    origins = [(w, l, m) for w, lg in games for l, m in lg.find(WORLD_EVENT)]
+    if not origins:
+        return Verdict(name, NOT_TESTED, f"no `world event ... by` line on any game (a build before "
+                       f"online/6-owner-session3-world); {listed}, 0 changed in this run")
+    applied = {w: [(l, m) for l, m in lg.find(WORLD_EVENT_APPLIED)] for w, lg in games}
+    used: dict[str, set[int]] = {w: set() for w, _lg in games}
+    findings: list[Finding] = []
+    ok = 0
+    for w, l, m in origins:
+        nm, what, after = m.group(1), m.group(2), m.group(5)
+        bad = []
+        cites = [f"{w}: {l.cite()}"]
+        for o, _lg in games:
+            if o == w:
+                continue
+            pick = None
+            for i, (al, am) in enumerate(applied[o]):
+                if i in used[o] or am.group(1) != nm or am.group(2) != what or al.t is None or l.t is None:
+                    continue
+                d = (al.t - l.t).total_seconds()
+                if -0.5 <= d <= WORLD_EVENT_S:
+                    pick = (i, al, am, d)
+                    break
+            if pick is None:
+                late = [al for al, am in applied[o] if am.group(1) == nm and am.group(2) == what]
+                bad.append(f"not applied on {o} within {WORLD_EVENT_S:.0f} s" + (" (later: " + when(late[0]) + ")"
+                                                                               if late else ""))
+                cites.append(late[0].cite() if late else absent(dict(games)[o], f"`world event {nm}#.. {what} applied here`"))
+                continue
+            used[o].add(pick[0])
+            if pick[2].group(3) != after:
+                bad.append(f"{o} applied state {pick[2].group(3)}, not {after}")
+                cites.append(f"{o}: {pick[1].cite()}")
+        if bad:
+            findings.append(Finding(f"{nm} {what} by {m.group(3)} on {w} at {when(l)}: " + "; ".join(bad), cites[:5]))
+        else:
+            ok += 1
+    changed = {m.group(1) for _w, _l, m in origins}
+    names = {n for n, _u, _k in objs}
+    untested = sorted(names - changed)
+    counts = (f"{len(origins)} world event(s), {ok} applied on every game within {WORLD_EVENT_S:.0f} s; {listed}, "
+              f"{len(names & changed)} changed in this run")
+    if untested:
+        counts += f"; untested: {', '.join(untested[:12])}" + (f" and {len(untested) - 12} more" if len(untested) > 12 else "")
+    return Verdict(name, FAIL if findings else PASS, counts, origins[0][1].cite(), findings)
+
+
 # --- enemy states and damage from S (W39) ---------------------------------------------------------------------
 #
 # The enemies author's lines (online/5-replica-attacks-land-2 4b9ae45d, S's online_enemy_state_convergence; his list
@@ -2653,6 +2748,7 @@ class LevelData:
     authored: dict = field(default_factory=dict)   # authored index -> (name, position): <level>-manifest.txt
     movers: list = field(default_factory=list)     # the level's re-arming mover spawners' names (levelpass_pieces)
     swap_zones: list = field(default_factory=list)  # W38: (name, unit) of each Swap Zone pad (a TurboZone component)
+    world_objects: list = field(default_factory=list)  # W39: (name, unit, kinds) the logic drops, lowers, opens, ...
 
 
 def run_level(run: Run) -> str:
@@ -2699,7 +2795,7 @@ def level_data(levelpass: Path | None, level: str) -> LevelData | None:
     zones = [(str(e.get("name") or ""), str(e.get("unit") or "")) for e in manifest.get("entities", []) or []
              if isinstance(e, dict) and any("TurboZone" in str(k) for k in (e.get("components") or []))]
     return LevelData(level, lh.holds_of(logic, disabled), lh.required_gates(manifest, logic, level), authored, movers,
-                     zones)
+                     zones, world_event_objects(logic))
 
 
 # --- held enemies in a run (levelpass_holds: what the generator reads) -------------------------------------
@@ -3310,6 +3406,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run),
             grade_coins_shared(run), grade_scenes_once(run), grade_level_changes(run), grade_enemy_kills(run),
             grade_gate_kinds(run, data), grade_dialog_skip(run), grade_enemy_server_damage(run),
+            grade_world_events(run, data),
             grade_loot(run),
             grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
             grade_fight_gates(run, data)]

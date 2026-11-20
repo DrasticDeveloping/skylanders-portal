@@ -780,6 +780,34 @@ class Together(unittest.TestCase):
         self.assertIn("D stayed where it entered", v.counts)
 
 
+class WorldEvents(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+    LP = Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass")
+
+    @unittest.skipUnless(LP.is_dir(), "the level data is not here")
+    def test_the_cage_step_lowered_on_h_applied_late_on_d(self) -> None:
+        # The world rows' author's line forms (online/6-owner-session3-world, written ahead of the build).
+        data = lc.level_data(self.LP, "tutorial_b")
+        self.assertIn("A2_CageStep_Hanging", [n for n, _u, _k in data.world_objects])
+        h = H_JOIN + [(50, "Online: world event A2_CageStep_Hanging#2653 lowered by H (state up -> down)")]
+        d = D_JOIN + [(53, "Online: world event A2_CageStep_Hanging#2701 lowered applied here (state down)")]
+        s = [(50, "Online: world event A2_CageStep_Hanging#3001 lowered applied here (state down)")]
+        v = lc.grade_world_events(lc.load_run(RunFolder(s, h, d).path), data)
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertTrue(v.findings[0].what.startswith("A2_CageStep_Hanging lowered by H on H at "), v.findings[0].what)
+        self.assertIn("not applied on D within 1 s (later: ", v.findings[0].what)
+        self.assertIn(", 1 changed in this run; untested: ", v.counts)
+        d_ok = D_JOIN + [(50, "Online: world event A2_CageStep_Hanging#2701 lowered applied here (state down)")]
+        self.assertEqual(lc.grade_world_events(lc.load_run(RunFolder(s, h, d_ok).path), data).status, lc.PASS)
+
+    @unittest.skipUnless(OWNER_3.is_dir() and LP.is_dir(), "the owner's third session or the level data is not here")
+    def test_the_owners_third_session_predates_the_lines(self) -> None:
+        r = lc.load_run(self.OWNER_3)
+        v = lc.grade_world_events(r, lc.level_data(self.LP, lc.run_level(r)))
+        self.assertEqual(v.status, lc.NOT_TESTED)
+        self.assertIn("0 changed in this run", v.counts)
+
+
 class EnemyServerDamage(unittest.TestCase):
     OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
 
