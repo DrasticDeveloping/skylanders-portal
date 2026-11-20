@@ -780,6 +780,57 @@ class Together(unittest.TestCase):
         self.assertIn("D stayed where it entered", v.counts)
 
 
+class LevelChanges(unittest.TestCase):
+    OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
+    OWNER_2 = Path(r"D:/SwapForceOnline-data/play/20261119-211901")
+
+    def test_each_change_loaded_in_play_present_and_quiet(self) -> None:
+        s = [(4, "Online: level 1 town/town_state10/town_state10: open"),
+             (19, "Online: level 2 tutorial/tutorial_b/tutorial_b: open"),
+             (30, "Online: barrier 2 released at tick 900 (2 clients)"),
+             (31, "Online: puppet 1 for peer 2 spawned at 0,0,0 (generation 2)"),
+             (31, "Online: puppet 2 for peer 1 spawned at 0,0,0 (generation 2)")]
+        h = H_JOIN + [(30, "Online: barrier 2 released at tick 900"),
+                      (31, "Online: puppet 2 spawned Scorp at 1,2,3 (epoch 1 gen 2, real)"),
+                      (32, "Where: tutorial_b at 1 2 100"), (34, "Where: tutorial_b at 1 2 101")]
+        d = [(20, "Online: level 2 tutorial/tutorial_b/tutorial_b: load"), (30, "Online: barrier 2 released at tick 900"),
+             (31, "Online: puppet 1 spawned Roller at 1,2,3 (epoch 1 gen 2, real)"),
+             (32, "Where: tutorial_b at 1 2 100"), (34, "Where: tutorial_b at 1 2 100")] + D_JOIN
+        v = lc.grade_level_changes(lc.load_run(RunFolder(s, h, sorted(d)).path))
+        self.assertEqual(v.status, lc.PASS, v)
+        self.assertIn("tutorial_b (g2) by S; H loaded", v.counts)
+        # A fall, an [error] after the load, and no body of the other player on D.
+        d2 = [(20, "Online: level 2 tutorial/tutorial_b/tutorial_b: load"), (30, "Online: barrier 2 released at tick 900"),
+              (32, "Where: tutorial_b at 1 2 100"), (34, "Where: tutorial_b at 1 2 -400"),
+              (40, "Online: stand-in RemotePuppet_1 0xB8A2DD00 still in the entity table before pool 57 is freed")] + D_JOIN
+        f = RunFolder(s, h, sorted(d2))
+        text = (f.path / "D" / "game.log").read_text(encoding="utf-8").replace(
+            "] [info] [core] [t1] Online: stand-in", "] [error] [core] [t1] Online: stand-in")
+        (f.path / "D" / "game.log").write_text(text, encoding="utf-8")
+        v = lc.grade_level_changes(lc.load_run(f.path))
+        self.assertEqual(v.status, lc.FAIL)
+        self.assertEqual(v.findings[0].what,
+                         "tutorial_b (g2): D: 1 [error] line(s) between its load and 30 s after the barrier; D: the other "
+                         "player's body not shown within 60 s of the barrier; D: its hero never stood within 60 s of the "
+                         "barrier (z 100 -> -400)")
+
+    @unittest.skipUnless(OWNER_3.is_dir(), "the owner's third session is not here")
+    def test_the_owners_third_session(self) -> None:
+        # "Map changes are bugged": tutorial_a's entry took 67 s to the barrier, and S's own [error] lines say its level
+        # entry made no progress for 30 s and its world had not run for 40 s (23:54:00, 23:54:11).
+        v = lc.grade_level_changes(lc.load_run(self.OWNER_3))
+        self.assertEqual([x.what for x in v.findings],
+                         ["tutorial_a (g1): S: 2 [error] line(s) between its open and 30 s after the barrier"])
+
+    @unittest.skipUnless(OWNER_2.is_dir(), "the owner's second session is not here")
+    def test_the_owners_second_session(self) -> None:
+        # tutorial_b's change: H 14 and D 6 `stand-in ... still in the entity table before pool <n> is freed` errors.
+        v = lc.grade_level_changes(lc.load_run(self.OWNER_2))
+        self.assertEqual([x.what for x in v.findings],
+                         ["tutorial_b (g2): H: 14 [error] line(s) between its load and 30 s after the barrier; D: 6 "
+                          "[error] line(s) between its load and 30 s after the barrier"])
+
+
 class ScenesOnce(unittest.TestCase):
     OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
     OWNER_2 = Path(r"D:/SwapForceOnline-data/play/20261119-211901")

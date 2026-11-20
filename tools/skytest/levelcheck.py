@@ -891,6 +891,146 @@ def grade_coins(run: Run) -> Verdict:
     return Verdict("coins", FAIL if findings else PASS, counts, first.cite(), findings)
 
 
+# --- level changes (W38) ------------------------------------------------------------------------------------
+#
+# The owner's third session: "Map changes are bugged". Per level S opens (`level <g> <path>: open[ (<cause>)]`): who
+# announced it (S's own change from the level's script: `the server's own level change`; else the owner's request,
+# H's `level request ... requested <zone> (...)` before it), each client's load (`level <g> <path>: load`) and its
+# time against S's open, each game's barrier (`barrier <g> released`), a joiner's arrival (`arrival: ...`), both
+# heroes present (on each client the other player's body, `puppet <n> spawned <character> at ... (epoch <e> gen <g>`;
+# on S each peer's puppet, `puppet <n> for peer <p> spawned ... (generation <g>)`) within LEVEL_PRESENT_S of the
+# barrier, each client's hero standing on ground (two `Where: <zone> at x y z` lines in a row within LEVEL_PRESENT_S
+# of the barrier, LEVEL_STAND_DZ apart in height or less; a hero that only falls is named) and no `[error]` line on any
+# game from its load to LEVEL_ERROR_S after its barrier (the hub, `town/...`, is left out). FAIL names what is
+# missing; a part with no line to read (no Where line) is said, not failed.
+LEVEL_OPEN = re.compile(r"Online: level (\d+) (\S+): open(?: \((.*))?")
+LEVEL_REQ = re.compile(r"Online: level request 0x[0-9A-Fa-f]+ requested (\S+) \((.*)")
+LEVEL_BARRIER = re.compile(r"Online: barrier (\d+) released")
+ARRIVAL_LINE = re.compile(r"Online: arrival: (?!armed)(.*)")
+BODY_SPAWNED_GEN = re.compile(r"Online: puppet (\d+) spawned (\S+) at .*\((?:epoch \d+ )?gen (\d+)")
+WHERE_LINE = re.compile(r"(?:Where:|Online: where) (\S+) at (-?[\d.]+)[ ,](-?[\d.]+)[ ,](-?[\d.]+)")
+ERROR_LINE = re.compile(r"\] \[error\] ")
+LEVEL_PRESENT_S = 60.0
+LEVEL_ERROR_S = 30.0
+LEVEL_STAND_DZ = 10.0
+LEVEL_BARRIER_S = 300.0
+
+
+def _secs(a: Line, b: Line) -> float | None:
+    return (b.t - a.t).total_seconds() if a.t is not None and b.t is not None else None
+
+
+def grade_level_changes(run: Run) -> Verdict:
+    name = "level changes"
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    opens = run.server.find(LEVEL_OPEN)
+    if not opens:
+        return Verdict(name, NOT_TESTED, "S opened no level (no `level <g> <path>: open` line)")
+    order = sorted(run.clients, key=lambda w: (w != "H", w))
+    peers = peer_numbers(run)
+    h = run.clients.get("H")
+    counts: list[str] = []
+    findings: list[Finding] = []
+    for k, (oline, om) in enumerate(opens):
+        g, path = int(om.group(1)), om.group(2)
+        level = path.split("/")[-1]
+        if path.startswith("town/"):
+            continue  # the hub before the party's first level: a joiner never loads it, it has no barrier
+        cause = (om.group(3) or "").rstrip(")")
+        nxt = opens[k + 1][0] if k + 1 < len(opens) else None
+        if "the server's own level change" in cause:
+            who = "S's own change (the level's script)"
+        else:
+            reqs = [l for l, m in (h.find(LEVEL_REQ) if h is not None else [])
+                    if m.group(1) == level and oline.t is not None and l.t is not None and
+                    timedelta(seconds=-60) <= oline.t - l.t <= timedelta(seconds=60)]
+            who = "H's request" if reqs else (f"S ({cause[:60]})" if cause else "S")
+        parts = [f"{level} (g{g}) by {who}"]
+        bad: list[str] = []
+        cites: list[str] = [oline.cite()]
+        s_bar = next((l for l, m in run.server.find(LEVEL_BARRIER) if int(m.group(1)) == g), None)
+
+        def errors(log: Log, since: Line, bar: Line | None) -> list[Line]:
+            # [error] lines from the load to LEVEL_ERROR_S after the barrier (or after the load without one)
+            last = (bar.t if bar is not None and bar.t is not None else since.t)
+            if since.t is None or last is None:
+                return []
+            stop = last + timedelta(seconds=LEVEL_ERROR_S)
+            if nxt is not None and nxt.t is not None:
+                stop = min(stop, nxt.t)
+            out = []
+            for i, raw in enumerate(log.lines):
+                if ERROR_LINE.search(raw):
+                    e = log.line(i)
+                    if e.t is not None and since.t <= e.t <= stop:
+                        out.append(e)
+            return out
+        s_errs = errors(run.server, oline, s_bar)
+        if s_errs:
+            bad.append(f"S: {len(s_errs)} [error] line(s) between its open and {LEVEL_ERROR_S:.0f} s after the barrier")
+            cites += [e.cite() for e in s_errs[:3]]
+        for w in order:
+            log = run.clients[w]
+            load = next((l for l, m in log.find(LEVEL_LOAD) if int(m.group(1)) == g), None)
+            if load is None:
+                bad.append(f"{w}: no load of {level}")
+                cites.append(absent(log, f"`level {g} {path}: load`"))
+                continue
+            d = _secs(oline, load)
+            bar = next((l for l, m in log.find(LEVEL_BARRIER) if int(m.group(1)) == g), None)
+            bs = _secs(load, bar) if bar is not None else None
+            part = f"{w} loaded {d:+.1f} s" if d is not None else f"{w} loaded"
+            part += f", in play after {bs:.0f} s" if bs is not None else ", no barrier"
+            if bar is None or (bs is not None and bs > LEVEL_BARRIER_S):
+                bad.append(f"{w}: not in play (no `barrier {g} released`" + (f" within {LEVEL_BARRIER_S:.0f} s)" if bar else ")"))
+                cites.append(bar.cite() if bar else absent(log, f"`barrier {g} released`"))
+            arr = [l for l, m in log.find(ARRIVAL_LINE) if l.t and load.t and l.t >= load.t and
+                   (nxt is None or nxt.t is None or l.t < nxt.t)]
+            if arr:
+                part += f", arrival `{ARRIVAL_LINE.search(arr[0].text).group(1)[:40]}`"
+            errs = errors(log, load, bar)
+            if errs:
+                bad.append(f"{w}: {len(errs)} [error] line(s) between its load and {LEVEL_ERROR_S:.0f} s after the barrier")
+                cites += [e.cite() for e in errs[:3]]
+            if bar is None or bar.t is None:
+                parts.append(part)
+                continue
+            end = bar.t + timedelta(seconds=LEVEL_PRESENT_S)
+            # the other player's body here
+            if len(order) > 1:
+                bodies = [l for l, m in log.find(BODY_SPAWNED_GEN) if int(m.group(3)) == g and l.t and l.t <= end]
+                if not bodies:
+                    bad.append(f"{w}: the other player's body not shown within {LEVEL_PRESENT_S:.0f} s of the barrier")
+                    cites.append(absent(log, f"`puppet <n> spawned <character> ... gen {g}`"))
+            # standing on ground
+            wh = [(l, m) for l, m in log.find(WHERE_LINE) if l.t and bar.t <= l.t <= end]
+            if not wh:
+                part += ", ground not read (no Where line)"
+            else:
+                zs = [float(m.group(4)) for _l, m in wh]
+                stood = any(abs(zs[i + 1] - zs[i]) <= LEVEL_STAND_DZ for i in range(len(zs) - 1))
+                if stood:
+                    part += f", standing at z {zs[-1]:.0f}"
+                elif len(zs) > 1:
+                    bad.append(f"{w}: its hero never stood within {LEVEL_PRESENT_S:.0f} s of the barrier (z "
+                               + " -> ".join(f"{z:.0f}" for z in zs[:5]) + ")")
+                    cites.append(wh[0][0].cite())
+                else:
+                    part += ", ground not read (one Where line)"
+            parts.append(part)
+        # S: each peer's puppet in this generation
+        spawned = {int(m.group(2)) for l, m in run.server.find(PUPPET_FOR) if int(m.group(3)) == g}
+        missing = [p for p in sorted(peers) if p not in spawned]
+        if missing and s_bar is not None:
+            bad.append("S: no puppet for peer " + ", ".join(map(str, missing)) + f" in generation {g}")
+            cites.append(absent(run.server, f"`puppet <n> for peer <p> spawned ... (generation {g})`"))
+        counts.append("; ".join(parts))
+        if bad:
+            findings.append(Finding(f"{level} (g{g}): " + "; ".join(bad), cites[:8]))
+    return Verdict(name, FAIL if findings else PASS, " | ".join(counts), opens[0][0].cite(), findings)
+
+
 # --- cutscenes: each scene played once per game (W38) -----------------------------------------------------
 #
 # The owner's third session: "cutscenes play multiple times". Each game's own scene lines (`scene local <g>/L<n>
@@ -2812,7 +2952,7 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     together = grade_together(run)
     rows = [grade_server_alive(run), grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run),
-            grade_coins_shared(run), grade_scenes_once(run), grade_loot(run),
+            grade_coins_shared(run), grade_scenes_once(run), grade_level_changes(run), grade_loot(run),
             grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
             grade_fight_gates(run, data)]
     # The enemies and the loot are read where both players stand only when D followed H: each says which.
