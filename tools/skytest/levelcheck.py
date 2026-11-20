@@ -1197,10 +1197,18 @@ EFFECT_S = re.compile(r"Online: level effect (\S+?)(?:#\d+)? component (\d+) (on
 EFFECT_C = re.compile(r"Online: level effect (\S+?)(?:#\d+)? component (\d+) (on|off) here \(S's at shared tick")
 CONV_ENDED_S = re.compile(r"Online: conversation (\S+?)(?:#\d+)? ended on S at shared tick")
 CONV_END_S = 1.0
-# W41: the scenes author puts the conversation-lines sync (his item 9) behind its own setting, off by default; its name
-# is not given yet. The conversations-in-step part is checked only in a run that passes it (a peer's command holds
-# `--<setting>=true`), else said "not tested". Set the name here when he names it.
-CONV_SYNC_SETTING: str | None = None
+# W41: the scenes author puts the conversation-lines sync (his item 9) behind its own setting, off by default:
+# online_scene_lines (online/6-owner-session3-scenes af0864a4; forwarded from Host to S like online_scene_hold and
+# needing it on). The conversations-in-step part is checked only in a run that passes it (a peer's command holds
+# `--online_scene_lines=true`), else said "not tested": each S line `conversation <Name#id> turn <t> line <l> of <n> at
+# shared tick <k> (S's line)` (l >= 1) wants on every client `conversation <Name#id> turn <t> line <l-1> -> next here at
+# shared tick <k'> (<why>)` with |k' - k| <= CONV_LINE_TICKS (300 ms), never `(behind S, at <pos>: jumped)`; and each
+# conversation S ends ends on every client within CONV_END_S. A turn's line 0 is the turn's start (no client line to
+# pair): not checked.
+CONV_SYNC_SETTING: str | None = "online_scene_lines"
+CONV_LINE_TICKS = 18
+CONV_LINE_S = re.compile(r"Online: conversation (\S+?)(?:#\d+)? turn (\d+) line (\d+) of \d+ at shared tick (\d+) \(S's line\)")
+CONV_LINE_C = re.compile(r"Online: conversation (\S+?)(?:#\d+)? turn (\d+) line (\d+) -> next here at shared tick (\d+) \((.*)\)")
 
 
 def grade_level_events(run: Run) -> Verdict:
@@ -1300,6 +1308,26 @@ def level_states_findings(run: Run, games: list) -> "tuple[list[str], list[Findi
                     later = [l for n, l in ends if n == nm and l.t and sl.t and l.t > sl.t]
                     late.append((w, nm, sl, later[0] if later else None))
         counts.append(f"conversations ended on S {len(s_conv)}")
+        s_lines = [(l, m) for l, m in run.server.find(CONV_LINE_S) if int(m.group(3)) >= 1]
+        bad_lines = []
+        for w, lg in clients:
+            mine: dict[tuple[str, str, int], list[tuple[Line, int, str]]] = {}
+            for l, m in lg.find(CONV_LINE_C):
+                mine.setdefault((m.group(1), m.group(2), int(m.group(3))), []).append((l, int(m.group(4)), m.group(5)))
+            for sl, m in s_lines:
+                key = (m.group(1), m.group(2), int(m.group(3)) - 1)
+                got = mine.get(key, [])
+                ok = [g for g in got if abs(g[1] - int(m.group(4))) <= CONV_LINE_TICKS and "jumped" not in g[2]]
+                if not ok:
+                    why = (f"{got[0][1] - int(m.group(4)):+d} ticks" + (" (jumped)" if "jumped" in got[0][2] else "")
+                           if got else "no line")
+                    bad_lines.append((w, m.group(1), m.group(2), m.group(3), why, sl))
+        counts.append(f"conversation lines on S {len(s_lines)} (each wanted on every client within "
+                      f"{CONV_LINE_TICKS} shared ticks)")
+        if bad_lines:
+            findings.append(Finding(f"{len(bad_lines)} conversation line(s) not started in step with S's: " + ", ".join(
+                f"{w} {nm} turn {t} line {ln}: {why}" for w, nm, t, ln, why, _sl in bad_lines[:5]),
+                [sl.cite() for *_x, sl in bad_lines[:3]]))
         if late:
             findings.append(Finding(f"{len(late)} conversation end(s) not within {CONV_END_S:.0f} s of S's: " + ", ".join(
                 f"{w} {nm}" + (f" {(x.t - sl.t).total_seconds():+.1f} s" if x is not None and x.t else " never")

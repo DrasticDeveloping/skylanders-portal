@@ -26,7 +26,8 @@ from pathlib import Path
 # the rest. A case with no spec in the tree it runs from (one that arrives with its branch) gets a "no run" row.
 CASES = ["offline-plain", "party-continue", "soul-gem-tb", "enemy-attack-ta", "hits-that-count",
          "moves-figure-mid-tb", "moves-swapper-tb", "moves-block-probe-tb", "moves-shot-tb", "moves-ko-tb",
-         "world-event-cage-tb", "element-gate-tb", "element-gate-dual-tb", "element-gate-dual-swapper-tb",
+         "world-event-cage-tb", "element-gate-tb", "door-alone-tb", "door-together-tb", "element-gate-dual-tb",
+         "element-gate-dual-swapper-tb", "scene-lines-tb",
          "gpu-pipeline-drops", "gpu-pipeline-drops-fixed",
          "gpu-pipeline-drops-sync", "swap-zone-tb", "spark-lock-ww1", "rail-launch-tb", "fight-gate-tb",
          "enemy-damage-tb", "coins-broken-both"]
