@@ -194,6 +194,16 @@ def server_stall_reasons(folder: Path) -> list[str]:
     return [f"{f.what}: " + "; ".join(f.lines) for f in fs]
 
 
+def server_notes(folder: Path) -> list[str]:
+    """W40: every case with a server log: how many of each player's attack presses S started."""
+    import levelcheck as lc
+    try:
+        line = lc.attacks_started_line(lc.load_run(folder))
+    except (OSError, ValueError):
+        return []
+    return [line] if line else []
+
+
 def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None) -> list[str]:
     """The reasons the named level check rows give against this run folder (empty: every row passed); `levelpass`:
     the level's data for the rows that need it (fight gates)."""
@@ -2958,6 +2968,9 @@ class CaseResult:
     scenes: str = ""
     # PS15: the machine slots it held (Lease.summary: slots, of, all, waited_s, waited_for).
     machine: dict = field(default_factory=dict)
+    # W40: lines that inform without grading (levelcheck: `attacks started on the server: H 4 of 9`), shown under
+    # the status line, in report.md and in result.json.
+    notes: list[str] = field(default_factory=list)
     # C7: a failed case's fatal signature (case_signature: signature, peer, line, kind); {} otherwise.
     signature: dict = field(default_factory=dict)
     # "bulk" for a case of a `test --bulk` run (hidden games: BulkMode), '' for the default mode. The
@@ -6158,6 +6171,8 @@ def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: di
             lines += [f"Fatal signature ({r.signature['peer']}, {r.signature['kind']}): `{r.signature['signature']}`", ""]
         if r.scenes:
             lines += [f"Scenes: {r.scenes}", ""]
+        for note in r.notes:
+            lines += [note, ""]
         lines += [
                   "| Peer | Status | Exit | Time | Startup stall | Levels | FPS | Longest frame | Peak private MB "
                   "| Errors | Measures |",
@@ -6854,6 +6869,8 @@ def schedule_cases(specs: list[Spec], jobs: int, max_games: int, run_one, say=No
                             r.ran_with = overlapped(i, *spans[i])
                         why = f": {'; '.join(r.reasons)}" if r.reasons else ""
                         tell(f"  {r.status.upper()}{why}" if jobs == 1 else f"{spec.name}: {r.status.upper()}{why}")
+                        for note in r.notes:
+                            tell(f"  {note}" if jobs == 1 else f"{spec.name}: {note}")
                         if done is not None:
                             try:
                                 done(spec, r)
@@ -8297,6 +8314,7 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                     r.reasons.append(why)
                     if r.status == "pass":
                         r.status = "fail"
+                r.notes += server_notes(Path(r.folder))
             # W34: the spec's level check rows ([grade.level_check]) on the finished run.
             if "level_check" in spec.grades and r.folder and Path(r.folder).is_dir():
                 for why in level_check_reasons(Path(r.folder), spec.grades["level_check"],

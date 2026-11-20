@@ -2699,6 +2699,38 @@ def skipped_head(h: Log | None) -> list[str]:
             f"{', '.join(rows)} (a NOT TESTED row among them says so)"]
 
 
+# W40: how many of each player's attack presses S's puppet started (S's own `press <p>:<n> done: <a> landed, <b>
+# without damage, <k> kills, started yes|no (<why>)`, server/attacks.cpp): batch 17's moves-shot-tb started 1 of 8.
+# On every page's head and every case's result (skytest's notes).
+PRESS_DONE = re.compile(r"Online: press (\d+):(\d+) done: .*, started (yes|no) ")
+
+
+def attacks_started_line(run: Run) -> str | None:
+    """`attacks started on the server: H 4 of 9, D 0 of 2` (by S's done lines, one per press); None with no S log."""
+    if run.server is None:
+        return None
+    done: dict[tuple[int, int], bool] = {}
+    for _line, m in run.server.find(PRESS_DONE):
+        done[(int(m.group(1)), int(m.group(2)))] = m.group(3) == "yes"
+    if not done:
+        return "attacks started on the server: no press done (no `press <p>:<n> done` line)"
+    names = peer_numbers(run)
+    parts = []
+    for peer in sorted({p for p, _n in done}):
+        mine = [ok for (p, _n), ok in done.items() if p == peer]
+        who = names.get(peer)
+        parts.append(f"{who + ' (peer ' + str(peer) + ')' if who else 'peer ' + str(peer)} {sum(mine)} of {len(mine)}")
+    return "attacks started on the server: " + ", ".join(parts)
+
+
+def attacks_started_head(folder: Path) -> list[str]:
+    try:
+        line = attacks_started_line(load_run(folder))
+    except (OSError, ValueError):
+        return []
+    return [line] if line else []
+
+
 def run_head(folder: Path, levelpass: Path | None = None) -> list[str]:
     """The page's head from the run's result.json: the case, its status, minutes, build snapshot, runner; with the
     [levelpass] folder also the fight gates fought (W34)."""
@@ -2722,6 +2754,7 @@ def run_head(folder: Path, levelpass: Path | None = None) -> list[str]:
             *gates_line,
             *invulnerable_head(folder),
             *launch_relay_head(folder),
+            *attacks_started_head(folder),
             *skipped_head(read_log(folder, "H/game.log", "H")),
             *route_head(folder)]
 

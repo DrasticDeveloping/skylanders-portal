@@ -246,6 +246,21 @@ class Moves(unittest.TestCase):
         self.assertTrue(v.counts.endswith(lc.BLOCK_NOT_TESTED), v.counts)
 
 
+class AttacksStarted(unittest.TestCase):
+    def test_counts_each_players_presses_by_the_servers_done_lines(self) -> None:
+        # W40: S's `press <p>:<n> done: ... started yes|no (...)`, one per press; H is peer 1, D peer 2.
+        s = [(30, "Online: press 1:1 done: 0 landed, 0 without damage, 0 kills, started yes (missed)"),
+             (31, "Online: press 1:2 done: 0 landed, 0 without damage, 0 kills, started no (missed)"),
+             (32, "Online: press 1:3 done: 1 landed, 0 without damage, 1 kills, started yes (landed)"),
+             (33, "Online: press 2:1 done: 0 landed, 0 without damage, 0 kills, started no (missed)")]
+        run = lc.load_run(RunFolder(s, H_JOIN, D_JOIN).path)
+        self.assertEqual(lc.attacks_started_line(run),
+                         "attacks started on the server: H (peer 1) 2 of 3, D (peer 2) 0 of 1")
+        run = lc.load_run(RunFolder([(30, "Online: frames 60 fps 60.0 p50 16")], H_JOIN, D_JOIN).path)
+        self.assertEqual(lc.attacks_started_line(run),
+                         "attacks started on the server: no press done (no `press <p>:<n> done` line)")
+
+
 class PlayerDamage(unittest.TestCase):
     def test_one_to_one_and_the_health_read_back(self) -> None:
         # W33: S's two hits on H's puppet, H's one hit by that enemy: one unmatched; H's drop read back by S.
