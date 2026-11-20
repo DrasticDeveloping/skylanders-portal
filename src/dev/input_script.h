@@ -110,6 +110,11 @@ void RegisterScriptCondition(const std::string& name, std::function<bool()> hold
 // position each frame): while `on`, it replaces the script's `stick` events on the script's virtual
 // pad; x and y in -1..1. Any thread.
 void SetScriptStick(bool on, double x, double y);
+// The right stick the game's own developer code drives (a microgame that wants the camera stick wiggled):
+// while `on` it is the script's virtual pad's right stick (the script itself has no right stick events);
+// centred when off. x and y in -1..1. Any thread.
+#define SKYLANDERS_DEV_SCRIPT_RIGHT_STICK 1
+void SetScriptRightStick(bool on, double x, double y);
 // Buttons the game's own developer code holds (the closed-loop walk's jump): while `on`, they are
 // added to the script's own presses; XInput button bits (A is 0x1000). Any thread.
 #define SKYLANDERS_DEV_SCRIPT_BUTTONS 1
