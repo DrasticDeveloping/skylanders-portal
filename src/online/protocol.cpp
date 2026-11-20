@@ -421,6 +421,25 @@ bool ReadPose(ByteReader& r, PlayerPose& m) {
     if (r.Ok() && !ValidElements(m.figure.elements)) return false;
   }
   if (ok && r.Ok() && r.Remaining() > 0) m.teleports = r.U16();  // stage 4 (absent before: 0)
+  if (ok && r.Ok() && r.Remaining() > 0) {
+    // The moves' command block (protocol.h PlayerCommand): another version's is skipped, a cut one is invalid.
+    const uint8_t version = r.U8();
+    if (r.Ok() && version == kPlayerCommandVersion1) {
+      // The first layout (no peer epoch): exactly its size, and read as no command (it names no player).
+      if (r.Remaining() != kPlayerCommandV1Bytes - 1) return false;
+    } else if (r.Ok() && version == kPlayerCommandVersion) {
+      // Exactly its size (the 27 bytes after the version byte): a longer version 2 block is not a version 2 one.
+      if (r.Remaining() != kPlayerCommandBytes - 1) return false;
+      m.command.peer_epoch = r.U32();
+      m.command.held = r.U32();
+      for (uint8_t& p : m.command.presses) p = r.U8();
+      std::array<float, 1> magnitude{};
+      ok = GetFloats(r, magnitude) && GetFloats(r, m.command.move);
+      m.command.magnitude = magnitude[0];
+      m.has_command = ok && r.Ok();
+      if (!m.has_command) return false;
+    }
+  }
   return ok && r.Ok();
 }
 
@@ -506,6 +525,15 @@ bool Fields(ByteWriter& w, const PlayerPose& m) {
   w.U16(m.figure.bottom_variant);
   w.U16(m.figure.elements);  // item 11: a trailing field, so a pose without it reads as 0 (not read)
   w.U16(m.teleports);        // stage 4: trailing too, so a pose without it reads as 0
+  if (m.has_command) {
+    // The moves' command block, last (protocol.h PlayerCommand).
+    w.U8(kPlayerCommandVersion);
+    w.U32(m.command.peer_epoch);
+    w.U32(m.command.held);
+    for (const uint8_t p : m.command.presses) w.U8(p);
+    const std::array<float, 1> magnitude{m.command.magnitude};
+    if (!PutFloats(w, magnitude) || !PutFloats(w, m.command.move)) return false;
+  }
   return true;
 }
 bool Fields(ByteWriter& w, const PlayerActionShown& m) {
@@ -519,6 +547,7 @@ bool Fields(ByteWriter& w, const PlayerActionShown& m) {
 }
 bool Fields(ByteWriter& w, const PlayerPoseShown& m) {
   w.U16(m.peer);
+  w.U32(m.peer_epoch);  // moves final F5
   return Fields(w, m.pose);
 }
 bool Fields(ByteWriter& w, const OccurrenceAccept& m) {
@@ -907,6 +936,7 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
     case MessageType::kPlayerPoseShown: {
       PlayerPoseShown m;
       m.peer = r.U16();
+      m.peer_epoch = r.U32();  // moves final F5
       ok = r.Ok() && ReadPose(r, m.pose);
       result = m;
       break;
