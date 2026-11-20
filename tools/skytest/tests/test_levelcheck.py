@@ -272,6 +272,37 @@ class Unpublished(unittest.TestCase):
         self.assertTrue(f.what.startswith("S did not publish 1 enemy spawn line(s)"), f.what)
         self.assertIn("EA_Manager_W1_B_componentDataOverrides", f.what)
 
+
+LEVELPASS_FOLDER = Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass")
+
+
+@unittest.skipUnless((LEVELPASS_FOLDER / "tutorial_b").is_dir(), "the levelpass folder is not here")
+class FightGates(unittest.TestCase):
+    def test_the_arena_waves_named_with_their_counts(self) -> None:
+        # W34: waves 1 and 2 complete on S; the third (W1_B's nested manager) refused by S and never complete.
+        nested = ("EA_Manager_W1_B_componentDataOverrides_archetype_CEncounterManagerComponentData_encounterActTargets_0_"
+                  "target")
+        s = [(100, "Online: encounter complete EA_Manager_W1#2421"),
+             (130, "Online: encounter complete EA_Manager_W1_B#2422"),
+             (131, f'Online: enemy spawn of a00000a85.0629f659.00001234@2 not published: the new entry is "x", not '
+                   f'"{nested}_actor_0"'),
+             (132, f'Online: enemy spawn of a00000a85.0629f659.00001235@2 not published: the new entry is "x", not '
+                   f'"{nested}_actor_1"')]
+        h = [(90, "Input script: LEVELPASS required r1 arena_gate TutorialBattleGate_01 (win its fight: ...)"),
+             (99, "Dev: encounter_clear EA_Manager_W1#2421 finished: spawned 6/6, 9 bursts, 0 lowered; 0 rechecks"),
+             (129, "Dev: encounter_clear EA_Manager_W1_B#2422 finished: spawned 6/6, 7 bursts, 0 lowered; 0 rechecks"),
+             (300, f"Dev: encounter_clear {nested}#2430 time: running 1 alive 8 spawned 9/15, 40 bursts")]
+        run = lc.load_run(RunFolder(s, H_JOIN + h, D_JOIN).path)
+        v = lc.grade_fight_gates(run, lc.level_data(LEVELPASS_FOLDER, "tutorial_b"))
+        self.assertEqual(v.status, lc.FAIL, v)
+        self.assertIn("wave 1 (EA_Manager_W1): complete on S ", v.counts)
+        self.assertIn("H's copy spawned 6/6 (finished)", v.counts)
+        whats = [x.what for x in v.findings]
+        self.assertTrue(whats[0].startswith("TutorialBattleGate_01 wave 3 (EA_Manager_W1_B_componentDataOverrides"), whats)
+        self.assertIn("never complete on S; S refused 2 of its spawns (`not published`)", whats[0])
+        self.assertIn("H's copy spawned 9/15 (not finished)", v.findings[0].lines[0])
+        self.assertIn("TutorialBattleGate_01: never opened on S", whats)
+
 class Windows(unittest.TestCase):
     def test_a_clients_time_in_each_level(self) -> None:
         f = RunFolder([], H_JOIN + LEVEL_END, D_JOIN + LEVEL_END)

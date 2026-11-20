@@ -2245,6 +2245,81 @@ def fight_gate_managers(run: Run, g) -> list[str]:
     return out
 
 
+# W34: the row "fight gates": each required fight gate's waves (its managers in the data's order, upstream first:
+# tutorial_b's arena: EA_Manager_W1, EA_Manager_W1_B, then W1_B's nested manager, whose end opens the gate), each wave
+# graded on S (`encounter complete <Name#id>`), with how many of its spawns S refused (`enemy spawn of ... not
+# published` naming the manager) and how many H's own copy made (H's `encounter_clear <Name#id> ... spawned a/b`, its
+# last line), then the gate open on S and every client and walked through. A finding names the wave, the manager and
+# the counts. A fight gate the pass did not fight: NOT TESTED by name.
+ENC_CLEAR = re.compile(r"Dev: encounter_clear (\S+?)#\d+ (finished|time|start|started|progress [\d.]+ s): .*?spawned "
+                       r"(\d+)/(\d+)")
+
+
+def wave_lines(run: Run, g) -> list[tuple[str, str, list[str]]]:
+    """Per wave of a fight gate: (manager name, its words, its faults)."""
+    s_done = [(line, m.group(1)) for line, m in run.server.find(ENCOUNTER_COMPLETE)] if run.server else []
+    s_refused = [m.group(2) for _l, m in run.server.find(UNPUBLISHED_SPAWN)] if run.server else []
+    h = run.clients.get("H")
+    clears = h.find(ENC_CLEAR) if h is not None else []
+    out = []
+    for k in getattr(g, "openers", []) or []:
+        name = k.split(".")[-1]
+        if "Manager" not in name and "_target" not in name:
+            continue
+        key = name[:60]
+        done = next((line for line, n in s_done if n.split("#")[0][:60] == key), None)
+        refused = sum(1 for e in s_refused if e[:60] == key)
+        mine = [m for _l, m in clears if m.group(1)[:60] == key]
+        last = mine[-1] if mine else None
+        h_words = (f"H's copy spawned {last.group(3)}/{last.group(4)} ({'finished' if last.group(2) == 'finished' else 'not finished'})"
+                   if last else "H fought no actor of it (no `encounter_clear` line)")
+        words = (f"{'complete on S ' + done.cite() if done else 'never complete on S'}; S refused {refused} of its "
+                 f"spawns; {h_words}")
+        faults = []
+        if done is None:
+            faults.append("never complete on S")
+        if refused:
+            faults.append(f"S refused {refused} of its spawns (`not published`)")
+        out.append((name, words, faults))
+    return out
+
+
+def grade_fight_gates(run: Run, data: "LevelData | None" = None) -> Verdict:
+    """Each required fight gate: its waves on S and H, its opening and the walk through."""
+    name = "fight gates"
+    if data is None:
+        return Verdict(name, NOT_TESTED, "no level data (the [levelpass] folder) to name the fight gates")
+    gates = [g for g in data.gates if g.required and g.kind in ("battle gate", "arena gate")]
+    if not gates:
+        return Verdict(name, NOT_TESTED, "the level has no fight gate")
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    h = run.clients.get("H")
+    reqs = h.find(REQ_LINE) if h is not None else []
+    clears = [m.group(1)[:60] for _l, m in h.find(ENC_CLEAR)] if h is not None else []
+    counts, findings, untested = [], [], []
+    for g in gates:
+        managers = [k.split(".")[-1][:60] for k in getattr(g, "openers", []) or []]
+        fought = any(m.group(3) == g.name and not m.group(4) for _l, m in reqs) or any(n in clears for n in managers)
+        if not fought:
+            untested.append(g.name)
+            continue
+        waves = wave_lines(run, g)
+        lines = [f"wave {i + 1} ({n}): {w}" for i, (n, w, _f) in enumerate(waves)]
+        counts.append(f"{g.name}: " + "; ".join(lines) if lines else f"{g.name}: no wave in the data")
+        for i, (n, _w, faults) in enumerate(waves):
+            if faults:
+                findings.append(Finding(f"{g.name} wave {i + 1} ({n}): " + "; ".join(faults), [lines[i]]))
+        opened = gate_open_ids(run.server, g.name, mover=False, run=run)
+        if not opened:
+            findings.append(Finding(f"{g.name}: never opened on S", [absent(run.server, f"an opening of {g.name}")]))
+    if untested:
+        counts.append("not fought by this pass (NOT TESTED): " + ", ".join(untested))
+    if not counts or all(c.startswith("not fought") for c in counts):
+        return Verdict(name, NOT_TESTED, "; ".join(counts))
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), "", findings)
+
+
 def fight_gates_head(run: Run, data: "LevelData | None") -> list[str]:
     """The page head's count of the level's fight gates the pass fought (W34), and the ones it did not, by name."""
     if data is None:
@@ -2399,7 +2474,8 @@ def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> lis
     together = grade_together(run)
     rows = [grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
             grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run), grade_loot(run),
-            grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run)]
+            grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
+            grade_fight_gates(run, data)]
     # The enemies and the loot are read where both players stand only when D followed H: each says which.
     followed = bool(run.clients.get("D") and run.clients["D"].find(FOLLOW_ON))
     if together.status in (PASS, FAIL):

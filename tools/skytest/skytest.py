@@ -180,14 +180,17 @@ GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_t
 # W34: a spec's [grade.level_check] `rows = [...]` grades its run with those rows of the level check's page
 # (levelcheck.py): a row's FAIL fails the case with the row's findings as the reason; `must_test = true` fails a row
 # that says NOT TESTED too (a spec written to show it). LEVEL_CHECK_ROWS: the rows a spec may name.
-LEVEL_CHECK_ROWS = ("enemies hurt players", "other player's moves")
+LEVEL_CHECK_ROWS = ("enemies hurt players", "other player's moves", "fight gates")
 
 
-def level_check_reasons(folder: Path, g: dict) -> list[str]:
-    """The reasons the named level check rows give against this run folder (empty: every row passed)."""
+def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None) -> list[str]:
+    """The reasons the named level check rows give against this run folder (empty: every row passed); `levelpass`:
+    the level's data for the rows that need it (fight gates)."""
     import levelcheck as lc
     run = lc.load_run(folder)
-    graders = {"enemies hurt players": lc.grade_player_damage, "other player's moves": lc.grade_moves}
+    data = lc.level_data(levelpass, lc.run_level(run)) if levelpass is not None else None
+    graders = {"enemies hurt players": lc.grade_player_damage, "other player's moves": lc.grade_moves,
+               "fight gates": lambda r: lc.grade_fight_gates(r, data)}
     out = []
     for name in g.get("rows", []):
         v = graders[name](run)
@@ -8215,7 +8218,8 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                     tell_breaker(t)
             # W34: the spec's level check rows ([grade.level_check]) on the finished run.
             if "level_check" in spec.grades and r.folder and Path(r.folder).is_dir():
-                for why in level_check_reasons(Path(r.folder), spec.grades["level_check"]):
+                for why in level_check_reasons(Path(r.folder), spec.grades["level_check"],
+                                               levelpass_folder(cfg, None)):
                     r.reasons.append(why)
                     if r.status == "pass":
                         r.status = "fail"
