@@ -1,6 +1,7 @@
-"""Tests for skytest's drop_tiles grade (drop_tiles.py): the PNG reader, the tile rule (a flat black or
-cyan whole cell of the scene's 64-pixel grid beside a cell that isn't), and the verdicts (seen, not seen,
-none, tiles, inconclusive) from the round markers and the picture lines. Run: python -I -m unittest
+"""Tests for skytest's drop_tiles grade (drop_tiles.py): the PNG reader (a malformed file is unreadable, never
+an exception), the tile rule (a flat black or cyan whole cell of the scene's 64-pixel grid beside a cell that
+isn't), and the verdicts (seen, not seen, none, needs reading, inconclusive, inconclusive (geometry)) from the
+script's prescribed shots, the round markers and the saved frames' capture times. Run: python -I -m unittest
 discover -s tools/skytest/tests"""
 from __future__ import annotations
 
@@ -20,8 +21,9 @@ W, H = 208, 124
 
 
 def png(path: Path, cells: dict[tuple[int, int], tuple[int, int, int]], alpha: bool = False,
-        filters: int = 0) -> None:
+        filters: int = 0, width: int = W) -> None:
     """A textured picture (no flat cell), with the given cells filled flat."""
+    W = width  # noqa: N806
     bpp = 4 if alpha else 3
     rows = []
     prev = bytes(W * bpp)
@@ -75,47 +77,105 @@ class Tiles(unittest.TestCase):
 
 
 class Verdicts(unittest.TestCase):
-    def saved(self, s: str, n: int, name: str, overwriting: int) -> tuple[str, str]:
-        return (s, f"[info] [gpu] Pipeline wait: frame {n} saved as {name} ({overwriting} overwriting, 0 "
-                   f"depth-writing draws dropped in it; the same swap's guest output, before the host's scaling "
-                   f"and presentation; window 3; 1 of 200)")
+    def saved(self, logged: str, n: int, name: str, overwriting: int) -> tuple[str, str]:
+        return (logged, f"[info] [gpu] Pipeline wait: frame {n} saved as {name} ({overwriting} overwriting, 0 "
+                        f"depth-writing draws dropped in it; the same swap's guest output, before the host's "
+                        f"scaling and presentation; window 3; 1 of 200)")
+
+    @staticmethod
+    def script(folder: Path, per_round: int = 2) -> None:
+        lines = ["wait 1", "shot boot", "log probe round 1"] + [f"shot r1-{i}" for i in range(per_round)]
+        lines += ["log probe round 2"] + [f"shot r2-{i}" for i in range(per_round)] + ["log probe end"]
+        (folder / "script.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_prescribed_shots_come_from_the_script(self) -> None:
+        text = "log probe round 1; shot a # one\nshot b\nlog probe round 2\nshot c.png\nlog probe end\nshot after\n"
+        self.assertEqual(dt.prescribed_shots(text, "probe"), {1: ["a.png", "b.png"], 2: ["c.png"]})
 
     def test_seen_needs_the_tile_in_a_frame_with_its_own_overwriting_drop(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            png(Path(d) / "f1.png", {(5, 5): (0, 254, 255)})
-            png(Path(d) / "f2.png", {(5, 5): (0, 0, 0)})
-            text = log(*ROUNDS, self.saved("02.000", 41, "f1.png", 2), self.saved("04.000", 77, "f2.png", 0))
+            png(Path(d) / "pipeline-drop-f41-030002-000.png", {(5, 5): (0, 254, 255)})
+            png(Path(d) / "pipeline-drop-f77-030004-000.png", {(5, 5): (0, 0, 0)})
+            text = log(*ROUNDS, self.saved("02.100", 41, "pipeline-drop-f41-030002-000.png", 2),
+                       self.saved("04.100", 77, "pipeline-drop-f77-030004-000.png", 0))
             graded, why = dt.grade(Path(d), text, {"expect": "seen", "marker": "probe"})
-            self.assertEqual(why, [])
-            self.assertEqual([s["file"] for s in graded["seen"]], ["f1.png"])
-            # The depth-only frame alone is not enough.
-            text = log(*ROUNDS, self.saved("04.000", 77, "f2.png", 0))
+            self.assertEqual((why, graded["verdict"]), ([], "seen"))
+            self.assertEqual([s["file"] for s in graded["seen"]], ["pipeline-drop-f41-030002-000.png"])
+            self.assertTrue((Path(d) / "drop_tiles.md").is_file())
+            # The depth-only frame alone: a tile without its own overwriting drop needs reading, and the
+            # grade neither passes nor fails the case.
+            text = log(*ROUNDS, self.saved("04.100", 77, "pipeline-drop-f77-030004-000.png", 0))
+            graded, why = dt.grade(Path(d), text, {"expect": "seen", "marker": "probe"})
+            self.assertEqual((why, graded["verdict"]), ([], "needs reading"))
+            self.assertIn("NEEDS READING", graded["note"])
+            self.assertTrue((Path(d) / "drop_tiles" / "pipeline-drop-f77-030004-000-c5r5.png").is_file())
+
+    def test_the_capture_time_decides_the_round_not_the_write(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            png(Path(d) / "pipeline-drop-f9-030000-900.png", {(5, 5): (0, 0, 0)})
+            # Captured before round 1's marker, written (logged) after it: not an attack frame.
+            text = log(*ROUNDS, self.saved("01.200", 9, "pipeline-drop-f9-030000-900.png", 3))
             graded, why = dt.grade(Path(d), text, {"expect": "seen", "marker": "probe"})
             self.assertTrue(why[0].startswith("grade drop_tiles: INCONCLUSIVE"), why)
+            # Captured in round 2, logged after the end marker: still round 2's.
+            png(Path(d) / "pipeline-drop-f10-030004-950.png", {(5, 5): (0, 0, 0)})
+            text = log(*ROUNDS, self.saved("05.300", 10, "pipeline-drop-f10-030004-950.png", 3))
+            graded, why = dt.grade(Path(d), text, {"expect": "seen", "marker": "probe"})
+            self.assertEqual((why, graded["verdict"], graded["seen"][0]["round"]), ([], "seen", 2))
 
     def test_seen_without_a_tile_is_not_seen(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            png(Path(d) / "f1.png", {})
-            text = log(*ROUNDS, self.saved("02.000", 41, "f1.png", 1))
+            png(Path(d) / "pipeline-drop-f41-030002-000.png", {})
+            text = log(*ROUNDS, self.saved("02.100", 41, "pipeline-drop-f41-030002-000.png", 1))
             graded, why = dt.grade(Path(d), text, {"expect": "seen", "marker": "probe"})
             self.assertTrue(why[0].startswith("grade drop_tiles: NOT SEEN"), why)
 
-    def test_none_reads_every_picture_inside_the_rounds(self) -> None:
+    def test_none_needs_every_prescribed_picture_usable(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            for i in range(3):
-                png(Path(d) / f"s{i}.png", {})
-            png(Path(d) / "boot.png", {(2, 2): (0, 0, 0)})  # before round 1: not judged
-            lines = [("00.500", "[info] Input script: shot boot.png")] + list(ROUNDS)
-            lines += [("01.500", "[info] Input script: shot s0.png"), ("02.500", "[info] Input script: shot s1.png"),
-                      ("03.500", "[info] Input script: shot s2.png")]
-            text = log(*sorted(lines))
-            graded, why = dt.grade(Path(d), text, {"expect": "none", "marker": "probe", "min_frames": 3})
-            self.assertEqual((why, graded["readable"]), ([], 3))
-            graded, why = dt.grade(Path(d), text, {"expect": "none", "marker": "probe"})
-            self.assertTrue(why[0].startswith("grade drop_tiles: INCONCLUSIVE"), why)  # 3 < 6
-            png(Path(d) / "s1.png", {(4, 4): (0, 254, 255)})
-            graded, why = dt.grade(Path(d), text, {"expect": "none", "marker": "probe", "min_frames": 3})
-            self.assertIn("s1.png (round 1, 1 tile(s))", why[0])
+            folder = Path(d)
+            self.script(folder)
+            png(folder / "boot.png", {(2, 2): (0, 0, 0)})  # before round 1: not judged
+            for name in ("r1-0", "r1-1", "r2-0"):
+                png(folder / f"{name}.png", {})
+            g = {"expect": "none", "marker": "probe"}
+            graded, why = dt.grade(folder, log(*ROUNDS), g)  # r2-1 missing
+            self.assertTrue(why[0].startswith("grade drop_tiles: INCONCLUSIVE: 1 of 4"), why)
+            # A fade to black at an attack moment is not gameplay.
+            png(folder / "r2-1.png", {(c, r): (0, 0, 0) for c in range(16) for r in range(10)})
+            graded, why = dt.grade(folder, log(*ROUNDS), g)
+            self.assertIn("not gameplay", why[0])
+            # A truncated file is unreadable, never an exception.
+            (folder / "r2-1.png").write_bytes((folder / "r1-0.png").read_bytes()[:30])
+            graded, why = dt.grade(folder, log(*ROUNDS), g)
+            self.assertIn("unreadable", why[0])
+            png(folder / "r2-1.png", {})
+            graded, why = dt.grade(folder, log(*ROUNDS), g)
+            self.assertEqual((why, graded["verdict"], graded["usable_shots"]), ([], "none", 4))
+            # A tile in a fix-on picture needs reading: the grade does not fail the case on it.
+            png(folder / "r1-1.png", {(4, 4): (0, 254, 255)})
+            graded, why = dt.grade(folder, log(*ROUNDS), g)
+            self.assertEqual((why, graded["verdict"]), ([], "needs reading"))
+            self.assertEqual(graded["candidates"][0]["cell"], [4, 4])
+
+    def test_a_picture_not_of_the_scene_shape_is_inconclusive_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            (folder / "script.txt").write_text("log probe round 1\nshot sq\nlog probe end\n", encoding="utf-8")
+            png(folder / "sq.png", {}, width=124)
+            graded, why = dt.grade(folder, log(ROUNDS[0], ROUNDS[2]), {"expect": "none", "marker": "probe"})
+            self.assertEqual(graded["verdict"], "inconclusive (geometry)")
+            self.assertIn("INCONCLUSIVE (geometry)", why[0])
+
+    def test_malformed_pngs_are_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "a.png"
+            png(p, {})
+            good = p.read_bytes()
+            short_ihdr = good[:8] + struct.pack(">I", 2) + b"IHDR\x00\x00" + struct.pack(">I", 0) + good[33:]
+            for bad in (good[:20], short_ihdr, good[:-12], b"junk", good[:8] + b"\xff\xff\xff\xffIDAT"):
+                p.write_bytes(bad)
+                with self.assertRaises(dt.Unreadable):
+                    dt.tiles(p)
 
     def test_spec_table(self) -> None:
         self.assertIsNone(dt.check_spec({"expect": "none", "marker": "probe"}, ["H"]))

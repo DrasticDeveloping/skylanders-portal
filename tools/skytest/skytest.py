@@ -6110,6 +6110,10 @@ def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: di
         for p in r.peers:
             for why in p.reasons:
                 lines.append(f"- {p.peer}: {why}")
+            # Stage 8's picture grade: its verdict line, NEEDS READING included (a verdict that neither
+            # passes nor fails the case: the run's reader decides from drop_tiles.md and its crops).
+            if note := p.graded.get(drop_tiles.NAME, {}).get("note"):
+                lines.append(f"- {p.peer}: {note}")
         for p in r.peers:
             if p.startup_stall_s is not None and p.startup_stall_s > STARTUP_STALL_WARN_S:
                 lines.append(f"- WARNING: {p.peer}: startup stall {p.startup_stall_s:.1f} s (shader storage to the "
