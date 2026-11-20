@@ -682,6 +682,18 @@ void Version2Scenes() {
     CHECK(RoundTrip(SceneBarrier{p, 2, loaded, SceneKind::kCutscene}));
     CHECK(RoundTrip(SceneBarrier{p, 2, Scene(), SceneKind::kConversation}));
   }
+  // kStart's mark rides in the skips byte (the game's scene_share_rules.h); no other phase but kEnd has one.
+  for (uint8_t mark : {uint8_t(1), uint8_t(2), uint8_t(3), uint8_t(255)}) {
+    SceneBarrier m{ScenePhase::kStart, 2, Scene(), SceneKind::kCutscene};
+    m.skips = mark;
+    CHECK(RoundTrip(m));
+    CHECK(EncodeMessage(m).back() == mark);
+  }
+  {
+    SceneBarrier m{ScenePhase::kHold, 2, loaded, SceneKind::kCutscene};
+    m.skips = 1;
+    CHECK(EncodeMessage(m).empty());
+  }
   // The shared skip's and the hold's phases: their numbers on the wire, and no end reason or skips.
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kSkip, 2, loaded, SceneKind::kCutscene})[4] == 5);
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kHold, 2, loaded, SceneKind::kCutscene})[4] == 6);
