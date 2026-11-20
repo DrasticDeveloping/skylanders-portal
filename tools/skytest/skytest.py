@@ -9519,6 +9519,16 @@ def lock_commands_known(cfg: Config) -> bool:
         "lock_ready" in table.conditions
 
 
+def command_known(cfg: Config, name: str) -> bool:
+    """The game registers the script command `name` (the checkout's tests/script_commands.toml)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        return name in la.CommandTable.load(path).registered
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+
+
 def launch_pad_known(cfg: Config) -> bool:
     """The game registers `launch_pad` (W27b; the checkout's tests/script_commands.toml)."""
     import launch_args as la
@@ -9600,6 +9610,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         raise SystemExit("levelpass: --no-end is for the generated pass, not --predictions")
     # W27b: the launch pads ridden only with the build's launch_pad and without --no-launch-rides.
     lp.LAUNCH_RIDES = launch_pad_known(cfg) and not getattr(a, "no_launch_rides", False)
+    # W32 (c): D fights one fight a level where the build registers stand_by.
+    lp.D_FIGHT = command_known(cfg, "stand_by")
     # W30: the late joiner waits for its arrival move before it is placed, where the build has the condition.
     conds = table_conditions(cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml"))
     lp.ARRIVAL_DONE = conds is not None and "online_arrival_done" in conds

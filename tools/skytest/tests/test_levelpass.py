@@ -1026,6 +1026,28 @@ class RequiredStepsPlan(unittest.TestCase):
     def plan(self, level: str, **kw):
         return lp.make_plan(lp.load_content(LEVELPASS_DATA, level), d_lobby=True, **kw)
 
+    def test_d_fights_one_fight_while_h_stands_by(self) -> None:
+        # W32 (c): the plan's first fight is D's: H waits beside it (stand_by), D stops following, fights, follows again.
+        old = lp.D_FIGHT
+        self.addCleanup(setattr, lp, "D_FIGHT", old)
+        lp.D_FIGHT = True
+        p = self.plan("tutorial_b", no_gates=True)
+        p.d_follow = True
+        ref = lp.d_fight_ref(p)
+        self.assertTrue(ref.startswith("auth:"), ref)
+        h = lp.script_h(p, None).splitlines()
+        k = h.index(f"stand_by {ref} {lp.FIGHT_RADIUS} {4 * lp.ACTION_TIMEOUT[lp.FIGHT]}")
+        self.assertEqual(h[k - 1], f"online_wait_peer_near_entity {ref} {lp.FIGHT_RADIUS} 60")
+        self.assertNotIn(f"fight_near {ref} {lp.FIGHT_RADIUS} {lp.ACTION_TIMEOUT[lp.FIGHT]}", h)
+        d = lp.script_d(p).splitlines()
+        j = d.index(f"fight_near {ref} {lp.FIGHT_RADIUS} {3 * lp.ACTION_TIMEOUT[lp.FIGHT]}")
+        self.assertEqual(d[j - 3:j], [f"online_wait_peer_near_entity {ref} {lp.FIGHT_RADIUS} {lp.D_FIGHT_WAIT_S}",
+                                      "online_auto_follow off", f"goto_entity {ref} 300"])
+        self.assertEqual(d[j + 1], "online_auto_follow on")
+        lp.D_FIGHT = False
+        self.assertEqual(lp.d_fight_ref(p), "")
+        self.assertNotIn("stand_by", lp.script_h(p, None))
+
     def test_the_late_joiner_waits_for_its_arrival(self) -> None:
         # W30: the late joiner is placed only after its arrival move is over, where the build has the condition.
         old = lp.ARRIVAL_DONE

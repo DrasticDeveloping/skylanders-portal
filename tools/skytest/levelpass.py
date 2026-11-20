@@ -424,6 +424,14 @@ def arrival_lines() -> list[str]:
 # launch. On only when the build has launch_pad (the checkout's command table) and the pass was not given
 # --no-launch-rides (skytest sets LAUNCH_RIDES); otherwise visited, as before. LAUNCH_PADS: the plan's pads.
 LAUNCH_RIDES = False
+# W32 (c): at one fight a level the SECOND player fights and the first stands by (stand_by), so the run shows D's own
+# hits and kills counting on S (S's `dead by <D's peer>`) and on H's screen; before, every fight was H's ("by a player:
+# H n, D 0" in every run). The fight: the plan's first fight action (a FIGHT stop of the sweep), when D follows H in
+# the lobby flow. On when the build registers stand_by (skytest sets D_FIGHT from the command table). D_FIGHT_AT: the
+# fight's reference while a plan's scripts are written (d_fight_ref).
+D_FIGHT = False
+D_FIGHT_AT = ""
+D_FIGHT_WAIT_S = 900
 LAUNCH_PADS: dict[str, tuple[str, int]] = {}   # obj key -> (button, presses)
 LAUNCH_EXTRA_PRESSES = 3
 LAUNCH_RIDE_S = 90
@@ -1995,7 +2003,12 @@ def action_lines(a: Action, label: str, after: str = "", cap: int = 0, long_paus
         # The helpers find a live object; goto_entity first wakes an asleep one (its area streamed in).
         out.append(f"goto_entity {ref}")
         out += dismiss_after(o)
-    if a.action == FIGHT:
+    if a.action == FIGHT and D_FIGHT_AT and ref == D_FIGHT_AT:
+        # W32 (c): D fights this one (d_fight_lines); H waits for D beside it and attacks nothing.
+        out += [f"log LEVELPASS fight by D at {ref}: H stands by",
+                f"online_wait_peer_near_entity {ref} {FIGHT_RADIUS} 60",
+                f"stand_by {ref} {FIGHT_RADIUS} {4 * ACTION_TIMEOUT[FIGHT]}"]
+    elif a.action == FIGHT:
         out.append(f"fight_near {ref} {FIGHT_RADIUS} {ACTION_TIMEOUT[FIGHT]}")
     elif a.action == ATTACK:
         out.append(f"attack_until {ref} {ACTION_TIMEOUT[ATTACK]}")
@@ -2061,8 +2074,31 @@ PAUSE_FATAL = r"Dev: \S+ \S+ no player frame took a read for \d+ s \(paused"
 MADE_COPY_LEFT = r"Online: runtime spawn (?:made copy|twin) .* still in the entity table"
 
 
+def d_fight_ref(plan: Plan) -> str:
+    """W32 (c): the reference of the plan's fight by D (its first fight action), or "" (off, or no fight)."""
+    if not (D_FIGHT and plan.d_lobby and plan.d_follow):
+        return ""
+    for s in plan.stops:
+        for a in s.actions:
+            if a.action == FIGHT and a.obj.ref:
+                return a.obj.ref
+    return ""
+
+
+def d_fight_lines(plan: Plan) -> list[str]:
+    """D's part of the fight by D: once H is beside it, D stops following, goes there and fights; then follows again."""
+    ref = d_fight_ref(plan)
+    if not ref:
+        return []
+    return [f"log LEVELPASS D fights at {ref}", f"online_wait_peer_near_entity {ref} {FIGHT_RADIUS} {D_FIGHT_WAIT_S}",
+            "online_auto_follow off", f"goto_entity {ref} 300", f"fight_near {ref} {FIGHT_RADIUS} {3 * ACTION_TIMEOUT[FIGHT]}",
+            "online_auto_follow on", "log LEVELPASS D fought"]
+
+
 def script_h(plan: Plan, late_join_after: str | None) -> str:
     """H's script: boot, Host, the level, the sweep, the late join's wait, the exit."""
+    global D_FIGHT_AT
+    D_FIGHT_AT = d_fight_ref(plan)
     # The one boot (party_boot_h): the lobby (with D) or the host alone (D joins late, or no D).
     lines = party_boot_h(plan.late_join and plan.d_lobby and late_join_after is None, plan.new_slot, plan.figures_h)
     lines += ["online_mark_level", f"level {plan.level}",
@@ -2544,6 +2580,7 @@ def script_d(plan: Plan) -> str:
             # From here D's hero follows H's (the game's Auto follow: a move whenever it is farther than 400 and
             # free on the ground); D's script presses nothing more, it only waits for the level's end.
             lines += ["online_auto_follow on", "log LEVELPASS D follows H"]
+            lines += d_fight_lines(plan)
         if d_brought(plan):
             lines += d_come_lines(plan)
         elif plan.pass_gates and d_through_end(plan):

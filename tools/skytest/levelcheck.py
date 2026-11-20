@@ -534,6 +534,16 @@ def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
     first = next(iter(keys.values())).placed.cite()
     fights, fight_findings = fight_findings_of(run, by_player, len(unrecorded), data)
     counts.append(fights)
+    # W32 (c): the fight by D (D's own fight_area lines): its kills on S, and a fight that killed nothing by D.
+    d_log = run.clients.get("D")
+    d_fights = d_log.find(FIGHT_START) if d_log is not None else []
+    if d_fights:
+        counts.append(f"killed by D: {by_player.get('D', 0)} (D fought {len(d_fights)} time(s))")
+        if not by_player.get("D"):
+            fight_findings.append(Finding(
+                f"D fought {len(d_fights)} time(s) and no enemy died by D on S: the second player's hits never landed "
+                "on the server", [d_fights[0][0].cite(),
+                                  absent(run.server, "`enemy ... dead by <D's peer>`") if run.server else "no S log"]))
     if scenery or unreleased:
         counts.append(f"set apart: {len(scenery)} scenery, {len(unreleased)} held and not released in this run")
     gone_early = [k for k in slept if k not in expected]
