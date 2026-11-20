@@ -369,6 +369,13 @@ class ServerAlive(unittest.TestCase):
         fs = lc.server_hard_findings(lc.load_run(RunFolder(s, H_JOIN, D_JOIN).path))
         self.assertEqual([f.what.split(" (")[0].split(":")[0] for f in fs],
                          ["the server's game stopped", "the server refused the presses of peer 2 for a while"])
+        # W39: the level entry's [error], and a recovery press nobody asked for.
+        s = [(10, "Online: the server's level entry has made no progress for 31.0 s with 2 client(s) connected: x"),
+             (12, "Online: the server's world is paused: pressed A once on its own screen (press 1 of 3, x)")]
+        fs = lc.server_hard_findings(lc.load_run(RunFolder(s, H_JOIN, D_JOIN).path))
+        self.assertEqual([f.what.split(" (")[0] for f in fs],
+                         ["the server's game stopped", "the server pressed A on its own screen without "
+                          "--online_server_unstick=true"])
 
     def test_a_server_that_works_to_the_end_passes(self) -> None:
         s = [(10, "Online: world 2 a00000000.0629f659.00012836@2 written"), (19, "Online: frames 599 fps 59.9 p50 16"),
