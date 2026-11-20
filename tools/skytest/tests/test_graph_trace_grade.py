@@ -23,7 +23,9 @@ def line(t: str, text: str) -> str:
 
 
 CLIENT = "\n".join([
-    line("00.000", "Online: enemy spawn sd1.00000001#1/0@1 as ECI_Manager_actor_0#b78d66e0 (live)"),
+    line("00.000", "Online: enemy spawn sd0.00000001#1/0@1 as ECI_Manager_actor_0#b78d0000 (live)"),
+    line("00.050", "Input script: TRACE_SHIP_START"),
+    line("00.060", "Online: enemy spawn sd1.00000001#1/0@1 as ECI_Manager_actor_0#b78d66e0 (live)"),
     line("00.100", "Online: enemy spawn s99.00000001#1/0@1 as Other_actor_0#b78d0000 (live)"),
     line("01.000", "Input script: TRACE_SHIP_STAND"),
     line("02.000", "Online: graph trace copy sd1.00000001#1/0@1 tick 9000 states none clip none pos 0,0,0"),
