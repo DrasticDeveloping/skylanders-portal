@@ -3246,10 +3246,10 @@ LATE_JOIN_MARK = r"Input script: LEVELPASS late-join start"
 # god mode to keep fights short and the hero alive (dev_damage_multiplier is forwarded to S, which
 # scales the puppets' hits), the fight helpers' lowering setting (refused in a session in its own
 # words, never "is off"), the encounter lines, logs large enough for the whole pass.
-# Batch 18d: no --dev_damage_multiplier=-1 any more. With the owner's session settings the players' own hits decide the
-# damage on S, and the level check's host sent no hit at all where hits-that-count (the same build, without the
-# multiplier) had 91 counted (logs/levelcheck/levelcheck-vs-hits-that-count.txt; the cause INFERRED). The fights take
-# the game's own damage.
+# Batch 18d: no --dev_damage_multiplier=-1 any more: with the owner's session settings the players' own hits decide the
+# damage on S, and the level check fights with the game's own damage, as the owner plays. (It was first suspected of
+# the host's hits that never reached S in tutorial_b; the cause was the second rail pad's dropped launch, fixed in
+# 19b: logs/press-refusal-notes.txt. The fight commands now say so at once when the presses start no attack.)
 H_ARGS = ["--dev_authored_probe=true", "--dev_backend_commands=true", "--dev_hello_ungated_loopback=true",
           "--dev_hero_invulnerable=true", "--dev_defeat_commands=true", "--dev_trigger_commands=true",
           "--log_max_file_size_mb=64", "--log_max_files=4"]
