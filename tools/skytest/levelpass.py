@@ -3382,10 +3382,27 @@ def pass_verdict(status: str, reasons: list[str], h_text: str, plan: Plan, d_tex
     return (INCOMPLETE if missed else PASS), missed
 
 
+# W33: --vulnerable leaves out the two settings that keep the heroes from being hurt (VULNERABLE, skytest sets it),
+# for a full-level run where enemies may hurt the players. Not yet survivable: a knocked-out hero waits at the game's
+# "place a Skylander" screen and the pass's route steps fail as held until it ends (what a pass needs to go on, a
+# figure swap at a knock-out, is written in levelpass's KO_SURVIVAL note).
+VULNERABLE = False
+INVULNERABLE_ARGS = ("--dev_hero_invulnerable=true", "--dev_damage_multiplier=-1")
+# KO_SURVIVAL: for a pass to go on after a knock-out the swap must come at the moment it happens, which a script
+# cannot wait for in the middle of a route step. It needs (1) a dev setting in the game (dev_ko_figure=<file>): at
+# the game's figure prompt of a knock-out (swap_hooks.cpp's `swap placement none reason <r> (KO; player 0`) the
+# software portal lifts the hero's figure and places that file, as the script's `remove 0` / `place 0` do; (2) the
+# route steps to wait out the knock-out (its hold) instead of failing `held too long`; (3) the page to count each such
+# swap. Not built.
+
+
 def probe_args(args: list[str], probe: bool, extra: list[str] | None = None) -> list[str]:
     """A peer's arguments, without the authored probe for a --no-probe pass, plus the pass's --game-arg
-    settings (after the defaults, so a later value wins)."""
-    return (list(args) if probe else [a for a in args if not a.startswith("--dev_authored_probe")]) + list(extra or [])
+    settings (after the defaults, so a later value wins); with VULNERABLE without INVULNERABLE_ARGS."""
+    out = list(args) if probe else [a for a in args if not a.startswith("--dev_authored_probe")]
+    if VULNERABLE:
+        out = [a for a in out if a not in INVULNERABLE_ARGS]
+    return out + list(extra or [])
 
 
 def check_game_arg(arg: str) -> str:

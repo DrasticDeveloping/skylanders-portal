@@ -1709,6 +1709,9 @@ OWN_VITALS = re.compile(r"Online: own vitals (-?[\d.]+)/(-?[\d.]+) \(was (-?[\d.
 PEER_VITALS = re.compile(r"Online: peer (\d+) vitals (-?[\d.]+)/(-?[\d.]+)")
 PAIR_HIT_S = 1.0
 PAIR_VITALS_S = 1.5
+ANY_VITALS = re.compile(r"Online: own vitals (-?[\d.]+)/(-?[\d.]+) \(was ([^;]+); hit by (\S+)")
+KO_SCREEN = re.compile(r"Online: swap placement none reason \d+ \(KO; player 0")
+DEFERRED_SHOT = re.compile(r"its deferred projectile made here")
 
 
 def invulnerable_clients(folder: Path) -> list[str]:
@@ -1731,8 +1734,9 @@ def grade_player_damage(run: Run) -> Verdict:
     name = "enemies hurt players"
     invulnerable = invulnerable_clients(run.folder)
     if invulnerable:
-        return Verdict(name, NOT_TESTED, f"heroes invulnerable in this run ({', '.join(invulnerable)}): "
-                       "enemy-damage-tb and enemy-knockout-tb test it")
+        return Verdict(name, NOT_TESTED, f"heroes invulnerable in this run ({', '.join(invulnerable)}): enemy damage "
+                       "not tested; this is what hid it until 19 November (enemy-damage-tb and moves-ko-tb test it, "
+                       "and a level check with --vulnerable)")
     if run.server is None:
         return Verdict(name, NOT_TESTED, "no server log in this run folder")
     peers = peer_numbers(run)
@@ -1771,9 +1775,24 @@ def grade_player_damage(run: Run) -> Verdict:
                 late.append(line)
         kinds = {k: sum(1 for _l, m in hits if m.group(3) == k) for k in ("sweep", "shot", "other")}
         any_hit = any_hit or bool(hits or mine)
+        vit = log.find(ANY_VITALS)
+        unknown = [line for line, m in vit if m.group(4) == "unknown" and m.group(3) != "-" and
+                   float(m.group(1)) < float(m.group(3))]
+        lowest = min((float(m.group(1)) for _l, m in vit), default=None)
+        top = max((float(m.group(2)) for _l, m in vit), default=None)
+        kos = log.find(KO_SCREEN)
         counts.append(f"{who}: hit {len(hits)} time(s) ({', '.join(f'{k} {n}' for k, n in kinds.items() if n) or '-'}"
                       f"{f', {len(refused)} refused here' if refused else ''}); S counted {len(mine)} on its puppet, "
-                      f"{len(mine) - len(unmatched)} matched one to one; health drops {len(drops)}")
+                      f"{len(mine) - len(unmatched)} matched one to one; health drops {len(drops)}"
+                      + (f", {len(unknown)} by unknown" if unknown else "")
+                      + (f"; lowest health {lowest:.0f}/{top:.0f}" if lowest is not None and top else "")
+                      + (f"; knocked out {len(kos)} time(s), shown the placement screen" if kos else ""))
+        if mine and not hits:
+            findings.append(Finding(f"{who}: one-sided: S counted {len(mine)} hit(s) on its puppet and its hero logged "
+                                    "no `hero hit by` at all", [mine[0][0].cite(), absent(log, "`hero hit by`")]))
+        if unknown:
+            findings.append(Finding(f"{who}: its health fell {len(unknown)} time(s) with `hit by unknown` (no enemy "
+                                    "hit of S's within 3 s)", [x.cite() for x in unknown[:4]]))
         if not example and hits:
             example = hits[0][0].cite()
         if unmatched:
@@ -1785,6 +1804,14 @@ def grade_player_damage(run: Run) -> Verdict:
         if late:
             findings.append(Finding(f"{who}: {len(late)} health drop(s) S never read back (`peer {peer} vitals` with "
                                     f"that health within {PAIR_VITALS_S} s)", [x.cite() for x in late[:4]]))
+    # Who was shown the placement screen of a knock-out (only the knocked-out player should be).
+    shown_ko = [who for who, log in run.clients.items() if log.find(KO_SCREEN)]
+    if shown_ko:
+        counts.append(f"the knock-out's placement screen shown on: {', '.join(sorted(shown_ko))}")
+    # Shots: graded only where the deferred-shot fix is in (`its deferred projectile made here`); else not tested.
+    if not any(log.find(DEFERRED_SHOT) for log in run.clients.values()):
+        counts.append("shots not tested: no client made a deferred projectile (the bomb throwers' shots are dropped "
+                      "on the clients without online/5-replica-deferred-shots)")
     if not any_hit:
         return Verdict(name, NOT_TESTED, "no player was hit in this run (no `hero hit by` on a client, no hit S counted "
                        "on a puppet): " + "; ".join(counts))

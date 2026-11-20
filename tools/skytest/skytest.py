@@ -9614,6 +9614,8 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
     lp.D_FIGHT = command_known(cfg, "stand_by")
     # W31: the pieces step enters its trigger on foot where the build has walk_into.
     lp.WALK_INTO = command_known(cfg, "walk_into")
+    # W33: --vulnerable leaves out --dev_hero_invulnerable and --dev_damage_multiplier.
+    lp.VULNERABLE = bool(getattr(a, "vulnerable", False))
     # W30: the late joiner waits for its arrival move before it is placed, where the build has the condition.
     conds = table_conditions(cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml"))
     lp.ARRIVAL_DONE = conds is not None and "online_arrival_done" in conds
@@ -9865,6 +9867,9 @@ def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
                      " dismisses a pause screen within seconds")
     lp_.add_argument("--long-pause-at", default="", metavar="NAME", help="the object whose pickup takes the long"
                      " pause (default: the plan's first pickup of a collectible)")
+    lp_.add_argument("--vulnerable", action="store_true", help="the heroes can be hurt: --dev_hero_invulnerable and "
+                     "--dev_damage_multiplier are left out (the page's row \"enemies hurt players\" is then graded); a "
+                     "knock-out stops the pass's route until the hero is back (no swap at a knock-out yet)")
     lp_.add_argument("--no-launch-rides", action="store_true", help="the launch pad microgames are only visited, not "
                      "pressed and ridden (launch_pad), even where the build has the command: for runs that must not "
                      "depend on a ride rail-launch-tb has not shown yet")

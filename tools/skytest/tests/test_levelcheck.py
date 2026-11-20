@@ -253,8 +253,9 @@ class PlayerDamage(unittest.TestCase):
         f = RunFolder(s, H_JOIN + h, D_JOIN)
         v = lc.grade_player_damage(lc.load_run(f.path))
         self.assertEqual(v.status, lc.FAIL, v)
-        self.assertIn("H: hit 1 time(s) (sweep 1); S counted 2 on its puppet, 1 matched one to one; health drops 1",
-                      v.counts)
+        self.assertIn("H: hit 1 time(s) (sweep 1); S counted 2 on its puppet, 1 matched one to one; health drops 1; "
+                      "lowest health 190/200", v.counts)
+        self.assertIn("shots not tested: no client made a deferred projectile", v.counts)
         self.assertEqual([x.what for x in v.findings],
                          ["H: 1 hit(s) S counted on its puppet with no hit on its hero by the same enemy within 1 s"])
 
