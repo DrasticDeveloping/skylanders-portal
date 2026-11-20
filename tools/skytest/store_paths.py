@@ -379,6 +379,41 @@ def command_lines(exe: str) -> list[str] | None:
     return out
 
 
+def pid_command_line(pid: int) -> str | None:
+    """One process's command line, None when it cannot be read (not Windows, it ended, access denied)."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", ctypes.c_void_p)]
+
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    ntdll.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.ULONG,
+                                                ctypes.POINTER(wintypes.ULONG)]
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    try:
+        size = wintypes.ULONG(0)
+        ntdll.NtQueryInformationProcess(h, 60, None, 0, ctypes.byref(size))  # ProcessCommandLineInformation
+        if not size.value:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if ntdll.NtQueryInformationProcess(h, 60, buf, size, ctypes.byref(size)) != 0:
+            return None
+        us = UNICODE_STRING.from_buffer(buf)
+        return ctypes.wstring_at(us.Buffer, us.Length // 2) if us.Buffer else ""
+    finally:
+        k32.CloseHandle(h)
+
+
 def split_command_line(line: str) -> list[str] | None:
     """A command line's arguments as the program sees them (Windows' CommandLineToArgvW: a token quoted as a
     whole, `"--user_data_root=C:/a b"`, is one argument)."""

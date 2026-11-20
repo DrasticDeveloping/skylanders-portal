@@ -131,6 +131,7 @@ import remote_agent  # noqa: E402
 import remote_swap_grade  # noqa: E402  (stage 4's remote_swap grade over swap_pairs.py, the ordered form)
 import exclusive_grade  # noqa: E402  (stage 4's exclusive grade: a race exactly one client wins)
 import drop_tiles  # noqa: E402  (stage 8's drop_tiles grade: black or cyan 64x64 tiles in a run's pictures)
+import session_settings as sessions  # noqa: E402  (the owner's session settings: tests/session_settings.toml)
 import swap_pairs  # noqa: E402
 import memory_growth  # noqa: E402  (stage 5's soak grade)
 import occurrence_outcomes  # noqa: E402  (stage 5's occurrence grade)
@@ -684,6 +685,9 @@ class Config:
     # every window as before).
     bulk_settings: "BulkSettings" = field(default_factory=lambda: BulkSettings())
     bulk: "BulkMode | None" = None
+    # `test --session-settings` (acceptance passes it): every session case (layout server+N) runs with the owner's
+    # session settings on every game, unless its spec says `session_settings = false` (session_applies).
+    session_settings: bool = False
 
 
 def main_store(repo: Path) -> Path:
@@ -1076,6 +1080,9 @@ class Spec:
     bulk: bool = True
     bulk_reason: str = ""
     shader_cache: str = "fresh"
+    # `session_settings = true|false` (the owner's session settings, tests/session_settings.toml, on every game of
+    # the case before its own args; session_applies): None when the spec does not say.
+    session_settings: bool | None = None
 
 
 PEER_KINDS = ("local", "remote")
@@ -1636,6 +1643,9 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
     shader_cache = d.get("shader_cache", "fresh")
     if shader_cache not in SHADER_CACHE_VALUES:
         raise SpecError(f"{path.name}: shader_cache = {shader_cache!r} ({' or '.join(SHADER_CACHE_VALUES)})")
+    session = d.get("session_settings")
+    if session is not None and not isinstance(session, bool):
+        raise SpecError(f"{path.name}: session_settings is true or false (the owner's session settings on every game)")
     return Spec(
         name=d["name"], path=path, layout=d["layout"], stage=str(d["stage"]),
         description=d.get("description", ""), timeout=float(d.get("timeout", default_timeout)),
@@ -1644,7 +1654,7 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         exclusive=exclusive, tolerate=list(tolerate), not_ready=not_ready, scenes=scenes,
         scenes_reason=scenes_reason.strip(), breaker=breaker, sha256=hashlib.sha256(data).hexdigest(),
         synthetic=synthetic, build_copy=build_copy, bulk=bulk, bulk_reason=bulk_reason.strip(),
-        shader_cache=shader_cache,
+        shader_cache=shader_cache, session_settings=session,
     )
 
 
@@ -4017,6 +4027,46 @@ def show_server_args(cfg: Config, spec: Spec, peer: str) -> list[str]:
     return []
 
 
+# --- the owner's session settings (2026-11-20) ---------------------------------------------------------------------
+#
+# The level checks of the first acceptance pass ran without the owner's session settings: the players' hits not
+# wired (`hit session off`), a stand-in for the other player all run long, no enemy died on S. One list
+# (session_settings.py, the game's tests/session_settings.toml) now goes on every game of a case that asks for it
+# (`session_settings = true`: the generated level checks, party-continue) or, under `test --session-settings`
+# (acceptance), of every session case (layout server+N) that does not say `session_settings = false`. The list
+# comes after the runner's own args and before the spec's, without a name either already sets (the spec's value
+# wins; a bool setting's occurrences sum, so a name never goes twice). A name without its launch_allow row fails
+# the case before any game starts.
+
+
+def session_applies(cfg: Config, spec: Spec) -> bool:
+    if spec.session_settings is not None:
+        return spec.session_settings
+    return cfg.session_settings and spec.layout.startswith("server+")
+
+
+def session_list(cfg: Config) -> "sessions.SessionSettings":
+    """The repository's list, checked against the launch allow list; SpecError when it does not hold."""
+    try:
+        ss = sessions.load(cfg.repo)
+    except sessions.SessionSettingsError as e:
+        raise SpecError(f"session settings: {e}") from None
+    allow, _commands = launch_tables(cfg)
+    wrong = sessions.unknown_names(ss, allow.rules)
+    if wrong:
+        raise SpecError(f"session settings {ss.path}: {', '.join(wrong)}: no row in tests/launch_allow.toml (a name the"
+                        " game does not register is never passed)")
+    return ss
+
+
+def session_args(cfg: Config, spec: Spec, peer: str, *others: list[str]) -> list[str]:
+    """The owner's session settings for one game of the case (none when session_applies is false), without the
+    names `others` (the runner's and the spec's own args) set."""
+    if not session_applies(cfg, spec):
+        return []
+    return sessions.for_game(session_list(cfg), *others)
+
+
 def setting_values(args: list[str], name: str) -> list[str]:
     """Every value of `--name=value` in args, in order."""
     return [a.split("=", 1)[1] for a in args if a.split("=", 1)[0] == f"--{name}" and "=" in a]
@@ -4150,6 +4200,7 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0,
         runner = [*cfg.default_args, *scene_args(cfg, spec), *show_server_args(cfg, spec, peer),
                   *([f"--online_port={port}"] if port and peer == "H" else []),
                   *synthetic_server_args(cfg, spec, peer), *seed_args]
+        runner += session_args(cfg, spec, peer, runner, spec.peers[peer].args)
         args = la.build_game(ctx, peer_args(cfg, spec.peers[peer].args), script, fixtures=(saves, figures),
                              runner_args=runner)
     except la.LaunchError as e:
@@ -4424,8 +4475,9 @@ def start_remote(cfg: Config, spec: Spec, peer: str, run: Path, port: int) -> Re
         if not rp._call("hello").get("verified"):
             rp._call("verify", manifest=target.manifest)
         join = f"{client.sock.getsockname()[0]}:{port}" if port else ""
-        args = [a for a in [*cfg.default_args, *scene_args(cfg, spec), *show_server_args(cfg, spec, peer),
-                            *spec.peers[peer].args] if a[2:].split("=", 1)[0] not in REMOTE_AGENT_ARGS]
+        own = [*cfg.default_args, *scene_args(cfg, spec), *show_server_args(cfg, spec, peer)]
+        own += session_args(cfg, spec, peer, own, spec.peers[peer].args)
+        args = [a for a in [*own, *spec.peers[peer].args] if a[2:].split("=", 1)[0] not in REMOTE_AGENT_ARGS]
         plan = {"name": remote_plan_name(spec.name),
                 "timeout_s": min(remote_agent.MAX_RUN_S, int(spec.timeout) + 120),
                 "entries": [{"role": "game", "peer": peer, "args": args,
@@ -7794,14 +7846,54 @@ def owner_parts_changed(before: dict[str, dict], after: dict[str, dict]) -> list
     return [p for p in OWNER_PARTS if p in changed] + ([OWNER_OTHER] if OWNER_OTHER in changed else [])
 
 
+RUN_COPY_MARKER = ".skytest-copy"   # build_game's run copy: <run>/<peer>/data/.skytest-copy
+
+
+def test_game(pid: int, roots: list[Path] | None = None) -> bool:
+    """Whether a running game is a test game (any runner's, this one's or another worktree's): its command line's
+    --user_data_root is a runner's run copy (the folder, or one of its three parents, holds RUN_COPY_MARKER; a
+    hosted server's data folder is inside its H's). A data folder under the owner's own folders is never looked
+    into, and a command line that cannot be read is the owner's game (the list then waits, the safe side)."""
+    line = store_paths.pid_command_line(pid)
+    args = store_paths.split_command_line(line) if line else None
+    if not args:
+        return False
+    root = next((a.split("=", 1)[1] for a in args if a.startswith("--user_data_root=")), None)
+    if not root or under_owner_root(root, owner_data_roots() if roots is None else roots):
+        return False
+    p = Path(root)
+    for q in [p, *list(p.parents)[:3]]:
+        try:
+            if (q / RUN_COPY_MARKER).is_file():
+                return True
+        except OSError:
+            return False
+    return False
+
+
 def owner_games_running(runner_pid: int | None = None, table: list | None = None,
-                        started: "dict[int, str] | None" = None) -> list[tuple[str, str]]:
+                        started: "dict[int, str] | None" = None, is_test=None) -> list[tuple[str, str]]:
     """The owner's own games running now: (exe name, start time) of each process named *recompiled.exe that is not
-    runner_pid's descendant (this runner's games are); `table`/`started` for the unit cases (else read here)."""
+    runner_pid's descendant (this runner's games are) and not another runner's test game (test_game, or the child
+    of one: a hosted server); `table`/`started`/`is_test` for the unit cases (else read here)."""
     table = process_table() if table is None else table
     if not table:
         return []
     parent = {pid: ppid for pid, ppid, _ in table}
+    names = {pid: name for pid, _pp, name in table}
+    is_test = test_game if is_test is None else is_test
+    tested: dict[int, bool] = {}
+
+    def a_test_game(pid: int) -> bool:
+        seen = set()
+        while pid and pid not in seen and len(seen) < 8 and names.get(pid, "").lower().endswith(OWNER_GAME_SUFFIX):
+            if pid not in tested:
+                tested[pid] = bool(is_test(pid))
+            if tested[pid]:
+                return True
+            seen.add(pid)
+            pid = parent.get(pid, 0)
+        return False
 
     def ours(pid: int) -> bool:
         seen = set()
@@ -7812,7 +7904,8 @@ def owner_games_running(runner_pid: int | None = None, table: list | None = None
             pid = parent.get(pid, 0)
         return False
 
-    games = [(pid, name) for pid, _pp, name in table if name.lower().endswith(OWNER_GAME_SUFFIX) and not ours(pid)]
+    games = [(pid, name) for pid, _pp, name in table if name.lower().endswith(OWNER_GAME_SUFFIX) and not ours(pid)
+             and not a_test_game(pid)]
     starts = started if started is not None else process_start_times([pid for pid, _n in games])
     return sorted({(name, starts.get(pid, "?")) for pid, name in games})
 
@@ -8179,7 +8272,8 @@ def cmd_acceptance(cfg: Config, a: argparse.Namespace) -> int:
     """W39 item 6: the acceptance list (acceptance.py), its estimate first."""
     import acceptance
     cases = [c for c in (a.cases.split(",") if a.cases else acceptance.CASES) if c]
-    levels = [lv for lv in (a.levels.split(",") if a.levels else acceptance.LEVELS) if lv]
+    # --levels with an empty value: no level check (only the cases); without --levels: all three.
+    levels = list(acceptance.LEVELS) if a.levels is None else [lv for lv in a.levels.split(",") if lv.strip()]
     heads = []
     for repo in (cfg.repo, cfg.repo / "thirdparty" / "skylanders-portal"):
         r = subprocess.run(["git", "-C", str(repo), "log", "-1", "--format=%h %s"], capture_output=True, text=True,
@@ -8276,6 +8370,7 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     if getattr(a, "rerun_known_failure", None) is not None and not rerun_why:
         raise SystemExit("--rerun-known-failure needs the reason: why this rerun can end otherwise")
     bulk_on = bool(getattr(a, "bulk", False))
+    cfg.session_settings = bool(getattr(a, "session_settings", False))
     pacing = getattr(a, "bulk_pacing", None)
     if pacing and not bulk_on:
         raise SystemExit("--bulk-pacing goes with --bulk")
@@ -8606,6 +8701,13 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 breaker.record(spec.name, r.folder, r.signature)
                 if (t := breaker.tripped()) is not None:
                     tell_breaker(t)
+            # The owner's session settings: the list's version this case's games ran with (session_applies).
+            if session_applies(cfg, spec):
+                try:
+                    ss = sessions.load(cfg.repo)
+                    r.notes.append(f"session settings {ss.label()}: {len(ss.on)} on every game")
+                except sessions.SessionSettingsError as e:
+                    r.notes.append(f"session settings: {e}")
             # The owner's data (acceptance pass 1): each game of the case ran with its own data folder, and the owner's
             # own games running at the case's end; a game on the owner's data fails the case hard.
             if r.folder and Path(r.folder).is_dir():
@@ -10442,6 +10544,9 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--jobs", type=int, default=None, help="most cases at once (default 1: one after another; with"
                    " --bulk half the bulk budget); their games count against --max-games, and a spec with exclusive"
                    " = true runs alone")
+    t.add_argument("--session-settings", action="store_true", help="every session case (layout server+N) runs with"
+                   " the owner's session settings (tests/session_settings.toml) on every game, unless its spec says"
+                   " session_settings = false; a spec's own value for a name wins")
     t.add_argument("--bulk", action="store_true", help="bulk mode: every game hidden with the draw skip, waitfor"
                    " timeouts scaled ([defaults] bulk_wait_factor), the budget [defaults] bulk_machine_games;"
                    " specs that cannot run hidden are reported `not in bulk` (docs/testing-guide.md, bulk mode)")
@@ -10524,7 +10629,8 @@ def main(argv: list[str] | None = None) -> int:
     ac = sub.add_parser("acceptance", help="the acceptance list on one build: each case once, one session at a time,"
                         " then the level checks with two players, one page (acceptance.py)")
     ac.add_argument("--cases", default=None, help="comma-separated case names instead of the list")
-    ac.add_argument("--levels", default=None, help="comma-separated levels instead of tutorial_a,tutorial_b,ww1")
+    ac.add_argument("--levels", default=None, help="comma-separated levels instead of tutorial_a,tutorial_b,ww1;"
+                    " an empty value (--levels=) runs no level check")
     ac.add_argument("--run-not-ready", action="store_true", help="pass --run-not-ready to every case")
     ac.add_argument("--dry-run", action="store_true", help="print the list and its estimate only, start no game"
                     " (and whether it would wait for the owner's own game)")

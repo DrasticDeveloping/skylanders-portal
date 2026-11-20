@@ -803,6 +803,13 @@ class Case(unittest.TestCase):
             self.assertTrue(pf.setting_on(s.peers["D"].args, setting), setting)
         self.assertEqual(lp.script_settings(["--dev_defeat_commands=true"], d).count("--dev_defeat_commands=true"), 1)
 
+    def test_every_generated_case_runs_with_the_owners_session_settings(self):
+        """2026-11-20: the two-player tutorial_b check ran without them (`hit session off`, a stand-in for the
+        other player): each generated case asks the runner for the list on every game."""
+        for text in (lp.spec_toml(lp.make_plan(content(), d_lobby=True)), lp.spec_toml(lp.make_plan(content())),
+                     lp.spec_from_scripts("madeup", "quit\n", "quit\n")):
+            self.assertIs(self.load(text).session_settings, True)
+
     def test_the_lobby_boot_is_the_owners_order(self):
         """Both clients join in the lobby (D by the join code, H lets it in), then H picks the slot (the
         save's continue, or a new game with --new-slot), the party enters the level together; D stays to the

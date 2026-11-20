@@ -1384,6 +1384,42 @@ quit
         self.assertEqual(len(touched), 1)
         self.assertIn(str(home), touched[0]["folder"])
 
+    def test_the_owners_session_settings_go_on_every_game_of_a_case_that_asks(self) -> None:
+        """2026-11-20: the level checks ran without the owner's session settings. A spec's `session_settings = true`
+        puts the game's list (tests/session_settings.toml) on its games before the spec's own args; the spec's own
+        value for a name wins; a name without its launch_allow row fails the case before any game starts."""
+        lst = self.repo / "tests" / "session_settings.toml"
+        lst.write_text('version = "t1"\n[on]\ndev_x = 3\ny = 4\n', encoding="utf-8")
+        self.spec("sess", 'layout = "solo"\nstage = "0"\nsession_settings = true\n'
+                          '[peer.H]\nargs = ["--y=7"]\nscript = "quit\\n"\n')
+        self.spec("plain", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
+        r = self.run_cases("sess", "plain")
+        by = {c["case"]: c for c in r["cases"]}
+        cmd = by["sess"]["peers"][0]["command"]
+        self.assertIn("--dev_x=3", cmd)
+        self.assertEqual([a for a in cmd if a.startswith("--y=")], ["--y=7"])  # the spec's value, once
+        self.assertTrue(any(n.startswith("session settings t1 (sha256 ") for n in by["sess"]["notes"]), by["sess"]["notes"])
+        self.assertNotIn("--dev_x=3", by["plain"]["peers"][0]["command"])  # not asked, not under --session-settings
+        lst.write_text('version = "t2"\n[on]\nonline_not_a_setting = true\n', encoding="utf-8")
+        r = self.run_cases("sess")
+        case = r["cases"][0]
+        self.assertEqual(case["status"], "error", case["reasons"])
+        self.assertIn("online_not_a_setting: no row in tests/launch_allow.toml", " ".join(case["reasons"]))
+
+    def test_session_settings_under_the_flag_reach_only_session_layouts(self) -> None:
+        cfg = skytest.Config.__new__(skytest.Config)
+        cfg.session_settings = True
+
+        def spec(layout: str, own: bool | None) -> skytest.Spec:
+            return skytest.Spec(name="x", path=Path("x.toml"), layout=layout, stage="0", description="", timeout=1.0,
+                                peers={}, measures={}, standin_seconds=1.0, session_settings=own)
+        self.assertTrue(skytest.session_applies(cfg, spec("server+1", None)))
+        self.assertFalse(skytest.session_applies(cfg, spec("solo", None)))
+        self.assertFalse(skytest.session_applies(cfg, spec("server+2", False)))  # a spec's own false, on purpose
+        cfg.session_settings = False
+        self.assertFalse(skytest.session_applies(cfg, spec("server+1", None)))
+        self.assertTrue(skytest.session_applies(cfg, spec("solo", True)))
+
     def test_the_checkpoint_line(self) -> None:
         self.spec("zero", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
         self.spec("five", 'layout = "server+4"\nstage = "0"\n[peer.all]\n' + self.HUB)

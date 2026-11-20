@@ -3482,6 +3482,13 @@ def _toml_list(items: list[str]) -> str:
     return "[" + ", ".join("'" + i.replace("'", "") + "'" for i in items) + "]"
 
 
+# Every generated case runs with the owner's session settings on every game (the game's tests/session_settings.toml,
+# put on by the runner: skytest.py session_args): the first acceptance pass's tutorial_b check ran without them
+# (`hit session off`, a stand-in for the other player) and tested another game than the owner plays. The level
+# pass's own settings (H_ARGS, D_ARGS, --game-arg) are test-only and come on top; a --game-arg wins.
+SESSION_LINE = "session_settings = true"
+
+
 def case_name(level: str, no_end: bool = False) -> str:
     """The generated case's name: a --no-end pass is its own case (its runs and results apart)."""
     return f"levelpass-{level}" + ("-no-end" if no_end else "")
@@ -3493,7 +3500,7 @@ def spec_from_scripts(level: str, h: str, d: str | None, d_args: list[str] | Non
     (when given) starts at H's LEVELPASS late-join start mark."""
     out = [f'name = "{name or case_name(level)}"', f'layout = "{"server+2" if d else "server+1"}"', 'stage = "8"',
            'server = "host"', f'description = "The level pass of {level} (skytest levelpass; generated, not committed)"',
-           f"timeout = {CASE_TIMEOUT_S}", 'scenes = "skip"',
+           f"timeout = {CASE_TIMEOUT_S}", 'scenes = "skip"', SESSION_LINE,
            f"show_server_window = {'false' if server_hidden else 'true'}", 'shader_cache = "snapshot"',
            "", "[peer.H]", f"args = {_toml_list(script_settings(H_ARGS, h))}", "script = '''\n" + h + "'''"]
     if d:
@@ -3525,6 +3532,7 @@ def spec_toml(plan: Plan) -> str:
            f'description = "The automatic level pass of {plan.level}{" without its end (--no-end)" if plan.no_end else ""}'
            ' (skytest levelpass; generated, not committed)"',
            f"timeout = {int(CASE_TIMEOUT_S + plan.scene_extra_s + plan.required_s)}",
+           SESSION_LINE,
            *(['scenes = "play"', 'scenes_reason = "the level check grades the cutscenes, played in full on both clients"']
              if plan.scenes else ['scenes = "skip"']),
            f"show_server_window = {'false' if plan.server_hidden else 'true'}",
