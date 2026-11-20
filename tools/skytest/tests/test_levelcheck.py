@@ -928,6 +928,52 @@ class AuthorsFinalLines(unittest.TestCase):
         self.assertTrue(any("touched by NinjaStealthElf#3800 (elements life/none, the lock wants Life)" in f.what
                             for f in v.findings), [f.what for f in v.findings])
 
+    @unittest.skipUnless(LP.is_dir(), "the level data is not here")
+    def test_an_unnamed_elemental_gate_is_read_by_its_authored_index_batch_18d(self) -> None:
+        # Run 20261120-064619 element-gate-tb, its lines: the Life gate (tutorial_b_zone_elemental_02, authored 1635 =
+        # row a00000000.0629f659.00010663) opened on S, H and D; no game names it LockedElementalGate#<id>.
+        data = lc.level_data(self.LP, "tutorial_b")
+        ref = "a00000000.0629f659.00010663@2"
+        s = [(39.882, f"Online: world 2 {ref} written"),
+             (52.059, "Online: backend gate.open run b82aa6f0 key 1/1/2/25"),
+             (52.094, f"Online: world 2 {ref} written"),
+             (52.167, "Online: backend gate.open applied b82aa6f0 key 1/1/2/25")]
+        h = H_JOIN + [(40, "Online: authored obj 0629f659 1 1635 class 1f2e3d4c entity 1 name 811c9dc5 name0 811c9dc5 "
+                           "mid 806 state registered flags 28000000 act 1 pos 8527.10 9221.20 1606.90 text -"),
+                      (49.148, "Online: elemental gate b82aa6f0 single lock: element(s) Life, unlock radius 300"),
+                      (49.149, "Online: hero Hero_shaman#2096 elements Life/None"),
+                      (49.150, "Online: elemental gate b82aa6f0 touched by Hero_shaman#2096: sides approach/approach: no "
+                               "unlock"),
+                      (51.021, f"Online: backend key gate {ref} watched b82aa6f0 (locked Scripts.ElementalLock=2)"),
+                      (51.157, "Online: elemental gate b82aa6f0 touched by Hero_shaman#2096: sides completed/completed: "
+                               "unlocks"),
+                      (52.041, f"Online: backend key gate {ref} watched b82aa6f0 (unlocked Scripts.ElementalLock=3)")]
+        d = D_JOIN + [(40, "Online: authored obj 0629f659 1 1635 class 1f2e3d4c entity 1 name 811c9dc5 name0 811c9dc5 "
+                           "mid 83b state registered flags 28000000 act 1 pos 8527.10 9221.20 1606.90 text -"),
+                      (52.136, "Online: world gate ?#2107 open apply: 1 lock(s) set UnLocked first (locked "
+                               "Scripts.ElementalLock=1)")]
+        v = lc.grade_gate_kinds(lc.load_run(RunFolder(s, h, d).path), data)
+        self.assertEqual([f.what for f in v.findings], [])  # the latest touch unlocks; opened on all three
+        self.assertIn("1 opened", v.counts)
+        self.assertIn("gate elements read: b82aa6f0 single Life", v.counts)
+        # 2429afb4's label (`?#<id>`) on the element lines: the same.
+        h2 = [(a, b.replace("b82aa6f0 single", "?#2054 single").replace("gate b82aa6f0 touched", "gate ?#2054 touched"))
+              for a, b in h]
+        v2 = lc.grade_gate_kinds(lc.load_run(RunFolder(s, h2, d).path), data)
+        self.assertEqual([f.what for f in v2.findings], [])
+        self.assertIn("1 opened", v2.counts)
+        # Nothing opened, a hero stood there, S knows the row (written once): opened on no game; with no line for the
+        # gate anywhere: cannot decide, never "opened on no game".
+        pose = [(30, "Online: puppet 1 for peer 1 spawned at 0,0,0 (generation 2)"),
+                (49.0, "Online: puppet 1 pose 9 at 8527.0,9221.0,1606.0 client at 8527.0,9221.0,1606.0 off 0 age 1 ms")]
+        shut = lc.grade_gate_kinds(lc.load_run(RunFolder(sorted([s[0], *pose]), H_JOIN, D_JOIN).path), data)
+        self.assertTrue(any("opened on no game (closed on S" in f.what for f in shut.findings),
+                        [f.what for f in shut.findings])
+        blind = lc.grade_gate_kinds(lc.load_run(RunFolder(pose, H_JOIN, D_JOIN).path), data)
+        self.assertEqual(blind.findings, [])
+        self.assertIn("CANNOT DECIDE: LockedElementalGate tutorial_b_zone_elemental_02 (single element) [authored 1635]",
+                      blind.counts)
+
     def test_look_boxes_effects_and_conversation_ends_against_s(self) -> None:
         # online/6-owner-session3-scenes 2e901d2d
         s = [(10, "Online: level look box 1a2b3c4d #2 at (1, 2, 3) state 1 -> 0 at shared tick 600 (S's look)"),
@@ -1005,10 +1051,41 @@ class WorldEvents(unittest.TestCase):
                            "draw 1: 1 of 0..5 (the game drew 1)")]
         v = lc.grade_world_events(lc.load_run(RunFolder(s, h, sorted(d)).path), data)
         self.assertEqual(v.status, lc.FAIL)
+        # Batch 18d: a client's missing `applied here` is no fault (a copy already in S's state writes none): the gate
+        # is "cannot decide" on D; the differing draw is the finding.
         self.assertEqual([f.what.split(" at ")[0] for f in v.findings], [
-            "TutorialLockedGate gate by the level on S", "place draw FoxenMale Scripts.MaterialOverrideComponent.ApplyOverrides component 0 draw 1 differs: S 3, H 3, D 1"])
-        self.assertIn("not applied on D", v.findings[0].what)
-        self.assertIn("3 world event(s), 2 applied on every game (1 later, at a copy's wake)", v.counts)
+            "place draw FoxenMale Scripts.MaterialOverrideComponent.ApplyOverrides component 0 draw 1 differs: S 3, H 3, D 1"])
+        self.assertIn("3 world event(s), 2 applied on every game (1 later, at a copy's wake), 1 cannot decide", v.counts)
+        self.assertIn("TutorialLockedGate gate at", v.counts)
+
+    @unittest.skipUnless(LP.is_dir(), "the level data is not here")
+    def test_level_start_events_and_removed_cages_batch_18d(self) -> None:
+        # Run 20261120-064438 world-event-cage-tb, its lines: S's level-start events at 53.399, before H's and D's
+        # `level 2: loaded here` (.423, .435); the cages S removed by death, D's `world breakable ... killed (live)`.
+        data = lc.level_data(self.LP, "tutorial_b")
+        s = [(53.399, "Online: world event CEntityData#3222 component 2 by the level (state as placed -> disabled (count 0))"),
+             (53.399, "Online: world event TrappingPit_DynamicClip#2450 clip wall by the level (state as placed -> off)"),
+             (63.349, "Online: world event A2_HangCage_03#3840 removed by the level (state present -> removed by death)"),
+             (63.763, "Online: world event A2_CageStep_Hanging#3837 moved by the level (state moving -> still at (4311, "
+                      "6931, 750))")]
+        h = H_JOIN + [(40, "Online: level 2 tutorial/tutorial_b/tutorial_b: load"), (53.423, "Online: level 2: loaded here")]
+        d = D_JOIN + [(40, "Online: level 2 tutorial/tutorial_b/tutorial_b: load"), (53.435, "Online: level 2: loaded here"),
+                      (63.398, "Online: world breakable A2_HangCage_03#3872 killed (live)"),
+                      (63.890, "Online: world event A2_CageStep_Hanging#3895 moved applied here (state still at (4311, "
+                               "6931, 750))")]
+        v = lc.grade_world_events(lc.load_run(RunFolder(s, sorted(h), sorted(d)).path), data)
+        self.assertEqual(v.findings, [])
+        self.assertEqual(v.status, lc.NOT_TESTED)  # no event applied on every game here: nothing passed
+        self.assertIn("4 world event(s), 0 applied on every game (0 later, at a copy's wake), 4 cannot decide (2 at a "
+                      "client's level load)", v.counts)
+        self.assertIn("A2_HangCage_03 removed at", v.counts)
+        self.assertIn("cannot decide on H (no line", v.counts)
+        self.assertNotIn("cannot decide on H (no line: its copy may have made the change itself), D", v.counts)
+        # A client's apply of another state stays a fault.
+        d2 = d + [(63.95, "Online: world event TrappingPit_DynamicClip#2499 clip wall applied here (state on)")]
+        s2 = s + [(63.90, "Online: world event TrappingPit_DynamicClip#2450 clip wall by the level (state on -> off)")]
+        v2 = lc.grade_world_events(lc.load_run(RunFolder(sorted(s2), sorted(h), sorted(d2)).path), data)
+        self.assertTrue(any("D applied state on, not off" in f.what for f in v2.findings), [f.what for f in v2.findings])
 
     @unittest.skipUnless(OWNER_3.is_dir() and LP.is_dir(), "the owner's third session or the level data is not here")
     def test_the_owners_third_session_predates_the_lines(self) -> None:
