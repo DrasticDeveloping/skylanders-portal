@@ -1026,6 +1026,19 @@ class RequiredStepsPlan(unittest.TestCase):
     def plan(self, level: str, **kw):
         return lp.make_plan(lp.load_content(LEVELPASS_DATA, level), d_lobby=True, **kw)
 
+    def test_the_late_joiner_waits_for_its_arrival(self) -> None:
+        # W30: the late joiner is placed only after its arrival move is over, where the build has the condition.
+        old = lp.ARRIVAL_DONE
+        self.addCleanup(setattr, lp, "ARRIVAL_DONE", old)
+        p = lp.make_plan(lp.load_content(LEVELPASS_DATA, "tutorial_b"), d_lobby=False)
+        lp.ARRIVAL_DONE = True
+        d = lp.script_d(p).splitlines()
+        k = d.index("waitfor online_barrier 300")
+        self.assertEqual(d[k + 1], lp.ARRIVAL_WAIT)
+        self.assertLess(k + 1, min(i for i, l in enumerate(d) if l.startswith("goto_entity ")))
+        lp.ARRIVAL_DONE = False
+        self.assertNotIn(lp.ARRIVAL_WAIT, lp.script_d(p))
+
     def test_tutorial_b_carries_both_keys(self) -> None:
         p = self.plan("tutorial_b")
         self.assertEqual([(r.kind, r.why_not) for r in p.required], [("key gate", ""), ("key gate", "")])

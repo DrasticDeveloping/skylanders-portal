@@ -409,6 +409,15 @@ OUTLIER_FLOOR = 8000.0
 FIGHT, ATTACK, INTERACT_A, PICKUP, ENTER, TALK, EXIT_A, VISIT = (
     "fight", "attack", "interact", "pickup", "enter", "talk", "exit", "visit")
 LAUNCH = "launch"
+# W30: a late joiner's first level of the session moves it to the host once the level start releases it (the game's
+# arrival move); D is placed only after `online_arrival_done` (made, dropped or not needed). On when the build lists
+# the condition (skytest sets it from the checkout's command table); otherwise the line is left out, as before.
+ARRIVAL_DONE = False
+ARRIVAL_WAIT = "waitfor online_arrival_done 120"
+
+
+def arrival_lines() -> list[str]:
+    return [ARRIVAL_WAIT] if ARRIVAL_DONE else []
 # W27b: a launch pad microgame from the level's data (Scripts.MicrogameComponentData with a button and a press count,
 # Scripts.LaunchPathComponentData, a SuccessTelegrams' LaunchPathComponentMessage with AddPlayers): pressed and ridden
 # (`interact`, then `launch_pad`: the presses and the ride to its landing); every player is carried by the game's own
@@ -1854,7 +1863,7 @@ def party_boot_d(figures: list[str] | None = None) -> list[str]:
     level as soon as it is in play there, before that level's start is released (D_MARK_BEFORE_BARRIER)."""
     return ["waitfor online_title 300", "waitfor title_ready 240", *place_lines(figures or [FIGURE_D]),
             "online_join {joincode}", "waitfor online_in_play 300", "online_mark_level", "waitfor online_barrier 300",
-            "wait_free 120"]
+            *arrival_lines(), "wait_free 120"]
 
 
 # D's mark of its first level (the pick's) and H's `level` command raced: the barrier of the first level releases
@@ -2547,8 +2556,8 @@ def script_d(plan: Plan) -> str:
         lines += ["log LEVELPASS D done", "online_end", "quit"]
         return "\n".join(lines) + "\n"
     lines = boot_lines(False, plan.figures_d or [FIGURE_D])
-    lines += ["waitfor online_in_play 300", "online_join {join}", "waitfor online_barrier 300", "wait_free 120",
-              "online_mark_level", f"hold_cap {HOLD_CAP_S}",
+    lines += ["waitfor online_in_play 300", "online_join {join}", "waitfor online_barrier 300", *arrival_lines(),
+              "wait_free 120", "online_mark_level", f"hold_cap {HOLD_CAP_S}",
               "log LEVELPASS D in", "online_audit d-in"]
     acted = [s for s in plan.stops if s.actions and s is not plan.exit_stop and visit_ref(s)
              and reachable(visit_obj(s), [])]

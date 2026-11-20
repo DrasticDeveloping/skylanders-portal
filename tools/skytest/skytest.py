@@ -9600,6 +9600,9 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         raise SystemExit("levelpass: --no-end is for the generated pass, not --predictions")
     # W27b: the launch pads ridden only with the build's launch_pad and without --no-launch-rides.
     lp.LAUNCH_RIDES = launch_pad_known(cfg) and not getattr(a, "no_launch_rides", False)
+    # W30: the late joiner waits for its arrival move before it is placed, where the build has the condition.
+    conds = table_conditions(cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml"))
+    lp.ARRIVAL_DONE = conds is not None and "online_arrival_done" in conds
     plan = lp.make_plan(content, full=a.full, late_join=not a.no_late_join, provoke=a.provoke or "",
                         no_end=a.no_end, d_stays=not a.d_leaves_before_end,
                         d_lobby=not getattr(a, "d_joins_late", False), new_slot=getattr(a, "new_slot", False),
