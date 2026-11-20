@@ -9554,6 +9554,15 @@ def lock_commands_known(cfg: Config) -> bool:
         "lock_ready" in table.conditions
 
 
+def setting_known(cfg: Config, name: str) -> bool:
+    """The checkout's launch allow list (tests/launch_allow.toml) has a row for the setting `name`."""
+    try:
+        return name in (tomllib.loads((cfg.repo / "tests" / "launch_allow.toml").read_text(encoding="utf-8"))
+                        .get("settings") or {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+
+
 def command_known(cfg: Config, name: str) -> bool:
     """The game registers the script command `name` (the checkout's tests/script_commands.toml)."""
     import launch_args as la
@@ -9695,8 +9704,13 @@ def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
         plan.game_args = [lp.check_game_arg(g) for g in (a.game_arg or [])]
         # W31: a level with run-time movers (Cascade Glade's islands) runs with the islands shared, unless the pass
         # names the setting itself (--game-arg=--online_island_spawns=false keeps each game's own).
-        if plan.pieces and not any(g.startswith("--online_island_spawns=") for g in plan.game_args):
+        if plan.pieces and not a.predictions and not any(g.startswith("--online_island_spawns=") for g in plan.game_args):
             plan.game_args.append(lp.PIECES_SETTING)
+        # W36: a level with a launch pad microgame relays its ride to every player's game, where the build knows
+        # online_launch_relay (the checkout's tests/launch_allow.toml), unless the pass names the setting itself.
+        if (lp.launch_pads(content.manifest) and not a.predictions and setting_known(cfg, "online_launch_relay")
+                and not any(g.startswith("--online_launch_relay=") for g in plan.game_args)):
+            plan.game_args.append(lp.LAUNCH_RELAY_SETTING)
     except ValueError as e:
         raise SystemExit(f"levelpass: {e}") from None
     if plan.game_args and a.predictions:

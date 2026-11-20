@@ -5,6 +5,7 @@ Run: python -I -m unittest discover -s tools/skytest/tests -p "test_levelcheck.p
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 import tempfile
@@ -330,6 +331,18 @@ class FightGates(unittest.TestCase):
         self.assertTrue(whats[0].startswith("TutorialBattleGate_01 wave 3 (EA_Manager_W1_B_componentDataOverrides"), whats)
         self.assertIn("never complete on S", whats[0])
         self.assertIn("wave 1 (EA_Manager_W1): complete on S ", v.counts)
+
+
+class LaunchRelayHead(unittest.TestCase):
+    def test_the_head_says_whether_the_ride_was_relayed(self) -> None:
+        f = RunFolder([], H_JOIN, D_JOIN)
+        res = {"peers": [{"peer": "H", "command": ["x.exe", "--online_launch_relay=true"]}]}
+        (f.path / "result.json").write_text(json.dumps(res), encoding="utf-8")
+        self.assertEqual(lc.launch_relay_head(f.path), ["launch pad relay: on (online_launch_relay; off: a ride carries "
+                                                        "the presser only)"])
+        res["peers"][0]["command"] = ["x.exe"]
+        (f.path / "result.json").write_text(json.dumps(res), encoding="utf-8")
+        self.assertTrue(lc.launch_relay_head(f.path)[0].startswith("launch pad relay: off"))
 
 class Windows(unittest.TestCase):
     def test_a_clients_time_in_each_level(self) -> None:
