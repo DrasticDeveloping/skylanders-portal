@@ -152,6 +152,7 @@ SYNTHETIC = ["h1", "h2"]
 SYNTHETIC_START_AFTER = r"Online: the server is in its hub"
 SYNTHETIC_CONNECTED = re.compile(r"Online: synthetic peer (\d+) connected")
 SYNTHETIC_FATAL = [r"Online: synthetic peer (could not connect|script |refused|leaves: no player records)"]
+LEFTOVER_SETTLE_S = 3.0   # a job's count of an ended process settles within this (see run_case)
 SYNTHETIC_EXIT_GRACE = 20.0
 SYNTHETIC_ARG_PLACEHOLDERS = ("{port}", "{script}", "{digest}", "{server}", "{peer}")
 SYNTHETIC_KEYS = ("script", "start_after", "start_peer", "expect", "forbid", "expect_count", "expect_order")
@@ -182,6 +183,16 @@ GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_t
 # (levelcheck.py): a row's FAIL fails the case with the row's findings as the reason; `must_test = true` fails a row
 # that says NOT TESTED too (a spec written to show it). LEVEL_CHECK_ROWS: the rows a spec may name.
 LEVEL_CHECK_ROWS = ("enemies hurt players", "other player's moves", "fight gates")
+
+
+def server_stall_reasons(folder: Path) -> list[str]:
+    """W37: the hard rule on every run with a server log (levelcheck.server_stalled), as a case's reasons."""
+    import levelcheck as lc
+    try:
+        fs = lc.server_hard_findings(lc.load_run(folder))
+    except (OSError, ValueError):
+        return []
+    return [f"{f.what}: " + "; ".join(f.lines) for f in fs]
 
 
 def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None) -> list[str]:
@@ -5244,7 +5255,14 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                         pass
                 results[sn].exit_code = sp.returncode
                 results[sn].seconds = round(time.monotonic() - syn_started[sn], 1)
+            # A process whose wait returned can still be counted by its job for a moment while Windows tears it
+            # down (8 test chunks at once: the fail-fast test saw 1 for an S stand-in the runner had just ended and
+            # waited for): the count settles for up to LEFTOVER_SETTLE_S before it is a leftover.
+            settle_until = time.monotonic() + LEFTOVER_SETTLE_S
             res.leftover_processes = job.active()
+            while res.leftover_processes and time.monotonic() < settle_until:
+                time.sleep(0.1)
+                res.leftover_processes = job.active()
             if res.leftover_processes:
                 job.terminate()
             for n, hold in holds:  # every game ended: each token is free, its outcome known
@@ -8226,6 +8244,13 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 breaker.record(spec.name, r.folder, r.signature)
                 if (t := breaker.tripped()) is not None:
                     tell_breaker(t)
+            # W37: every case with a server log: S's game must not have stopped while its frames went on with a client
+            # connected (levelcheck.server_stalled).
+            if r.folder and Path(r.folder).is_dir():
+                for why in server_stall_reasons(Path(r.folder)):
+                    r.reasons.append(why)
+                    if r.status == "pass":
+                        r.status = "fail"
             # W34: the spec's level check rows ([grade.level_check]) on the finished run.
             if "level_check" in spec.grades and r.folder and Path(r.folder).is_dir():
                 for why in level_check_reasons(Path(r.folder), spec.grades["level_check"],

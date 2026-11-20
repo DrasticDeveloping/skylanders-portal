@@ -723,6 +723,7 @@ class Stop:
     cluster: Cluster
     actions: list[Action]
     visit_only: list[tuple[Obj, str]]
+    level_starts_fight: bool = False  # W37: a silent trigger's enter dropped: the fight waits for the level's own start
 
 
 @dataclass
@@ -815,6 +816,18 @@ def estimate_seconds(stops: list[Stop], late_join: bool, end: bool = True) -> fl
     if late_join:
         t += LATE_JOIN_S
     return t
+
+
+def silent_triggers(content: Content) -> set[str]:
+    """W37: the triggers (a trigger volume's object: CScriptTriggerEntity) that send nothing in the level's logic."""
+    if not content.logic:
+        return set()
+    senders = {str(e.get("from")) for e in content.logic.get("edges", []) or [] if isinstance(e, dict)}
+    return {obj_key(o) for o in content.objects
+            if o.cls == "CScriptTriggerEntity" and obj_key(o) not in senders}
+
+
+LEVEL_FIGHT_WAIT_S = 90   # W37: a fight the level's own timeline starts (tutorial_a's: 31 s after StartTunnel)
 
 
 def make_plan(content: Content, full: bool = False, late_join: bool = True, budget_s: float = BUDGET_S,
@@ -1105,6 +1118,22 @@ def _make_plan(content: Content, full: bool, late_join: bool, budget_s: float, s
     # sweep_share): a plan the estimate fits is a sweep its deadline does not cut (before, the estimate kept
     # EXIT_S and the deadline the exit's own timeouts: every tutorial_b pass of 18 November had a step
     # skipped at the deadline).
+    # W37: a trigger that sends nothing in the level's logic is not entered: entering it changes nothing the logic
+    # knows, and such triggers can hang in the air (tutorial_a's chompy intro trigger auth:tutorial_a:1775: no ground
+    # within 1,728, refused by the route's ground check since W31). tutorial_a's ship fight is started by the level's
+    # own timeline (its event manager: StartTunnel, then the chompy intro 31 s later), so a stop that loses such an
+    # enter and has a fight waits for the level's spawns (`waitfor online_enemy_bound`) before it fights.
+    silent = silent_triggers(content)
+    dropped_enters: list[str] = []
+    for s in stops:
+        keep = [a for a in s.actions if not (a.action == ENTER and obj_key(a.obj) in silent)]
+        if len(keep) != len(s.actions):
+            dropped_enters += [f"{a.obj.name} ({a.obj.ref or '-'})" for a in s.actions if a not in keep]
+            s.actions = keep
+            s.level_starts_fight = any(a.action == FIGHT for a in keep)
+    if dropped_enters:
+        left_out.append(f"{len(dropped_enters)} trigger(s) not entered: they send nothing in the level's logic "
+                        f"(a fight after them waits for the level's own spawns): {', '.join(dropped_enters)}")
     pieces, pieces_s = plan_pieces(content, set(end.keys() | set(end.path_keys)) if end is not None else set(),
                                    left_out)
     required = plan_required(content, holds, set(end.keys() | set(end.path_keys)) if end is not None else set(),
@@ -2540,7 +2569,12 @@ def stop_lines(s: Stop, cap: int = 0, long_pause: tuple[str, int] | None = None)
         out.append(f"goto_entity {ref}")
         out += dismiss_after(visit_obj(s))
     out.append(f"online_audit {s.label}")
+    waited = False
     for k, a in enumerate(s.actions):
+        if s.level_starts_fight and a.action == FIGHT and not waited:
+            out += [f"log LEVELPASS wait {s.label}: the level's own timeline starts this fight (no trigger of the logic "
+                    "does)", f"waitfor online_enemy_bound {LEVEL_FIGHT_WAIT_S}"]
+            waited = True
         lp_s = long_pause[1] if long_pause is not None and long_pause[0] == f"{s.label}_{k + 1}" else 0
         out += action_lines(a, f"{s.label}_{k + 1}", after=ref if k == 0 else "", cap=cap, long_pause=lp_s)
     if s.actions:
