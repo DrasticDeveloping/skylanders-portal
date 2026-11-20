@@ -162,6 +162,12 @@ def holds_of(logic: dict | None, disabled: list[tuple[str, str, str, tuple | Non
 SPARK = re.compile(r"MazeMinigame|LockPick", re.I)
 KEY_DATA = re.compile(r"KeyData: (\S+?)[,}]")
 SPARK_LOCK, BATTLE_GATE, KEY_GATE, PUZZLE_GATE = "Spark Lock", "battle gate", "key gate", "puzzle gate"
+# W34: an arena gate starts open and its fight shuts it (tutorial_b's TutorialBattleGate_01: StartsOpen, opened by the
+# encounter acts of EA_Manager_W1, EA_Manager_W1_B and W1_B's nested manager). It was "not counted", so no level check
+# ever fought it, and the owner was locked in when S's copy of the fight never ended (19 November). Now a fight gate
+# like a battle gate: required when its fight is in the logic.
+ARENA_GATE = "arena gate"
+FIGHT_GATES = (BATTLE_GATE, ARENA_GATE)
 
 
 @dataclass
@@ -181,9 +187,27 @@ FIGHT_GROUPS = ("enemy", "encounter")
 
 def fighters_into(gate_key: str, nodes: dict[str, le.Node], tels: list[le.Telegram]) -> list[str]:
     """The enemies and encounter managers whose telegrams reach the gate itself (its own node, not a namesake):
-    the fight that opens it."""
-    return sorted({t.sender for t in tels if t.receiver == gate_key and t.sender != gate_key and t.sender in nodes
-                   and nodes[t.sender].group in FIGHT_GROUPS})
+    the fight that opens it; W34: with the encounter managers whose own encounter act starts one of them, upstream
+    first (tutorial_b's arena: EA_Manager_W1 and EA_Manager_W1_B act on W1_B's nested manager, which acts on the
+    gate: the nested one runs only after the other two ended)."""
+    direct = sorted({t.sender for t in tels if t.receiver == gate_key and t.sender != gate_key and t.sender in nodes
+                     and nodes[t.sender].group in FIGHT_GROUPS})
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def upstream(k: str, depth: int) -> None:
+        if k in seen or depth > 6:
+            return
+        seen.add(k)
+        if nodes[k].group == "encounter":
+            for u in sorted({t.sender for t in tels if t.receiver == k and t.sender != k and t.sender in nodes
+                             and nodes[t.sender].group == "encounter" and "encounter" in str(t.when)}):
+                upstream(u, depth + 1)
+        out.append(k)
+
+    for k in direct:
+        upstream(k, 0)
+    return out
 
 
 def required_gates(manifest: dict, logic: dict | None, level: str) -> list[Gate]:
@@ -213,7 +237,13 @@ def required_gates(manifest: dict, logic: dict | None, level: str) -> list[Gate]
         elif unit in elemental_units:
             out.append(Gate(name, unit, f"behind an elemental gate (its unit {unit})", False, "", pos))
         elif "StartsOpen: true" in lock:
-            out.append(Gate(name, unit, "an arena gate that starts open (a fight closes it)", False, "", pos))
+            fighters = fighters_into(f"{unit}.{name}", nodes, tels)
+            if fighters:
+                out.append(Gate(name, unit, ARENA_GATE, True, "win its fight (" + ", ".join(
+                    nodes[k].name for k in fighters[:4]) + ")", pos, openers=fighters))
+            else:
+                out.append(Gate(name, unit, "an arena gate that starts open (no fight in the logic opens it)", False,
+                                "", pos))
         elif "KeyLockData" in lock:
             k = KEY_DATA.search(lock)
             out.append(Gate(name, unit, KEY_GATE, True, f"fetch its key {k.group(1) if k else '?'}", pos,

@@ -138,7 +138,11 @@ class Calibration(unittest.TestCase):
         self.assertTrue(hs["tutorial_b_encounter_a.Ambi_Chompy_03"].ambient)
         self.assertEqual(sum(1 for t in logic["edges"] if t.get("message") == lh.RELEASE), 21)
         req = [(g.name, g.opener) for g in lh.required_gates(manifest, logic, "tutorial_b") if g.required]
-        self.assertEqual(req, [("TutorialLockedGate", "fetch its key LockedDoorKey_Intro"),
+        # W34: the arena gate is required: its fight's three managers, upstream first.
+        self.assertEqual(req, [("TutorialBattleGate_01", "win its fight (EA_Manager_W1, EA_Manager_W1_B, EA_Manager_W1_B_"
+                                "componentDataOverrides_archetype_CEncounterManagerComponentData_encounterActTargets_0_"
+                                "targetToActOn)"),
+                               ("TutorialLockedGate", "fetch its key LockedDoorKey_Intro"),
                                ("TutorialLockedGate", "fetch its key LockedDoorKey_2")])
 
     def test_tutorial_a_has_no_gate_and_no_release(self) -> None:

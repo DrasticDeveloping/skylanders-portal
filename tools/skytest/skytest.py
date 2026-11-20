@@ -176,7 +176,26 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
 GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
           "symmetry", "route", "bandwidth", "remote_swap", "exclusive", "occurrence_outcomes",
-          "memory_growth", "data_root_untouched") + backend_grades.NAMES
+          "memory_growth", "data_root_untouched", "level_check") + backend_grades.NAMES
+# W34: a spec's [grade.level_check] `rows = [...]` grades its run with those rows of the level check's page
+# (levelcheck.py): a row's FAIL fails the case with the row's findings as the reason; `must_test = true` fails a row
+# that says NOT TESTED too (a spec written to show it). LEVEL_CHECK_ROWS: the rows a spec may name.
+LEVEL_CHECK_ROWS = ("enemies hurt players", "other player's moves")
+
+
+def level_check_reasons(folder: Path, g: dict) -> list[str]:
+    """The reasons the named level check rows give against this run folder (empty: every row passed)."""
+    import levelcheck as lc
+    run = lc.load_run(folder)
+    graders = {"enemies hurt players": lc.grade_player_damage, "other player's moves": lc.grade_moves}
+    out = []
+    for name in g.get("rows", []):
+        v = graders[name](run)
+        if v.status == lc.FAIL:
+            out.append(f"grade level_check {name}: " + "; ".join(f.what for f in v.findings))
+        elif v.status == lc.NOT_TESTED and g.get("must_test"):
+            out.append(f"grade level_check {name}: not tested: {v.counts}")
+    return out
 # The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
 # online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
 # for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
@@ -1418,6 +1437,11 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             continue
         if gname == "save_copy":
             check_save_copy(path.name, g, names, server)
+            continue
+        if gname == "level_check":
+            rows = g.get("rows") if isinstance(g, dict) else None
+            if not isinstance(rows, list) or not rows or any(x not in LEVEL_CHECK_ROWS for x in rows):
+                raise SpecError(f"{path.name}: grade level_check: `rows` names rows of {', '.join(LEVEL_CHECK_ROWS)}")
             continue
         if gname == DATA_ROOT_GRADE:
             check_data_root(path.name, g, names, server)
@@ -4462,7 +4486,7 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
     reasons = []
     for gname, g in spec.grades.items():
         if gname in ("requests_answered", "symmetry", "save_copy", "route", "bandwidth", "remote_swap", "exclusive",
-                     DATA_ROOT_GRADE):
+                     DATA_ROOT_GRADE, "level_check"):
             continue  # graded across peers (grade_cross_peer, grade_save_copy, grade_data_root)
         if g.get("peer", "S" if gname == "server_frame_time" else "H") != r.peer:
             continue
@@ -7744,7 +7768,7 @@ def cmd_levelcheck(cfg: Config, a: argparse.Namespace) -> int:
         if not folder.is_dir():
             raise SystemExit(f"levelcheck: no run folder {folder}")
         verdicts = lc.grade(folder, cfg.repo, levelpass_folder(cfg, getattr(a, "folder", None)))
-        print(lc.page(folder, verdicts, lc.run_head(folder)))
+        print(lc.page(folder, verdicts, lc.run_head(folder, levelpass_folder(cfg, getattr(a, "folder", None)))))
         return levelcheck_exit(lc, verdicts)
     if a.predictions:
         raise SystemExit("levelcheck: --predictions is levelpass's own mode; the check grades the generated pass")
@@ -7758,7 +7782,8 @@ def cmd_levelcheck(cfg: Config, a: argparse.Namespace) -> int:
             print(f"levelcheck {a.level}: no run to grade (levelpass exit {code})", flush=True)
         return code
     verdicts = lc.grade(run, cfg.repo, levelpass_folder(cfg, getattr(a, "folder", None)))
-    head = lc.run_head(run) + [f"level pass report: {a.check.get('report', '-')}"]
+    head = lc.run_head(run, levelpass_folder(cfg, getattr(a, "folder", None))) + [
+        f"level pass report: {a.check.get('report', '-')}"]
     text = lc.page(run, verdicts, head)
     out = levelpass_folder(cfg, getattr(a, "folder", None)) / f"{a.level}-check-{time.strftime('%Y%m%d-%H%M%S')}.txt"
     out.write_text(text + "\n", encoding="utf-8")
@@ -8188,6 +8213,12 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 breaker.record(spec.name, r.folder, r.signature)
                 if (t := breaker.tripped()) is not None:
                     tell_breaker(t)
+            # W34: the spec's level check rows ([grade.level_check]) on the finished run.
+            if "level_check" in spec.grades and r.folder and Path(r.folder).is_dir():
+                for why in level_check_reasons(Path(r.folder), spec.grades["level_check"]):
+                    r.reasons.append(why)
+                    if r.status == "pass":
+                        r.status = "fail"
             # A caller's own verdict of the case (the level pass: W15), decided before the case's status line is
             # printed and its result.json, report.md and results.json are written, so all of them carry one verdict.
             if (case_verdict := getattr(a, "case_verdict", None)) is not None:

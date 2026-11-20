@@ -393,6 +393,36 @@ def slept_before_made(k: "EnemyKey", c: "ClientEnemy | None") -> bool:
             and c.retired_streamed is not None and not (c.bound or c.waits or c.pending or c.skipped or c.seen_dead))
 
 
+# W34: S's enemy writer refused to publish spawns (server/enemy_writer.cpp): `enemy spawn of <id> not published: the
+# new entry is "<name>", not "<expected>"` (tutorial_b's arena: the nested manager's name cut at 96 characters, so its
+# nine spawns were never shared and each client fought its own) and `enemy <Name>#<id> not published as placed: a
+# run-time spawn`. Any of them fails the enemies row in any run, with the managers named (the author's coming [error]
+# line per manager is read the same way: it names `not published`).
+UNPUBLISHED_SPAWN = re.compile(r'Online: enemy spawn of \S+ not published: the new entry is "([^"]*)", not "([^"]*)"')
+UNPUBLISHED_PLACED = re.compile(r"Online: enemy (\S+?)#\d+ not published as placed: a run-time spawn")
+UNPUBLISHED_ANY = re.compile(r"Online: .*\bnot published\b")
+
+
+def unpublished_finding(run: Run) -> "Finding | None":
+    """One finding for every enemy spawn S did not publish, the managers or names it names; None when there is none."""
+    if run.server is None:
+        return None
+    lines = run.server.find(UNPUBLISHED_ANY)
+    if not lines:
+        return None
+    names: list[str] = []
+    for _l, m in run.server.find(UNPUBLISHED_SPAWN):
+        expected = re.sub(r"_actor_\d+$", "", m.group(2)) or m.group(1)
+        if expected not in names:
+            names.append(expected)
+    for _l, m in run.server.find(UNPUBLISHED_PLACED):
+        if m.group(1) not in names:
+            names.append(m.group(1))
+    return Finding(f"S did not publish {len(lines)} enemy spawn line(s) (each client then fights its own copy and S's "
+                   f"stay alive): {', '.join(n[:80] for n in names[:6]) or 'names not read'}",
+                   [line.cite() for line, _m in lines[:6]])
+
+
 def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
     """Every enemy S had, per client: bound there, waiting asleep (its copy asleep far from that player: no
     fault by itself), or never there; and each death S logged: seen on a bound copy, or dead before bind. PASS
@@ -552,6 +582,8 @@ def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
         held_notes.append("gone to sleep on the server before any player's game made it (not graded): " + "; ".join(
             f"{keys[k].name} ({k}): {keys[k].streamed.cite()}" for k in gone_early[:6]))
     findings = fight_findings + findings  # the fights first: the most telling
+    if (unpub := unpublished_finding(run)) is not None:
+        findings.insert(0, unpub)
     if not expected and not findings:
         # Nothing a client should have had (every key set apart, made too late or gone before it came): not a pass.
         return Verdict("enemies", NOT_TESTED, "; ".join(counts) + "; no enemy any client should have had", first,
@@ -1773,8 +1805,9 @@ def grade_player_damage(run: Run) -> Verdict:
                       + (f"; lowest health {lowest:.0f}/{top:.0f}" if lowest is not None and top else "")
                       + (f"; knocked out {len(kos)} time(s), shown the placement screen" if kos else ""))
         if mine and not hits:
-            findings.append(Finding(f"{who}: one-sided: S counted {len(mine)} hit(s) on its puppet and its hero logged "
-                                    "no `hero hit by` at all", [mine[0][0].cite(), absent(log, "`hero hit by`")]))
+            findings.append(Finding(f"{who}: S's enemies attacked the stand-in {len(mine)} times, no attack was played "
+                                    f"here (S refused {len(mine)} hit(s) on peer {peer}'s puppet; no `hero hit by` on "
+                                    f"{who})", [mine[0][0].cite(), absent(log, "`hero hit by`")]))
         if unknown:
             findings.append(Finding(f"{who}: its health fell {len(unknown)} time(s) with `hit by unknown` (no enemy "
                                     "hit of S's within 3 s)", [x.cite() for x in unknown[:4]]))
@@ -1798,8 +1831,8 @@ def grade_player_damage(run: Run) -> Verdict:
         counts.append("shots not tested: no client made a deferred projectile (the bomb throwers' shots are dropped "
                       "on the clients without online/5-replica-deferred-shots)")
     if not any_hit:
-        return Verdict(name, NOT_TESTED, "no player was hit in this run (no `hero hit by` on a client, no hit S counted "
-                       "on a puppet): " + "; ".join(counts))
+        return Verdict(name, NOT_TESTED, "no enemy attacked: S counted no hit on any stand-in and no attack was played "
+                       "on any client (no `hero hit by`): " + "; ".join(counts))
     return Verdict(name, FAIL if findings else PASS, "; ".join(counts), example, findings)
 
 
@@ -2170,9 +2203,11 @@ def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[st
             where[who] = ids[k] if len(ids) > k else None
         missing = [w for w, line in where.items() if line is None]
         trail = key_gate_trail(run, g.name, k) if g.kind == "key gate" else []
-        if g.kind == "battle gate" and where.get("S") is None:
+        if g.kind in ("battle gate", "arena gate") and where.get("S") is None:
             trail.append(battle_gate_left(run, data, g))
+        fight_faults = fight_gate_managers(run, g) if g.kind in ("battle gate", "arena gate") else []
         passed, faults, unchecked = gate_passes(run, g.name, k, where)
+        faults = fight_faults + faults
         walk = ([f"passed on foot by {', '.join(passed)}"] if passed else []) + unchecked
         if missing:
             opened_on = [f"{w} at {when(where[w])}" for w in where if where[w] is not None]
@@ -2187,6 +2222,42 @@ def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[st
                         + "; ".join(f"{w} at {when(line)} {line.cite()}" for w, line in where.items())
                         + ("; " + "; ".join(walk + trail) if walk or trail else ""))
     return shut, done
+
+
+# W34: a fight gate's fight graded on S: each encounter manager that opens it (the data's openers) has its `encounter
+# complete <Name#id>` on S (dev/trigger_tools.cpp; on S with online_sentinel or dev_trigger_commands). One without it
+# is a fault of the gate, named.
+ENCOUNTER_COMPLETE = re.compile(r"Online: encounter complete (\S+)")
+
+
+def fight_gate_managers(run: Run, g) -> list[str]:
+    """The fight's managers with no `encounter complete` on S, in words (empty: every one completed, or no S log)."""
+    if run.server is None:
+        return []
+    done = [m.group(1) for _l, m in run.server.find(ENCOUNTER_COMPLETE)]
+    out = []
+    for k in getattr(g, "openers", []) or []:
+        name = k.split(".")[-1]
+        if "Manager" not in name and "manager" not in name and "_target" not in name:
+            continue  # a placed enemy: its death is in the enemies row
+        if not any(d.split("#")[0][:60] == name[:60] for d in done):
+            out.append(f"its fight's manager {name} never completed on S ({absent(run.server, f'`encounter complete {name[:60]}...`')})")
+    return out
+
+
+def fight_gates_head(run: Run, data: "LevelData | None") -> list[str]:
+    """The page head's count of the level's fight gates the pass fought (W34), and the ones it did not, by name."""
+    if data is None:
+        return []
+    gates = [g for g in data.gates if g.required and g.kind in ("battle gate", "arena gate")]
+    if not gates:
+        return []
+    h = run.clients.get("H")
+    reqs = h.find(REQ_LINE) if h is not None else []
+    fought = [g for g in gates if any(m.group(3) == g.name and not m.group(4) for _l, m in reqs)]
+    missed = [g.name for g in gates if g not in fought]
+    return [f"fight gates: fought {len(fought)} of {len(gates)}"
+            + (f"; NOT TESTED: {', '.join(missed)}" if missed else "")]
 
 
 # W23: each client's walk through the gate (`Dev: pass_gate <Name#id> done (passed on foot: ...)` / `failed (not
@@ -2365,8 +2436,16 @@ def skipped_head(h: Log | None) -> list[str]:
             f"{', '.join(rows)} (a NOT TESTED row among them says so)"]
 
 
-def run_head(folder: Path) -> list[str]:
-    """The page's head from the run's result.json: the case, its status, minutes, build snapshot, runner."""
+def run_head(folder: Path, levelpass: Path | None = None) -> list[str]:
+    """The page's head from the run's result.json: the case, its status, minutes, build snapshot, runner; with the
+    [levelpass] folder also the fight gates fought (W34)."""
+    gates_line: list[str] = []
+    if levelpass is not None:
+        try:
+            run = load_run(folder)
+            gates_line = fight_gates_head(run, level_data(levelpass, run_level(run)))
+        except (OSError, ValueError):
+            gates_line = []
     try:
         r = json.loads((folder / "result.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -2377,6 +2456,7 @@ def run_head(folder: Path) -> list[str]:
             f"{(secs / 60):.1f} min" if isinstance(secs, (int, float)) else f"case {r.get('case', '?')}",
             f"build snapshot {prov.get('build') or '?'}, runner {prov.get('runner') or '?'}",
             *figures_head(folder),
+            *gates_line,
             *invulnerable_head(folder),
             *skipped_head(read_log(folder, "H/game.log", "H")),
             *route_head(folder)]

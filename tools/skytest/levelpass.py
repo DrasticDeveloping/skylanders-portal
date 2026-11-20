@@ -1420,10 +1420,11 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                           "waitfor lock_ready 30", "lock_solve 120", f"online_audit {label}"]
                 step.d = [f"interact {ref} 20", "waitfor lock_ready 30", "lock_solve 120"]
                 step.est_s = REQ_SPARK_S
-        elif g.kind == lh.BATTLE_GATE:
+        elif g.kind in lh.FIGHT_GATES:
             releases: list[str] = []
             blocked: list[str] = []
             fight = ""
+            fights: list[str] = []
             fight_s = gate_fight_seconds(content.manifest, g.openers)
             for k in g.openers:
                 h = holds.get(k)
@@ -1447,10 +1448,14 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                                     releases.append(line)
                                 break
                 ob = by_key.get(k)
-                if not fight and ob is not None and ob.ref:
-                    is_encounter = n is not None and n.group == "encounter"
-                    fight = (f"encounter_clear {ob.ref} 1500 {fight_s} exact" if is_encounter
-                             else f"fight_near {ob.ref} 1500 {fight_s}")
+                is_encounter = n is not None and n.group == "encounter"
+                # W34: every encounter manager of the fight is fought (tutorial_b's arena: three, chained); a gate
+                # opened by placed enemies keeps its one fight_near.
+                if ob is not None and ob.ref and (is_encounter or not fight):
+                    line = (f"encounter_clear {ob.ref} 1500 {fight_s} exact" if is_encounter
+                            else f"fight_near {ob.ref} 1500 {fight_s}")
+                    fights.append(line)
+                    fight = fight or line
                     # W16: an encounter nothing toggles starts when a player comes within its activation radius of
                     # the manager (the data's `activationRadius`): the step goes to the manager first, so
                     # encounter_clear waits there for it to run and fights its spawnees. Batch 12 case 7's r2
@@ -1467,8 +1472,8 @@ def plan_required(content: Content, holds: dict, forbidden: set[str], lock_comma
                 step.why_not = "its enemies are held: " + "; ".join(blocked[:2])
             else:
                 names = ", ".join(_safe(k.split(".")[-1]) for k in g.openers[:4])
-                step.h = [f"{head} (win its fight: {names})", *releases, fight, f"online_audit {label}"]
-                step.est_s = REQ_BATTLE_S + fight_s
+                step.h = [f"{head} (win its fight: {names})", *releases, *fights, f"online_audit {label}"]
+                step.est_s = REQ_BATTLE_S + fight_s * len(fights)
         else:
             step.why_not = f"no rule for a {g.kind} yet ({g.opener})"
     return out

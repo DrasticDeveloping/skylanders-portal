@@ -1063,16 +1063,21 @@ class RequiredStepsPlan(unittest.TestCase):
 
     def test_tutorial_b_carries_both_keys(self) -> None:
         p = self.plan("tutorial_b")
-        self.assertEqual([(r.kind, r.why_not) for r in p.required], [("key gate", ""), ("key gate", "")])
+        self.assertEqual([(r.kind, r.why_not) for r in p.required],
+                         [("arena gate", ""), ("key gate", ""), ("key gate", "")])  # W34: the arena's fight first
+        # W34: the arena gate's three managers, upstream first (W1 and W1_B act on the nested one, which opens it).
+        self.assertEqual([l.split()[1] for l in p.required[0].h if l.startswith("encounter_clear ")],
+                         ["auth:tutorial_b:13926", "auth:tutorial_b:13947", "auth:tutorial_b:13980"])
         h = lp.script_h(p, None).splitlines()
         k = h.index("log LEVELPASS phase required")
         self.assertLess(h.index("sweep_deadline 0"), k)
         # W25: each gate's own key (key_of:<gate>), never a key of the same name by distance.
-        for r in p.required:
+        keys = [r for r in p.required if r.kind == "key gate"]
+        for r in keys:
             self.assertIn(f"pickup key_of:{r.gate_ref} {lp.KEY_PICKUP_S}", h[k:])
         # W10: back to the gate, then the lock nearest the hero there (a bounded nearest: of the lock's own name):
         # the bare name from the pickup's end pressed gate 1's lock for gate 2 (tutorial_b 20261119-065111).
-        for r in p.required:
+        for r in keys:
             press = f"interact nearest:TutorialLockedGate_keylock:{lp.KEY_LOCK_NEAR} {lp.KEY_PRESS_S}"
             i = h.index(f"log LEVELPASS required {r.label} key_gate TutorialLockedGate (fetch its key {r.gate.key_data})")
             self.assertEqual(h[i + 1:i + 6], [f"goto_entity {r.gate_ref}", f"pickup key_of:{r.gate_ref} {lp.KEY_PICKUP_S}",
@@ -1106,11 +1111,12 @@ class RequiredStepsPlan(unittest.TestCase):
         for r in p.required:
             i = h.index(f"online_audit {r.label}")
             self.assertEqual(h[i - 1], f"pass_gate {r.gate_ref} {lp.PASS_DISTANCE} {lp.PASS_H_S} yaw {r.yaw:.4f}")
-        self.assertEqual(p.required[0].yaw, 0.6109)
+        key = next(r for r in p.required if r.kind == "key gate")  # W34: the arena gate comes first now
+        self.assertEqual(key.yaw, 0.6109)
         d = lp.script_d(p).splitlines()
-        j = d.index(f"log LEVELPASS D passes required r1 TutorialLockedGate")
+        j = d.index(f"log LEVELPASS D passes required {key.label} TutorialLockedGate")
         self.assertEqual(d[j + 2], "online_auto_follow off")
-        self.assertTrue(d[j + 3].startswith(f"pass_gate {p.required[0].gate_ref} {lp.PASS_DISTANCE} "))
+        self.assertTrue(d[j + 3].startswith(f"pass_gate {key.gate_ref} {lp.PASS_DISTANCE} "))
         self.assertEqual(d[j + 4], "online_auto_follow on")
         self.assertEqual(lp.position_literals("\n".join(h + d)), [])
         off = self.plan("tutorial_b")  # a build without pass_gate: no walk
@@ -1161,7 +1167,10 @@ class RequiredStepsPlan(unittest.TestCase):
         self.assertLessEqual(free.estimate_s, lp.BUDGET_S)
         self.assertIn(f"log {lp.GATES_SKIPPED}", lp.script_h(free, None).splitlines())
         self.assertIn("; gates not attempted (--no-gates); total 600 s", lp.budget_words(free))
-        self.assertIn(f"gates phase {2 * lp.REQ_KEY_S:.0f} s of its own (2 of 2 required gate(s) performed)",
+        # W34: the arena gate's fight (three managers) and the two keys.
+        arena = gated.required[0]
+        self.assertEqual(arena.kind, "arena gate")
+        self.assertIn(f"gates phase {2 * lp.REQ_KEY_S + arena.est_s:.0f} s of its own (3 of 3 required gate(s) performed)",
                       lp.budget_words(gated))
 
     def test_ww1_fights_its_battle_gates_and_waits_for_the_lock_commands(self) -> None:
@@ -1179,8 +1188,11 @@ class RequiredStepsPlan(unittest.TestCase):
         self.assertEqual(ec.h[2], "encounter_clear auth:ww1:8291 1500 70 exact")  # W18: 6 spawns: 30 + 5 * 6 + 10
         # W18: the three-wave gate (3 placed, 6 and 5 spawns): 30 + 5 * 14 + 10.
         fin = next(r for r in p.required if r.gate.name == "Finale_DemonGate008")
-        self.assertTrue(fin.h[-2].startswith("fight_near ") and fin.h[-2].endswith(" 1500 110"), fin.h)
-        self.assertEqual(fin.est_s, lp.REQ_BATTLE_S + 110)
+        # W34: every manager of the fight is fought (the placed wave by fight_near, then each wave's manager).
+        self.assertEqual([l for l in fin.h if l.startswith(("fight_near ", "encounter_clear "))],
+                         ["fight_near auth:ww1:6561 1500 110", "encounter_clear auth:ww1:6693 1500 110 exact",
+                          "encounter_clear auth:ww1:6722 1500 110 exact"])
+        self.assertEqual(fin.est_s, lp.REQ_BATTLE_S + 3 * 110)
         # W17: no gate step waits for its gate to move (a LockedObjectComponent gate opens in place).
         for r in p.required + self.plan("tutorial_b").required + self.plan("ww1", lock_commands=True).required:
             self.assertFalse([l for l in r.h if l.startswith("wait_moved")], r.h)

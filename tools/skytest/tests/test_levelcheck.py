@@ -259,6 +259,19 @@ class PlayerDamage(unittest.TestCase):
         self.assertEqual([x.what for x in v.findings],
                          ["H: 1 hit(s) S counted on its puppet with no hit on its hero by the same enemy within 1 s"])
 
+
+class Unpublished(unittest.TestCase):
+    def test_the_arena_spawns_s_never_published(self) -> None:
+        # W34: the nested manager's spawns refused by S (its name cut at 96 characters): a finding naming it.
+        s = [(30, 'Online: enemy spawn of a00000a85.0629f659.00001234@2 not published: the new entry is '
+                  '"EA_Manager_W1_B_componentDataOverrides_archetype_CEncounterManagerComponentData_encounterAc", not '
+                  '"EA_Manager_W1_B_componentDataOverrides_archetype_CEncounterManagerComponentData_encounterActTargets_0_'
+                  'targetToActOn_actor_3"')]
+        f = lc.unpublished_finding(lc.load_run(RunFolder(s, H_JOIN, D_JOIN).path))
+        self.assertIsNotNone(f)
+        self.assertTrue(f.what.startswith("S did not publish 1 enemy spawn line(s)"), f.what)
+        self.assertIn("EA_Manager_W1_B_componentDataOverrides", f.what)
+
 class Windows(unittest.TestCase):
     def test_a_clients_time_in_each_level(self) -> None:
         f = RunFolder([], H_JOIN + LEVEL_END, D_JOIN + LEVEL_END)
@@ -715,9 +728,11 @@ class EnemiesCalibration(unittest.TestCase):
         self.assertIn("D: bound 7 of 25, waiting asleep 17 (its copy asleep, far from this player: not a fault by "
                       "itself), never existed here 1; deaths 11: 6 seen on a bound copy, 5 dead before bind", v.counts)
         whats = [x.what for x in v.findings]
-        self.assertEqual(whats[0], "a fight step failed with no damage done: 17 burst(s) at 3085,-534,3746, no hit "
+        # W34: S's unpublished spawns come first, in any run.
+        self.assertTrue(whats[0].startswith("S did not publish "), whats[0])
+        self.assertEqual(whats[1], "a fight step failed with no damage done: 17 burst(s) at 3085,-534,3746, no hit "
                                    "took a hit point")
-        self.assertIn("S's kills by player (`dead by <peer>`): H 11, D 0", v.findings[0].lines)
+        self.assertIn("S's kills by player (`dead by <peer>`): H 11, D 0", v.findings[1].lines)
         self.assertIn("existed on no client: sb7fe49cd.52540001#3/0@2 (BomberSpawner_02_Spawned3#3951)", whats)
         self.assertEqual(v.status, lc.FAIL)
 
@@ -774,7 +789,7 @@ class HeldEnemiesCalibration(unittest.TestCase):
 
     def test_the_aim_run_passes_with_its_scenery_and_holds_listed(self) -> None:
         v = self.grade(TB_AIM)
-        self.assertEqual(v.status, lc.PASS, [x.what for x in v.findings])
+        self.assertEqual([x.what for x in v.findings if not x.what.startswith("S did not publish ")], [])
         self.assertTrue(v.notes[0].startswith("scenery, not counted (the level never releases them): Ambi_Chompy_01,"))
         held = [n for n in v.notes if n.startswith("held, not released in this run: ")]
         self.assertEqual([n.split(": ", 1)[1].split(" (")[0] for n in held], ["Chompy", "Chompy001", "Chompy002", "Chompy003"])
@@ -785,14 +800,16 @@ class HeldEnemiesCalibration(unittest.TestCase):
     @unittest.skipUnless((CALIBRATION_RUNS / "20261119-061110-levelpass-tutorial_b").is_dir(), "batch 11's run is not here")
     def test_batch_11_follow_run_passes_with_its_slept_spawn_apart(self) -> None:
         v = self.grade(CALIBRATION_RUNS / "20261119-061110-levelpass-tutorial_b")
-        self.assertEqual(v.status, lc.PASS, [x.what for x in v.findings])
+        # W34: only S's unpublished spawns fail it (they fail the row in any run).
+        self.assertEqual([x.what for x in v.findings if not x.what.startswith("S did not publish ")], [])
         self.assertIn("D: bound 11 of 11", v.counts)
         self.assertIn("gone to sleep on the server before any player's game made it: 1", v.counts)
 
     def test_033620_fails_only_on_the_bomber_no_client_had(self) -> None:
         v = self.grade(TUTORIAL_B)
-        self.assertEqual([x.what for x in v.findings],
-                         ["existed on no client: sb7fe49cd.52540001#3/0@2 (BomberSpawner_02_Spawned3#3951)"])
+        whats = [x.what for x in v.findings]
+        self.assertTrue(whats[0].startswith("S did not publish "), whats)  # W34: S's unpublished spawns, first
+        self.assertEqual(whats[1:], ["existed on no client: sb7fe49cd.52540001#3/0@2 (BomberSpawner_02_Spawned3#3951)"])
 
 
 PROBE = CALIBRATION_RUNS / "20261119-042921-islands-probe-ww1"
@@ -868,8 +885,11 @@ class KeyGateCalibration(unittest.TestCase):
         shut, done = lc.required_steps(run, lc.level_data(Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass"), "tutorial_b"))
         self.assertEqual(len(done), 1, done)
         self.assertIn("opened on S, H, D: S at 06:54:11.743 ", done[0])  # W17: S's own row of the gate, written again
-        self.assertEqual(len(shut), 1, shut)
-        self.assertIn("the press went to TutorialLockedGate#2607, the gate an earlier step pressed", shut[0])
+        # W34: the arena gate is a required fight gate now; this pass never fought it: named, never silent.
+        self.assertEqual(len(shut), 2, shut)
+        self.assertTrue(shut[0].startswith("TutorialBattleGate_01 (arena gate: win its fight (EA_Manager_W1, "), shut[0])
+        self.assertIn("not performed by this pass", shut[0])
+        self.assertIn("the press went to TutorialLockedGate#2607, the gate an earlier step pressed", shut[1])
 
 
 @unittest.skipUnless((CALIBRATION_RUNS / "20261119-124636-levelpass-ww1").is_dir(), "batch 12's ww1 gates run is not here")
