@@ -1184,9 +1184,10 @@ class GateKinds(unittest.TestCase):
         r = lc.load_run(self.OWNER_3)
         v = lc.grade_gate_kinds(r, lc.level_data(self.LP, lc.run_level(r)))
         # W40: the Swap Zone refusal is the off state there (online_swap_zones off in his session): said, not failed.
+        # A gate finding names the gate's authored index (6dc1c0c: a gate is found by it).
         self.assertEqual([f.what.split(":")[0] for f in v.findings], [
-            "LockedElementalGate tutorial_b_zone_elemental_01 (dual element)",
-            "LockedElementalGate tutorial_b_zone_elemental_02 (single element)"])
+            "LockedElementalGate tutorial_b_zone_elemental_01 (dual element) [authored 2509]",
+            "LockedElementalGate tutorial_b_zone_elemental_02 (single element) [authored 1635]"])
         self.assertIn("refused 1 (Swap Zones off in this run", v.counts)
 
     @unittest.skipUnless(LP.is_dir(), "the level data is not here")
