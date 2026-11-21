@@ -1069,6 +1069,37 @@ bool Replica::Completes(Scope scope, uint64_t at_lsn) const {
   return true;
 }
 
+std::vector<Replica::HeldRow> Replica::HeldRows(TimePoint now, size_t max) const {
+  const Impl& s = *impl_;
+  std::vector<HeldRow> out;
+  const TimePoint world = WorldTime(now);
+  for (const RecordKey& key : s.held) {
+    if (out.size() >= max) break;
+    const auto it = s.queue.find(key);
+    if (it == s.queue.end()) continue;
+    HeldRow h;
+    h.key = key;
+    h.lsn = it->second.rec.lsn;
+    // The rows TryRelease waits for: the same walk, read only.
+    for (KindId dep : s.graph.DepsOf(key.kind)) {
+      for (auto u = s.queue.lower_bound(FirstKeyOf(dep)); u != s.queue.end() && u->first.kind == dep; ++u) {
+        if (u->second.first_lsn > h.lsn || u->second.late) continue;
+        if (h.holders.size() >= max) break;
+        Holder d;
+        d.key = u->first;
+        d.last = u->second.last;
+        d.has_grace = u->second.has_grace;
+        if (u->second.has_grace && world >= u->second.grace_start) {
+          d.unsettled = std::chrono::duration_cast<std::chrono::milliseconds>(world - u->second.grace_start);
+        }
+        h.holders.push_back(d);
+      }
+    }
+    out.push_back(std::move(h));
+  }
+  return out;
+}
+
 size_t Replica::Unsettled() const { return impl_->queue.size(); }
 
 size_t Replica::HandedOut() const {

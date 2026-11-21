@@ -198,7 +198,7 @@ void IdentityMap::OnSpawn(const EntityId& id, Handle h, TimePoint now) {
   e.gone = false;
   if (e.live.size() <= 2) e.since = now;  // became resolved, or became ambiguous
   handles_[h] = id;
-  if (id.form == IdForm::kAuthored) by_mid_[{id.epoch, id.a}] = id;
+  if (id.form == IdForm::kAuthored && id.a != 0) by_mid_[{id.epoch, id.a}] = id;  // mID word 0: no mID
 }
 
 void IdentityMap::OnDespawn(Handle h, bool streamed_out, TimePoint now) {
@@ -264,8 +264,9 @@ IdentityMap::Lookup IdentityMap::Resolve(const EntityId& id) const {
   }
   const auto it = ids_.find(id);
   if (it == ids_.end()) {
-    // Never reported. An authored id whose mID holds a thing with other hashes names nothing here.
-    if (id.form == IdForm::kAuthored) {
+    // Never reported. An authored id whose mID holds a thing with other hashes names nothing here
+    // (mID word 0 names no mID: never probed).
+    if (id.form == IdForm::kAuthored && id.a != 0) {
       if (const auto m = by_mid_.find({id.epoch, id.a}); m != by_mid_.end() && m->second != id) {
         out.resolution = Resolution::kUnresolved;
         return out;

@@ -25,9 +25,12 @@ import launch_args  # noqa: E402
 import remote_agent  # noqa: E402
 import skytest  # noqa: E402
 import winjob  # noqa: E402
+sys.path.insert(0, str(HERE))
+import temp_sweep  # noqa: E402
 
 FAKE = HERE / "fake_game.py"
 _REAL_TOKEN_RESTRICTION = skytest.token_restriction
+_REAL_OWNER_GAMES = skytest.owner_games_running
 
 
 def setUpModule() -> None:
@@ -39,10 +42,24 @@ def setUpModule() -> None:
     # The machine budget's memory check (PS15) reads the real machine's free memory: off here (another
     # program's load must not make a test a capacity result); MachineTest sets it.
     skytest.GB_PER_GAME = 0.0
+    # build_guard.py: a build of this PC holding its slot must not make these cases wait (the guard's own
+    # tests set it); a runner these tests start as a process reads an empty slot folder.
+    skytest.build_holders = lambda: []
+    # preflight_gate.py: the throwaway game has no source or level data to check a spec against.
+    skytest.preflight_check = lambda cfg, spec, cache: []
+    # The suite's own temp folders (temp_sweep.py): last runs' leftovers older than a day go first; this module's
+    # empty slot folder is removed again in tearDownModule.
+    temp_sweep.sweep()
+    os.environ["SFO_BUILD_SLOT_DIR"] = temp_sweep.make("skytest-no-builds-")
+    # The owner's own games on this machine (*recompiled.exe) are not these tests' business: none runs for them
+    # (a real one would excuse an owner-folder change); test_owner_guard.py tests the reader.
+    skytest.owner_games_running = lambda *a, **k: []
 
 
 def tearDownModule() -> None:
+    temp_sweep.remove(os.environ.pop("SFO_BUILD_SLOT_DIR", None))
     skytest.token_restriction = _REAL_TOKEN_RESTRICTION
+    skytest.owner_games_running = _REAL_OWNER_GAMES
 
 
 def toml_str(p: Path | str) -> str:
@@ -96,6 +113,32 @@ reason = "Host names its own server's pipe"
 TEST_COMMANDS = "[commands]\n" + "".join(f'{c} = "none"\n' for c in (
     "hang", "crash", "exit", "nopresent", "fps0", "scribble", "ownerwrite", "serverframes", "online_host",
     "serverlog", "online_join", "savewrite"))
+
+
+class DataDriveTest(unittest.TestCase):
+    """2026-11-20: the store's drive gone (int2's .replication-tests a junction to D:): one plain line, no game."""
+
+    def test_a_store_whose_drive_or_link_target_is_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            here = Path(d) / "store"
+            self.assertEqual(skytest.data_drive_missing(here), "")  # not there yet: made by the runner
+            here.mkdir()
+            self.assertEqual(skytest.data_drive_missing(here), "")
+            free = next((c for c in "QRSTUVWXYZ" if not Path(f"{c}:/").exists()), None)
+            if free:
+                self.assertEqual(skytest.data_drive_missing(Path(f"{free}:/SwapForceOnline-data/tests/x")),
+                                 f"the test data drive is not attached ({Path(f'{free}:/SwapForceOnline-data')})")
+            if os.name == "nt":
+                target = Path(d) / "data" / "tests" / "int2"
+                target.mkdir(parents=True)
+                link = Path(d) / "wt" / ".replication-tests"
+                link.parent.mkdir()
+                r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True)
+                if r.returncode == 0:
+                    self.assertEqual(skytest.data_drive_missing(link), "")
+                    target.rmdir()
+                    self.assertTrue(skytest.data_drive_missing(link).startswith("the test data drive is not attached"))
+                    os.rmdir(link)  # the junction itself, never through it
 
 
 class SkytestTest(unittest.TestCase):
@@ -179,6 +222,31 @@ fps 8
 quit
 """
 '''
+
+    def test_a_callers_verdict_is_the_one_printed_and_written(self) -> None:
+        # W15 (batch 12 case 7): the console printed the runner's PASS while the level pass's verdict and the
+        # case's result.json said INCOMPLETE. A caller's case_verdict decides before the status line and the files.
+        self.spec("lp", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB)
+        seen = []
+
+        def case_verdict(spec, r) -> None:
+            seen.append(r.status)
+            r.status = "incomplete"
+            r.reasons.append("levelpass: incomplete: 10 step(s) skipped at the sweep's deadline")
+
+        a = argparse.Namespace(cases=["lp"], stage=None, max_games=5, case_verdict=case_verdict)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            skytest.cmd_test(self.cfg, a)
+        text = out.getvalue()
+        self.assertEqual(seen, ["pass"])
+        self.assertIn("  INCOMPLETE: levelpass: incomplete: 10 step(s) skipped", text)
+        self.assertNotIn("  PASS", text)
+        report = text.strip().splitlines()[-1].split("report: ", 1)[1]
+        session = json.loads((Path(report).parent / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(session["cases"][0]["status"], "incomplete")
+        own = json.loads((Path(session["cases"][0]["folder"]) / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(own["status"], "incomplete")
+        self.assertIn("| lp | server+1 | 0 | INCOMPLETE |", (Path(report).parent / "report.md").read_text(encoding="utf-8"))
 
     def test_a_layout_runs_every_peer_and_ends_them(self) -> None:
         self.spec("two", 'layout = "server+2"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB +
@@ -641,6 +709,110 @@ quit
         self.assertEqual(skytest.args_sha256(self.cfg, spec), prov["args_sha256"])
         spec.peers["H"].args.append("--dev_x=1")
         self.assertNotEqual(skytest.args_sha256(self.cfg, spec), prov["args_sha256"])
+
+    def test_a_known_failure_is_not_started_again_unless_a_reason_is_given(self) -> None:
+        # known_failures.py: two results on one build with one case content that failed with the same first
+        # reason; the third start is refused (no game, no run folder, exit 3), --rerun-known-failure runs it
+        # and records why. result.json records the build and the case content's hash.
+        self.spec("kf", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB +
+                  'expect = ["never in any log"]\n')
+        first = self.run_cases("kf")
+        second = self.run_cases("kf")
+        for r in (first, second):
+            self.assertEqual(r["cases"][0]["status"], "fail")
+        prov = second["cases"][0]["provenance"]
+        self.assertEqual(len(prov["case_sha256"]), 64)
+        self.assertEqual(prov["build"], Path(second["snapshot"]).name)
+        on_disk = json.loads((Path(second["cases"][0]["folder"]) / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["provenance"]["case_sha256"], prov["case_sha256"])
+        runs_before = sorted((self.cfg.store / "runs").glob("*-kf"))
+        third = self.run_cases("kf")
+        case = third["cases"][0]
+        self.assertEqual(case["status"], "known failure")
+        self.assertEqual(third["exit"], skytest.EXIT_KNOWN_FAILURE)
+        self.assertEqual(case["peers"], [])
+        self.assertIn(first["cases"][0]["folder"], case["reasons"][0])
+        self.assertIn(second["cases"][0]["folder"], case["reasons"][0])
+        self.assertEqual(sorted((self.cfg.store / "runs").glob("*-kf")), runs_before)
+        # The override runs it and says why in the result.
+        a = argparse.Namespace(cases=["kf"], stage=None, max_games=5, rerun_known_failure="the fake game changed")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skytest.cmd_test(self.cfg, a)
+        self.assertEqual(code, 1)
+        self.assertIn("run again (--rerun-known-failure: the fake game changed)", out.getvalue())
+        res = json.loads((sorted((self.cfg.store / "runs").glob("*-kf"))[-1] / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual((res["status"], res["rerun_known_failure"]), ("fail", "the fake game changed"))
+        # An empty reason is refused before anything starts.
+        with self.assertRaises(SystemExit):
+            skytest.cmd_test(self.cfg, argparse.Namespace(cases=["kf"], stage=None, max_games=5,
+                                                          rerun_known_failure="  "))
+        # Another case content (the spec's text) starts again.
+        self.spec("kf", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB +
+                  'expect = ["never in any log either"]\n')
+        self.assertEqual(self.run_cases("kf")["cases"][0]["status"], "fail")
+
+    def test_a_case_waits_for_a_build_then_is_not_started_unless_a_reason_is_given(self) -> None:
+        # build_guard.py: a build slot held past --build-wait-min: `build running`, no game, exit 4;
+        # --ignore-build starts it and the result says why.
+        self.spec("bw", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB)
+        build = {"worktree": "C:/w/x", "recipes": ["build-release"], "pid": 7, "since": "14:00:00"}
+        skytest.build_holders = lambda: [build]
+        try:
+            a = argparse.Namespace(cases=["bw"], stage=None, max_games=5, build_wait_min=0.0001)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = skytest.cmd_test(self.cfg, a)
+            self.assertEqual(code, skytest.EXIT_BUILD_RUNNING)
+            self.assertIn("bw: waits for a build to end (C:/w/x (build-release), pid 7", out.getvalue())
+            self.assertEqual(list((self.cfg.store / "runs").glob("*-bw")), [])
+            a = argparse.Namespace(cases=["bw"], stage=None, max_games=5, ignore_build="a test of the override")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(skytest.cmd_test(self.cfg, a), 0)
+            res = json.loads((sorted((self.cfg.store / "runs").glob("*-bw"))[-1] / "result.json")
+                             .read_text(encoding="utf-8"))
+            self.assertEqual(res["status"], "pass")
+            self.assertIn("--ignore-build: a test of the override", res["ignored_build"])
+        finally:
+            skytest.build_holders = lambda: []
+
+    def test_a_preflight_error_starts_no_game_unless_a_reason_is_given(self) -> None:
+        # preflight_gate.py: an error of the case's preflight: `preflight`, no game, its lines in the result, exit
+        # 6; a warning only: printed and the case runs; --ignore-preflight starts it and the result says why.
+        import preflight
+        self.spec("pf", 'layout = "server+1"\nstage = "0"\nstandin_seconds = 1\n[peer.all]\n' + self.HUB)
+        err = preflight.Problem("error", "pf", "H", "objects", "goto_entity Gem: no run-time name")
+        warn = preflight.Problem("warn", "pf", "H", "lines", "pattern /Foo/ names no literal of the code")
+        seen: list = []
+
+        def fake(cfg, spec, cache):
+            seen.append((spec.name, id(cache)))
+            return problems
+        skytest.preflight_check = fake
+        try:
+            problems = [warn, err]
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = skytest.cmd_test(self.cfg, argparse.Namespace(cases=["pf"], stage=None, max_games=5))
+            self.assertEqual(code, skytest.EXIT_PREFLIGHT)
+            self.assertIn(f"preflight error: {err.line()}", out.getvalue())
+            self.assertIn(f"preflight warning: {warn.line()}", out.getvalue())
+            self.assertEqual(list((self.cfg.store / "runs").glob("*-pf")), [])
+            r = self.run_cases("pf")["cases"][0]
+            self.assertEqual(r["status"], "preflight")
+            self.assertIn(err.line(), r["reasons"])
+            self.assertEqual(r["preflight"]["errors"], [err.line()])
+            problems = [warn]
+            r = self.run_cases("pf")["cases"][0]
+            self.assertEqual(r["status"], "pass")
+            self.assertEqual(r["preflight"], {"errors": [], "warnings": [warn.line()]})
+            problems = [err]
+            a = argparse.Namespace(cases=["pf"], stage=None, max_games=5, ignore_preflight="the level data is older")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(skytest.cmd_test(self.cfg, a), 0)
+            res = json.loads((sorted((self.cfg.store / "runs").glob("*-pf"))[-1] / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual((res["status"], res["preflight"]["ignored"]), ("pass", "the level data is older"))
+            with self.assertRaises(SystemExit):
+                skytest.cmd_test(self.cfg, argparse.Namespace(cases=["pf"], stage=None, max_games=5, ignore_preflight=" "))
+        finally:
+            skytest.preflight_check = lambda cfg, spec, cache: []
 
     def write_janitor(self, body: str) -> None:
         tools = self.repo / "tools"
@@ -1237,6 +1409,42 @@ quit
         touched = [g for g in r["guarded_folders"] if not g["unchanged"]]
         self.assertEqual(len(touched), 1)
         self.assertIn(str(home), touched[0]["folder"])
+
+    def test_the_owners_session_settings_go_on_every_game_of_a_case_that_asks(self) -> None:
+        """2026-11-20: the level checks ran without the owner's session settings. A spec's `session_settings = true`
+        puts the game's list (tests/session_settings.toml) on its games before the spec's own args; the spec's own
+        value for a name wins; a name without its launch_allow row fails the case before any game starts."""
+        lst = self.repo / "tests" / "session_settings.toml"
+        lst.write_text('version = "t1"\n[on]\ndev_x = 3\ny = 4\n', encoding="utf-8")
+        self.spec("sess", 'layout = "solo"\nstage = "0"\nsession_settings = true\n'
+                          '[peer.H]\nargs = ["--y=7"]\nscript = "quit\\n"\n')
+        self.spec("plain", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
+        r = self.run_cases("sess", "plain")
+        by = {c["case"]: c for c in r["cases"]}
+        cmd = by["sess"]["peers"][0]["command"]
+        self.assertIn("--dev_x=3", cmd)
+        self.assertEqual([a for a in cmd if a.startswith("--y=")], ["--y=7"])  # the spec's value, once
+        self.assertTrue(any(n.startswith("session settings t1 (sha256 ") for n in by["sess"]["notes"]), by["sess"]["notes"])
+        self.assertNotIn("--dev_x=3", by["plain"]["peers"][0]["command"])  # not asked, not under --session-settings
+        lst.write_text('version = "t2"\n[on]\nonline_not_a_setting = true\n', encoding="utf-8")
+        r = self.run_cases("sess")
+        case = r["cases"][0]
+        self.assertEqual(case["status"], "error", case["reasons"])
+        self.assertIn("online_not_a_setting: no row in tests/launch_allow.toml", " ".join(case["reasons"]))
+
+    def test_session_settings_under_the_flag_reach_only_session_layouts(self) -> None:
+        cfg = skytest.Config.__new__(skytest.Config)
+        cfg.session_settings = True
+
+        def spec(layout: str, own: bool | None) -> skytest.Spec:
+            return skytest.Spec(name="x", path=Path("x.toml"), layout=layout, stage="0", description="", timeout=1.0,
+                                peers={}, measures={}, standin_seconds=1.0, session_settings=own)
+        self.assertTrue(skytest.session_applies(cfg, spec("server+1", None)))
+        self.assertFalse(skytest.session_applies(cfg, spec("solo", None)))
+        self.assertFalse(skytest.session_applies(cfg, spec("server+2", False)))  # a spec's own false, on purpose
+        cfg.session_settings = False
+        self.assertFalse(skytest.session_applies(cfg, spec("server+1", None)))
+        self.assertTrue(skytest.session_applies(cfg, spec("solo", True)))
 
     def test_the_checkpoint_line(self) -> None:
         self.spec("zero", 'layout = "solo"\nstage = "0"\n[peer.H]\nscript = "quit\\n"\n')
@@ -2756,6 +2964,72 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(skytest.check_count_and_order(text, ps), [
             r"log has /Online: barrier \d+ released/ 1 time(s), expected 2",
             r"log lacks /level 2 \S+: open/ after /barrier 2 released/ (expect_order)"])
+
+    def test_a_puppet_is_tied_to_its_peer_by_the_servers_spawn_line(self) -> None:
+        # W40: S numbers puppets by spawn order (batch 17: peer 2's came first), and the numbers change hands at a
+        # level change; {puppet:<p>} is peer <p>'s puppet at that line.
+        text = ("[t] Online: puppet 1 for peer 2 spawned at (0, 0, 0) (generation 1)\n"
+                "[t] Online: puppet 2 for peer 1 spawned at (0, 0, 0) (generation 1)\n"
+                "[t] Online: press 1:3 replayed slot 0 on PeerPuppet_2\n"
+                "[t] Online: puppet 1 for peer 1 spawned at (0, 0, 0) (generation 2)\n"
+                "[t] Online: puppet 2 for peer 2 spawned at (0, 0, 0) (generation 2)\n"
+                "[t] Online: press 1:4 replayed slot 0 on PeerPuppet_1\n")
+        tied, peers = skytest.tie_puppets(text)
+        self.assertEqual(peers, {"1", "2"})
+        self.assertIn("on PeerPuppet_2@peer1\n", tied)
+        self.assertIn("on PeerPuppet_1@peer1\n", tied)
+        ps = skytest.PeerSpec(name="S", expect=[r"press 1:\d+ replayed slot \d+ on PeerPuppet_{puppet:1}\b"],
+                              expect_count={r"replayed slot \d+ on PeerPuppet_{puppet:1}\b": 2},
+                              expect_order=[r"press 1:3 replayed .* PeerPuppet_{puppet:1}\b",
+                                            r"press 1:4 replayed .* PeerPuppet_{puppet:1}\b"],
+                              forbid=[r"replayed slot \d+ on PeerPuppet_{puppet:2}\b"])
+        spec = skytest.Spec(name="x", path=Path("x.toml"), layout="server+1", stage="8", description="", timeout=60,
+                            peers={"S": ps}, measures={}, standin_seconds=0)
+        r = skytest.PeerResult(peer="S", exit_code=0)
+        skytest.grade_peer(spec, r, text, skytest.parse_log(text))
+        self.assertEqual(r.status, "pass", r.reasons)
+        # H's presses replayed on peer 2's puppet: the count fails and the forbid hits.
+        bad = text.replace("on PeerPuppet_2", "on PeerPuppet_1")
+        skytest.grade_peer(spec, r, bad, skytest.parse_log(bad))
+        self.assertEqual(r.status, "fail")
+        self.assertIn(r"log has /replayed slot \d+ on PeerPuppet_{puppet:1}\b/ 1 time(s), expected 2", r.reasons)
+        self.assertTrue(any(w.startswith("log has forbidden /replayed slot") for w in r.reasons), r.reasons)
+        # A plain pattern still sees the log as written.
+        plain = skytest.PeerSpec(name="S", expect_count={r"on PeerPuppet_2$": 1})
+        self.assertEqual(skytest.check_count_and_order(text, plain), [])
+        # No spawn line for the peer: said so.
+        _t, why = skytest.puppet_reasons(ps, "[t] Online: puppet 1 for peer 2 spawned at (0, 0, 0)\n")
+        self.assertEqual(why, ["log has no `puppet <n> for peer 1 spawned` line: its {puppet:1} matches nothing"])
+
+    def test_within_a_line_must_follow_in_time(self) -> None:
+        # W41 (soul-gem-tb): the pick-up's collect line must come within 20 s, else the case tested nothing.
+        rule = skytest.parse_within("x.toml", "D", [{"after": "GEM_D_PICKUP", "want": "collect native 000b0018 ",
+                                                    "seconds": 20, "why": "not picked up: nothing tested"}])
+        ok = ("[2026-11-19 23:45:32.681] [info] Input script: GEM_D_PICKUP\n"
+              "[2026-11-19 23:45:40.000] [info] Online: collect native 000b0018 script (reported to S) (827513a0)\n")
+        self.assertEqual(skytest.within_reasons(ok, rule), [])
+        late = ok.replace("23:45:40.000", "23:45:53.000")
+        never = ok.splitlines()[0] + "\n"
+        for text in (late, never):
+            self.assertEqual(skytest.within_reasons(text, rule),
+                             ["not picked up: nothing tested (no /collect native 000b0018 / within 20 s of "
+                              "/GEM_D_PICKUP/)"])
+        self.assertEqual(skytest.within_reasons("[2026-11-19 23:45:32.681] x\n", rule), [])
+        with self.assertRaises(skytest.SpecError):
+            skytest.parse_within("x.toml", "D", [{"after": "a", "want": "b", "seconds": 0, "why": "c"}])
+        p = skytest.PeerResult(peer="D", exit_code=0)
+        p.reasons = skytest.within_reasons(never, rule)
+        self.assertTrue(skytest.tested_nothing([p]).startswith("D: not picked up: nothing tested"))
+        # Fail fast stops at the missed deadline.
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "game.log"
+            log.write_text(never, encoding="utf-8")
+            watch = skytest.FailFast({"D": log}, {"D": []}, within={"D": [{**rule[0], "seconds": 0.01}]})
+            self.assertIsNone(watch.check())
+            time.sleep(0.05)
+            hit = watch.check()
+            self.assertEqual(hit[0], "D")
+            self.assertTrue(hit[1].startswith("not picked up: nothing tested"), hit)
 
 
 THRESHOLDS = {"press_to_reaction": {"fixed_ms": 250.0, "plus": ["send_interval", "rtt"]},

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -299,6 +300,23 @@ class Replica {
   // entity does not hold a completion; a fenced row held behind an unsettled dependency does, up to
   // the grace.
   bool Completes(Scope scope, uint64_t at_lsn) const;
+  // Read only, for a client's lines (SwapForceOnline's coin claim watch: why a decision's completion or an
+  // obligation waits): each row the fence holds now, and for each the unsettled, not late rows of the kinds it
+  // depends on (directly or through others) whose first change is at or below its LSN: the rows TryRelease waits
+  // for. Each holder with its last apply result and how long it has been unsettled in world-runnable time (0 before
+  // its first kWaiting or kFailed). At most `max` held rows and `max` holders each. Changes nothing.
+  struct Holder {
+    RecordKey key;
+    RowApply last = RowApply::kWaiting;
+    bool has_grace = false;
+    std::chrono::milliseconds unsettled{0};
+  };
+  struct HeldRow {
+    RecordKey key;
+    uint64_t lsn = 0;
+    std::vector<Holder> holders;
+  };
+  std::vector<HeldRow> HeldRows(TimePoint now, size_t max) const;
   size_t Unsettled() const;  // held, queued, handed out, waiting or failed
   // Rows TakeReady handed out that OnApplied has not answered yet. The client answers every one in
   // the pump that took it, so this is 0 after each Client::Pump (section 7.3's invariant). The

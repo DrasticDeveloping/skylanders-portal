@@ -54,6 +54,10 @@ files removed or cut at a marker line (launch_args.copy_build); the shared snaps
                                                             --gate the gate cases and their expected
                                                             minutes, the per-build ones apart with their
                                                             last result on this build (no game started)
+    skytest.py preflight CASE ... | --all-ready             a spec's mistakes before any game: its objects
+               [--runs DIR] [--strict] [--wording]          against the level data, its waits, its log patterns
+                                                            against the code, its settings, and a replay on its
+                                                            newest recorded run (preflight.py; no game)
     skytest.py lint [--timeouts [--since STAMP]]            check every spec and the manifest; warn of fps
                                                             windows nothing grades (and of waitfor timeouts)
     skytest.py timeouts [--since STAMP]                     each waitfor condition's history in the store's
@@ -100,6 +104,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+from datetime import datetime
 import fnmatch
 import getpass
 import hashlib
@@ -121,12 +126,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import winjob  # noqa: E402
 import backend_grades  # noqa: E402  (stage 3's backend grades: compare, faults, memory)
 import launch_args as la  # noqa: E402
+import live_session  # noqa: E402  (the live sessions' pure parts: `skytest.py live`)
 import remote_agent  # noqa: E402
 import remote_swap_grade  # noqa: E402  (stage 4's remote_swap grade over swap_pairs.py, the ordered form)
 import exclusive_grade  # noqa: E402  (stage 4's exclusive grade: a race exactly one client wins)
+import drop_tiles  # noqa: E402  (stage 8's drop_tiles grade: black or cyan 64x64 tiles in a run's pictures)
+import session_settings as sessions  # noqa: E402  (the owner's session settings: tests/session_settings.toml)
 import swap_pairs  # noqa: E402
 import memory_growth  # noqa: E402  (stage 5's soak grade)
 import occurrence_outcomes  # noqa: E402  (stage 5's occurrence grade)
+import graph_trace_grade  # noqa: E402  (stage 5's shared enemies' evidence grade)
+import known_failures  # noqa: E402  (a pointless rerun refused: the last two results failed alike)
+import build_guard  # noqa: E402  (no session while a build holds its slot)
+import store_paths  # noqa: E402  (which folders a cleanup may touch; shared with the janitor)
+import preflight_gate  # noqa: E402  (a case whose preflight has an error starts no game)
+import script_checks  # noqa: E402  (a script that waits on a session it never starts; a wait whose peer is gone)
 
 STORE = ".replication-tests"
 CLIENTS = ["H", "D", "E", "F"]
@@ -141,6 +155,7 @@ SYNTHETIC = ["h1", "h2"]
 SYNTHETIC_START_AFTER = r"Online: the server is in its hub"
 SYNTHETIC_CONNECTED = re.compile(r"Online: synthetic peer (\d+) connected")
 SYNTHETIC_FATAL = [r"Online: synthetic peer (could not connect|script |refused|leaves: no player records)"]
+LEFTOVER_SETTLE_S = 3.0   # a job's count of an ended process settles within this (see run_case)
 SYNTHETIC_EXIT_GRACE = 20.0
 SYNTHETIC_ARG_PLACEHOLDERS = ("{port}", "{script}", "{digest}", "{server}", "{peer}")
 SYNTHETIC_KEYS = ("script", "start_after", "start_peer", "expect", "forbid", "expect_count", "expect_order")
@@ -166,7 +181,71 @@ FRAMES = re.compile(r"Online: frames (\d+) fps ([\d.]+) p50 ([\d.]+) p95 ([\d.]+
 HOSTED_SERVER_LOG = Path("data") / "Online" / "session" / "game.log"
 GRADES = ("server_frame_time", "client_fps", "level_load", "save_copy", "press_to_reaction", "requests_answered",
           "symmetry", "route", "bandwidth", "remote_swap", "exclusive", "occurrence_outcomes",
-          "memory_growth", "data_root_untouched") + backend_grades.NAMES
+          "memory_growth", "data_root_untouched", "level_check", "graph_trace", drop_tiles.NAME) + backend_grades.NAMES
+# W34: a spec's [grade.level_check] `rows = [...]` grades its run with those rows of the level check's page
+# (levelcheck.py): a row's FAIL fails the case with the row's findings as the reason; `must_test = true` fails a row
+# that says NOT TESTED too (a spec written to show it). LEVEL_CHECK_ROWS: the rows a spec may name.
+LEVEL_CHECK_ROWS = ("enemies hurt players", "other player's moves", "fight gates", "coins shared",
+                    "cutscenes once", "level changes", "enemies can be killed", "elemental gates and Swap Zones",
+                    "dialogs skipped", "enemy states and damage from S", "world events",
+                    "level events in step", "reward gold and food", "the server's world advances")
+
+
+def server_stall_reasons(folder: Path) -> list[str]:
+    """W37: the hard rule on every run with a server log (levelcheck.server_stalled), as a case's reasons."""
+    import levelcheck as lc
+    try:
+        fs = lc.server_hard_findings(lc.load_run(folder))
+    except (OSError, ValueError):
+        return []
+    return [f"{f.what}: " + "; ".join(f.lines) for f in fs]
+
+
+def scene_repeat_reasons(folder: Path) -> list[str]:
+    """W38: the hard rule on every case with a game log: a cutscene started more than once on one game in one level
+    generation (levelcheck.scene_repeats), as a case's reasons."""
+    import levelcheck as lc
+    try:
+        _counts, fs = lc.scene_repeats(lc.load_run(folder))
+    except (OSError, ValueError):
+        return []
+    return [f"cutscene played more than once: {f.what}: " + "; ".join(f.lines) for f in fs]
+
+
+def server_notes(folder: Path) -> list[str]:
+    """W40: every case with a server log: how many of each player's attack presses S started."""
+    import levelcheck as lc
+    try:
+        line = lc.attacks_started_line(lc.load_run(folder))
+    except (OSError, ValueError):
+        return []
+    return [line] if line else []
+
+
+def level_check_reasons(folder: Path, g: dict, levelpass: Path | None = None,
+                        run_repo: Path | None = None) -> list[str]:
+    """The reasons the named level check rows give against this run folder (empty: every row passed); `levelpass`:
+    the level's data for the rows that need it (fight gates)."""
+    import levelcheck as lc
+    run = lc.load_run(folder)
+    data = lc.level_data(levelpass, lc.run_level(run)) if levelpass is not None else None
+    graders = {"enemies hurt players": lc.grade_player_damage, "other player's moves": lc.grade_moves,
+               "fight gates": lambda r: lc.grade_fight_gates(r, data), "coins shared": lc.grade_coins_shared,
+               "cutscenes once": lc.grade_scenes_once, "level changes": lc.grade_level_changes,
+               "enemies can be killed": lc.grade_enemy_kills,
+               "elemental gates and Swap Zones": lambda r: lc.grade_gate_kinds(r, data),
+               "dialogs skipped": lc.grade_dialog_skip, "enemy states and damage from S": lc.grade_enemy_server_damage,
+               "world events": lambda r: lc.grade_world_events(r, data), "level events in step": lc.grade_level_events,
+               "reward gold and food": lc.grade_rewards_food,
+               "the server's world advances": lambda r: lc.grade_server_world(r, run_repo)}
+    out = []
+    for name in g.get("rows", []):
+        v = graders[name](run)
+        if v.status == lc.FAIL:
+            out.append(f"grade level_check {name}: " + "; ".join(f.what for f in v.findings))
+        elif v.status == lc.NOT_TESTED and g.get("must_test"):
+            out.append(f"grade level_check {name}: not tested: {v.counts}")
+    return out
 # The attack path's press and reaction lines on the requester (stage 1B item 7; the game's
 # online/client/attack_presses.h): `press <peer>:<seq> slot <s> at pose <p> (generation <g>)`, and
 # for its Reaction `reaction <peer>:<seq> after <ms> ms (interim) landed ...` (a press whose hit
@@ -376,6 +455,169 @@ class SpecError(Exception):
     pass
 
 
+# --- bulk mode (`test --bulk`) ----------------------------------------------------------------------
+#
+# Bulk mode runs many more games at once than the watched default (every window visible, 4 games) by
+# hiding them: every game it starts gets a hidden window and the SDK's draw skip (rexglue-sdk
+# render_hidden_draw=false: a hidden window's draws, resolves and presents are skipped, memexport
+# draws still run; include/rex/graphics/draw_skip.h). A client (H, D, E, F) gets --window_hidden=true
+# --render_hidden_draw=false, a standalone S the same, and a hosted S is hidden because H no longer
+# gets --dev_show_server_window (Host then passes --window_hidden=true and --render_hidden_draw=false
+# itself, host.cpp). Measured 2026-11-17: a hidden game takes about 0.95 GB private memory and almost
+# no video memory, against 2.0 GB and 1.2 GB visible, and the visible games were GPU-bound at 4.
+# Bulk results are labelled (CaseResult.mode, results.json `mode` and `bulk`, the args hash) and never
+# mix with the default mode's history (run times, statuses, per-build gate results, waitfor history).
+# Specs that cannot run hidden or must not are not run in bulk (bulk_exclusion): they are reported
+# `not in bulk` with the reason, and the report names the command that runs them visible.
+BULK_MACHINE_GAMES = 8  # [defaults] bulk_machine_games when the key is missing
+BULK_WAIT_FACTOR = 2.0  # [defaults] bulk_wait_factor: every `waitfor <condition> <seconds>` times this
+BULK_GB_PER_GAME = 1.5  # [defaults] bulk_gb_per_game: free memory a game needs at its case's start
+BULK_HIDDEN = ["--window_hidden=true", "--render_hidden_draw=false"]
+BULK_MARK = "bulk-mode.txt"  # in every bulk case folder: the waitfor history (`timeouts`) skips its logs
+NOT_IN_BULK = "not in bulk"  # a spec bulk mode leaves out (bulk_exclusion): reported, not failed
+# The pacing a bulk run gives its games (`test --bulk --bulk-pacing NAME`): never changed silently,
+# part of the run's label and args hash, and only ever on the hidden games of a bulk run (a plain
+# game and a watched playtest never get it). What each changes in the tested condition is in
+# docs/testing-guide.md (bulk mode); the measured ladder per arm too. None changes the session's
+# shared tick (online_server_hz): halving it would double every tick constant in real time.
+BULK_PACINGS = {
+    # The game's own pacing: a frame that misses the 60 Hz vblank waits for the next (60, 30, 20, 15).
+    "default": {"client": [], "host": [], "server": []},
+    # A 240 Hz guest vblank on every game the runner starts (rexglue-sdk guest_vblank_rate): a late
+    # frame goes at the next 4 ms vblank, frame_rate_limit 60 still caps the rate. A hosted S keeps the
+    # default (server_role.cpp pins guest_vblank_rate, and Host does not forward it).
+    "vblank240": {"client": ["--guest_vblank_rate=240"], "host": [], "server": ["--guest_vblank_rate=240"]},
+    # The console's frame rate on the games the runner starts: frame_rate_limit 30 (the guest's tick
+    # paced at 30, ThrottleGuestTickRate; the vblank stays 60), the session's tick still 60. A hosted
+    # S keeps 60 (server_role.cpp sets frame_rate_limit 60 itself; Host does not forward it). Jumps
+    # come out about 5 % higher than at 60 (docs/high-framerate.md, jump height).
+    "fps30": {"client": ["--frame_rate_limit=30"], "host": [], "server": ["--frame_rate_limit=30"]},
+}
+# Settings whose subject is the window, the draw skip or the pacing: a spec that sets one itself is
+# not run in bulk (bulk mode sets them, or its subject is what bulk mode changes).
+BULK_OWN_SETTINGS = ("window_hidden", "render_hidden_draw", "dev_server_draw", "guest_vblank_rate", "present_interval",
+                     "online_server_hz", "frame_rate_limit")
+# Script commands and expected lines bulk mode leaves out, (rx, reason) each. A hidden window still runs
+# the UI's draw callback (ImGui): on 2026-11-18 a hidden H's settings menu (key F4) took its presses as a
+# visible one's did (bulk-hidden-f4, host-button), and an auto-opened portal menu closed after a figure
+# went back on (bulk-hidden-remove), so neither is excluded. The party panel's `Online: panel drawn`
+# line is not shown hidden yet (its only spec runs alone), and a hidden window has no picture.
+BULK_SCRIPT_EXCLUDED: list[tuple[re.Pattern, str]] = []
+BULK_EXPECT_EXCLUDED = [
+    (re.compile(r"panel drawn"), "expects `Online: panel drawn`, logged from the party panel's draw callback"),
+    (re.compile(r"no picture"), "grades a picture (`shot`), which a hidden window under the draw skip does not have"),
+]
+
+
+@dataclass
+class BulkSettings:
+    """[defaults] bulk_machine_games, bulk_wait_factor and bulk_gb_per_game (load_config)."""
+    games: int = BULK_MACHINE_GAMES
+    wait_factor: float = BULK_WAIT_FACTOR
+    gb_per_game: float = BULK_GB_PER_GAME
+
+
+@dataclass
+class BulkMode:
+    """A bulk run's choices (cmd_test): the game budget it shares with every runner, the waitfor factor,
+    the free memory per game at a case's start, and the pacing (BULK_PACINGS)."""
+    games: int = BULK_MACHINE_GAMES
+    wait_factor: float = BULK_WAIT_FACTOR
+    gb_per_game: float = BULK_GB_PER_GAME
+    pacing: str = "default"
+
+    def label(self) -> dict:
+        """What results.json and each case's result record about the mode (`bulk`)."""
+        return {"games": self.games, "wait_factor": self.wait_factor, "gb_per_game": self.gb_per_game,
+                "pacing": self.pacing, "hidden": list(BULK_HIDDEN)}
+
+    def line(self) -> str:
+        return (f"Mode: BULK: every game hidden with the draw skip ({' '.join(BULK_HIDDEN)}), pacing {self.pacing}"
+                + (f" ({' '.join(sorted(set(a for v in BULK_PACINGS[self.pacing].values() for a in v)))})"
+                   if self.pacing != "default" else "")
+                + f", waitfor timeouts x{self.wait_factor:g} (and the case timeouts), at most {self.games} games"
+                f" at once machine-wide, {self.gb_per_game:g} GB free per game at a case's start. Bulk results"
+                " never count for the default mode's history, gate or checkpoint.")
+
+
+def setting_set(args: list[str], name: str) -> bool:
+    """Whether args set `--name` at all (`--name=value`)."""
+    return any(a.split("=", 1)[0] == f"--{name}" for a in args)
+
+
+def bulk_exclusion(spec: "Spec") -> str:
+    """Why bulk mode does not run a spec ('' when it does): the spec's own `bulk = false`, a case that runs
+    alone (exclusive, a timed grade, a [compare], a remote peer: its measurement or condition is the
+    visible default), a server whose window the spec shows, a setting bulk mode owns (BULK_OWN_SETTINGS),
+    a settings file of none (the release defaults), or a script command or expected line that needs a
+    drawn window (BULK_SCRIPT_EXCLUDED, BULK_EXPECT_EXCLUDED). A unit case starts no game: never excluded."""
+    if spec.layout == UNIT:
+        return ""
+    if not spec.bulk:
+        return "bulk = false: " + (spec.bulk_reason or "(no bulk_reason)")
+    if runs_alone(spec):
+        what = ", ".join(timed_grades(spec)) or ("a remote peer" if any(p.kind == "remote" for p in spec.peers.values())
+                                                 else "exclusive = true")
+        return f"runs alone ({what}): its measurement or condition is the visible default"
+    if spec.show_server_window is True:
+        return "show_server_window = true: its subject needs the server's window shown"
+    for n, p in spec.peers.items():
+        if own := [s for s in BULK_OWN_SETTINGS if setting_set(p.args, s)]:
+            return f"peer {n} sets --{own[0]} itself: its subject is the window, the draw skip or the pacing"
+        if p.settings_file == "none":
+            return f"peer {n} starts on the release defaults (settings_file = \"none\")"
+    for n, p in spec.peers.items():
+        for rx, why in BULK_SCRIPT_EXCLUDED:
+            if rx.search(p.script):
+                return f"peer {n} {why}"
+        for rx, why in BULK_EXPECT_EXCLUDED:
+            if any(rx.search(x) for x in p.expect + list(p.expect_count) + p.expect_order + p.forbid):
+                return f"peer {n} {why}"
+    return ""
+
+
+WAITFOR_LINE = re.compile(r"(?m)^([ \t]*waitfor[ \t]+\S+[ \t]+)(\d+(?:\.\d+)?)([ \t]*)$")
+
+
+def scale_waitfors(script: str, factor: float) -> str:
+    """A script with every `waitfor <condition> <seconds>` timeout times `factor` (bulk mode; the spec file
+    is never changed). A met waitfor returns at once whatever its timeout, and the input script counts
+    what follows from its return (input_script.cpp g_timeline_shift), so only a wait that would time out
+    changes. Whole seconds stay whole; the rest keep one decimal."""
+    if factor == 1:
+        return script
+
+    def longer(m: re.Match) -> str:
+        v = float(m.group(2)) * factor
+        text = str(int(v)) if v == int(v) else f"{v:.1f}"
+        return f"{m.group(1)}{text}{m.group(3)}"
+    return WAITFOR_LINE.sub(longer, script)
+
+
+def bulk_spec(spec: "Spec", bulk: BulkMode) -> "Spec":
+    """The spec as a bulk run runs it: each peer's waitfor timeouts, the case's timeout and a stand-in
+    server's seconds times the wait factor (under load every wait takes longer; the spec file stays)."""
+    f = bulk.wait_factor
+    peers = {n: replace(p, script=scale_waitfors(p.script, f)) for n, p in spec.peers.items()}
+    return replace(spec, peers=peers, timeout=spec.timeout * f, standin_seconds=spec.standin_seconds * f)
+
+
+def bulk_peer_args(bulk: BulkMode, spec: "Spec", peer: str) -> list[str]:
+    """What bulk mode gives one local peer: hidden with the draw skip, and the pacing's settings. An H whose
+    spec keeps its hosted server drawing (--dev_server_draw=true) gets no --render_hidden_draw=false: Host
+    would forward it after its own --render_hidden_draw=true and the server would skip after all
+    (host_modes.h HostChoosesForServer); such a spec is not run in bulk (BULK_OWN_SETTINGS), this only
+    keeps a direct call from breaking it."""
+    pacing = BULK_PACINGS[bulk.pacing]
+    if peer == "S":
+        return [*BULK_HIDDEN, *pacing["server"]]
+    keeps_drawing = peer == "H" and spec.server == "host" and "true" in setting_values(
+        spec.peers[peer].args, "dev_server_draw")
+    hidden = ["--window_hidden=true"] if keeps_drawing else list(BULK_HIDDEN)
+    host = pacing["host"] if peer == "H" and spec.server == "host" else []
+    return [*hidden, *pacing["client"], *host]
+
+
 # --- configuration --------------------------------------------------------------------------------
 
 
@@ -415,6 +657,9 @@ class Config:
     # worktree; machine_slots_dir). Missing key: MACHINE_GAMES.
     machine_games: int = 4
     slots: Path | None = None
+    # The build snapshots' folder when it is not the store's own snapshots/ (the store's one-line
+    # snapshots-folder.txt, snapshots_setting): None, the store's.
+    snapshots: Path | None = None
     # A unit case's ctest command (default: `ctest` on PATH, as the build prompt has it), and a
     # command put in front of its test binary (only the runner's own tests set that one).
     ctest: list[str] = field(default_factory=list)
@@ -435,6 +680,44 @@ class Config:
     synthetic_args: list[str] = field(default_factory=list)
     synthetic_setting: str = ""
     synthetic_launcher: list[str] = field(default_factory=list)
+    # Bulk mode's [defaults] keys (BulkSettings: the game budget, the waitfor factor, the free memory a
+    # game needs at its case's start), and `test --bulk`'s choice for this run (None: the default mode,
+    # every window as before).
+    bulk_settings: "BulkSettings" = field(default_factory=lambda: BulkSettings())
+    bulk: "BulkMode | None" = None
+    # `test --session-settings` (acceptance passes it): every session case (layout server+N) runs with the owner's
+    # session settings on every game, unless its spec says `session_settings = false` (session_applies).
+    session_settings: bool = False
+
+
+# The test data drive (2026-11-20: the PC came back without the external drive; int2's .replication-tests is a
+# junction to D:\SwapForceOnline-data\tests\int2): `test`, `acceptance`, `levelcheck` and `levelpass` stop before
+# any game with one plain line when the store cannot be reached, instead of failing somewhere inside.
+DATA_DRIVE_MISSING = "the test data drive is not attached ({root})"
+
+
+def link_target(p: Path) -> Path | None:
+    """A junction's or symbolic link's target (without Windows' \\?\ prefix), None for anything else."""
+    try:
+        if not os.path.islink(p) and not (hasattr(os.path, "isjunction") and os.path.isjunction(p)):
+            return None
+        return plain_path(Path(os.readlink(p)))
+    except (OSError, ValueError):
+        return None
+
+
+def data_drive_missing(store: Path) -> str:
+    """'' when the test store can be reached (or will be made); else the line naming the missing drive's data folder:
+    a store that is a link whose target is gone, or a store on a drive that is not there."""
+    p = Path(store)
+    target = link_target(p) if os.path.lexists(p) else None
+    where = target if target is not None else p
+    drive_gone = bool(where.anchor) and not Path(where.anchor).exists()
+    if drive_gone or (target is not None and not target.exists()):
+        parts = where.parts
+        root = Path(parts[0], parts[1]) if len(parts) > 1 else Path(where.anchor or str(where))
+        return DATA_DRIVE_MISSING.format(root=root)
+    return ""
 
 
 def main_store(repo: Path) -> Path:
@@ -485,6 +768,18 @@ def load_config(repo: Path) -> Config:
     if not isinstance(machine, int) or isinstance(machine, bool) or not 1 <= machine <= MACHINE_SLOT_FILES:
         raise SystemExit(f"{f}: [defaults] machine_games is a whole number from 1 to {MACHINE_SLOT_FILES} (the games"
                          " all runners on the machine share)")
+    bulk_games = d.get("bulk_machine_games", BULK_MACHINE_GAMES)
+    if not isinstance(bulk_games, int) or isinstance(bulk_games, bool) or not 1 <= bulk_games <= MACHINE_SLOT_FILES:
+        raise SystemExit(f"{f}: [defaults] bulk_machine_games is a whole number from 1 to {MACHINE_SLOT_FILES} (the"
+                         " games all runners share while a `test --bulk` run holds them)")
+    factor = d.get("bulk_wait_factor", BULK_WAIT_FACTOR)
+    if not isinstance(factor, (int, float)) or isinstance(factor, bool) or not 1 <= factor <= 10:
+        raise SystemExit(f"{f}: [defaults] bulk_wait_factor is a number from 1 to 10 (what bulk mode multiplies"
+                         " every waitfor timeout and case timeout by)")
+    gb = d.get("bulk_gb_per_game", BULK_GB_PER_GAME)
+    if not isinstance(gb, (int, float)) or isinstance(gb, bool) or not 0 < gb <= 16:
+        raise SystemExit(f"{f}: [defaults] bulk_gb_per_game is a number of GB above 0 (free memory a hidden game"
+                         " needs at its case's start)")
     syn = c.get("synthetic", {})
     syn_args = syn.get("args", [])
     if not isinstance(syn_args, list) or not all(isinstance(x, str) and x.strip() for x in syn_args):
@@ -493,7 +788,7 @@ def load_config(repo: Path) -> Config:
         for ph in ARG_PLACEHOLDER.findall(x):
             if ph not in SYNTHETIC_ARG_PLACEHOLDERS:
                 raise SystemExit(f"{f}: [synthetic] args: {ph} is not one of {', '.join(SYNTHETIC_ARG_PLACEHOLDERS)}")
-    return Config(
+    cfg = Config(
         repo=repo,
         store=repo / STORE,
         exe=g["exe"],
@@ -526,7 +821,12 @@ def load_config(repo: Path) -> Config:
         synthetic_args=list(syn_args),
         synthetic_setting=str(syn.get("server_setting", "")),
         synthetic_launcher=[os.path.expandvars(x) for x in syn.get("launcher", [])],
+        bulk_settings=BulkSettings(games=bulk_games, wait_factor=float(factor), gb_per_game=float(gb)),
     )
+    cfg.snapshots = snapshots_setting(cfg)
+    global SCRIPT_CONDITIONS
+    SCRIPT_CONDITIONS = table_conditions(cfg.script_commands)
+    return cfg
 
 
 # --- safety ---------------------------------------------------------------------------------------
@@ -538,15 +838,97 @@ def owner_data_roots() -> list[Path]:
     return la.owner_data_roots()
 
 
+def plain_path(p: Path) -> Path:
+    """A resolved path without Windows' `\\\\?\\` (or `\\\\?\\UNC\\`) prefix. Python's ntpath.realpath (3.14) keeps
+    that prefix on a path that does not exist when the error code of its two lookups differs: a parent folder
+    another thread creates between them (two unit cases of one run making `snapshots`) gives 3 then 2, and
+    `\\\\?\\C:\\...\\snapshots\\unit-...partial-...` was then "outside the test store" (the flip of
+    test_unit_cases_run_through_the_scheduler_without_machine_slots, 18 November)."""
+    s = str(p)
+    if s.startswith("\\\\?\\UNC\\"):
+        return Path("\\\\" + s[len("\\\\?\\UNC\\"):])
+    if s.startswith("\\\\?\\"):
+        return Path(s[len("\\\\?\\"):])
+    return p
+
+
+def resolved(p: Path) -> Path:
+    """`p` resolved through its deepest existing ancestor (junctions and links followed there), the parts
+    that do not exist yet appended as they are: a path being made is never handed to realpath's lookups of
+    a missing path (plain_path's race)."""
+    p = Path(os.path.abspath(p))
+    tail: list[str] = []
+    cur = p
+    while not cur.exists() and cur.parent != cur:
+        tail.append(cur.name)
+        cur = cur.parent
+    base = plain_path(cur.resolve())
+    for name in reversed(tail):
+        base = base / name
+    return base
+
+
 def inside(path: Path, folder: Path) -> bool:
-    p, f = path.resolve(), folder.resolve()
+    p, f = resolved(path), resolved(folder)
     return p == f or f in p.parents
 
 
+# --- where the build snapshots live ------------------------------------------------------------------
+#
+# The store may sit behind a directory junction on a slow drive (the owner's external drive since 19
+# November: 6 MB a second with small files); the build snapshots (the exe and DLLs every game starts from,
+# large files) may then stay on the internal one. The store's one-line file snapshots-folder.txt names
+# that folder, an absolute path (`#` starts a comment); snapshots_setting checks it at every start, and
+# the guards (check_output_path, launch_args.copy_build) accept it besides the store and nothing else.
+# Without the file the snapshots stay in the store's snapshots/.
+SNAPSHOTS_FILE = "snapshots-folder.txt"
+
+
+def snapshots_setting(cfg: Config) -> Path | None:
+    """The snapshots folder the store's SNAPSHOTS_FILE names, None without the file; refused (SystemExit)
+    as store_paths.validate_snapshots_folder says (the janitor's own check): one absolute plain drive path to
+    an existing folder with no link on its way, holding this store's SFO-TEST-STORE.txt, not equal to, inside
+    or around a git checkout, a disc, the owner's data, the user profile's root, a drive root, the repository
+    or the store. Resolved once (its real path); the runner hands that to the janitor."""
+    f = cfg.store / SNAPSHOTS_FILE
+    if not f.is_file():
+        return None
+    lines = [ln.split("#", 1)[0].strip() for ln in f.read_text(encoding="utf-8-sig", errors="replace").splitlines()]
+    lines = [ln for ln in lines if ln]
+    where = f"{f}: the snapshots folder"
+    if len(lines) != 1:
+        raise SystemExit(f"{where}: one line with one absolute path, found {len(lines)}")
+    folder, why = store_paths.validate_snapshots_folder(
+        lines[0], os.path.abspath(cfg.store),
+        [("the disc", cfg.rom), ("the repository", cfg.repo), ("the test store", cfg.store)], owner_data_roots())
+    if folder is None:
+        raise SystemExit(f"{where}: {why}")
+    return folder
+
+
+def remove_temporary(tmp: Path, root: str) -> None:
+    """A partial snapshot folder of this process removed: only while its real path is inside `root` (the
+    snapshots root's real path, resolved once by the caller: the store's snapshots/ or the outside folder) and
+    it is no link; else the run stops."""
+    if not os.path.lexists(tmp):
+        return
+    why = store_paths.check_victim(tmp, root)
+    if why:
+        raise SystemExit(f"refusing to remove {tmp}: {why}")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def snapshots_root(cfg: Config) -> Path:
+    """The folder the build snapshots are in: the store's snapshots/ or the one snapshots-folder.txt names."""
+    return cfg.snapshots if cfg.snapshots is not None else cfg.store / "snapshots"
+
+
 def check_output_path(cfg: Config, path: Path) -> None:
-    """Everything a run writes goes inside the worktree's store, never the owner's data or the disc."""
-    if not inside(path, cfg.store):
-        raise SystemExit(f"refusing to write {path}: outside the test store {cfg.store}")
+    """Everything a run writes goes inside the worktree's store (or its snapshots folder, snapshots_setting),
+    never the owner's data or the disc."""
+    if not inside(path, cfg.store) and not (cfg.snapshots is not None and inside(path, cfg.snapshots)):
+        raise SystemExit(f"refusing to write {path}: outside the test store {cfg.store}"
+                         + (f" and its snapshots folder {cfg.snapshots}" if cfg.snapshots is not None else ""))
     for root in owner_data_roots():
         if inside(path, root):
             raise SystemExit(f"refusing to write {path}: inside the owner's data folder {root}")
@@ -616,6 +998,11 @@ class PeerSpec:
     # and patterns whose first matches come in this order (each after the one before).
     expect_count: dict[str, int] = field(default_factory=dict)
     expect_order: list[str] = field(default_factory=list)
+    # within = [{ after = '<rx>', want = '<rx>', seconds = <s>, why = '<text>' }] (W41): once a line matches `after`, a
+    # line matching `want` must follow within `seconds`, or the case fails with `why` (fail fast stops the run then).
+    # A `why` ending in NOTHING_TESTED marks the case as having tested nothing: the server's hard rule then says
+    # NOT TESTED instead of failing it (soul-gem-tb: the collectible was never picked up).
+    within: list[dict] = field(default_factory=list)
     # save_slots = { "<slot>" = <fixture slot> } (stage 3 item 7): this peer's copy of the fixture saves
     # gets the save of `fixture slot` once more in `slot` (both one-based, as the save menu counts them),
     # before the game starts (fill_save_slots). {} leaves the copy as the fixture store has it.
@@ -627,9 +1014,28 @@ class PeerSpec:
     # "none" (Swap Force Online stage 8 P5 defaults-release: no settings file, --config_file names where it
     # would be, and the game starts on its compiled-in defaults; launch_args.RunContext.no_settings).
     settings_file: str = "template"
+    # files = { "<name>" = """<text>""" }: files written into the peer's run folder before its game starts
+    # (a plain file name each, not one the builder writes), e.g. a file the script follows (`follow`).
+    files: dict[str, str] = field(default_factory=dict)
+    # start_after = '<regex>' (the level pass's late joiner): this local client starts only once the
+    # first line of `start_peer`'s log (default H) matches the pattern: a condition, never a fixed delay.
+    # Not started by the run's end: the peer fails `never started`.
+    start_after: str = ""
+    start_peer: str = "H"
+    # wait_needs = { <condition> = ["D"] } (script_checks.needed_peer_gone): this peer's `waitfor <condition>`
+    # can be met only with those peers' games running; when one exited while such a wait is still ahead or
+    # running, fail fast ends the run (the game logs a wait's end, not its start: the spec says which).
+    wait_needs: dict[str, list[str]] = field(default_factory=dict)
 
 
 SETTINGS_FILE_VALUES = ("template", "none")
+# shader_cache = "snapshot" (the level pass): every peer's cache folder starts from the build snapshot's
+# shader cache (<snapshot>/shader-cache/, the merge of earlier runs' caches of the same build; Host's
+# server through --dev_server_cache_from), and the run's caches are merged back into it afterwards.
+# "fresh" (the default): every peer starts with an empty cache, as before.
+SHADER_CACHE_VALUES = ("fresh", "snapshot")
+SHADER_CACHE_DIR = "shader-cache"
+SERVER_CACHE_SEED = "server-cache-seed"
 
 
 @dataclass
@@ -699,6 +1105,14 @@ class Spec:
     # the build snapshot with these files removed or cut short (case_build_copy, launch_args.copy_build);
     # None: from the shared snapshot, as every other case.
     build_copy: la.BuildEdits | None = None
+    # `bulk = false` with a `bulk_reason`: bulk mode (`test --bulk`) does not run the case (bulk_exclusion),
+    # beside the specs it leaves out by themselves.
+    bulk: bool = True
+    bulk_reason: str = ""
+    shader_cache: str = "fresh"
+    # `session_settings = true|false` (the owner's session settings, tests/session_settings.toml, on every game of
+    # the case before its own args; session_applies): None when the spec does not say.
+    session_settings: bool | None = None
 
 
 PEER_KINDS = ("local", "remote")
@@ -959,11 +1373,56 @@ def fill_save_slots(data: Path, title: str, name_pattern: str, slots: dict[int, 
     return done
 
 
+# A spec script line that depends on the build: `when <condition> <line>` keeps <line> when the checkout's command
+# table (Config.script_commands, tests/script_commands.toml: the conditions the game's source registers, checked
+# against it by tools/tests/test_launch_tables.py) lists <condition>, `unless <condition> <line>` when it does not.
+# Expanded when a spec is read (load_spec, the preflight), so the runner, the preflight's checks and the game see
+# plain lines; the game has no `when` command, so a line left unexpanded is refused there (fail closed). Without a
+# table (SCRIPT_CONDITIONS None: no config read) a condition counts as not listed. First use: scene-skip-press-tb
+# waits for the cutscene skip prompt (`scene_skip_prompt_up`, online/8-test-conditions) where the build has it.
+SCRIPT_CONDITIONS: set[str] | None = None
+WHEN_LINE = re.compile(r"^(\s*)(when|unless)\s+(\S+)\s+(\S.*)$")
+
+
+def table_conditions(path: Path) -> set[str] | None:
+    """The conditions a command table lists, or None when it cannot be read."""
+    try:
+        return set(tomllib.loads(path.read_text(encoding="utf-8")).get("conditions", []))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+
+
+def expand_when_lines(script: str, conditions: set[str] | None) -> str:
+    """A script with its `when` / `unless` lines decided (WHEN_LINE): the kept ones without their prefix."""
+    out = []
+    for line in script.split("\n"):
+        m = WHEN_LINE.match(line)
+        if not m:
+            out.append(line)
+            continue
+        listed = conditions is not None and m.group(3) in conditions
+        if listed == (m.group(2) == "when"):
+            out.append(m.group(1) + m.group(4))
+    return "\n".join(out)
+
+
+def expand_spec_dict(d: dict, conditions: set[str] | None = None) -> dict:
+    """A spec table with every peer's script (and the common one) expanded (expand_when_lines); the table's own
+    SCRIPT_CONDITIONS unless `conditions` is given."""
+    conds = SCRIPT_CONDITIONS if conditions is None else conditions
+    if isinstance(d.get("script"), str):
+        d["script"] = expand_when_lines(d["script"], conds)
+    for peer in (d.get("peer") or {}).values():
+        if isinstance(peer, dict) and isinstance(peer.get("script"), str):
+            peer["script"] = expand_when_lines(peer["script"], conds)
+    return d
+
+
 def load_spec(path: Path, default_timeout: float) -> Spec:
     try:
         data = path.read_bytes()
         text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")  # as read_text reads it
-        d = tomllib.loads(text)
+        d = expand_spec_dict(tomllib.loads(text))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
         raise SpecError(f"{path.name}: {e}") from e
     for key in ("name", "layout", "stage"):
@@ -1005,10 +1464,28 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             forbid=list(common.get("forbid", [])) + list(own.get("forbid", [])),
             expect_count={**common.get("expect_count", {}), **own.get("expect_count", {})},
             expect_order=list(own.get("expect_order", common.get("expect_order", []))),
+            within=parse_within(path.name, n, own.get("within", common.get("within", []))),
             save_slots=parse_save_slots(path.name, n, own.get("save_slots", common.get("save_slots", {}))),
             kind=kind,
             settings_file=peer_settings_file(path.name, n, own, common, d.get("server", "standin"), kind),
+            files=peer_files(path.name, n, own.get("files", common.get("files", {}))),
+            start_after=str(own.get("start_after", "")),
+            start_peer=str(own.get("start_peer", "H")),
+            wait_needs=parse_wait_needs(path.name, n, own.get("wait_needs", common.get("wait_needs", {})), names,
+                                        script),
         )
+        if peers[n].start_after:
+            if n in ("H", "S") or kind != "local":
+                raise SpecError(f"{path.name}: peer {n}: start_after is for a local client that joins (D, E, F)")
+            if peers[n].start_peer not in names or peers[n].start_peer == n:
+                raise SpecError(f"{path.name}: peer {n}: start_peer {peers[n].start_peer!r} is not another peer of"
+                                f" {names}")
+            if JOIN_CODE_PLACEHOLDER in script:
+                raise SpecError(f"{path.name}: peer {n}: start_after with {{joincode}}: join by {{join}} instead")
+            try:
+                re.compile(peers[n].start_after)
+            except re.error as e:
+                raise SpecError(f"{path.name}: peer {n}: bad start_after {peers[n].start_after!r}: {e}") from e
         for arg in peers[n].args:
             for ph in ARG_PLACEHOLDER.findall(arg):
                 if ph not in ARG_PLACEHOLDERS:
@@ -1033,6 +1510,15 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         raise SpecError(f"{path.name}: save_slots: a hosted server has no data folder of its own (Host copies the"
                         " owner's slot into its session folder)")
     check_join_code_peers(path.name, peers, server)
+    if server == "host":
+        # A client that waits on a session before it hosts or joins one waits for nothing (script_checks).
+        for n, ps in peers.items():
+            if n != "S" and (why := script_checks.host_problem(ps.script)):
+                raise SpecError(f"{path.name}: peer {n}: {why}")
+    for n, ps in peers.items():
+        for cond, needed in ps.wait_needs.items():
+            if server == "host" and "S" in needed:
+                raise SpecError(f"{path.name}: peer {n}: wait_needs {cond}: a hosted S is no process of its own")
     synthetic = load_synthetic(path.name, d, names, server)
     grades = d.get("grade", {})
     for gname, g in grades.items():
@@ -1043,6 +1529,11 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
             continue
         if gname == "save_copy":
             check_save_copy(path.name, g, names, server)
+            continue
+        if gname == "level_check":
+            rows = g.get("rows") if isinstance(g, dict) else None
+            if not isinstance(rows, list) or not rows or any(x not in LEVEL_CHECK_ROWS for x in rows):
+                raise SpecError(f"{path.name}: grade level_check: `rows` names rows of {', '.join(LEVEL_CHECK_ROWS)}")
             continue
         if gname == DATA_ROOT_GRADE:
             check_data_root(path.name, g, names, server)
@@ -1076,6 +1567,16 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
                 exclusive_grade.check_exclusive(path.name, g, names)
             except exclusive_grade.ExclusiveSpecError as e:
                 raise SpecError(str(e)) from e
+            continue
+        if gname == "graph_trace":
+            # The shared enemies' evidence grade (graph_trace_grade.py: one row tied on both sides).
+            if why := graph_trace_grade.check_spec(g, names):
+                raise SpecError(f"{path.name}: grade graph_trace: {why}")
+            continue
+        if gname == drop_tiles.NAME:
+            # Stage 8 (drop_tiles.py): the pictures a run saved, judged for the black and cyan tiles.
+            if why := drop_tiles.check_spec(g, names):
+                raise SpecError(f"{path.name}: grade {gname}: {why}")
             continue
         if gname in ("occurrence_outcomes", "memory_growth"):
             # Stage 5's grades, each in its own module (its check_spec says what it takes).
@@ -1150,6 +1651,15 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
                 raise SpecError(f"{path.name}: peer {n} sets --{SCENE_SETTING} in its args beside the spec's"
                                 f" scenes key: the key says it (the runner passes --{SCENE_SETTING} itself)")
     check_remote_peers(path.name, peers, grades, names)
+    bulk, bulk_reason = d.get("bulk", True), d.get("bulk_reason", "")
+    if not isinstance(bulk, bool):
+        raise SpecError(f"{path.name}: bulk is true or false")
+    if not isinstance(bulk_reason, str):
+        raise SpecError(f"{path.name}: bulk_reason is a string (why bulk mode must not run the case)")
+    if bulk is False and not bulk_reason.strip():
+        raise SpecError(f"{path.name}: bulk = false needs a `bulk_reason` (why the case must not run hidden)")
+    if bulk_reason.strip() and bulk is not False:
+        raise SpecError(f"{path.name}: bulk_reason without bulk = false")
     build_copy = None
     if "build_copy" in d:
         try:
@@ -1160,6 +1670,12 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         if remote:
             raise SpecError(f"{path.name}: [build_copy]: peer {', '.join(remote)} is remote and runs the second PC's"
                             " verified install, not a copy of this build")
+    shader_cache = d.get("shader_cache", "fresh")
+    if shader_cache not in SHADER_CACHE_VALUES:
+        raise SpecError(f"{path.name}: shader_cache = {shader_cache!r} ({' or '.join(SHADER_CACHE_VALUES)})")
+    session = d.get("session_settings")
+    if session is not None and not isinstance(session, bool):
+        raise SpecError(f"{path.name}: session_settings is true or false (the owner's session settings on every game)")
     return Spec(
         name=d["name"], path=path, layout=d["layout"], stage=str(d["stage"]),
         description=d.get("description", ""), timeout=float(d.get("timeout", default_timeout)),
@@ -1167,7 +1683,8 @@ def load_spec(path: Path, default_timeout: float) -> Spec:
         server=server, grades=grades, compare=compare, fail_fast=fail_fast, show_server_window=show,
         exclusive=exclusive, tolerate=list(tolerate), not_ready=not_ready, scenes=scenes,
         scenes_reason=scenes_reason.strip(), breaker=breaker, sha256=hashlib.sha256(data).hexdigest(),
-        synthetic=synthetic, build_copy=build_copy,
+        synthetic=synthetic, build_copy=build_copy, bulk=bulk, bulk_reason=bulk_reason.strip(),
+        shader_cache=shader_cache, session_settings=session,
     )
 
 
@@ -1190,7 +1707,24 @@ UNIT_SUMMARY = re.compile(r"^(\d+) (\w+) tests, (\d+) failed, (\d+) ms")
 # The keys that say how games run or are graded (a unit case starts none). `breaker` among them: a unit
 # case never counts toward the circuit breaker nor is stopped by it (C7 guards the build's games).
 GAME_ONLY_KEYS = ("peer", "grade", "measure", "compare", "server", "standin_seconds", "fail_fast",
-                  "show_server_window", "tolerate", "scenes", "scenes_reason", "breaker", "build_copy")
+                  "show_server_window", "tolerate", "scenes", "scenes_reason", "breaker", "build_copy",
+                  "shader_cache")
+
+
+# What a peer's `files` may not name: the files the launch builder and the game write in the run folder.
+PEER_FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,60}")
+PEER_FILE_TAKEN = {"game.log", "stderr.txt", "settings.toml", "swapforcerecomp.toml"}
+
+
+def peer_files(spec_name: str, peer: str, value: object) -> dict[str, str]:
+    """A peer's `files` table: plain names (no folder), each with its text."""
+    if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+        raise SpecError(f"{spec_name}: peer {peer}: files is a table of name = text")
+    for name in value:
+        if not PEER_FILE_NAME.fullmatch(name) or name.lower() in PEER_FILE_TAKEN or name == la.SCRIPT_FILE \
+                or ".." in name:
+            raise SpecError(f"{spec_name}: peer {peer}: files: {name!r} is not a plain file name of its own")
+    return dict(value)
 
 
 def build_relative(name: str, what: str, value: object) -> str:
@@ -2142,6 +2676,10 @@ def grade_cross_peer(spec: Spec, r: PeerResult, texts: dict[str, str], repo: Pat
             # Stage 5: one outcome per S occurrence on each client, S's claim lines (occurrence_outcomes.py).
             r.graded[gname], why = occurrence_outcomes.grade_spec(texts, g, list(spec.peers))
             reasons += why
+        elif gname == "graph_trace" and g.get("client", "H") == r.peer:
+            # The shared enemies' evidence run: a spawned row's samples on the client and the server (graph_trace_grade.py).
+            r.graded[gname], why = graph_trace_grade.grade_spec(texts, g, list(spec.peers))
+            reasons += why
         elif gname == "memory_growth" and g.get("anchor_peer", "H") == r.peer:
             # Stage 5's soak: private memory's slope on each graded peer (memory_growth.py), once per run.
             r.graded[gname], why = memory_growth.grade_spec(texts, g, list(spec.peers))
@@ -2323,7 +2861,8 @@ def snapshot_build(cfg: Config) -> Path:
     files = build_files(cfg)
     if not files:
         raise SystemExit(f"no build at {cfg.build / cfg.exe}: build the release first (`just build-release`)")
-    snap = cfg.store / "snapshots" / build_hash(cfg, files)
+    root = snapshots_root(cfg)
+    snap = root / build_hash(cfg, files)
     check_output_path(cfg, snap)
     if snapshot_complete(snap, files, cfg):
         return snap
@@ -2332,8 +2871,10 @@ def snapshot_build(cfg: Config) -> Path:
     # with FileExistsError), then renames it into place; when the rename fails because another runner
     # put the same snapshot there first, that one is used.
     tmp = snap.with_name(f"{snap.name}.partial-{os.getpid()}-{threading.get_ident()}")
+    root.mkdir(parents=True, exist_ok=True)
+    pinned = store_paths.real(root)  # resolved once; every cleanup of tmp below uses it
     check_output_path(cfg, tmp)
-    shutil.rmtree(tmp, ignore_errors=True)
+    remove_temporary(tmp, pinned)
     try:
         tmp.mkdir(parents=True)
         for f in files:
@@ -2346,7 +2887,7 @@ def snapshot_build(cfg: Config) -> Path:
                 raise SystemExit(f"could not put the snapshot in place at {snap} ({e}), and no complete one is"
                                  " there") from e
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        remove_temporary(tmp, pinned)
     return snap
 
 
@@ -2370,7 +2911,8 @@ def case_build_copy(cfg: Config, spec: Spec, snap: Path, run: Path) -> Path:
     check_output_path(cfg, dest)
     try:
         copy = la.copy_build(snap.resolve(), run.resolve() / la.BUILD_COPY_DIR, spec.build_copy,
-                             store=cfg.store.resolve(), exe=cfg.exe)
+                             store=cfg.store.resolve(), exe=cfg.exe,
+                             snapshots=cfg.snapshots.resolve() if cfg.snapshots is not None else None)
     except (la.LaunchError, OSError) as e:
         raise SpecError(f"[build_copy]: {e}") from None
     done = [f"removed {f}" for f in spec.build_copy.remove] + \
@@ -2391,15 +2933,18 @@ def snapshot_unit(cfg: Config, binary: str) -> Path:
     for f in files:
         st = f.stat()
         h.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns}\n".encode())
-    snap = cfg.store / "snapshots" / f"unit-{h.hexdigest()[:12]}"
+    root = snapshots_root(cfg)
+    snap = root / f"unit-{h.hexdigest()[:12]}"
     check_output_path(cfg, snap)
     if snapshot_complete(snap, files):
         return snap / src.name
     # As snapshot_build (PS11): each runner and each case thread copies into its own partial folder and
     # renames it into place; a rename that loses to another one's complete snapshot uses that one.
     tmp = snap.with_name(f"{snap.name}.partial-{os.getpid()}-{threading.get_ident()}")
+    root.mkdir(parents=True, exist_ok=True)
+    pinned = store_paths.real(root)  # resolved once; every cleanup of tmp below uses it
     check_output_path(cfg, tmp)
-    shutil.rmtree(tmp, ignore_errors=True)
+    remove_temporary(tmp, pinned)
     try:
         tmp.mkdir(parents=True)
         for f in files:
@@ -2411,7 +2956,7 @@ def snapshot_unit(cfg: Config, binary: str) -> Path:
                 raise SpecError(f"could not put the unit snapshot in place at {snap} ({e}), and no complete one"
                                 " is there") from e
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        remove_temporary(tmp, pinned)
     return snap / src.name
 
 
@@ -2473,6 +3018,9 @@ class PeerResult:
     # (BootHold.outcome: its first frame line, its exit, or BOOT_TIMEOUT_S).
     boot_wait_s: float = 0.0
     boot: str = ""
+    # The fps of each `Online: frames` window (every 10 s on a server and on a client in a session), for
+    # bulk mode's run load line (the lowest client fps seen).
+    frames_fps: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -2505,8 +3053,22 @@ class CaseResult:
     scenes: str = ""
     # PS15: the machine slots it held (Lease.summary: slots, of, all, waited_s, waited_for).
     machine: dict = field(default_factory=dict)
+    # W40: lines that inform without grading (levelcheck: `attacks started on the server: H 4 of 9`), shown under
+    # the status line, in report.md and in result.json.
+    notes: list[str] = field(default_factory=list)
     # C7: a failed case's fatal signature (case_signature: signature, peer, line, kind); {} otherwise.
     signature: dict = field(default_factory=dict)
+    # "bulk" for a case of a `test --bulk` run (hidden games: BulkMode), '' for the default mode. The
+    # history walks (run times, statuses, per-build results) keep the two apart (payload_mode).
+    mode: str = ""
+    # known_failures.py: the why of `--rerun-known-failure` when this case ran although its last two
+    # results on the build failed with the same first reason; '' otherwise.
+    rerun_known_failure: str = ""
+    # build_guard.py: `started beside a build (...): --ignore-build: <why>` when it started while a build
+    # held its slot; '' otherwise.
+    ignored_build: str = ""
+    # preflight_gate.py: {errors, warnings, ignored} of the case's preflight before it started; {} for none.
+    preflight: dict = field(default_factory=dict)
 
 
 def crash_exit_code(code: int | None) -> bool:
@@ -2573,9 +3135,17 @@ class FailFast:
     session), the line is no longer in the log that is graded, so the hit is dropped and the watch
     goes on."""
 
-    def __init__(self, logs: dict[str, Path], patterns: dict[str, list[str]]) -> None:
+    def __init__(self, logs: dict[str, Path], patterns: dict[str, list[str]],
+                 needs: dict[str, dict[str, list[str]]] | None = None, scripts: dict[str, str] | None = None,
+                 within: dict[str, list[dict]] | None = None) -> None:
         self.tails = {n: LogTail(p) for n, p in logs.items()}
+        # within (PeerSpec.within): per peer, each rule with the time its `after` line was read and whether `want` came.
+        self.within = {n: [{**r, "at": None, "met": False} for r in rs] for n, rs in (within or {}).items() if rs}
         self.patterns = {n: [re.compile(rx, re.M) for rx in patterns.get(n, [])] for n in logs}
+        # wait_needs (script_checks.needed_peer_gone): each waiting peer's planned waits and the ends seen.
+        self.needs = {n: c for n, c in (needs or {}).items() if c}
+        self.planned = {n: script_checks.wait_counts((scripts or {}).get(n, "")) for n in self.needs}
+        self.done: dict[str, dict[str, int]] = {n: {} for n in self.needs}
         self.hit: tuple[str, str] | None = None
         self.hit_at = 0.0
         self._hit_generation: int | None = None  # the hit line's log generation; None for an exit code
@@ -2595,11 +3165,28 @@ class FailFast:
             self.hit = self._hit_generation = None
         for n, tail in self.tails.items():
             for line in tail.new_lines():
+                if n in self.done and (cond := script_checks.wait_done(line)):
+                    self.done[n][cond] = self.done[n].get(cond, 0) + 1
                 if any(rx.search(line) for rx in self.patterns[n]):
                     return self._found((n, line.strip()[:200]), tail.generation)
+                for r in self.within.get(n, []):
+                    if r["at"] is None and re.search(r["after"], line):
+                        r["at"] = time.monotonic()
+                    elif r["at"] is not None and not r["met"] and re.search(r["want"], line):
+                        r["met"] = True
+        for n, rules in self.within.items():
+            for r in rules:
+                if r["at"] is not None and not r["met"] and time.monotonic() - r["at"] > r["seconds"]:
+                    return self._found((n, f"{r['why']} (no /{r['want']}/ within {r['seconds']:g} s)"),
+                                       self.tails[n].generation)
         for n, p in (procs or {}).items():
             if crash_exit_code(code := p.poll()):
                 return self._found((n, f"exit code 0x{code & 0xFFFFFFFF:08X}"), None)
+        if self.needs and procs:
+            gone = script_checks.needed_peer_gone(self.needs, self.planned, self.done,
+                                                  {n: p.poll() for n, p in procs.items()})
+            if gone is not None:
+                return self._found(gone, None)
         return None
 
 
@@ -2633,6 +3220,73 @@ def peer_fatal_lines(spec: Spec, peer: str) -> list[tuple[str, str]]:
 def fail_fast_patterns(spec: Spec, peer: str) -> list[str]:
     """A peer's fatal lines for fail fast: exactly the forbidden lines grade_peer fails it on."""
     return [rx for rx, _ in peer_fatal_lines(spec, peer)]
+
+
+NOTHING_TESTED = ": nothing tested"
+STAMP = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})\]")
+
+
+def parse_within(spec_name: str, peer: str, raw: object) -> list[dict]:
+    """A peer's `within` rules (PeerSpec.within): each a table with after, want, seconds and why."""
+    if not isinstance(raw, list):
+        raise SpecError(f"{spec_name}: peer {peer}: within is a list of tables (after, want, seconds, why)")
+    out = []
+    for t in raw:
+        if not isinstance(t, dict) or set(t) != {"after", "want", "seconds", "why"}:
+            raise SpecError(f"{spec_name}: peer {peer}: each within rule has exactly after, want, seconds and why")
+        if not isinstance(t["seconds"], (int, float)) or isinstance(t["seconds"], bool) or t["seconds"] <= 0:
+            raise SpecError(f"{spec_name}: peer {peer}: within seconds must be a number > 0")
+        for k in ("after", "want"):
+            try:
+                re.compile(str(t[k]))
+            except re.error as e:
+                raise SpecError(f"{spec_name}: peer {peer}: bad within {k} {t[k]!r}: {e}") from e
+        out.append({"after": str(t["after"]), "want": str(t["want"]), "seconds": float(t["seconds"]),
+                    "why": str(t["why"])})
+    return out
+
+
+def within_reasons(text: str, rules: list[dict]) -> list[str]:
+    """The `within` rules a log broke, by its own line times: the first `after` line, then the first `want` line after
+    it no later than `seconds`. A log that never reached `after` breaks none (its other expectations say so)."""
+    out = []
+    lines = text.splitlines()
+    for r in rules:
+        at = next((k for k, line in enumerate(lines) if re.search(r["after"], line)), None)
+        if at is None:
+            continue
+        m = STAMP.search(lines[at])
+        t0 = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f") if m else None
+        ok = False
+        for line in lines[at + 1:]:
+            if re.search(r["want"], line):
+                w = STAMP.search(line)
+                ok = t0 is None or w is None or (
+                    datetime.strptime(w.group(1), "%Y-%m-%d %H:%M:%S.%f") - t0).total_seconds() <= r["seconds"]
+                break
+        if not ok:
+            out.append(f"{r['why']} (no /{r['want']}/ within {r['seconds']:g} s of /{r['after']}/)")
+    return out
+
+
+def tested_nothing(peers: list["PeerResult"]) -> str:
+    """The first peer reason that says the case tested nothing (a `within` rule's why), or ''."""
+    return next((f"{p.peer}: {w}" for p in peers for w in p.reasons if NOTHING_TESTED in w), "")
+
+
+def parse_wait_needs(spec_name: str, peer: str, raw: object, names: list[str], script: str) -> dict[str, list[str]]:
+    """A peer's wait_needs: {condition: [other peers]}, each condition one its script waits for."""
+    if not isinstance(raw, dict):
+        raise SpecError(f"{spec_name}: peer {peer}: wait_needs is a table (condition = [peers])")
+    waits = script_checks.wait_counts(script)
+    out: dict[str, list[str]] = {}
+    for cond, needed in raw.items():
+        if cond not in waits:
+            raise SpecError(f"{spec_name}: peer {peer}: wait_needs {cond}: its script has no `waitfor {cond}`")
+        if not isinstance(needed, list) or not needed or any(p not in names or p == peer for p in needed):
+            raise SpecError(f"{spec_name}: peer {peer}: wait_needs {cond}: a list of other peers of {names}")
+        out[str(cond)] = [str(p) for p in needed]
+    return out
 
 
 def peer_script(spec: Spec, peer: str, figures: Path, join: str = "", joincode: str = "") -> str:
@@ -3157,6 +3811,104 @@ class LoadSampler:
         return out
 
 
+RUN_LOAD_SAMPLE_S = 5.0
+
+
+def busy_threads(s0: tuple[int, int], s1: tuple[int, int], threads: int) -> float | None:
+    """The CPU threads in use between two _system_times samples (idle, total): the busy share of all
+    cores times the machine's threads."""
+    total = s1[1] - s0[1]
+    if total <= 0:
+        return None
+    return round(max(0.0, 1.0 - (s1[0] - s0[0]) / total) * threads, 2)
+
+
+def lowest_client_fps(results: list["CaseResult"]) -> dict:
+    """The lowest fps any client (not S) showed in a run's cases: its `fps` windows (`guest FPS`) and its
+    `Online: frames` windows, each with the case and peer, and how many windows there were."""
+    out: dict = {}
+    for kind, attr in (("fps", "fps"), ("frames", "frames_fps")):
+        seen = [(v, r.case, p.peer) for r in results for p in r.peers
+                if p.peer.split(":")[-1] != "S" for v in getattr(p, attr)]
+        if seen:
+            v, case, peer = min(seen)
+            values = sorted(x for x, _, _ in seen)
+            out[kind] = {"min": v, "case": case, "peer": peer, "windows": len(seen),
+                         "p10": values[max(0, (len(values) - 1) // 10)]}
+    return out
+
+
+class RunLoad:
+    """Bulk mode's load for the whole run (one thread from start() to summary()): every `every` seconds
+    the games alive on the machine (any runner's) and the CPU threads in use (busy_threads), so a bulk
+    batch that was too heavy shows in its report (run_load_line). Nothing in it ever stops a case."""
+
+    def __init__(self, exe: str, every: float | None = None) -> None:
+        self.exe = Path(exe).name
+        self.every = RUN_LOAD_SAMPLE_S if every is None else every
+        self.games: list[int] = []
+        self.threads: list[float] = []
+        self.error = ""
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="skytest-run-load", daemon=True)
+
+    def start(self) -> "RunLoad":
+        if WINDOWS:
+            self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        try:
+            last = _system_times()
+            while not self._stop.wait(self.every):
+                table = process_table()
+                if table is not None:
+                    self.games.append(count_games(table, self.exe, os.getpid())[0])
+                now = _system_times()
+                if last and now and (t := busy_threads(last, now, os.cpu_count() or 1)) is not None:
+                    self.threads.append(t)
+                last = now
+        except Exception as e:  # noqa: BLE001 - a load sample never stops a case
+            self.error = f"{type(e).__name__}: {e}"
+
+    def summary(self, results: list["CaseResult"]) -> dict:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=15)
+        out: dict = {"samples": len(self.games), "every_s": self.every, "threads_of": os.cpu_count() or 0}
+        busy = [g for g in self.games if g > 0]
+        if busy:
+            out["games_max"] = max(busy)
+            out["games_mean"] = round(sum(busy) / len(busy), 1)
+        if self.threads:
+            out["threads_max"] = max(self.threads)
+            out["threads_mean"] = round(sum(self.threads) / len(self.threads), 1)
+        out["client_fps"] = lowest_client_fps(results)
+        if self.error:
+            out["error"] = self.error
+        return out
+
+
+def run_load_line(load: dict) -> str:
+    """report.md's per-run load line of a bulk run (RunLoad.summary): games at once, CPU threads used, the
+    lowest client fps seen."""
+    parts = []
+    if "games_max" in load:
+        parts.append(f"games at once {load['games_max']} max, {load['games_mean']:.1f} mean while any ran")
+    if "threads_max" in load:
+        parts.append(f"CPU threads used {load['threads_mean']:.1f} mean, {load['threads_max']:.1f} max of"
+                     f" {load.get('threads_of', '?')}")
+    fps = load.get("client_fps") or {}
+    for kind, what in (("fps", "fps windows"), ("frames", "Online: frames windows")):
+        if kind in fps:
+            f = fps[kind]
+            parts.append(f"lowest client {what} {f['min']:.1f} ({f['case']} {f['peer']}; p10 {f['p10']:.1f} of"
+                         f" {f['windows']})")
+    if not fps:
+        parts.append("no client fps window")
+    return "Run load (bulk): " + ("; ".join(parts) if parts else "not sampled") + "."
+
+
 def load_line(load: dict) -> str:
     """report.md's load line for a case (LoadSampler.summary)."""
     if not load:
@@ -3212,6 +3964,8 @@ def args_sha256(cfg: Config, spec: Spec) -> str:
         parts.append([n, show_server_args(cfg, spec, n), p.args])
     for r in spec.compare.get("run", []) if spec.compare else []:
         parts.append([r.get("name"), {n: t.get("args", []) for n, t in sorted(r.get("peer", {}).items())}])
+    if cfg.bulk is not None:  # a bulk run's hash never equals a visible run's (its own label part)
+        parts.append(["mode", "bulk", cfg.bulk.label()])
     return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
@@ -3221,9 +3975,64 @@ def fixture_sha256(cfg: Config) -> str:
     return hashlib.sha256(f"{folder_state(saves)[2]}\n{folder_state(figures)[2]}".encode()).hexdigest()
 
 
-def case_provenance(cfg: Config, spec: Spec, fixtures: str) -> dict:
-    return {"spec_sha256": spec.sha256 or file_sha256(spec.path), "args_sha256": args_sha256(cfg, spec),
-            "fixture_sha256": fixtures, "runner": runner_version()}
+def case_provenance(cfg: Config, spec: Spec, fixtures: str, build: str = "") -> dict:
+    """What ran: the spec's text, the arguments, the fixtures (each a sha256), the case content's hash over
+    the three (known_failures.case_sha256: what a rerun repeats), the build snapshot's name (build_hash; ''
+    for a case that took none) and the runner's version."""
+    spec_hash, args_hash = spec.sha256 or file_sha256(spec.path), args_sha256(cfg, spec)
+    return {"spec_sha256": spec_hash, "args_sha256": args_hash, "fixture_sha256": fixtures,
+            "case_sha256": known_failures.case_sha256(spec_hash, args_hash, fixtures), "build": build,
+            "runner": runner_version()}
+
+
+def case_history(cfg: Config, case: str) -> list[known_failures.Prior]:
+    """The case's earlier results in this store (each run folder `<stamp>-<case>` with a result.json); an
+    older result without `provenance.build` takes its session's snapshot (results.json)."""
+    runs = cfg.store / "runs"
+    out: list[known_failures.Prior] = []
+    sessions: dict[str, str] = {}
+    if not runs.is_dir():
+        return out
+    for d in runs.glob(f"*-{case}"):
+        m = known_failures.RUN_NAME.match(d.name)
+        if not m or m.group(2) != case or not (d / "result.json").is_file():
+            continue
+        try:
+            res = json.loads((d / "result.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(res, dict):
+            continue
+        snapshot = ""
+        prov = res.get("provenance") if isinstance(res.get("provenance"), dict) else {}
+        if not prov.get("build") and res.get("session"):
+            sess = str(res["session"])
+            if sess not in sessions:
+                try:
+                    sessions[sess] = str(json.loads((Path(sess) / "results.json").read_text(encoding="utf-8"))
+                                         .get("snapshot") or "")
+                except (OSError, ValueError, AttributeError):
+                    sessions[sess] = ""
+            snapshot = sessions[sess]
+        script, log = "", ""
+        if res.get("status") in known_failures.FAILED and (d / "H" / "script.txt").is_file():
+            # A phased script (the level pass): the part its failure belongs to (known_failures.script_parts).
+            try:
+                script = (d / "H" / "script.txt").read_text(encoding="utf-8", errors="replace")
+                if known_failures.PHASE_MARK.search(script.replace("\r", "")) or "log LEVELPASS phase" in script:
+                    log = (d / "H" / "game.log").read_text(encoding="utf-8", errors="replace") \
+                        if (d / "H" / "game.log").is_file() else ""
+            except OSError:
+                script, log = "", ""
+        out.append(known_failures.prior_from_result(str(d), res, snapshot, script, log))
+    return out
+
+
+def known_failure_result(spec: Spec, refusal: known_failures.Refusal) -> CaseResult:
+    """A case not started as a known failure: status `known failure`, 0 s, never a pass."""
+    return CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage, status=known_failures.KNOWN_FAILURE,
+                      reasons=[f"not started: {refusal.line(spec.name)}"], exclusive=runs_alone(spec),
+                      started=time.strftime("%Y%m%d-%H%M%S"))
 
 
 # The game's test-only setting that shows the online server's window (src/online/server/server_role.cpp):
@@ -3236,12 +4045,56 @@ def show_server_args(cfg: Config, spec: Spec, peer: str) -> list[str]:
     standalone S gets --window_hidden=true. Shown (the spec's show_server_window, else [defaults]):
     a standalone S gets --dev_show_server_window=true instead, and in a hosted layout H gets it (Host
     starts its server with it)."""
+    if cfg.bulk is not None:
+        # Bulk mode: every game hidden with the draw skip (bulk_peer_args); a hosted S is hidden since H
+        # gets no --dev_show_server_window, and Host gives it the skip itself.
+        return bulk_peer_args(cfg.bulk, spec, peer)
     show = spec.show_server_window if spec.show_server_window is not None else cfg.show_server_window
     if peer == "S":
         return [f"--{SHOW_SERVER_SETTING}=true"] if show else ["--window_hidden=true"]
     if peer == "H" and show and spec.server == "host":
         return [f"--{SHOW_SERVER_SETTING}=true"]
     return []
+
+
+# --- the owner's session settings (2026-11-20) ---------------------------------------------------------------------
+#
+# The level checks of the first acceptance pass ran without the owner's session settings: the players' hits not
+# wired (`hit session off`), a stand-in for the other player all run long, no enemy died on S. One list
+# (session_settings.py, the game's tests/session_settings.toml) now goes on every game of a case that asks for it
+# (`session_settings = true`: the generated level checks, party-continue) or, under `test --session-settings`
+# (acceptance), of every session case (layout server+N) that does not say `session_settings = false`. The list
+# comes after the runner's own args and before the spec's, without a name either already sets (the spec's value
+# wins; a bool setting's occurrences sum, so a name never goes twice). A name without its launch_allow row fails
+# the case before any game starts.
+
+
+def session_applies(cfg: Config, spec: Spec) -> bool:
+    if spec.session_settings is not None:
+        return spec.session_settings
+    return cfg.session_settings and spec.layout.startswith("server+")
+
+
+def session_list(cfg: Config) -> "sessions.SessionSettings":
+    """The repository's list, checked against the launch allow list; SpecError when it does not hold."""
+    try:
+        ss = sessions.load(cfg.repo)
+    except sessions.SessionSettingsError as e:
+        raise SpecError(f"session settings: {e}") from None
+    allow, _commands = launch_tables(cfg)
+    wrong = sessions.unknown_names(ss, allow.rules)
+    if wrong:
+        raise SpecError(f"session settings {ss.path}: {', '.join(wrong)}: no row in tests/launch_allow.toml (a name the"
+                        " game does not register is never passed)")
+    return ss
+
+
+def session_args(cfg: Config, spec: Spec, peer: str, *others: list[str]) -> list[str]:
+    """The owner's session settings for one game of the case (none when session_applies is false), without the
+    names `others` (the runner's and the spec's own args) set."""
+    if not session_applies(cfg, spec):
+        return []
+    return sessions.for_game(session_list(cfg), *others)
 
 
 def setting_values(args: list[str], name: str) -> list[str]:
@@ -3326,7 +4179,32 @@ def launch_context(cfg: Config, folder: Path, tables: tuple[la.AllowList, la.Com
                          read_roots=[(cfg.repo / "tests" / "routes").resolve()], no_settings=no_settings)
 
 
-def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -> tuple[Path, list[str]]:
+def copy_cache(src: Path, dst: Path) -> int:
+    """Copies the shader cache files under `src` into `dst` (folders made); a file `dst` already has at
+    the same or a larger size stays. The number of files copied. Never fails the run: a file that cannot
+    be copied is skipped."""
+    n = 0
+    if not src.is_dir():
+        return 0
+    for f in src.rglob("*"):
+        if not f.is_file() or ".tmp-" in f.name:
+            continue
+        to = dst / f.relative_to(src)
+        try:
+            if to.is_file() and to.stat().st_size >= f.stat().st_size:
+                continue
+            to.parent.mkdir(parents=True, exist_ok=True)
+            tmp = to.with_name(to.name + f".tmp-{os.getpid()}")
+            shutil.copyfile(f, tmp)
+            os.replace(tmp, to)
+            n += 1
+        except OSError:
+            continue
+    return n
+
+
+def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0,
+                 cache_seed: Path | None = None) -> tuple[Path, list[str]]:
     """A local peer's own run folder and command line, made by the launch builder (launch_args.build_game,
     design D21): the copies of the fixture saves and figures, the settings template's copy, the input
     script (checked command by command, every path inside the folder), and the settings, checked as a
@@ -3340,16 +4218,32 @@ def prepare_peer(cfg: Config, spec: Spec, peer: str, run: Path, port: int = 0) -
     tables = launch_tables(cfg)
     try:
         d = la.make_run_folder(run.resolve(), peer)
+        seed_args: list[str] = []
+        if cache_seed is not None:  # shader_cache = "snapshot": this peer's cache starts warm
+            copy_cache(cache_seed, d / "cache")
+            if spec.server == "host" and peer == "H":  # and the server Host starts, through its setting
+                copy_cache(cache_seed, d / SERVER_CACHE_SEED)
+                (d / SERVER_CACHE_SEED).mkdir(exist_ok=True)
+                seed_args = [f"--dev_server_cache_from={d / SERVER_CACHE_SEED}"]
         ctx = launch_context(cfg, d, tables, no_settings=spec.peers[peer].settings_file == "none")
         script = peer_script(spec, peer, ctx.figures, f"127.0.0.1:{port}" if port else "", JOIN_CODE_STANDIN)
         runner = [*cfg.default_args, *scene_args(cfg, spec), *show_server_args(cfg, spec, peer),
                   *([f"--online_port={port}"] if port and peer == "H" else []),
-                  *synthetic_server_args(cfg, spec, peer)]
+                  *synthetic_server_args(cfg, spec, peer), *seed_args]
+        runner += session_args(cfg, spec, peer, runner, spec.peers[peer].args)
         args = la.build_game(ctx, peer_args(cfg, spec.peers[peer].args), script, fixtures=(saves, figures),
                              runner_args=runner)
     except la.LaunchError as e:
         raise SpecError(f"peer {peer}: {e}") from None
     (d / "data" / ".skytest-copy").write_text("a skytest run copy\n", encoding="ascii")  # the game's dev hooks need it
+    for name, text in spec.peers[peer].files.items():  # a spec's `files`, as written (no newline added)
+        try:
+            target = la.contained(ctx, name, f"peer {peer} file {name}", d, d)
+        except la.LaunchError as e:
+            raise SpecError(f"peer {peer}: {e}") from None
+        if target.exists():
+            raise SpecError(f"peer {peer}: files: {name} exists in the run folder already (the builder's)")
+        target.write_bytes(text.encode("utf-8"))
     if spec.peers[peer].save_slots:
         for line in fill_save_slots(d / "data", cfg.title_id, cfg.save_slot_name, spec.peers[peer].save_slots):
             print(f"  {spec.name} {peer}: save_slots: {line}")
@@ -3611,8 +4505,9 @@ def start_remote(cfg: Config, spec: Spec, peer: str, run: Path, port: int) -> Re
         if not rp._call("hello").get("verified"):
             rp._call("verify", manifest=target.manifest)
         join = f"{client.sock.getsockname()[0]}:{port}" if port else ""
-        args = [a for a in [*cfg.default_args, *scene_args(cfg, spec), *show_server_args(cfg, spec, peer),
-                            *spec.peers[peer].args] if a[2:].split("=", 1)[0] not in REMOTE_AGENT_ARGS]
+        own = [*cfg.default_args, *scene_args(cfg, spec), *show_server_args(cfg, spec, peer)]
+        own += session_args(cfg, spec, peer, own, spec.peers[peer].args)
+        args = [a for a in [*own, *spec.peers[peer].args] if a[2:].split("=", 1)[0] not in REMOTE_AGENT_ARGS]
         plan = {"name": remote_plan_name(spec.name),
                 "timeout_s": min(remote_agent.MAX_RUN_S, int(spec.timeout) + 120),
                 "entries": [{"role": "game", "peer": peer, "args": args,
@@ -3717,7 +4612,7 @@ def grade_synthetic(spec: Spec, r: PeerResult, text: str, started: bool) -> None
 
 def parse_log(text: str) -> dict:
     out = {"levels": [], "fps": [], "longest": [], "private": 0, "working": 0, "errors": 0, "build": "",
-           "lines": [], "frame_p95": [], "video": 0}
+           "lines": [], "frame_p95": [], "video": 0, "frames_fps": []}
     for line in text.splitlines():
         m = TS.match(line)
         t = time.mktime(time.strptime(m.group(1)[:19], "%Y-%m-%d %H:%M:%S")) + float("0" + m.group(1)[19:]) \
@@ -3738,6 +4633,8 @@ def parse_log(text: str) -> dict:
             out["working"] = max(out["working"], int(mem.group(2)))
         if fr := FRAMES.search(line):
             out["frame_p95"].append(float(fr.group(4)))
+            if int(fr.group(1)) > 0:
+                out["frames_fps"].append(float(fr.group(2)))
             out["private"] = max(out["private"], int(fr.group(6)))
             out["working"] = max(out["working"], int(fr.group(7)))
             out["video"] = max(out["video"], int(fr.group(8)))
@@ -3808,7 +4705,7 @@ def grade_thresholds(spec: Spec, r: PeerResult, parsed: dict, thresholds: dict, 
     reasons = []
     for gname, g in spec.grades.items():
         if gname in ("requests_answered", "symmetry", "save_copy", "route", "bandwidth", "remote_swap", "exclusive",
-                     DATA_ROOT_GRADE):
+                     DATA_ROOT_GRADE, "level_check", drop_tiles.NAME):
             continue  # graded across peers (grade_cross_peer, grade_save_copy, grade_data_root)
         if g.get("peer", "S" if gname == "server_frame_time" else "H") != r.peer:
             continue
@@ -4256,18 +5153,69 @@ def measure(lines: list[tuple[float | None, str]], start: str | None, end: str) 
     return None
 
 
-def check_count_and_order(text: str, ps: PeerSpec) -> list[str]:
+# A pattern's `{puppet:<p>}` (W40): peer <p>'s driven puppet on S, tied by S's own `puppet <n> for peer <p> spawned`
+# lines. S numbers its puppets by spawn order, not by peer (batch 17's moves-attack-tb: `puppet 1 for peer 2 spawned`
+# came first, and H's presses were replayed on PeerPuppet_2), and the numbers change hands at a level change, so a
+# spec writes `PeerPuppet_{puppet:1}` for H's puppet. Such a pattern is matched against S's log with each
+# `PeerPuppet_<n>` named by the peer that puppet <n> belonged to at that line (`PeerPuppet_2@peer1`); a pattern
+# without the placeholder sees the log as written.
+PUPPET_SPAWNED = re.compile(r"Online: puppet (\d+) for peer (\d+) spawned ")
+PUPPET_PLACEHOLDER = re.compile(r"\{puppet:(\d+)\}")
+PEER_PUPPET_NAME = re.compile(r"\bPeerPuppet_(\d+)")
+
+
+def tie_puppets(text: str) -> tuple[str, set[str]]:
+    """S's log with each `PeerPuppet_<n>` written `PeerPuppet_<n>@peer<p>` (<p>: puppet <n>'s peer by the last spawn
+    line before it; a name before any is left as it is), and the peers that had a puppet spawned."""
+    owner: dict[str, str] = {}
+    out = []
+    for line in text.splitlines(keepends=True):
+        m = PUPPET_SPAWNED.search(line)
+        if m:
+            owner[m.group(1)] = m.group(2)
+        out.append(PEER_PUPPET_NAME.sub(
+            lambda k: k.group(0) + (f"@peer{owner[k.group(1)]}" if k.group(1) in owner else ""), line))
+    return "".join(out), set(owner.values())
+
+
+def puppet_view(rx: str, text: str, tied: str | None) -> tuple[str, str]:
+    """The pattern and the text it is matched against: a `{puppet:<p>}` pattern against the tied log."""
+    if tied is None or not PUPPET_PLACEHOLDER.search(rx):
+        return rx, text
+    return PUPPET_PLACEHOLDER.sub(lambda m: rf"\d+@peer{m.group(1)}(?!\d)", rx), tied
+
+
+def puppet_reasons(ps: PeerSpec, text: str) -> tuple[str | None, list[str]]:
+    """The tied log when any of the peer's patterns names `{puppet:<p>}` (else None), and a reason for each peer an
+    expectation names whose puppet S never spawned."""
+    pats = ps.expect + ps.expect_order + list(ps.expect_count) + ps.forbid
+    if not any(PUPPET_PLACEHOLDER.search(rx) for rx in pats):
+        return None, []
+    tied, peers = tie_puppets(text)
+    expects = ps.expect + ps.expect_order + [rx for rx, n in ps.expect_count.items() if n > 0]
+    missing = sorted({p for rx in expects for p in PUPPET_PLACEHOLDER.findall(rx) if p not in peers})
+    return tied, [f"log has no `puppet <n> for peer {p} spawned` line: its {{puppet:{p}}} matches nothing"
+                  for p in missing]
+
+
+def check_count_and_order(text: str, ps: PeerSpec, tied: str | None = None) -> list[str]:
     """expect_count: the number of log lines matching each pattern; expect_order: each pattern's
-    first match after the previous pattern's (so `[a, b, a]` wants an a, a later b, a later a)."""
+    first match after the previous pattern's (so `[a, b, a]` wants an a, a later b, a later a).
+    `tied`: S's log with its puppets tied to their peers (tie_puppets), for the `{puppet:<p>}` patterns."""
     reasons = []
-    lines = text.splitlines()
+    views = {text: text.splitlines()}
+    if tied is not None:
+        views[tied] = tied.splitlines()
     for rx, want in ps.expect_count.items():
-        got = sum(1 for line in lines if re.search(rx, line))
+        pat, src = puppet_view(rx, text, tied)
+        got = sum(1 for line in views[src] if re.search(pat, line))
         if got != want:
             reasons.append(f"log has /{rx}/ {got} time(s), expected {want}")
     i, prev = 0, None
     for rx in ps.expect_order:
-        at = next((k for k in range(i, len(lines)) if re.search(rx, lines[k])), None)
+        pat, src = puppet_view(rx, text, tied)
+        lines = views[src]
+        at = next((k for k in range(i, len(lines)) if re.search(pat, lines[k])), None)
         if at is None:
             reasons.append(f"log lacks /{rx}/" + (f" after /{prev}/" if prev else "") + " (expect_order)")
             break
@@ -4286,15 +5234,21 @@ def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
     if not text:
         reasons.append("no log written")
     ps = spec.peers.get(r.peer)
+    tied = None
+    if ps is not None:
+        tied, why = puppet_reasons(ps, text)
+        reasons += why
     expect = ps.expect if ps else []
     for rx in expect:
-        if not re.search(rx, text, re.M):
+        if not re.search(*puppet_view(rx, text, tied), re.M):
             reasons.append(f"log lacks /{rx}/")
-    reasons += check_count_and_order(text, ps) if ps else []
+    reasons += check_count_and_order(text, ps, tied) if ps else []
+    reasons += within_reasons(text, ps.within) if ps and ps.within else []
     if any(f == 0.0 for f in parsed["fps"]):
         reasons.append("presented no frame during an fps window (frozen, or not booted yet)")
     for rx, shown in peer_fatal_lines(spec, r.peer):
-        if m := re.search(rx, text, re.M):
+        pat, src = puppet_view(rx, text, tied)
+        if m := re.search(pat, src, re.M):
             start = text.rfind("\n", 0, m.start()) + 1
             end = text.find("\n", m.end())
             whole = text[start:end if end != -1 else len(text)].strip()
@@ -4311,10 +5265,12 @@ def grade_peer(spec: Spec, r: PeerResult, text: str, parsed: dict) -> None:
 def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
              thresholds: dict | None = None, baseline: dict | None = None,
              accepted_grades: tuple[str, ...] = (), folder: Path | None = None,
-             pacer: StartPacer | None = None) -> CaseResult:
+             pacer: StartPacer | None = None, live: "LiveHooks | None" = None) -> CaseResult:
     """One run of a case. `folder`: where the run goes (a compared case's run, inside the case's
     folder); by default a new `<stamp>-<case>` folder in the store's runs. `pacer`: the start gap
-    shared with the cases running beside it (`test --jobs N`); by default this case's own."""
+    shared with the cases running beside it (`test --jobs N`); by default this case's own. `live`: a
+    live session's hooks (LiveHooks: told the run folder, asked each turn of the watch loop whether to
+    stop); None for every case."""
     pacer = pacer if pacer is not None else StartPacer(cfg.start_gap, machine_budget(cfg))
     names = list(spec.peers)
     hosted = spec.server == "host"
@@ -4354,7 +5310,10 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         # Every peer's folder first (copies take a moment), then all games start close together, and
         # a spec error in a later peer starts no game at all.
         port = free_loopback_port() if hosted else 0
-        prepared = {n: prepare_peer(cfg, spec, n, run, port) for n in starts if n not in remote}
+        seed = (snap / SHADER_CACHE_DIR) if spec.shader_cache == "snapshot" else None
+        prepared = {n: prepare_peer(cfg, spec, n, run, port, seed) for n in starts if n not in remote}
+        if live is not None:
+            live.on_run(run, port)
         # server+N+hK: each synthetic peer's folder and command, before any game starts.
         syn_prepared = {n: prepare_synthetic(cfg, spec, n, run, snap, port) for n in spec.synthetic}
         # save_copy: each named peer's save copy as it is before any game starts.
@@ -4414,8 +5373,12 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             # Stage 8 item 4: a client whose script names {joincode} starts once the hosted server
             # logged its join code (start_joiners below), never before.
             joiners = [n for n in starts if n not in remote and uses_join_code(spec, n)]
+            # start_after: a client that starts once its start peer's log shows the pattern.
+            late = {n: (LogTail(peer_log_path(run, spec.peers[n].start_peer, hosted)),
+                        re.compile(spec.peers[n].start_after))
+                    for n in starts if n not in remote and spec.peers[n].start_after}
             for n in starts:
-                if n in joiners:
+                if n in joiners or n in late:
                     continue
                 # Games booting in the same instant crashed and froze each other in a test
                 # (stage 0, five at once); real sessions never start them together either. The gap
@@ -4434,6 +5397,13 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             join_tail = LogTail(peer_log_path(run, "S", hosted)) if joiners else None
             join_waits = list(joiners)
             not_started: dict[str, str] = {}  # a joiner that will not start, and why
+
+            def start_late() -> None:
+                for ln, (tail, rx) in list(late.items()):
+                    if any(rx.search(line) for line in tail.new_lines()):
+                        del late[ln]
+                        pacer.wait_turn(note_ends)
+                        start_local(ln)
 
             def start_joiners() -> None:
                 code, problem = join_code_from(join_tail.new_lines())
@@ -4477,7 +5447,10 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             # Fail fast: the first fatal line (or crash exit) moves the stop to a grace after it.
             watch = FailFast({**{n: peer_log_path(run, n, hosted) for n in names}, **syn_logs},
                              {**{n: fail_fast_patterns(spec, n) for n in names},
-                              **{n: s.forbid + SYNTHETIC_FATAL for n, s in spec.synthetic.items()}}) \
+                              **{n: s.forbid + SYNTHETIC_FATAL for n, s in spec.synthetic.items()}},
+                             needs={n: spec.peers[n].wait_needs for n in names if n in spec.peers},
+                             scripts={n: spec.peers[n].script for n in names if n in spec.peers},
+                             within={n: spec.peers[n].within for n in names if n in spec.peers}) \
                 if spec.fail_fast else None
             stop_at, next_check, early = deadline, 0.0, False
             while len(ended) < len(procs) and time.monotonic() < stop_at:
@@ -4488,16 +5461,22 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                     droot.check()  # a phase line: that phase's end snapshot
                 if join_waits and not (watch is not None and watch.hit):  # no new game after a fatal line
                     start_joiners()
+                if late and not (watch is not None and watch.hit):
+                    start_late()
                 if watch is not None and time.monotonic() >= next_check:
                     next_check = time.monotonic() + FAIL_FAST_POLL
                     # Checked through the grace too: a hit whose log was replaced meanwhile is dropped.
                     stop_at = min(deadline, watch.hit_at + cfg.fail_fast_grace) \
                         if watch.check({**procs, **syn_procs}) else deadline
                     early = stop_at < deadline  # else the timeout comes first: a timeout as before
+                if live is not None and live.tick(procs):
+                    break  # the session's stop: its grace is over, what still runs is ended below
                 time.sleep(min(0.5, max(0.0, stop_at - time.monotonic())))
             # {joincode}: a joiner still waiting when the run ended never got the code (fails closed).
             not_started.update({n: "never started: S never logged its join code (/"
                                    f"{SERVER_JOIN_CODE.pattern}/), so {{joincode}} had no value" for n in join_waits})
+            not_started.update({n: f"never started: {spec.peers[n].start_peer} never logged"
+                                   f" /{spec.peers[n].start_after}/" for n in late})
             stopped = ""
             if early and watch is not None and watch.hit and any(p.poll() is None for p in procs.values()):
                 stopped = f"stopped early: {watch.hit[0]} {watch.hit[1]} (fail fast)"
@@ -4529,7 +5508,14 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
                         pass
                 results[sn].exit_code = sp.returncode
                 results[sn].seconds = round(time.monotonic() - syn_started[sn], 1)
+            # A process whose wait returned can still be counted by its job for a moment while Windows tears it
+            # down (8 test chunks at once: the fail-fast test saw 1 for an S stand-in the runner had just ended and
+            # waited for): the count settles for up to LEFTOVER_SETTLE_S before it is a leftover.
+            settle_until = time.monotonic() + LEFTOVER_SETTLE_S
             res.leftover_processes = job.active()
+            while res.leftover_processes and time.monotonic() < settle_until:
+                time.sleep(0.1)
+                res.leftover_processes = job.active()
             if res.leftover_processes:
                 job.terminate()
             for n, hold in holds:  # every game ended: each token is free, its outcome known
@@ -4544,6 +5530,12 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             rp.client.close()
         res.status, res.reasons = "error", [str(e)]
         return res
+    if spec.shader_cache == "snapshot":
+        # The run's caches into the snapshot's, for the next run of this build (S's in H's session folder).
+        for n in starts:
+            copy_cache(run / n / "cache", snap / SHADER_CACHE_DIR)
+        if hosted:
+            copy_cache(run / "H" / "data" / "Online" / "session" / "cache", snap / SHADER_CACHE_DIR)
     saves_after = {n: save_state(run / n / "data", save_title) for n in saves_before}
     if droot is not None:
         droot.finish()
@@ -4559,6 +5551,7 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
         parsed = parse_log(text)
         r = results[n]
         r.build, r.levels, r.fps, r.longest_frame_ms = parsed["build"], parsed["levels"], parsed["fps"], parsed["longest"]
+        r.frames_fps = parsed["frames_fps"]
         r.peak_private_mb, r.peak_working_set_mb, r.errors = parsed["private"], parsed["working"], parsed["errors"]
         r.frame_p95_ms, r.peak_video_mb = parsed["frame_p95"], parsed["video"]
         r.startup_stall_s = parsed["startup_stall"]
@@ -4577,6 +5570,11 @@ def run_case(cfg: Config, spec: Spec, snap: Path, max_games: int, stamp: str,
             if droot is not None and n in droot.peers:
                 extra += grade_data_root(r, droot, droot_title)
             extra += grade_cross_peer(spec, r, {**texts, **syn_texts}, cfg.repo, thresholds or {})
+            g_tiles = spec.grades.get(drop_tiles.NAME)
+            if g_tiles is not None and g_tiles.get("peer", "H") == n:
+                # Stage 8: the pictures beside this peer's log (shots and pipeline_drop_capture frames).
+                r.graded[drop_tiles.NAME], why = drop_tiles.grade(run / n, texts.get(n, ""), g_tiles)
+                extra += why
             # A grade the manifest accepts for this case (plan 5.4: accepted failures with a reason)
             # is recorded, not failed on; everything else still has to pass.
             # Only a measured violation is accepted: a missing measurement or baseline still fails.
@@ -5320,17 +6318,28 @@ def checkpoint_verdict(manifest: dict, stage: str, stages: list[str], results: l
 def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: dict, thresholds: dict,
                  max_games: int, guard: list[dict], unwritten: list[str], checkpoint: dict | None = None,
                  gate: dict | None = None, token: dict | None = None, jobs: int = 1, progress: str = "",
-                 queue_unmatched: list[str] | None = None, breaker: dict | None = None) -> None:
+                 queue_unmatched: list[str] | None = None, breaker: dict | None = None,
+                 run_load: dict | None = None) -> None:
     """report.md. `progress` (PS14): the run is still going; the report so far (its finished cases)
     says so and leaves out what only the run's end knows (the manifest's cases not run, the guarded
-    folders, the checkpoint and the gate)."""
+    folders, the checkpoint and the gate). A bulk run (cfg.bulk) says so first, with its run load."""
     head = f"At most {max_games} game(s) at once."
     if jobs > 1:
         head = (f"At most {max_games} game(s) and {jobs} case(s) at once (--jobs {jobs}); an exclusive case ran"
                 " alone. With: the cases that ran beside it.")
-    lines = [f"# skytest run {out.name}", "", head, ""]
+    lines = [f"# skytest run {out.name}{' (BULK)' if cfg.bulk is not None else ''}", ""]
+    if cfg.bulk is not None:
+        lines += [f"**{cfg.bulk.line()}**", ""]
+        if run_load:
+            lines += [run_load_line(run_load), ""]
+        left = [r for r in results if r.status == NOT_IN_BULK]
+        if left:
+            lines += [f"{len(left)} case(s) not in bulk (listed below with why); they run visible with"
+                      f" `skytest.py test {' '.join(r.case for r in left)}`.", ""]
+    lines += [head, ""]
     if cfg.slots is not None:
-        lines += [f"The machine's budget, shared with every other runner: {cfg.machine_games} game(s); an exclusive"
+        budget = cfg.bulk.games if cfg.bulk is not None else cfg.machine_games
+        lines += [f"The machine's budget, shared with every other runner: {budget} game(s); an exclusive"
                   " or timed case takes all of it (Machine: under each case).", ""]
     if breaker:
         lines += [f"**{breaker_line(breaker)}**", ""]
@@ -5361,6 +6370,8 @@ def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: di
             lines += [f"Fatal signature ({r.signature['peer']}, {r.signature['kind']}): `{r.signature['signature']}`", ""]
         if r.scenes:
             lines += [f"Scenes: {r.scenes}", ""]
+        for note in r.notes:
+            lines += [note, ""]
         lines += [
                   "| Peer | Status | Exit | Time | Startup stall | Levels | FPS | Longest frame | Peak private MB "
                   "| Errors | Measures |",
@@ -5376,6 +6387,10 @@ def write_report(cfg: Config, out: Path, results: list[CaseResult], manifest: di
         for p in r.peers:
             for why in p.reasons:
                 lines.append(f"- {p.peer}: {why}")
+            # Stage 8's picture grade: its verdict line, NEEDS READING included (a verdict that neither
+            # passes nor fails the case: the run's reader decides from drop_tiles.md and its crops).
+            if note := p.graded.get(drop_tiles.NAME, {}).get("note"):
+                lines.append(f"- {p.peer}: {note}")
         for p in r.peers:
             if p.startup_stall_s is not None and p.startup_stall_s > STARTUP_STALL_WARN_S:
                 lines.append(f"- WARNING: {p.peer}: startup stall {p.startup_stall_s:.1f} s (shader storage to the "
@@ -5440,8 +6455,19 @@ def write_text_replacing(path: Path, text: str, retry_s: float | None = None) ->
     return False
 
 
+def payload_mode(payload: object) -> str:
+    """A recorded run's mode: "bulk" (`test --bulk`, results.json `mode`), else '' (the default mode)."""
+    return "bulk" if isinstance(payload, dict) and payload.get("mode") == "bulk" else ""
+
+
+def cfg_mode(cfg: Config) -> str:
+    """This run's mode, as payload_mode names it."""
+    return "bulk" if cfg.bulk is not None else ""
+
+
 def previous_statuses(cfg: Config, current: Path) -> dict[str, str]:
-    """The last recorded status of each case before this run, from earlier results.json files."""
+    """The last recorded status of each case before this run, from earlier results.json files of the same
+    mode (a bulk run's statuses are its own; a case not run in bulk says nothing)."""
     seen: dict[str, str] = {}
     runs = cfg.store / "runs"
     if not runs.is_dir():
@@ -5450,7 +6476,12 @@ def previous_statuses(cfg: Config, current: Path) -> dict[str, str]:
         if f.parent == current:
             continue
         try:
-            for c in json.loads(f.read_text(encoding="utf-8")).get("cases", []):
+            payload = json.loads(f.read_text(encoding="utf-8"))
+            if payload_mode(payload) != cfg_mode(cfg):
+                continue
+            for c in payload.get("cases", []):
+                if c.get("status") == NOT_IN_BULK:
+                    continue
                 seen[c["case"]] = c["status"]
         except (OSError, ValueError, KeyError):
             continue
@@ -5501,6 +6532,8 @@ def last_run_seconds(cfg: Config, current: Path | None = None) -> dict[str, dict
             continue
         try:
             payload = json.loads(f.read_text(encoding="utf-8"))
+            if payload_mode(payload) != cfg_mode(cfg):  # a bulk run's times are its own (hidden, loaded)
+                continue
             cases = payload.get("cases", [])
         except (OSError, ValueError, AttributeError):
             continue
@@ -5627,6 +6660,8 @@ def build_results(cfg: Config, build: str, current: Path | None = None) -> dict[
             continue
         try:
             payload = json.loads(f.read_text(encoding="utf-8"))
+            if payload_mode(payload):  # a bulk run never decides a per-build gate case
+                continue
             snap = payload.get("snapshot")
             if not isinstance(snap, str) or re.split(r"[\\/]", snap.rstrip("\\/"))[-1] != build:
                 continue
@@ -5644,7 +6679,7 @@ def build_results(cfg: Config, build: str, current: Path | None = None) -> dict[
 
 # A result that never started the game (no machine room, the circuit breaker, not ready) does not decide a
 # per-build case: the result before it stands.
-PER_BUILD_NOT_RUN = ("capacity", "breaker", "not ready")
+PER_BUILD_NOT_RUN = ("capacity", "breaker", "not ready", "known failure", "build running", "preflight")
 
 
 def per_build_state(cfg: Config, spec: Spec, entries: list[tuple[str, str, dict]], build: str) -> dict:
@@ -6037,6 +7072,8 @@ def schedule_cases(specs: list[Spec], jobs: int, max_games: int, run_one, say=No
                             r.ran_with = overlapped(i, *spans[i])
                         why = f": {'; '.join(r.reasons)}" if r.reasons else ""
                         tell(f"  {r.status.upper()}{why}" if jobs == 1 else f"{spec.name}: {r.status.upper()}{why}")
+                        for note in r.notes:
+                            tell(f"  {note}" if jobs == 1 else f"{spec.name}: {note}")
                         if done is not None:
                             try:
                                 done(spec, r)
@@ -6213,9 +7250,15 @@ def check_slots_folder(cfg: Config, folder: Path) -> None:
 
 
 def machine_budget(cfg: Config) -> "MachineBudget | None":
+    """The machine's game budget for this run: [defaults] machine_games, or a bulk run's own budget and
+    free memory per game (BulkMode). Every runner counts the same slot files, so a bulk run's games hold
+    a default runner's cases off while they run, and the other way round."""
     if cfg.slots is None:
         return None
     check_slots_folder(cfg, cfg.slots)
+    bulk = getattr(cfg, "bulk", None)
+    if bulk is not None:
+        return MachineBudget(cfg.slots, bulk.games, gb_per_game=bulk.gb_per_game)
     return MachineBudget(cfg.slots, cfg.machine_games)
 
 
@@ -6311,8 +7354,10 @@ def memory_recheck(want: float, mem: float, seconds: float | None = None, every:
 class MachineBudget:
     """The game budget every runner on the machine shares (PS15): `games` slots in `folder`."""
 
-    def __init__(self, folder: Path, games: int, owner: str = "") -> None:
+    def __init__(self, folder: Path, games: int, owner: str = "", gb_per_game: float | None = None) -> None:
         self.folder, self.games = Path(folder), max(1, min(int(games), MACHINE_SLOT_FILES))
+        # None: GB_PER_GAME as it is when a case is admitted (read then, not when the budget is made).
+        self.gb_per_game = gb_per_game
         self.owner = owner or f"skytest pid {os.getpid()}"
         self.folder.mkdir(parents=True, exist_ok=True)
 
@@ -6416,7 +7461,7 @@ class MachineBudget:
                             for _, fd in taken[need:]:
                                 _unlock_close(fd)
                             mem = available_memory_gb()
-                            want = memory_games * GB_PER_GAME
+                            want = memory_games * (GB_PER_GAME if self.gb_per_game is None else self.gb_per_game)
                             if mem is not None and mem < want and not held and rechecked is not None:
                                 mem = max(mem, rechecked)
                             if mem is not None and mem < want:
@@ -6775,6 +7820,207 @@ def folder_state(root: Path, skip: tuple[str, ...] = ()) -> tuple[int, float, st
     return count, newest, h.hexdigest()
 
 
+# --- the owner's data, by part, and the owner's own games (acceptance pass 1, 2026-11-20) -----------------------
+#
+# The first acceptance pass stopped on "changed during the run: owner data ...\Documents\Skylanders" while the case's
+# games ran on their own data folders: the owner's other game (imaginatorsrecompiled.exe, one of the six that share
+# Documents\Skylanders) was running. The guard now says which part changed, never a name inside it and never a file's
+# content: "Swap Force" and "Figures" (the folders this game writes on real data) by name, everything else as "only
+# other games' folders". The owner's own games are the processes named *recompiled.exe that are not this runner's
+# (not its descendants), by name and start time. A case is "untouched" when every game of it ran with its own data
+# folder (its command's --user_data_root and its log's `Data folder: <path> (--user_data_root)`, outside every owner
+# root); OWNER DATA AT RISK when one did not, or when "Swap Force" / "Figures" changed with no other owner game running.
+OWNER_PARTS = ("Swap Force", "Figures")
+OWNER_OTHER = "only other games' folders"
+OWNER_GAME_SUFFIX = "recompiled.exe"
+OWNER_AT_RISK = "OWNER DATA AT RISK"
+DATA_FOLDER_LINE = re.compile(r"Data folder: (.+?) \((--user_data_root|[^)]*)\)")
+
+
+def owner_parts_state(root: Path) -> dict[str, tuple[int, float, str]]:
+    """One owner root's state by part: its "Swap Force" and "Figures" folders each, the rest (every other top-level
+    entry) as one; nothing but counts, times and hashes is kept."""
+    out = {p: folder_state(root / p) for p in OWNER_PARTS}
+    count, newest = 0, 0.0
+    h = hashlib.sha256()
+    try:
+        tops = sorted(os.scandir(root), key=lambda e: e.name) if root.is_dir() else []
+    except OSError:
+        tops = []
+    for e in tops:
+        if e.name in OWNER_PARTS:
+            continue
+        if e.is_dir(follow_symlinks=False):
+            c, n, d = folder_state(Path(e.path))
+        else:
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            c, n, d = 1, st.st_mtime, f"{st.st_size}|{st.st_mtime_ns}"
+        count += c
+        newest = max(newest, n)
+        h.update(f"{e.name}|{d}\n".encode("utf-8", "surrogateescape"))
+    out[OWNER_OTHER] = (count, newest, h.hexdigest())
+    return out
+
+
+def owner_parts_changed(before: dict[str, dict], after: dict[str, dict]) -> list[str]:
+    """Which parts changed over every owner root: "Swap Force", "Figures" (in that order), and OWNER_OTHER last."""
+    changed = set()
+    for root in set(before) | set(after):
+        b, a = before.get(root, {}), after.get(root, {})
+        for part in set(b) | set(a):
+            if b.get(part) != a.get(part):
+                changed.add(part)
+    return [p for p in OWNER_PARTS if p in changed] + ([OWNER_OTHER] if OWNER_OTHER in changed else [])
+
+
+RUN_COPY_MARKER = ".skytest-copy"   # build_game's run copy: <run>/<peer>/data/.skytest-copy
+
+
+def test_game(pid: int, roots: list[Path] | None = None) -> bool:
+    """Whether a running game is a test game (any runner's, this one's or another worktree's): its command line's
+    --user_data_root is a runner's run copy (the folder, or one of its three parents, holds RUN_COPY_MARKER; a
+    hosted server's data folder is inside its H's). A data folder under the owner's own folders is never looked
+    into, and a command line that cannot be read is the owner's game (the list then waits, the safe side)."""
+    line = store_paths.pid_command_line(pid)
+    args = store_paths.split_command_line(line) if line else None
+    if not args:
+        return False
+    root = next((a.split("=", 1)[1] for a in args if a.startswith("--user_data_root=")), None)
+    if not root or under_owner_root(root, owner_data_roots() if roots is None else roots):
+        return False
+    p = Path(root)
+    for q in [p, *list(p.parents)[:3]]:
+        try:
+            if (q / RUN_COPY_MARKER).is_file():
+                return True
+        except OSError:
+            return False
+    return False
+
+
+def owner_games_running(runner_pid: int | None = None, table: list | None = None,
+                        started: "dict[int, str] | None" = None, is_test=None) -> list[tuple[str, str]]:
+    """The owner's own games running now: (exe name, start time) of each process named *recompiled.exe that is not
+    runner_pid's descendant (this runner's games are) and not another runner's test game (test_game, or the child
+    of one: a hosted server); `table`/`started`/`is_test` for the unit cases (else read here)."""
+    table = process_table() if table is None else table
+    if not table:
+        return []
+    parent = {pid: ppid for pid, ppid, _ in table}
+    names = {pid: name for pid, _pp, name in table}
+    is_test = test_game if is_test is None else is_test
+    tested: dict[int, bool] = {}
+
+    def a_test_game(pid: int) -> bool:
+        seen = set()
+        while pid and pid not in seen and len(seen) < 8 and names.get(pid, "").lower().endswith(OWNER_GAME_SUFFIX):
+            if pid not in tested:
+                tested[pid] = bool(is_test(pid))
+            if tested[pid]:
+                return True
+            seen.add(pid)
+            pid = parent.get(pid, 0)
+        return False
+
+    def ours(pid: int) -> bool:
+        seen = set()
+        while runner_pid and pid and pid not in seen and len(seen) < 64:
+            if pid == runner_pid:
+                return True
+            seen.add(pid)
+            pid = parent.get(pid, 0)
+        return False
+
+    games = [(pid, name) for pid, _pp, name in table if name.lower().endswith(OWNER_GAME_SUFFIX) and not ours(pid)
+             and not a_test_game(pid)]
+    starts = started if started is not None else process_start_times([pid for pid, _n in games])
+    return sorted({(name, starts.get(pid, "?")) for pid, name in games})
+
+
+def process_start_times(pids: list[int]) -> dict[int, str]:
+    """Each process's start time (HH:MM:SS, local) from GetProcessTimes; a process that cannot be opened is left out."""
+    if not WINDOWS or not pids:
+        return {}
+    out = {}
+    try:
+        ctypes, k32, _, _ = _load_api()
+        c, x, k, u_ = (ctypes.c_ulonglong() for _ in range(4))
+        for pid in pids:
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                continue
+            try:
+                if k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(x), ctypes.byref(k), ctypes.byref(u_)):
+                    secs = c.value / 1e7 - 11644473600.0  # FILETIME (1601, 100 ns) to the Unix epoch
+                    out[pid] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(secs))
+            finally:
+                k32.CloseHandle(h)
+    except (OSError, AttributeError):
+        return out
+    return out
+
+
+def under_owner_root(path: str, roots: list[Path]) -> bool:
+    p = str(path).replace("/", "\\").rstrip("\\").lower()
+    for r in roots:
+        rs = str(r).replace("/", "\\").rstrip("\\").lower()
+        if p == rs or p.startswith(rs + "\\"):
+            return True
+    return False
+
+
+def case_own_data_folders(peers: list, logs: dict[str, str], roots: list[Path],
+                          exe: str | None = None) -> tuple[bool, list[str]]:
+    """Whether every game of a case ran with its own data folder: each peer's command names --user_data_root outside
+    every owner root, and its log's `Data folder:` line (when the log has one) is outside too. (ok, evidence). With
+    `exe` (the game's file name), a peer whose command does not run it (a unit case's binary, a synthetic peer) is
+    no game and is left out."""
+    ok, ev = True, []
+    for p in peers:
+        name = p.get("peer") if isinstance(p, dict) else getattr(p, "peer", "?")
+        cmd = (p.get("command") if isinstance(p, dict) else getattr(p, "command", None)) or []
+        if exe and cmd and not any(str(x).lower().endswith(exe.lower()) for x in cmd[:3]):
+            continue
+        if not cmd:
+            pass  # a hosted server (S, or a compared run's `off1:S`): its owner's child, its data folder from its log
+        else:
+            root = next((a.split("=", 1)[1] for a in cmd if a.startswith("--user_data_root=")), None)
+            if root is None or under_owner_root(root, roots):
+                ok = False
+                ev.append(f"{name}: " + ("no --user_data_root in its command" if root is None
+                                         else "its --user_data_root is the owner's data"))
+                continue
+        m = DATA_FOLDER_LINE.search(logs.get(name, "") or "")
+        if m and under_owner_root(m.group(1), roots):
+            ok = False
+            ev.append(f"{name}: its log's Data folder is the owner's data")
+        elif m:
+            ev.append(f"{name} ok")
+        elif cmd:
+            ev.append(f"{name} ok (command)")
+    return ok, ev
+
+
+def owner_data_verdict(case_ok: bool, evidence: list[str], parts: list[str],
+                       other_games: list[tuple[str, str]]) -> tuple[str, bool]:
+    """The page's and result's line, and whether the owner's data is at risk."""
+    others = ", ".join(f"{n} (started {t})" for n, t in other_games)
+    if not case_ok:
+        return f"{OWNER_AT_RISK}: a game of this case did not run with its own data folder ({'; '.join(evidence)})", True
+    if any(p in OWNER_PARTS for p in parts) and not other_games:
+        return (f"{OWNER_AT_RISK}: owner data changed during the run: {', '.join(parts)}, and no other game of the "
+                "owner was running"), True
+    line = (f"owner data: untouched by this case (its games ran with their own data folders: {'; '.join(evidence)})")
+    if other_games:
+        line += f"; another game of the owner was running: {others}"
+    if parts:
+        line += f"; owner data changed during the run: {', '.join(parts)}"
+    return line, False
+
+
 def guarded_folders(cfg: Config) -> dict[str, tuple[Path, tuple[str, ...]]]:
     """What a run must leave alone: the owner's data folders and the disc (whose cachenonce.txt the
     game itself rewrites at every start)."""
@@ -6883,6 +8129,211 @@ class StoreJanitor:
                     pass
 
 
+# --- cleaning up: old snapshots after a run, old runs on request -----------------------------------------
+#
+# Both through the game repository's janitor (tools/test_store_janitor.py: its link-safe delete, its
+# refusals, its keep rules), never a deletion of the runner's own. After a run: every build snapshot
+# but the current build's and the one before it (the newest other build a finished session of this store
+# ran), and any a session still in progress names. `prune --older-than <hours>`: the run and session
+# folders whose newest file is older than that.
+SESSION_RECENT_S = 24 * 3600.0   # a session this young with no results.json yet may still be running
+SESSION_NAME = re.compile(r"-session(?:-\d+)?$")  # fresh_dir names a same-second second session -session-2
+
+
+def publish_live_session(cfg: Config, name: str, snap: Path) -> Path:
+    """A live session's own session folder (runs/<stamp>-live-<name>-session) naming its snapshot, written
+    while the caller holds the machine lock; it stays `in_progress` (active while a game runs in this store)."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:40] or "live"
+    out = make_run_dir(cfg, cfg.store / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-live-{safe}-session")
+    publish_session(out, snap)
+    return out
+
+
+def publish_session(out: Path, snap: Path | None) -> None:
+    """A session's results.json from its first moment (in progress, naming its snapshot), so every runner's
+    after-run cleanup keeps the snapshot it uses; write_progress replaces it as cases end."""
+    if (out / "results.json").is_file():
+        try:
+            if json.loads((out / "results.json").read_text(encoding="utf-8")).get("cases"):
+                return  # a case has ended: write_progress names the snapshot from now on
+        except (OSError, ValueError, AttributeError):
+            pass
+    write_text_replacing(out / "results.json", json.dumps({"in_progress": "starting: no case ended yet",
+                                                            "snapshot": str(snap) if snap else "", "cases": []}))
+
+
+def janitor_script(cfg: Config) -> Path | None:
+    """The game repository's janitor when it has the cleanup options, else None."""
+    script = cfg.repo / "tools" / "test_store_janitor.py"
+    try:
+        return script if "--keep-snapshot-names" in script.read_text(encoding="utf-8", errors="replace") else None
+    except OSError:
+        return None
+
+
+def snapshots_in_use(cfg: Config, current: str) -> list[str] | None:
+    """The snapshot names to keep after a run: `current`, the newest other one a finished session named,
+    and every one a session in progress names. None when a recent session has no results.json yet (its
+    snapshot is unknown: nothing is removed this time)."""
+    keep = [current]
+    previous = ""
+    runs = cfg.store / "runs"
+    games: list[bool] = []  # once: does a running game have its data folder in this store (None: cannot tell)
+
+    def games_here() -> bool:
+        """A session without a finished results file counts as active, whatever its age, while a running game
+        has its data folder in this store, or when that cannot be told."""
+        if not games:
+            roots = store_paths.data_roots_in_use()
+            store_real = store_paths.real(cfg.store)
+            games.append(roots is None or any(store_paths.within(r, store_real) for r in roots))
+        return games[0]
+    try:
+        sessions = sorted((d for d in runs.iterdir() if SESSION_NAME.search(d.name)), key=lambda d: d.name,
+                          reverse=True)
+    except OSError:
+        return keep
+    now = time.time()
+    for d in sessions:
+        stamp = known_failures.RUN_NAME.match(d.name)
+        young = False
+        if stamp:
+            try:
+                young = now - time.mktime(time.strptime(stamp.group(1)[:15], "%Y%m%d-%H%M%S")) < SESSION_RECENT_S
+            except (ValueError, OverflowError):
+                young = False
+        try:
+            res = json.loads((d / "results.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            res = None
+        if not isinstance(res, dict):
+            # No results file yet, or one that does not read: its snapshot is unknown; while it may be running
+            # (young, or a game runs in this store) nothing is removed this time.
+            if young or games_here():
+                return None
+            continue
+        name = Path(str(res.get("snapshot") or "")).name
+        if not name:
+            continue
+        if res.get("in_progress"):
+            if (young or games_here()) and name not in keep:
+                keep.append(name)
+        elif not previous and name != current:
+            previous = name
+        if previous and not young:
+            break
+    if previous and previous not in keep:
+        keep.insert(1, previous)
+    return keep
+
+
+def prune_snapshots(cfg: Config, current: str) -> str:
+    """After a run: the janitor removes the build snapshots no longer in use (snapshots_in_use). Its line,
+    or '' when this game repository's janitor has no such option."""
+    script = janitor_script(cfg)
+    if script is None or not current:
+        return ""
+    keep = snapshots_in_use(cfg, current)
+    if keep is None:
+        return "snapshots: none removed (a session younger than a day has no results.json yet)"
+    try:
+        r = subprocess.run([sys.executable, "-I", str(script), "--store", str(cfg.store), "--apply", "--line",
+                            "--only", "snapshots", "--keep-snapshot-names", ",".join(keep)]
+                           + (["--snapshots-folder", str(cfg.snapshots)] if cfg.snapshots is not None
+                              else ["--no-snapshots-folder"]),
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"snapshots: not cleaned ({e})"
+    return "snapshots: " + ((r.stdout or "").strip() or (r.stderr or "").strip()[-300:])
+
+
+def cmd_levelcheck(cfg: Config, a: argparse.Namespace) -> int:
+    """`levelcheck --grade <run folder>`: the level check's graders (levelcheck.py) on a run that exists, no
+    game: lobby, save slot, cutscenes, enemies, pickups, loot, each with its counts and one cited line.
+    Exit 0 when nothing failed (NOT TESTED included: it is said, never counted as a pass), 1 when a grader
+    found a difference."""
+    import levelcheck as lc
+    if getattr(a, "static", False):
+        text = lc.static_table(levelpass_folder(cfg, getattr(a, "folder", None)))
+        if getattr(a, "out", None):
+            Path(a.out).write_text(text + "\n", encoding="utf-8")
+        print(text)
+        return 0
+    if bool(a.grade) == bool(a.level):
+        raise SystemExit("levelcheck: give a level (a level pass, then its grade), --grade <run folder> or --static")
+    if a.grade:
+        folder = Path(a.grade)
+        if not folder.is_dir():
+            raise SystemExit(f"levelcheck: no run folder {folder}")
+        verdicts = lc.grade(folder, cfg.repo, levelpass_folder(cfg, getattr(a, "folder", None)))
+        print(lc.page(folder, verdicts, lc.run_head(folder, levelpass_folder(cfg, getattr(a, "folder", None)))))
+        return levelcheck_exit(lc, verdicts)
+    if a.predictions:
+        raise SystemExit("levelcheck: --predictions is levelpass's own mode; the check grades the generated pass")
+    # The level pass itself (its case through `test`: the known-failure refusal, the build-slot wait and the
+    # preflight gate), then the graders on its own run folder.
+    a.check = {}
+    code = cmd_levelpass(cfg, a)
+    run = a.check.get("run")
+    if a.plan_only or run is None:
+        if not a.plan_only:
+            print(f"levelcheck {a.level}: no run to grade (levelpass exit {code})", flush=True)
+        return code
+    verdicts = lc.grade(run, cfg.repo, levelpass_folder(cfg, getattr(a, "folder", None)))
+    head = lc.run_head(run, levelpass_folder(cfg, getattr(a, "folder", None))) + [
+        f"level pass report: {a.check.get('report', '-')}"]
+    text = lc.page(run, verdicts, head)
+    out = levelpass_folder(cfg, getattr(a, "folder", None)) / f"{a.level}-check-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+    out.write_text(text + "\n", encoding="utf-8")
+    print(text, flush=True)
+    print(f"levelcheck {a.level}: page {out}", flush=True)
+    return levelcheck_exit(lc, verdicts)
+
+
+def levelcheck_exit(lc, verdicts) -> int:
+    """1 when a grader failed, EXIT_INCOMPLETE when the pass did not cover its plan, else 0 (NOT TESTED rows
+    are said on the page, never counted as passed)."""
+    if any(v.status == lc.FAIL for v in verdicts):
+        return 1
+    return EXIT_INCOMPLETE if any(v.status == lc.INCOMPLETE for v in verdicts) else 0
+
+
+def cmd_acceptance(cfg: Config, a: argparse.Namespace) -> int:
+    """W39 item 6: the acceptance list (acceptance.py), its estimate first."""
+    import acceptance
+    cases = [c for c in (a.cases.split(",") if a.cases else acceptance.CASES) if c]
+    # --levels with an empty value: no level check (only the cases); without --levels: all three.
+    levels = list(acceptance.LEVELS) if a.levels is None else [lv for lv in a.levels.split(",") if lv.strip()]
+    heads = []
+    for repo in (cfg.repo, cfg.repo / "thirdparty" / "skylanders-portal"):
+        r = subprocess.run(["git", "-C", str(repo), "log", "-1", "--format=%h %s"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        heads.append(f"{repo.name} {r.stdout.strip() or '?'}")
+    return acceptance.run(Path(__file__).resolve(), cfg.repo, cfg.store, levelpass_folder(cfg, None), cases, levels,
+                          a.run_not_ready, a.dry_run, "; ".join(heads), [Path(x) for x in (a.history or [])],
+                          a.while_owner_plays)
+
+
+def cmd_prune(cfg: Config, a: argparse.Namespace) -> int:
+    """`prune --older-than <hours>`: the store's run and session folders older than that, through the
+    janitor (never through a directory link); it prints what it removed and what that freed."""
+    if not (math.isfinite(a.older_than) and a.older_than > 0):
+        raise SystemExit(f"prune: --older-than takes a finite number of hours above 0, not {a.older_than}")
+    script = janitor_script(cfg)
+    if script is None:
+        raise SystemExit(f"prune: {cfg.repo / 'tools' / 'test_store_janitor.py'} is missing or has no cleanup options")
+    cmd = [sys.executable, "-I", str(script), "--store", str(cfg.store), "--only", "runs",
+           "--older-than-hours", str(a.older_than)] + ([] if a.dry_run else ["--apply"])
+    return subprocess.run(cmd).returncode
+
+
+def not_in_bulk_result(spec: Spec, why: str) -> CaseResult:
+    """A case bulk mode leaves out (bulk_exclusion), reported at 0 s without a game; not failed."""
+    return CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage, status=NOT_IN_BULK,
+                      reasons=[f"not in bulk: {why}"], exclusive=runs_alone(spec), mode="bulk",
+                      started=time.strftime("%Y%m%d-%H%M%S"))
+
+
 def not_ready_result(spec: Spec) -> CaseResult:
     """PS2: a case that is not ready, reported at 0 s without a game (or a run folder)."""
     return CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage, status="not ready",
@@ -6937,6 +8388,30 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     if per_build_run and not gate_run:
         raise SystemExit("--per-build goes with --gate (`test --gate --per-build`: the per-build gate cases)")
     run_not_ready = bool(getattr(a, "run_not_ready", False))
+    rerun_why = (getattr(a, "rerun_known_failure", None) or "").strip()
+    ignore_build = (getattr(a, "ignore_build", None) or "").strip()
+    if getattr(a, "ignore_build", None) is not None and not ignore_build:
+        raise SystemExit("--ignore-build needs the reason: why this case may run beside a build")
+    build_wait_s = 60.0 * float(getattr(a, "build_wait_min", None) or build_guard.BUILD_WAIT_MIN)
+    ignore_preflight = (getattr(a, "ignore_preflight", None) or "").strip()
+    if getattr(a, "ignore_preflight", None) is not None and not ignore_preflight:
+        raise SystemExit("--ignore-preflight needs the reason: why this case may start with a preflight error")
+    preflight_cache: dict = {}
+    if getattr(a, "rerun_known_failure", None) is not None and not rerun_why:
+        raise SystemExit("--rerun-known-failure needs the reason: why this rerun can end otherwise")
+    bulk_on = bool(getattr(a, "bulk", False))
+    cfg.session_settings = bool(getattr(a, "session_settings", False))
+    pacing = getattr(a, "bulk_pacing", None)
+    if pacing and not bulk_on:
+        raise SystemExit("--bulk-pacing goes with --bulk")
+    if bulk_on:
+        if gate_run:
+            raise SystemExit("--bulk and --gate do not go together: a gate's verdict is the watched default mode's"
+                             " (bulk results never count for it)")
+        bs = cfg.bulk_settings
+        cfg.bulk = BulkMode(games=bs.games, wait_factor=bs.wait_factor, gb_per_game=bs.gb_per_game,
+                            pacing=pacing or "default")
+        print(cfg.bulk.line(), flush=True)
     queue_file = getattr(a, "queue", None)
     queue = CaseQueue(Path(queue_file)) if queue_file else None
     if queue is not None:
@@ -7029,9 +8504,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         check_disc(cfg)
     if getattr(a, "remote", None):
         cfg.remote = remote_target(a.remote, getattr(a, "remote_token_file", None), getattr(a, "remote_manifest", None))
-    max_games = a.max_games or default_max_games()
+    max_games = a.max_games or (cfg.bulk.games if cfg.bulk is not None else default_max_games())
     jobs = getattr(a, "jobs", None)
-    jobs = 1 if jobs is None else int(jobs)
+    # Bulk mode: as many cases at once as the budget has room for server+1 cases (two games each).
+    jobs = (max(1, max_games // 2) if cfg.bulk is not None else 1) if jobs is None else int(jobs)
     if jobs < 1:
         raise SystemExit("--jobs is 1 or more")
     # PS2: a case that is not ready starts no game; it is reported at 0 s with its reason.
@@ -7045,6 +8521,12 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         ready = []
         for sp in new:
             order.append(sp)
+            if (run_not_ready or not sp.not_ready) and cfg.bulk is not None and (why := bulk_exclusion(sp)):
+                print(f"{sp.name}: NOT IN BULK: {why} (no game started)", flush=True)
+                r = not_in_bulk_result(sp, why)
+                r.provenance = case_provenance(cfg, sp, fixtures)
+                by_case[id(sp)] = r
+                continue
             if run_not_ready or not sp.not_ready:
                 ready.append(sp)
                 continue
@@ -7064,6 +8546,10 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         print(rank.line(runnable), flush=True)
     janitor = StoreJanitor(cfg)
     budget = machine_budget(cfg)
+
+    def machine_lock():
+        """The machine-wide lock (machine.lock) when this machine has a budget; else nothing to share."""
+        return budget.mutex() if budget is not None else contextlib.nullcontext()
     if any(runs_alone(sp) for sp in runnable):
         janitor.skip("a case of this run runs alone: the janitor's walk never runs beside a measured case")
     else:
@@ -7080,16 +8566,32 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             with snapshot_lock:
                 if snap is None:
                     check_disc(cfg)
-                    snap = snapshot_build(cfg)
+                    if session_out:
+                        # Chosen later by a case: under the machine lock, and this session's results.json
+                        # names it at once (the after-run cleanup of every runner keeps what a session names).
+                        with machine_lock():
+                            snap = snapshot_build(cfg)
+                            publish_session(session_out[0], snap)
+                    else:
+                        snap = snapshot_build(cfg)  # the caller holds the machine lock (below)
                     breaker = CircuitBreaker(budget, snap.name) if budget is not None else None
                 return snap
 
-        if any(starts_games(sp) for sp in runnable):
-            game_snapshot()
         guarded = guarded_folders(cfg)
         before_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        out = make_run_dir(cfg, cfg.store / "runs" / f"{stamp}-session")
+        owner_roots = owner_data_roots()
+        owner_before = {str(r): owner_parts_state(r) for r in owner_roots}
+        owner_games_seen: set[tuple[str, str]] = set(owner_games_running(os.getpid()))
+        # The snapshot is chosen and the session folder that names it is written under the machine lock,
+        # which every runner's after-run snapshot cleanup also holds: no cleanup runs between the two.
+        session_out: list[Path] = []
+        with machine_lock():
+            if any(starts_games(sp) for sp in runnable):
+                game_snapshot()
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            out = make_run_dir(cfg, cfg.store / "runs" / f"{stamp}-session")
+            publish_session(out, snap)
+        session_out.append(out)
         thresholds = tomllib.loads(cfg.thresholds.read_text(encoding="utf-8")) if cfg.thresholds.is_file() else {}
         baseline = tomllib.loads(cfg.baseline.read_text(encoding="utf-8")) if cfg.baseline.is_file() else {}
         # The last recorded status of each case before this run (findings, the checkpoint's "passed before").
@@ -7133,7 +8635,36 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                 print(f"{spec.name}: {spec.path.name} changed since it was read; the case runs the text read before"
                       " (provenance records that text's sha256)", flush=True)
             game = None if unit else game_snapshot()
-            if (t := tripped(spec)) is not None:
+            prov = case_provenance(cfg, spec, fixtures, build=game.name if game is not None else "")
+            # A pointless rerun (known_failures.py): the last two results on this build with this case
+            # content failed with the same first reason; no game starts unless --rerun-known-failure says why.
+            parts = known_failures.script_parts(spec.peers["H"].script, prov["args_sha256"], prov["fixture_sha256"]) \
+                if "H" in spec.peers else {}
+            refusal = None if unit else known_failures.known_failure(case_history(cfg, spec.name), prov["build"],
+                                                                     prov["case_sha256"], parts)
+            if refusal is not None and rerun_why:
+                print(f"{spec.name}: a known failure, run again (--rerun-known-failure: {rerun_why}): "
+                      f"{refusal.reason}", flush=True)
+            gate = None
+            if not unit and (refusal is None or rerun_why):
+                # preflight_gate.py: an error of the case's preflight starts no game (--ignore-preflight says why).
+                try:
+                    problems = preflight_check(cfg, spec, preflight_cache)
+                except Exception as e:  # noqa: BLE001 (the preflight's own fault never stops a run unsaid)
+                    problems = []
+                    print(f"{spec.name}: preflight could not run ({type(e).__name__}: {e}); the case starts", flush=True)
+                gate = preflight_gate.decide([(p.severity, p.line()) for p in problems], ignore_preflight)
+                for line in gate.printed:
+                    print(line, flush=True)
+            if refusal is not None and not rerun_why:
+                print(refusal.line(spec.name), flush=True)
+                r = known_failure_result(spec, refusal)
+            elif gate is not None and not gate.start:
+                r = CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage, status=preflight_gate.PREFLIGHT,
+                               reasons=[gate.reason] + gate.errors, exclusive=runs_alone(spec),
+                               started=time.strftime("%Y%m%d-%H%M%S"))
+                r.preflight = gate.record()
+            elif (t := tripped(spec)) is not None:
                 r = breaker_result(spec, t)
             elif budget is not None and not unit and len(spec.peers) <= max_games:
                 need = machine_need(spec, budget.games)
@@ -7146,7 +8677,16 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                                    reasons=[lease.capacity], started=time.strftime("%Y%m%d-%H%M%S"))
                 elif (t := tripped(spec)) is not None:  # it tripped while this case waited
                     r = breaker_result(spec, t)
+            build_line = ""
             try:
+                if r is None and not unit:
+                    # build_guard.py: no session starts while a build holds its slot (it waits, then gives up).
+                    went, _waited, build_line = build_guard.wait_for_builds(
+                        spec.name, build_wait_s, ignore_build, build_holders, lambda s: print(s, flush=True))
+                    if went == build_guard.GIVE_UP:
+                        r = CaseResult(case=spec.name, layout=spec.layout, stage=spec.stage,
+                                       status=build_guard.BUILD_RUNNING, reasons=[build_line],
+                                       exclusive=runs_alone(spec), started=time.strftime("%Y%m%d-%H%M%S"))
                 if r is None:
                     case_begins()
                     if runs_alone(spec):
@@ -7154,7 +8694,9 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
                     # PS12: the load beside the case, sampled while it runs, and what ran.
                     sampler = LoadSampler(cfg.exe).start()
                     try:
-                        r = run(cfg, spec, game, max_games, time.strftime("%Y%m%d-%H%M%S"), thresholds, baseline,
+                        # Bulk mode: its waitfor and case timeouts scaled (bulk_spec); the spec file stays.
+                        r = run(cfg, bulk_spec(spec, cfg.bulk) if cfg.bulk is not None else spec, game, max_games,
+                                time.strftime("%Y%m%d-%H%M%S"), thresholds, baseline,
                                 tuple(entry.get("accepted_grades", [])), pacer=pacer)
                     finally:
                         load = sampler.summary()
@@ -7170,12 +8712,76 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             if note := not_alone_note(spec, r.load):
                 r.machine["not_alone"] = note
                 print(f"{spec.name}: NOT ALONE: {note}", flush=True)
-            r.provenance = case_provenance(cfg, spec, fixtures)
+            r.provenance = prov
+            if gate is not None and not r.preflight:
+                r.preflight = gate.record()
+            stamps = sorted({p.build for p in r.peers if p.build})
+            if stamps:
+                r.provenance = {**prov, "build_stamp": " ".join(stamps)}  # the game's own (its log's first line)
+            if refusal is not None and rerun_why:
+                r.rerun_known_failure = rerun_why
+            if build_line and r.status != build_guard.BUILD_RUNNING:
+                r.ignored_build = build_line
             r.scenes = scene_policy(cfg, spec)
+            if cfg.bulk is not None:
+                r.mode = "bulk"
+                if r.folder and Path(r.folder).is_dir():
+                    (Path(r.folder) / BULK_MARK).write_text(json.dumps(cfg.bulk.label()) + "\n", encoding="utf-8")
             if breaker is not None and spec.breaker and r.status in ("fail", "error") and r.signature:
                 breaker.record(spec.name, r.folder, r.signature)
                 if (t := breaker.tripped()) is not None:
                     tell_breaker(t)
+            # The owner's session settings: the list's version this case's games ran with (session_applies).
+            if session_applies(cfg, spec):
+                try:
+                    ss = sessions.load(cfg.repo)
+                    r.notes.append(f"session settings {ss.label()}: {len(ss.on)} on every game")
+                except sessions.SessionSettingsError as e:
+                    r.notes.append(f"session settings: {e}")
+            # The owner's data (acceptance pass 1): each game of the case ran with its own data folder, and the owner's
+            # own games running at the case's end; a game on the owner's data fails the case hard.
+            if r.folder and Path(r.folder).is_dir():
+                running = owner_games_running(os.getpid())
+                owner_games_seen.update(running)
+                logs = {p.peer: read_peer_log(Path(r.folder), p.peer, spec.server == "host") for p in r.peers}
+                ok, ev = case_own_data_folders(r.peers, logs, owner_roots, Path(cfg.exe).name)
+                if ev:  # a case that started no game (a unit case, synthetic peers only) has nothing to say
+                    line, risk = owner_data_verdict(ok, ev, [], running)
+                    r.notes.append(line)
+                    if risk:
+                        r.reasons.insert(0, line)
+                        if r.status not in ("fail", "error"):
+                            r.status = "fail"
+            # W37: every case with a server log: S's game must not have stopped while its frames went on with a client
+            # connected (levelcheck.server_stalled).
+            if r.folder and Path(r.folder).is_dir():
+                nothing = tested_nothing(r.peers)
+                for why in server_stall_reasons(Path(r.folder)):
+                    if nothing:  # W41: the case tested nothing; its server rule is not tested, not failed
+                        r.notes.append(f"server game alive: NOT TESTED ({nothing}): {why}")
+                        continue
+                    r.reasons.append(why)
+                    if r.status == "pass":
+                        r.status = "fail"
+                for why in scene_repeat_reasons(Path(r.folder)):  # W38: a cutscene played twice fails every case
+                    if nothing:
+                        r.notes.append(f"cutscenes once: NOT TESTED ({nothing}): {why}")
+                        continue
+                    r.reasons.append(why)
+                    if r.status == "pass":
+                        r.status = "fail"
+                r.notes += server_notes(Path(r.folder))
+            # W34: the spec's level check rows ([grade.level_check]) on the finished run.
+            if "level_check" in spec.grades and r.folder and Path(r.folder).is_dir():
+                for why in level_check_reasons(Path(r.folder), spec.grades["level_check"],
+                                               levelpass_folder(cfg, None), cfg.repo):
+                    r.reasons.append(why)
+                    if r.status == "pass":
+                        r.status = "fail"
+            # A caller's own verdict of the case (the level pass: W15), decided before the case's status line is
+            # printed and its result.json, report.md and results.json are written, so all of them carry one verdict.
+            if (case_verdict := getattr(a, "case_verdict", None)) is not None:
+                case_verdict(spec, r)
             return r
 
         def finished() -> list[CaseResult]:
@@ -7187,7 +8793,7 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             note = f"{len(done_now)} of {len(order)} case(s) ended" + (", more may come from the queue"
                                                                        if queue is not None else "")
             payload = {"in_progress": note, "snapshot": str(snap) if snap else "", "max_games": max_games, "jobs": jobs,
-                       "machine": machine_info, "stages": stages, "restricted_token": token["restricted"],
+                       **mode_info, "machine": machine_info, "stages": stages, "restricted_token": token["restricted"],
                        "restricted_token_cause": token["cause"], "runner": runner_version(),
                        "cases": [asdict(r) for r in done_now]}
             write_text_replacing(out / "results.json", json.dumps(payload, indent=2))
@@ -7208,7 +8814,11 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             print(f"  report: {out / 'report.md'}" if jobs == 1 else f"{spec.name}: report: {out / 'report.md'}",
                   flush=True)
 
-        machine_info = {"games": cfg.machine_games, "slots": str(cfg.slots) if cfg.slots else ""}
+        machine_info = {"games": cfg.bulk.games if cfg.bulk is not None else cfg.machine_games,
+                        "slots": str(cfg.slots) if cfg.slots else ""}
+        # Bulk mode: results.json says so (payload_mode keeps its history apart), and the run's own load.
+        mode_info = {"mode": "bulk", "bulk": cfg.bulk.label()} if cfg.bulk is not None else {}
+        run_load = RunLoad(cfg.exe).start() if cfg.bulk is not None else None
         write_progress()
         print(f"report (rewritten after every case): {out / 'report.md'}", flush=True)
         if not runnable and queue is not None:  # only not-ready cases so far: the queue may still add some
@@ -7219,7 +8829,13 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
             for sp, r in zip(runnable, got):  # `runnable` grew with the queue's cases
                 by_case.setdefault(id(sp), r)
         results = [by_case[id(sp)] for sp in order]
+        run_load_summary = run_load.summary(results) if run_load is not None else None
+        if run_load_summary is not None:
+            mode_info["run_load"] = run_load_summary
+            print(run_load_line(run_load_summary), flush=True)
         after_state = {k: folder_state(path, skip) for k, (path, skip) in guarded.items()}
+        owner_after = {str(r): owner_parts_state(r) for r in owner_roots}
+        owner_games_seen.update(owner_games_running(os.getpid()))
         tripped_now = breaker.tripped() if breaker is not None else None
         store_line = janitor.line()  # never started after the cases (PS1): their end waits for nothing new
     finally:
@@ -7235,12 +8851,32 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
     if gate is not None:
         unwritten = list(gate["no_spec"])  # a gate run names its own spec-less cases, nothing else
     touched = [g["folder"] for g in guard if not g["unchanged"]]
+    # The owner's data by part (never a name inside an owner root but "Swap Force" and "Figures"): the run's verdict;
+    # a guarded owner folder that changed only in other games' parts while another owner game ran is not this run's.
+    parts = owner_parts_changed(owner_before, owner_after)
+    other_games = sorted(owner_games_seen)
+    owner_line, owner_risk = owner_data_verdict(True, ["each case's own check above"], parts, other_games)
+    if owner_risk:
+        for r in results:
+            if OWNER_AT_RISK not in " ".join(r.reasons):
+                r.reasons.insert(0, owner_line)
+            if r.status not in ("fail", "error"):
+                r.status = "fail"
+    # An owner folder that changed while another owner game ran (and not at risk) is that game's, not this run's;
+    # with none running, any change stays the run's warning (and its exit 1).
+    if other_games and not owner_risk:
+        touched = [k for k in touched if not k.startswith("owner data ")]
     # A gate run is a subset: never a checkpoint; nor is a queue's run (its cases are the lane's).
     full_run = a.cases in ([], ["all"]) and gate is None and queue is None
-    checkpoint = checkpoint_verdict(manifest, a.stage, stages, results, touched, before) if a.stage and full_run else None
-    payload = {"snapshot": str(snap) if snap else "", "max_games": max_games, "jobs": jobs, "machine": machine_info,
+    # A bulk run never decides a checkpoint (its verdict is the watched default mode's).
+    checkpoint = checkpoint_verdict(manifest, a.stage, stages, results, touched, before) \
+        if a.stage and full_run and cfg.bulk is None else None
+    payload = {"snapshot": str(snap) if snap else "", "max_games": max_games, "jobs": jobs, **mode_info,
+               "machine": machine_info,
                "breaker": tripped_now, "stages": stages, "thresholds": thresholds,
                "guarded_folders": guard, "required_without_spec": unwritten, "checkpoint": checkpoint,
+               "owner_data": {"changed_parts": parts, "owner_games_running": [list(x) for x in other_games],
+                              "verdict": owner_line, "at_risk": owner_risk},
                "restricted_token": token["restricted"], "restricted_token_cause": token["cause"],
                "runner": runner_version(), "cases": [asdict(r) for r in results]}
     if queue is not None:
@@ -7257,12 +8893,27 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         payload["gate"] = gate
     write_text_replacing(out / "results.json", json.dumps(payload, indent=2))
     write_report(cfg, out, results, manifest, thresholds, max_games, guard, unwritten, checkpoint, gate, token,
-                 jobs=jobs, queue_unmatched=queue_unmatched, breaker=tripped_now)
+                 jobs=jobs, queue_unmatched=queue_unmatched, breaker=tripped_now, run_load=run_load_summary)
     write_findings(out, results, before)
-    failed = [r for r in results if r.status not in ("pass", "capacity")]
+    if parts or other_games or owner_risk:
+        try:  # the run's owner-data verdict on the page (each case's own line is under it, in its notes)
+            with open(out / "report.md", "a", encoding="utf-8") as f:
+                f.write(f"\nOwner data: {owner_line}\n")
+        except OSError:
+            pass
+    failed = [r for r in results if r.status not in ("pass", "capacity", NOT_IN_BULK)]
+    left_out = [r for r in results if r.status == NOT_IN_BULK]
+    if left_out:
+        print(f"{len(left_out)} case(s) not in bulk (reported, not failed; they run visible with `skytest.py test"
+              f" {' '.join(r.case for r in left_out)}`)")
     capacity = [r for r in results if r.status == "capacity"]
     not_ready = [r for r in results if r.status == "not ready"]
     stopped = [r for r in results if r.status == "breaker"]
+    if parts:
+        print((f"{OWNER_AT_RISK}: " if owner_risk else "") + (
+            f"owner data changed during the run: {', '.join(parts)}" if parts else "owner data unchanged")
+            + (f"; the owner's own game(s) running: {', '.join(f'{n} (started {t})' for n, t in other_games)}"
+               if other_games else ""))
     if touched:
         print(f"WARNING: changed during the run: {', '.join(touched)}")
     if capacity:
@@ -7282,10 +8933,43 @@ def cmd_test(cfg: Config, a: argparse.Namespace) -> int:
         label = gate_label(gate)
         print(f"{label}: {gate['actual_minutes']:.0f} min (the cases {gate['case_minutes']:.0f} min; expected"
               f" {gate['minutes']:.0f}); {gate['verdict']['line'].removeprefix(label + ': ')}")
+    building = [r for r in results if r.status == build_guard.BUILD_RUNNING]
+    if building:
+        print(f"{len(building)} case(s) not started: a build held its slot past the wait (not met): "
+              f"{', '.join(r.case for r in building)}")
+    refused = [r for r in results if r.status == preflight_gate.PREFLIGHT]
+    if refused:
+        print(f"{len(refused)} case(s) not started: an error in their preflight (not met): "
+              f"{', '.join(r.case for r in refused)}")
+    known = [r for r in results if r.status == known_failures.KNOWN_FAILURE]
+    if known:
+        print(f"{len(known)} case(s) not started as a known failure (their last two results on this build failed"
+              f" with the same first reason; not met): {', '.join(r.case for r in known)}")
     if store_line:
         print(store_line)
+    if snap is not None:
+        with machine_lock():  # no other runner chooses a snapshot or starts a session meanwhile
+            snaps_line = prune_snapshots(cfg, snap.name)
+        if snaps_line:
+            print(snaps_line)
     print(f"report: {out / 'report.md'}")
+    if known and len(known) == len(failed) and not touched and not queue_unmatched:
+        return EXIT_KNOWN_FAILURE  # its own exit code: nothing ran that failed anew
+    if building and len(building) == len(failed) and not touched and not queue_unmatched:
+        return EXIT_BUILD_RUNNING
+    if refused and len(refused) == len(failed) and not touched and not queue_unmatched:
+        return EXIT_PREFLIGHT
     return 1 if failed or touched or queue_unmatched else 0
+
+
+EXIT_KNOWN_FAILURE = 3   # `test`: every case that did not pass was refused as a known failure (no game started)
+EXIT_BUILD_RUNNING = 4   # `test`: every case that did not pass waited for a build past the limit (no game started)
+EXIT_PREFLIGHT = 6       # `test`: every case that did not pass had an error in its preflight (no game started)
+
+
+def build_holders() -> list[dict]:
+    """Who holds a build slot now (build_guard.py; the tests replace it)."""
+    return build_guard.held_slots(build_guard.slot_dir())
 
 
 def cmd_compare(cfg: Config, a: argparse.Namespace) -> int:
@@ -7338,6 +9022,105 @@ def cmd_list(cfg: Config, a: argparse.Namespace) -> int:
     return 0
 
 
+def preflight_context(cfg: Config, folder: str | None = None, extra_runs: list[str] | None = None,
+                      wording: bool = False):
+    """The preflight's context (preflight.py): the stored level data, the source's log texts, the allow
+    list, the conditions and the recorded runs; (ctx, runs, corpus, levels, wakes)."""
+    import preflight as pf
+    try:
+        lp_folder = levelpass_folder(cfg, folder)
+    except SystemExit:
+        lp_folder = None
+    levels: dict = {}
+    for lvl_dir in sorted(lp_folder.glob("*-manifest.txt")) if lp_folder is not None and lp_folder.is_dir() else []:
+        name = lvl_dir.name[: -len("-manifest.txt")]
+        lv = pf.load_level(lp_folder, name)
+        if lv is not None:
+            levels[name] = lv
+    roots = [cfg.repo / "src" / "online", cfg.repo / "thirdparty" / "skylanders-portal" / "src",
+             cfg.repo / "thirdparty" / "rexglue-sdk" / "src"]
+    corpus = pf.build_corpus(roots)
+    allow = set(la.AllowList.load(cfg.launch_allow).rules) if cfg.launch_allow.is_file() else None
+    conditions = None
+    if cfg.script_commands.is_file():
+        conditions = set(tomllib.loads(cfg.script_commands.read_text(encoding="utf-8")).get("conditions", []))
+    runs = [cfg.store / "runs"] + [expand(r) for r in (extra_runs or [])]
+    wakes = pf.build_wake_index(runs, cfg.store / "preflight-wakes.json")
+    ctx = pf.Context(levels, corpus, wakes, allow, conditions, runs, wording=wording)
+    return ctx, runs, corpus, levels, wakes
+
+
+def preflight_case(ctx, runs: list[Path], name: str, d: dict, current: bool = True) -> list:
+    """One case's preflight problems (preflight.Problem): its checks, and a replay on its newest recorded
+    run when the text is the current one."""
+    import preflight as pf
+    probs = pf.check_spec(name, d, ctx)
+    run = pf.latest_run(runs, name) if current else None  # an older text: no replay on newer runs
+    if run is not None:
+        probs += pf.replay(name, d, run)
+    return probs
+
+
+def preflight_check(cfg: Config, spec: Spec, cache: dict) -> list:
+    """The runner's gate (preflight_gate.py): the case's preflight problems, the context built once per
+    run (`cache`). The tests of the runner replace this (their throwaway game has no source or level data)."""
+    if "ctx" not in cache:
+        cache["ctx"], cache["runs"], *_ = preflight_context(cfg)
+    try:
+        d = expand_spec_dict(tomllib.loads(spec.path.read_text(encoding="utf-8")))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []  # load_spec read it: a file changed since is said by run_one
+    return preflight_case(cache["ctx"], cache["runs"], spec.name, d, True)
+
+
+def cmd_preflight(cfg: Config, a: argparse.Namespace) -> int:
+    """Each problem one line (preflight.py); exit 1 on an error (on a warning too with --strict)."""
+    import preflight as pf
+    paths = sorted(cfg.cases_dir.glob("*.toml")) if cfg.cases_dir.is_dir() else []
+    chosen = []
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        try:
+            d = expand_spec_dict(tomllib.loads(text))
+        except tomllib.TOMLDecodeError as e:
+            print(f"{path.stem}: error spec -: not TOML ({e})")
+            continue
+        if (a.cases and path.stem not in a.cases) or (not a.cases and not a.all_ready):
+            continue
+        if a.all_ready and not a.cases:
+            try:
+                if spec_readiness(path, d, text):
+                    continue
+            except SpecError:
+                continue
+        chosen.append((path.stem, d, True))
+    for f in a.file or []:
+        fp = expand(f)
+        try:
+            chosen.append((fp.stem.split("@")[0], expand_spec_dict(tomllib.loads(fp.read_text(encoding="utf-8"))),
+                           False))
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            print(f"{fp.name}: error spec -: {e}")
+    if not chosen:
+        raise SystemExit("preflight: no case chosen (name cases or give --all-ready)")
+    ctx, runs, corpus, levels, wakes = preflight_context(cfg, a.folder, a.runs, a.wording)
+    errors = warns = 0
+    for line in pf.check_table(corpus):
+        print(line)
+        warns += 1
+    for name, d, current in chosen:
+        probs = preflight_case(ctx, runs, name, d, current)
+        for pr in probs:
+            print(pr.line())
+            if pr.severity == "error":
+                errors += 1
+            else:
+                warns += 1
+    print(f"preflight: {len(chosen)} case(s), {errors} error(s), {warns} warning(s); levels {', '.join(sorted(levels))};"
+          f" {len(corpus.formats)} log texts; recorded logs of {len(wakes.runs_of)} zone(s)")
+    return 1 if errors or (a.strict and warns) else 0
+
+
 def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
     problems = []
     specs = {}
@@ -7352,6 +9135,11 @@ def cmd_lint(cfg: Config, a: argparse.Namespace) -> int:
                 problems.append(f"{p.name}: grades time or load ({', '.join(timed_grades(s))}) but is not"
                                 " `exclusive = true`: beside another case (test --jobs) it would measure that load too")
             problems += scene_problems(cfg, s)
+            if s.name.startswith("levelpass-"):  # a level pass names objects, never positions
+                import levelpass as lp
+                for n, ps in s.peers.items():
+                    for line in lp.position_literals(ps.script)[:3]:
+                        problems.append(f"{p.name}: peer {n}: a level-pass script carries a position: {line!r}")
             if s.synthetic and not ((cfg.synthetic_exe or cfg.synthetic_launcher) and cfg.synthetic_setting):
                 problems.append(f"{p.name}: synthetic peers, but tests/skytest.toml [synthetic] lacks exe or"
                                 " server_setting")
@@ -7592,6 +9380,8 @@ def store_game_logs(store: Path, since: str | None = None) -> list[tuple[str, Pa
     for name, path in run_dirs:
         if since and name < since:
             continue
+        if (Path(path) / BULK_MARK).is_file():  # a bulk case: its waits were scaled and loaded
+            continue
         out += [(name, log) for log in run_game_logs(Path(path))]
     return out
 
@@ -7747,6 +9537,1024 @@ def tolerated_lines(spec: Spec, folder: Path, most: int = 3) -> list[tuple[str, 
     return found
 
 
+# --- live sessions (`skytest.py live`) --------------------------------------------------------------
+#
+# A live session starts the games of a server layout exactly as a case does (run_case: the launch builder
+# with its guards, copies of the fixtures, the defaults, the machine's slots and boot token, the job
+# object), with a prologue per client that ends in `follow live.txt` (the input script's live mode). It
+# runs in a session process of its own, detached from the shell that started it; `live send` checks a line
+# like a spec's script line, appends it to a peer's file and waits for the game's `live <n> done` line.
+# The pure parts (prologues, numbering, matching, the idle rule, the spec skeleton) are in live_session.py.
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether a process runs (never os.kill: on Windows any signal but Ctrl+C/Break terminates it)."""
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = ctypes.c_ulong(0)
+        return bool(k32.GetExitCodeProcess(ctypes.c_void_p(h), ctypes.byref(code))) and code.value == 259
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+class LiveHooks:
+    """run_case's hooks for a live session: the run folder once it exists (the peers' logs, followed
+    files and the join address go to state.json), then each turn of run_case's watch loop: which peers
+    follow their file, the fatal lines (the peer's fail-fast patterns: ALWAYS_FORBIDDEN, DEFAULT_FATAL)
+    and exits as problems, a stop request or the idle stop (`quit` to every followed file, then the
+    games are ended after STOP_GRACE_S)."""
+
+    def __init__(self, folder: Path, info: "live_session.SessionInfo", spec: Spec,
+                 state: "live_session.SessionState") -> None:
+        self.folder, self.info, self.spec, self.state = folder, info, spec, state
+        self.hosted = spec.server == "host"
+        self.patterns = {n: [re.compile(rx, re.M) for rx in fail_fast_patterns(spec, n)] for n in spec.peers}
+        self.tails: dict[str, LogTail] = {}
+        self.exits: set[str] = set()
+        self.stop_at: float | None = None
+        self.live_since: float | None = None
+        self.last_save = 0.0
+        self.run: Path | None = None
+
+    def save(self) -> None:
+        live_session.save_state(self.folder, self.state)
+        self.last_save = time.monotonic()
+
+    def on_run(self, run: Path, port: int) -> None:
+        self.run = run
+        st = self.state
+        st.run = str(run)
+        st.join = f"127.0.0.1:{port}" if port else ""
+        st.state = "booting"
+        peers = list(self.info.clients) + (["S"] if self.info.server_live else [])
+        for n in list(self.spec.peers):
+            st.logs[n] = str(peer_log_path(run, n, self.hosted))
+            self.tails[n] = LogTail(peer_log_path(run, n, self.hosted))
+        for n in peers:
+            f = run / "H" / live_session.SERVER_LIVE_FILE if n == "S" else run / n / live_session.LIVE_FILE
+            f.touch()  # the game reads a missing file as empty; made now so `live send` finds it
+            st.live_files[n] = str(f)
+        self.save()
+
+    def last_activity(self) -> float:
+        sends = self.folder / "sends.jsonl"
+        t = max(self.info.created, self.live_since or 0.0)
+        with contextlib.suppress(OSError):
+            t = max(t, sends.stat().st_mtime)
+        return t
+
+    def request_stop(self, why: str) -> None:
+        if self.stop_at is not None:
+            return
+        self.stop_at = time.monotonic() + live_session.STOP_GRACE_S
+        self.state.state, self.state.note = "stopping", why
+        for n, f in self.state.live_files.items():
+            with contextlib.suppress(OSError), live_send_lock(self.folder, n):
+                live_session.append_lines(Path(f), ["quit"])
+        self.save()
+
+    def tick(self, procs: dict) -> bool:
+        st, changed = self.state, False
+        for n, tail in self.tails.items():
+            for line in tail.new_lines():
+                if live_session.FOLLOWING.search(line) and n not in st.following:
+                    st.following.append(n)
+                    changed = True
+                elif live_session.LIVE_ENDED in line and n in st.following:
+                    st.following.remove(n)
+                    changed = True
+                if any(rx.search(line) for rx in self.patterns.get(n, [])):
+                    st.problems.append(f"{n}: {line.strip()[:300]}")
+                    changed = True
+        for n, p in procs.items():
+            code = p.poll()
+            if code is not None and n not in self.exits:
+                self.exits.add(n)
+                st.problems.append(f"{n}: the game exited (code 0x{code & 0xFFFFFFFF:08X})")
+                changed = True
+        want = set(st.live_files)
+        if st.state == "booting" and want and want <= set(st.following):
+            st.state, st.note = "live", "every peer follows its file"
+            self.live_since = time.time()
+            changed = True
+        if self.stop_at is None:
+            stop = self.folder / "stop"
+            if stop.is_file():
+                self.request_stop(stop.read_text(encoding="utf-8", errors="replace").strip() or "stopped")
+            elif live_session.idle_due(self.last_activity(), time.time(), self.info.idle_minutes):
+                self.request_stop(f"idle stop: no send for {self.info.idle_minutes:g} min")
+        if changed or time.monotonic() - self.last_save > 5:
+            self.save()
+        return self.stop_at is not None and time.monotonic() >= self.stop_at
+
+
+@contextlib.contextmanager
+def live_send_lock(folder: Path, peer: str, wait: float = 30.0):
+    """One writer per followed file at a time (two sends to one peer would interleave their numbers)."""
+    fd = _open_lock_file(folder / f"send-{peer}.lock")
+    try:
+        t0 = time.monotonic()
+        while not _try_lock(fd):
+            if time.monotonic() - t0 > wait:
+                raise live_session.LiveError(f"another send to {peer} holds {folder / f'send-{peer}.lock'}")
+            time.sleep(0.05)
+        yield
+    finally:
+        _unlock_close(fd)
+
+
+def live_session_folder(cfg: Config, name: str) -> Path:
+    folder = live_session.session_dir(cfg.store, name)
+    if not (folder / "session.json").is_file():
+        matches = sorted(p.name for p in (cfg.store / "live").glob(f"*{name}*") if (p / "session.json").is_file()) \
+            if (cfg.store / "live").is_dir() else []
+        if len(matches) == 1:
+            return live_session.session_dir(cfg.store, matches[0])
+        raise SystemExit(f"no live session {name!r} in {cfg.store / 'live'}" +
+                         (f" (it matches {', '.join(matches)})" if matches else "; `skytest.py live list` names them"))
+    return folder
+
+
+def live_serve(cfg: Config, a: argparse.Namespace) -> int:
+    """The session process (`live _serve <session>`, started detached by `live start`)."""
+    folder = live_session_folder(cfg, a.session)
+    info = live_session.load_info(folder)
+    st = live_session.load_state(folder)
+    st.pid = os.getpid()
+    lease: Lease | None = None
+    hooks: LiveHooks | None = None
+
+    def say(state: str, note: str = "") -> None:
+        st.state, st.note = state, note
+        live_session.save_state(folder, st)
+        print(f"{time.strftime('%H:%M:%S')} {state}{': ' + note if note else ''}", flush=True)
+
+    try:
+        say("starting")
+        spec = load_spec(folder / "spec.toml", cfg.timeout)
+        token_preflight(bool(a.allow_restricted))
+        check_disc(cfg)
+        budget = machine_budget(cfg)
+        if budget is not None:
+            budget.owner = f"skytest live pid {os.getpid()}, {info.name}"
+            say("waiting for slots", f"{len(spec.peers)} game(s)")
+            lease = budget.acquire(machine_need(spec, budget.games), spec.name, memory_games=len(spec.peers),
+                                   say=lambda why: say("waiting for slots", why))
+            if lease.capacity:
+                say("failed", lease.capacity)
+                return 1
+        # The snapshot only once the slots are held (store cleanup review, item 5b), and named in a session
+        # folder of its own before the machine lock goes (re-check 3): every runner's after-run cleanup keeps
+        # what a session names.
+        with (budget.mutex() if budget is not None else contextlib.nullcontext()):
+            snap = snapshot_build(cfg)
+            publish_live_session(cfg, info.name, snap)
+        hooks = LiveHooks(folder, info, spec, st)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        res = run_case(cfg, spec, snap, len(spec.peers), stamp, {}, {}, (),
+                       folder=cfg.store / "runs" / f"{stamp}-{spec.name}",
+                       pacer=StartPacer(cfg.start_gap, budget), live=hooks)
+    except BaseException as e:  # noqa: BLE001 - said in state.json, then raised
+        say("failed", f"{type(e).__name__}: {e}")
+        raise
+    finally:
+        if lease is not None:
+            lease.release()
+    if res.folder and Path(res.folder).is_dir():
+        write_text_replacing(Path(res.folder) / "result.json",
+                             json.dumps({"live_session": info.name, "runner": runner_version(), **asdict(res)}, indent=2))
+    st.ended = time.time()
+    why = st.note if st.state == "stopping" else ("the games ended" if res.status != "error" else "; ".join(res.reasons))
+    say("ended", f"{why}; slots freed; run {res.folder}")
+    return 0
+
+
+def spawn_detached(cmd: list[str], log: Path, cwd: Path) -> int:
+    """Starts the session process outside the caller's console, process group and (when its job allows
+    it) job object, so it goes on after the caller ends."""
+    flags = 0
+    if os.name == "nt":
+        flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP
+    with open(log, "ab") as out:
+        for extra in ((0x01000000,) if os.name == "nt" else ()) + (0,):  # CREATE_BREAKAWAY_FROM_JOB, then without
+            try:
+                p = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                     creationflags=flags | extra, close_fds=True,
+                                     start_new_session=os.name != "nt")
+                return p.pid
+            except OSError:
+                if not extra:
+                    raise
+    raise OSError("could not start the session process")
+
+
+def live_peer_paths(info: "live_session.SessionInfo", st: "live_session.SessionState", peer: str) -> tuple[Path, Path, Path]:
+    """A peer's followed file, log and launch-check folder (S's: its owner's folder, its working directory)."""
+    if peer not in st.live_files:
+        raise live_session.LiveError(f"{peer} has no live file in this session (it has {', '.join(st.live_files) or 'none yet'})")
+    run = Path(st.run)
+    return Path(st.live_files[peer]), Path(st.logs.get(peer, "")), run / ("H" if peer == "S" else peer)
+
+
+def live_problem_text(st: "live_session.SessionState", since: int = 0) -> list[str]:
+    return [f"PROBLEM {p}" for p in st.problems[since:]]
+
+
+def read_from(path: Path, offset: int) -> tuple[str, int]:
+    """The text a log got after `offset` (from its start when it was replaced and is shorter now)."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return "", offset
+    if size < offset:
+        offset = 0
+    if size == offset:
+        return "", offset
+    with open(path, "rb") as f:
+        f.seek(offset)
+        data = f.read(size - offset)
+    cut = data.rfind(b"\n") + 1  # whole lines only; the rest comes with the next read
+    return data[:cut].decode("utf-8", errors="replace"), offset + cut
+
+
+def cmd_live(cfg: Config, a: argparse.Namespace) -> int:
+    try:
+        return LIVE_VERBS[a.verb](cfg, a)
+    except live_session.LiveError as e:
+        print(f"live {a.verb}: {e}", file=sys.stderr)
+        return 2
+
+
+def live_start(cfg: Config, a: argparse.Namespace) -> int:
+    layout = a.layout
+    if not LAYOUT.match(layout) or not layout.startswith("server+") or synthetic_of(layout):
+        raise live_session.LiveError(f"--layout {layout}: a server layout (server+1, server+2, ...)")
+    peers = peers_of(layout)
+    clients = [p for p in peers if p != "S"]
+    late = set(a.late or [])
+    if late - set(clients) or "H" in late:
+        raise live_session.LiveError(f"--late names a joining client of {layout} ({', '.join(c for c in clients if c != 'H')})")
+    if a.level and not re.fullmatch(r"[A-Za-z0-9_]+", a.level):
+        raise live_session.LiveError(f"--level {a.level!r}")
+    tag = a.name or f"{layout.replace('+', '')}-{a.level or 'hub'}"
+    if not live_session.TAG.fullmatch(tag):
+        raise live_session.LiveError(f"--name {tag!r}: letters, digits, - and _")
+    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{tag}"
+    folder = live_session.session_dir(cfg.store, name)
+    tables = launch_tables(cfg)
+    server_live = not a.no_server_live and live_session.SERVER_FOLLOW_SETTING in tables[0].rules
+    extra: dict[str, list[str]] = {c: [] for c in clients}
+    for item in a.arg or []:
+        peer, _, setting = item.partition(":")
+        if peer not in extra or not setting.startswith("--"):
+            raise live_session.LiveError(f"--arg {item!r}: PEER:--setting=value with PEER one of {', '.join(clients)}")
+        extra[peer].append(setting)
+    args = {c: ([*live_session.HOST_ARGS,
+                 *([f"--{live_session.SERVER_FOLLOW_SETTING}={live_session.SERVER_LIVE_FILE}"] if server_live else [])]
+                if c == "H" else []) + extra[c] for c in clients}
+    prologue = live_session.prologues(clients, a.level, late)
+    show = not a.hide_server
+    ignore = (getattr(a, "ignore_build", None) or "").strip()
+    if getattr(a, "ignore_build", None) is not None and not ignore:
+        raise live_session.LiveError("--ignore-build needs the reason")
+    went, _w, _line = build_guard.wait_for_builds(
+        f"live session {name}", 60.0 * float(getattr(a, "build_wait_min", None) or build_guard.BUILD_WAIT_MIN),
+        ignore, build_holders, lambda s: print(s, flush=True))
+    if went == build_guard.GIVE_UP:
+        return EXIT_BUILD_RUNNING
+    folder.mkdir(parents=True)
+    spec_text = live_session.session_spec_text(f"live-{tag}", layout, clients, prologue, args, show,
+                                               f"live session {name}")
+    (folder / "spec.toml").write_text(spec_text, encoding="utf-8")
+    load_spec(folder / "spec.toml", cfg.timeout)  # a spec error before anything starts
+    info = live_session.SessionInfo(name=name, layout=layout, level=a.level or "", clients=clients, late=sorted(late),
+                                    hide_server=not show, server_live=server_live, idle_minutes=a.idle_minutes,
+                                    prologue=prologue, args=args, worktree=str(cfg.repo))
+    live_session.write_json(folder / "session.json", asdict(info))
+    live_session.save_state(folder, live_session.SessionState())
+    cmd = [sys.executable, "-I", str(Path(__file__).resolve()), "--repo", str(cfg.repo), "live", "_serve", name]
+    if a.allow_restricted:
+        cmd.append("--allow-restricted")
+    pid = spawn_detached(cmd, folder / "session.log", cfg.repo)
+    print(f"live session {name} (session process {pid})", flush=True)
+    print(f"  session folder: {folder}", flush=True)
+    t0, last = time.monotonic(), ""
+    while True:
+        st = live_session.load_state(folder)
+        now = f"{st.state}{': ' + st.note if st.note else ''}"
+        if now != last:
+            print(f"  {time.monotonic() - t0:5.0f} s  {now}" +
+                  (f" (following: {', '.join(st.following)})" if st.following else ""), flush=True)
+            last = now
+        if st.state == "live":
+            break
+        if st.state in ("failed", "ended") or (st.pid and not pid_alive(st.pid)) or (not st.pid and not pid_alive(pid)):
+            for line in live_problem_text(st):
+                print(f"  {line}")
+            print(f"  the session did not reach live mode; its log: {folder / 'session.log'}")
+            return 1
+        if time.monotonic() - t0 > a.start_timeout:
+            print(f"  not live after {a.start_timeout:.0f} s (it goes on; `skytest.py live list` shows it)")
+            return 2
+        time.sleep(1.0)
+    print(f"  live after {time.monotonic() - t0:.0f} s; run folder: {st.run}")
+    for n in [*clients, "S"]:
+        if n in st.logs:
+            print(f"  {n} log: {st.logs[n]}" + (f"\n  {n} live file: {st.live_files[n]}" if n in st.live_files else ""))
+    if st.join:
+        print(f"  {{join}} = {st.join}")
+    for line in live_problem_text(st):
+        print(f"  {line}")
+    print(f'  send: skytest.py live send {name} H "goto <x> <y> <z>; waitfor goto_done 30"')
+    return 0
+
+
+def live_send(cfg: Config, a: argparse.Namespace) -> int:
+    folder = live_session_folder(cfg, a.session)
+    info, st = live_session.load_info(folder), live_session.load_state(folder)
+    if st.state in ("ended", "failed", "stopping"):
+        raise live_session.LiveError(f"the session is {st.state}: {st.note}" +
+                                     "".join(f"\n  {x}" for x in live_problem_text(st)))
+    if st.pid and not pid_alive(st.pid):
+        raise live_session.LiveError("the session process is gone (`skytest.py live list`)")
+    peer = a.peer
+    live_file, log, check_dir = live_peer_paths(info, st, peer)
+    raw = live_session.split_send(a.lines)
+    if not raw:
+        raise live_session.LiveError("nothing to send")
+    figures = str(Path(st.run) / ("H" if peer == "S" else peer) / "figures")
+    filled = [live_session.fill_placeholders(x, figures, st.join) for x in raw]
+    ctx = launch_context(cfg, check_dir.resolve(), launch_tables(cfg))
+    for x in filled:
+        try:
+            la.check_script(x, ctx, live=True)
+        except la.LaunchError as e:
+            raise live_session.LiveError(f"refused before sending (nothing sent): {x!r}: {e}") from None
+    if peer not in st.following:
+        print(f"note: {peer} does not follow its file yet ({st.state}); the line waits in the file", flush=True)
+    offsets = {n: (Path(p).stat().st_size if Path(p).is_file() else 0) for n, p in st.logs.items()}
+    problems_before = len(st.problems)
+    with live_send_lock(folder, peer):
+        numbers = live_session.append_lines(live_file, filled)
+        seq = len(live_session.read_sends(folder / "sends.jsonl"))
+        with open(folder / "sends.jsonl", "a", encoding="utf-8") as f:
+            for i, (n, line, sent) in enumerate(zip(numbers, raw, filled)):
+                f.write(json.dumps({"peer": peer, "number": n, "line": line, "sent": sent, "t": time.time(),
+                                    "seq": seq + i}) + "\n")
+    t0 = time.monotonic()
+    print(f"sent to {peer}: " + "; ".join(f"live {n}: {x}" for n, x in zip(numbers, filled)), flush=True)
+    if a.no_wait:
+        return 0
+    outcomes = {n: live_session.LineOutcome(n) for n, x in zip(numbers, filled) if not live_session.is_silent(x)}
+    wait_offset, problem, timed_out = offsets.get(peer, 0), "", False
+    next_state = 0.0
+    while not live_session.all_over(outcomes):
+        text, wait_offset = read_from(log, wait_offset)
+        if text:
+            live_session.match_outcomes(text.splitlines(), outcomes)
+            continue
+        if time.monotonic() - t0 > a.timeout:
+            timed_out = True
+            break
+        if time.monotonic() >= next_state:
+            next_state = time.monotonic() + 1.0
+            now = live_session.load_state(folder)
+            if len(now.problems) > problems_before or now.state in ("ended", "failed"):
+                st, problem = now, now.state
+                break
+        time.sleep(0.1)
+    round_trip = time.monotonic() - t0
+    time.sleep(0.3)  # the other peers' reaction to the last line, a moment later
+    for n in [*info.clients, "S"]:
+        if n not in st.logs:
+            continue
+        text, _ = read_from(Path(st.logs[n]), offsets.get(n, 0))
+        for line in text.splitlines():
+            if not a.grep or re.search(a.grep, line):
+                print(f"{n}| {line}")
+    st = live_session.load_state(folder)
+    for line in live_problem_text(st, problems_before):
+        print(line)
+    bad = False
+    for n, o in outcomes.items():
+        if o.refused:
+            print(f"live {n} REFUSED by the game: {o.refused}")
+            bad = True
+        elif not o.done:
+            print(f"live {n} NOT DONE after {round_trip:.1f} s" + (" (timeout; it still runs in the game)" if timed_out else
+                                                                  f" (the session is {problem})" if problem else ""))
+            bad = True
+    if not bad:
+        print(f"done: {', '.join(f'live {n}' for n in outcomes) or 'nothing to wait for'} in {round_trip:.2f} s (send to done)")
+    return 1 if bad or len(st.problems) > problems_before else 0
+
+
+def live_log(cfg: Config, a: argparse.Namespace) -> int:
+    folder = live_session_folder(cfg, a.session)
+    info, st = live_session.load_info(folder), live_session.load_state(folder)
+    peers = [a.peer] if a.peer else [n for n in [*info.clients, "S"] if n in st.logs]
+    for n in peers:
+        if n not in st.logs:
+            raise live_session.LiveError(f"no log for {n} in this session")
+        p = Path(st.logs[n])
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines() if p.is_file() else []
+        if a.since:
+            hits = [i for i, line in enumerate(lines) if a.since in line]
+            lines = lines[hits[-1]:] if hits else []
+        elif not a.all:
+            lines = lines[-a.tail:]
+        for line in lines:
+            if not a.grep or re.search(a.grep, line):
+                print(f"{n}| {line}")
+    return 0
+
+
+def live_list(cfg: Config, a: argparse.Namespace) -> int:
+    root = cfg.store / "live"
+    folders = sorted(p for p in root.iterdir() if (p / "session.json").is_file()) if root.is_dir() else []
+    shown = 0
+    for f in folders:
+        info, st = live_session.load_info(f), live_session.load_state(f)
+        alive = pid_alive(st.pid) if st.pid else False
+        if st.state in ("ended", "failed") and not a.all:
+            continue
+        state = st.state if alive or st.state in ("ended", "failed") else f"{st.state} (session process gone)"
+        idle = live_session.idle_seconds(max(info.created, (f / "sends.jsonl").stat().st_mtime
+                                             if (f / "sends.jsonl").is_file() else 0.0), time.time())
+        print(f"{info.name}: {state}; {info.layout}{' ' + info.level if info.level else ''}; "
+              f"following {', '.join(st.following) or 'none'}; idle {idle / 60:.1f} of {info.idle_minutes:g} min")
+        if st.note:
+            print(f"  {st.note}")
+        if st.run:
+            print(f"  run: {st.run}")
+        for line in live_problem_text(st):
+            print(f"  {line}")
+        shown += 1
+    if not shown:
+        print("no live session" + ("" if a.all else " running (--all lists the ended ones too)"))
+    return 0
+
+
+def live_stop(cfg: Config, a: argparse.Namespace) -> int:
+    folder = live_session_folder(cfg, a.session)
+    st = live_session.load_state(folder)
+    if st.state not in ("ended", "failed"):
+        (folder / "stop").write_text("stopped by `skytest.py live stop`", encoding="utf-8")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < live_session.STOP_GRACE_S + 90:
+            st = live_session.load_state(folder)
+            if st.state in ("ended", "failed") or (st.pid and not pid_alive(st.pid)):
+                break
+            time.sleep(0.5)
+    st = live_session.load_state(folder)
+    print(f"{folder.name}: {st.state}{': ' + st.note if st.note else ''}")
+    if st.pid and pid_alive(st.pid):
+        print("  the session process still runs (it ends its games itself; `skytest.py live list`)")
+    if st.run:
+        print(f"  run folder: {st.run}")
+    budget = machine_budget(cfg)
+    if budget is not None:
+        with budget.mutex():
+            taken, held = budget._probe()
+            for _, fd in taken:
+                _unlock_close(fd)
+        mine = [i for i, note in held.items() if folder.name in str(note.get("owner", ""))]
+        print(f"  machine slots: {len(held)} of {MACHINE_SLOT_FILES} held ({budget.holders(held)}); this session"
+              f" holds {len(mine)}")
+    return 0 if st.state in ("ended", "failed") else 1
+
+
+def live_spec(cfg: Config, a: argparse.Namespace) -> int:
+    folder = live_session_folder(cfg, a.session)
+    info = live_session.load_info(folder)
+    if not live_session.CASE_NAME.fullmatch(a.name):
+        raise live_session.LiveError(f"--name {a.name!r}: lower-case letters, digits, - and _")
+    out = cfg.cases_dir / f"{a.name}.toml"
+    if out.exists() and not a.force:
+        raise live_session.LiveError(f"{out} exists (--force replaces it)")
+    sends = live_session.read_sends(folder / "sends.jsonl")
+    text = live_session.skeleton_spec(a.name, info, sends, a.from_line, a.to_line, source=folder.name)
+    out.write_text(text, encoding="utf-8", newline="\n")
+    try:
+        load_spec(out, cfg.timeout)
+    except SpecError as e:
+        print(f"{out}: written, but it does not load: {e}")
+        return 1
+    print(f"{out}: {sum(1 for s in sends if (a.from_line or 0) <= s.number <= (a.to_line or s.number))} sent line(s)"
+          f" after the prologues; run it with `skytest.py test {a.name}`")
+    return 0
+
+
+LIVE_VERBS = {"start": live_start, "send": live_send, "log": live_log, "list": live_list, "stop": live_stop,
+              "spec": live_spec, "_serve": live_serve}
+
+
+def add_live_parser(sub) -> None:
+    lv = sub.add_parser("live", help="live sessions: start the games once, then send them script lines and read"
+                        " what every peer logs (docs/testing-guide.md, Live sessions)")
+    vs = lv.add_subparsers(dest="verb", required=True)
+    s = vs.add_parser("start", help="start a session's games (as a case does) and return when every peer follows"
+                      " its live file")
+    s.add_argument("--layout", required=True, help="server+1, server+2, ...")
+    s.add_argument("--level", default=None, help="H loads this level after the hub (the clients follow)")
+    s.add_argument("--hide-server", action="store_true", help="S hidden with its draw skip (the release"
+                   " configuration); else shown as in playtests")
+    s.add_argument("--name", default=None, help="a tag for the session's name (default: layout and level)")
+    s.add_argument("--late", action="append", metavar="PEER", help="this client stops at its title with its"
+                   " figure placed; send `online_join {join}` to join later (repeatable)")
+    s.add_argument("--arg", action="append", metavar="PEER:--SETTING=VALUE", help="an extra setting for a client"
+                   " (checked like a spec's args; repeatable)")
+    s.add_argument("--idle-minutes", type=float, default=live_session.DEFAULT_IDLE_MINUTES,
+                   help="the session stops itself after this long without a send (0: never)")
+    s.add_argument("--start-timeout", type=float, default=live_session.DEFAULT_START_TIMEOUT,
+                   help="seconds to wait for live mode before returning (the session goes on)")
+    s.add_argument("--ignore-build", default=None, metavar="WHY", help="start even while a build holds its slot"
+                   " (else the start waits for it, at most --build-wait-min); WHY is printed")
+    s.add_argument("--build-wait-min", type=float, default=None, metavar="MIN", help="as `test`'s")
+    s.add_argument("--no-server-live", action="store_true", help="S gets no live file (an older build without"
+                   " dev_server_follow gets none anyway)")
+    s.add_argument("--allow-restricted", action="store_true", help="as `test --allow-restricted`")
+    s = vs.add_parser("send", help="check lines, append them to a peer's live file, wait for the game's done line,"
+                      " print every peer's log lines since the send")
+    s.add_argument("session")
+    s.add_argument("peer", help="H, D, E, F, or S (its live file, when the build has one)")
+    s.add_argument("lines", nargs="+", help="script lines; several arguments or ';' send several")
+    s.add_argument("--timeout", type=float, default=live_session.DEFAULT_SEND_TIMEOUT)
+    s.add_argument("--no-wait", action="store_true", help="return once the lines are in the file")
+    s.add_argument("--grep", default=None, help="print only the log lines that match this regex")
+    s = vs.add_parser("log", help="a session's logs (the last lines, or from the last line holding --since)")
+    s.add_argument("session")
+    s.add_argument("peer", nargs="?", default=None)
+    s.add_argument("--since", default=None, metavar="TEXT", help="from the last line holding this text (e.g."
+                   " 'live 12:')")
+    s.add_argument("--grep", default=None, metavar="REGEX")
+    s.add_argument("--tail", type=int, default=60, help="without --since: the last N lines of each log")
+    s.add_argument("--all", action="store_true", help="the whole log")
+    s = vs.add_parser("list", help="the running sessions (--all: the ended ones too)")
+    s.add_argument("--all", action="store_true")
+    s = vs.add_parser("stop", help="quit every game of the session, end what is left, free the slots")
+    s.add_argument("session")
+    s = vs.add_parser("spec", help="write tests/runtime/<name>.toml from the prologues and the lines sent")
+    s.add_argument("session")
+    s.add_argument("--name", required=True, help="the case's name (the file's too)")
+    s.add_argument("--from", dest="from_line", type=int, default=None, help="each peer's first live line to take")
+    s.add_argument("--to", dest="to_line", type=int, default=None, help="each peer's last live line to take")
+    s.add_argument("--force", action="store_true", help="replace an existing spec file")
+    s = vs.add_parser("_serve")
+    s.add_argument("session")
+    s.add_argument("--allow-restricted", action="store_true")
+    lv.set_defaults(fn=cmd_live)
+
+
+# --- the level pass (levelpass.py) -----------------------------------------------------------------
+
+# Where the level pass reads its content and writes its reports and generated cases: tests/skytest.toml's
+# [levelpass] folder (outside the repository: everything there is derived from the disc), or --folder.
+LEVELPASS_DEFAULT = "~/Documents/T3Code/SwapForceOnline-work/levelpass"
+
+
+def lock_commands_known(cfg: Config) -> bool:
+    """The game registers the Spark Lock's test commands (lock_solve, lock_move) and its condition lock_ready
+    (the checkout's tests/script_commands.toml, which the launch builder checks every script against)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        table = la.CommandTable.load(path)
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+    return {"lock_solve", "lock_move"} <= set(table.registered) and table.conditions is not None and \
+        "lock_ready" in table.conditions
+
+
+def setting_known(cfg: Config, name: str) -> bool:
+    """The checkout's launch allow list (tests/launch_allow.toml) has a row for the setting `name`."""
+    try:
+        return name in (tomllib.loads((cfg.repo / "tests" / "launch_allow.toml").read_text(encoding="utf-8"))
+                        .get("settings") or {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+
+
+def command_known(cfg: Config, name: str) -> bool:
+    """The game registers the script command `name` (the checkout's tests/script_commands.toml)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        return name in la.CommandTable.load(path).registered
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+
+
+def launch_pad_known(cfg: Config) -> bool:
+    """The game registers `launch_pad` (W27b; the checkout's tests/script_commands.toml)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        return "launch_pad" in la.CommandTable.load(path).registered
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+
+
+def pass_gate_known(cfg: Config) -> bool:
+    """The game registers `pass_gate` (W23; the checkout's tests/script_commands.toml)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        return "pass_gate" in la.CommandTable.load(path).registered
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+
+
+def auto_follow_known(cfg: Config) -> bool:
+    """The game registers `online_auto_follow` (the checkout's tests/script_commands.toml: the launch builder
+    refuses a script with a command the table does not have)."""
+    import launch_args as la
+    path = cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml")
+    try:
+        return "online_auto_follow" in la.CommandTable.load(path).registered
+    except (OSError, ValueError, la.LaunchError, tomllib.TOMLDecodeError):
+        return False
+
+
+def levelpass_folder(cfg: Config, given: str | None) -> Path:
+    if given:
+        folder = expand(given)
+    else:
+        c = tomllib.loads((cfg.repo / "tests" / "skytest.toml").read_text(encoding="utf-8"))
+        folder = expand(str(c.get("levelpass", {}).get("folder", LEVELPASS_DEFAULT)))
+    folder = folder.resolve()
+    if inside(folder, cfg.repo.resolve()):
+        raise SystemExit(f"levelpass: {folder} is inside the repository; its content is derived from the disc and"
+                         " stays outside git")
+    return folder
+
+
+def measured_scene_lengths(cfg: Config, level: str, runs: int = 5) -> dict[str, float]:
+    """The cutscene lengths measured in this store's newest level-pass runs of the level (H's log: each scene
+    played to its natural end), for --scenes play's estimate; empty when none was measured yet."""
+    import levelpass as lp
+    out: dict[str, float] = {}
+    folders = sorted((d for d in (cfg.store / "runs").glob(f"*-levelpass-{level}*") if d.is_dir()),
+                     key=lambda d: d.name, reverse=True) if (cfg.store / "runs").is_dir() else []
+    seen = 0
+    for d in folders:
+        log = d / "H" / "game.log"
+        if not log.is_file():
+            continue
+        text = log.read_text(encoding="utf-8", errors="replace")
+        for name, s in lp.scene_lengths_from_log(text).items():
+            out[name] = max(out.get(name, 0.0), s)
+        held = lp.sweep_scene_seconds_from_log(text)  # what the scenes took inside that run's sweep
+        if held is not None:
+            out[lp.SWEEP_SCENES_KEY] = max(out.get(lp.SWEEP_SCENES_KEY, 0.0), held)
+        seen += 1
+        if seen >= runs:
+            break
+    return out
+
+
+def cmd_levelpass(cfg: Config, a: argparse.Namespace) -> int:
+    """One automatic level pass: the plan from the level's content, one generated case through `test`
+    (its guards, the machine's slots, fail fast), then the report from the run's logs."""
+    import levelpass as lp
+    folder = levelpass_folder(cfg, getattr(a, "folder", None))
+    try:
+        content = lp.load_content(folder, a.level, probe_ids=not a.no_probe)
+    except ValueError as e:
+        raise SystemExit(f"levelpass: {e}") from None
+    if a.no_end and a.predictions:
+        raise SystemExit("levelpass: --no-end is for the generated pass, not --predictions")
+    # W27b: the launch pads ridden only with the build's launch_pad and without --no-launch-rides.
+    lp.LAUNCH_RIDES = launch_pad_known(cfg) and not getattr(a, "no_launch_rides", False)
+    # W32 (c): D fights one fight a level where the build registers stand_by.
+    lp.D_FIGHT = command_known(cfg, "stand_by")
+    # W31: the pieces step enters its trigger on foot where the build has walk_into.
+    lp.WALK_INTO = command_known(cfg, "walk_into")
+    # W33: --vulnerable leaves out --dev_hero_invulnerable and --dev_damage_multiplier.
+    lp.VULNERABLE = bool(getattr(a, "vulnerable", False))
+    # W30: the late joiner waits for its arrival move before it is placed, where the build has the condition.
+    conds = table_conditions(cfg.script_commands or (cfg.repo / "tests" / "script_commands.toml"))
+    lp.ARRIVAL_DONE = conds is not None and "online_arrival_done" in conds
+    plan = lp.make_plan(content, full=a.full, late_join=not a.no_late_join, provoke=a.provoke or "",
+                        no_end=a.no_end, d_stays=not a.d_leaves_before_end,
+                        d_lobby=not getattr(a, "d_joins_late", False), new_slot=getattr(a, "new_slot", False),
+                        scenes=getattr(a, "scenes", "skip") == "play",
+                        scene_lengths=measured_scene_lengths(cfg, a.level) if getattr(a, "scenes", "skip") == "play"
+                        else None, lock_commands=lock_commands_known(cfg), no_gates=getattr(a, "no_gates", False))
+    plan.probe = not a.no_probe
+    plan.pass_gates = pass_gate_known(cfg)  # W23: H and D walk through each gate H opened
+    if plan.pass_gates:  # the walks' seconds in the gates phase's budget (H's; D's run beside H's next steps)
+        extra = sum(lp.PASS_H_S + lp.PASS_TELEPORT_S for r in plan.required if not r.why_not)
+        for r in plan.required:
+            if not r.why_not:
+                r.est_s += lp.PASS_H_S + lp.PASS_TELEPORT_S
+        plan.required_s += extra
+        plan.estimate_s += extra
+    # W21: a named figure (or a swapper's two halves) for H or D, from the copied figure folder.
+    for who, opt in (("h", "h_figure"), ("d", "d_figure")):
+        name = getattr(a, opt, None)
+        if name:
+            try:
+                setattr(plan, f"figures_{who}", lp.figure_files(fixture_dirs(cfg)[1], name))
+            except ValueError as e:
+                raise SystemExit(f"levelpass: --{who}-figure: {e}") from None
+    plan.server_hidden = bool(getattr(a, "server_hidden", False))
+    plan.long_pause_s = int(getattr(a, "long_pause", 0) or 0)
+    plan.long_pause_at = getattr(a, "long_pause_at", "") or ""
+    if plan.long_pause_s and lp.long_pause_label(plan) is None:
+        raise SystemExit(f"levelpass: --long-pause: the plan has no pickup of "
+                         f"{plan.long_pause_at or 'a collectible'} to leave its screen up at")
+    # D follows H by default once the game registers online_auto_follow (the checkout's command table, which
+    # the launch builder checks every script against: before that build nothing changes); --d-stays keeps D
+    # where it entered.
+    follow_known = auto_follow_known(cfg)
+    plan.d_follow = plan.d_lobby and not getattr(a, "d_stays", False) and follow_known
+    notices = []
+    if plan.d_lobby and not getattr(a, "d_stays", False) and not follow_known:
+        notices.append("D stays where it entered: this game does not register online_auto_follow yet")
+    try:
+        plan.game_args = [lp.check_game_arg(g) for g in (a.game_arg or [])]
+        # W31: a level with run-time movers (Cascade Glade's islands) runs with the islands shared, unless the pass
+        # names the setting itself (--game-arg=--online_island_spawns=false keeps each game's own).
+        if plan.pieces and not a.predictions and not any(g.startswith("--online_island_spawns=") for g in plan.game_args):
+            plan.game_args.append(lp.PIECES_SETTING)
+        # W36: a level with a launch pad microgame relays its ride to every player's game, where the build knows
+        # online_launch_relay (the checkout's tests/launch_allow.toml), unless the pass names the setting itself.
+        if (lp.launch_pads(content.manifest) and not a.predictions and setting_known(cfg, "online_launch_relay")
+                and not any(g.startswith("--online_launch_relay=") for g in plan.game_args)):
+            plan.game_args.append(lp.LAUNCH_RELAY_SETTING)
+    except ValueError as e:
+        raise SystemExit(f"levelpass: {e}") from None
+    if plan.game_args and a.predictions:
+        raise SystemExit("levelpass: --game-arg is for the generated pass, not --predictions")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    cases = folder / "cases" / stamp
+    cases.mkdir(parents=True, exist_ok=False)
+    case = lp.case_name(a.level, plan.no_end)
+    spec_path = cases / f"{case}.toml"
+    bugs: list = []
+    if a.predictions:
+        import levelpass_predictions as lpp
+        recipes_file = folder / "predictions.toml"
+        if not recipes_file.is_file():
+            raise SystemExit(f"levelpass --predictions: no {recipes_file}")
+        try:
+            recipes = lpp.load_recipes(recipes_file.read_text(encoding="utf-8"))
+        except (ValueError, tomllib.TOMLDecodeError) as e:
+            raise SystemExit(f"levelpass --predictions: {recipes_file}: {e}") from None
+        bugs = [b for b in recipes.bugs if b.level == a.level]
+        d_mode = recipes.d_mode.get(a.level, "early")  # D joins at the start and stays (the observed player)
+        h_script, d_script = lpp.scripts(a.level, bugs, d_mode)
+        text = lp.spec_from_scripts(a.level, h_script, d_script,
+                                    ["--trace_where_seconds=1"] if d_mode == "early" else [],
+                                    server_hidden=plan.server_hidden)
+        literals = lp.position_literals(h_script) + lp.position_literals(d_script or "")
+        plan.stops, plan.exit_stop, plan.late_join = [], None, d_mode != "none"
+        plan.left_out = [f"predictions mode: {len(bugs)} prediction(s) of {a.level}, D {d_mode}"]
+    else:
+        text = lp.spec_toml(plan)
+        literals = lp.position_literals(lp.script_h(plan, lp.LATE_JOIN_MARK)) + lp.position_literals(lp.script_d(plan))
+    if literals:  # the owner's rule: a level pass names objects; the game reads where they are
+        raise SystemExit(f"levelpass: the generated scripts carry positions: {literals[:3]}")
+    if not a.predictions:  # a fixed wait in the wrong unit hangs the game slot (batch 11 run 3: wait 25000)
+        bad = lp.wait_errors(lp.script_h(plan, lp.LATE_JOIN_MARK), plan.estimate_s) +             lp.wait_errors(lp.script_d(plan), plan.estimate_s)
+        if bad:
+            raise SystemExit(f"levelpass: the generated scripts' waits: {bad[:3]}")
+    spec_path.write_text(text, encoding="utf-8")
+    # The plan's first line: its estimate and which budget it is in (the gates phase, or --no-gates).
+    print(f"levelpass {a.level}: estimate {plan.estimate_s:.0f} s ({lp.budget_words(plan)}); content {plan.source}; "
+          f"{len(plan.stops)} stops, {sum(len(st.actions) for st in plan.stops)} actions; case {spec_path}", flush=True)
+    print(f"levelpass {a.level}: figures: H {lp.figure_words(plan.figures_h)}"
+          + (f"; D {lp.figure_words(plan.figures_d)}" if plan.late_join else ""), flush=True)
+    for n in notices:
+        print(f"levelpass {a.level}: {n}", flush=True)
+    for h in plan.held:  # the fights the level's script holds (levelpass_holds), in words
+        print(f"levelpass {a.level}: held: {h}", flush=True)
+    for r in plan.required:  # the gates a player opens on the way, performed or why not
+        what = r.why_not and f"not performed: {r.why_not}" or "; ".join(r.h[1:-1])
+        print(f"levelpass {a.level}: required {r.label} {r.kind} {r.gate.name}: {what}", flush=True)
+    gates = lp.gates_words(content)
+    if gates and not a.predictions:
+        print(f"levelpass {a.level}: gates on the way a teleporting pass does not open ({len(gates)}): "
+              f"{'; '.join(gates)}", flush=True)
+    if a.plan_only:
+        return 0
+    t0 = time.monotonic()
+    started = time.strftime("%Y%m%d-%H%M%S")
+    # The pass's verdict (R3), decided as the case ends (W15): batch 12 case 7 printed the runner's `PASS` while
+    # the level pass's verdict and result.json said INCOMPLETE (its sweep skipped steps for time). An incomplete
+    # pass is the case's status `incomplete` from the first line printed about it on.
+    decided: dict = {}
+
+    def case_verdict(_spec, r) -> None:
+        if not r.folder or not Path(r.folder).is_dir():
+            return
+        run_dir = Path(r.folder)
+        d_text = read_peer_log(run_dir, "D", False) if (run_dir / "D").is_dir() else ""
+        verdict, missed = lp.pass_verdict(r.status, list(r.reasons), read_peer_log(run_dir, "H", False), plan, d_text)
+        decided["verdict"] = (verdict, missed)
+        if verdict == lp.INCOMPLETE and r.status in ("pass", "fail"):
+            r.status = "incomplete"
+            r.reasons.append("levelpass: incomplete: " + "; ".join(missed))
+
+    ns = argparse.Namespace(cases=[case], stage=None, max_games=0, gate=False, per_build=False,
+                            allow_restricted=False, jobs=1, run_not_ready=False, no_breaker=False, queue=None,
+                            remote=None, remote_manifest=None, remote_token_file=None,
+                            rerun_known_failure=a.rerun_known_failure, ignore_build=a.ignore_build,
+                            build_wait_min=a.build_wait_min, ignore_preflight=a.ignore_preflight,
+                            case_verdict=case_verdict)
+    code = cmd_test(replace(cfg, cases_dir=cases), ns)
+    if code in (EXIT_KNOWN_FAILURE, EXIT_BUILD_RUNNING, EXIT_PREFLIGHT):
+        why = {EXIT_KNOWN_FAILURE: "a known failure", EXIT_BUILD_RUNNING: "a build held its slot",
+               EXIT_PREFLIGHT: "an error in its preflight"}[code]
+        print(f"levelpass {a.level}: not started ({why}, above); no report", flush=True)
+        return code
+    wall = time.monotonic() - t0
+    runs = sorted(p for p in (cfg.store / "runs").glob(f"*-{case}")
+                  if p.is_dir() and p.name[:15] >= started)
+    if not runs:
+        print(f"levelpass {a.level}: no run folder (the case did not start; exit {code})", flush=True)
+        return code or 1
+    run = runs[-1]
+    if isinstance(getattr(a, "check", None), dict):  # levelcheck grades this run after the report
+        a.check["run"] = run
+    script = (run / "H" / "script.txt").read_text(encoding="utf-8", errors="replace") \
+        if (run / "H" / "script.txt").is_file() else lp.script_h(plan, None)
+    labels = lp.step_labels(script)
+    texts = {"H": read_peer_log(run, "H", False), "S": read_peer_log(run, "S", True)}
+    if (run / "D").is_dir():
+        texts["D"] = read_peer_log(run, "D", False)
+    findings: list = []
+    crash = ""
+    for peer, text in texts.items():
+        findings += lp.findings_from_log(peer, text, labels)
+        for line in text.splitlines():
+            if not crash and re.search(r"\] Crash: |\[FATAL\]|Unhandled guest access violation", line):
+                crash = f"{peer}: {line.strip()[:300]}"
+    notes = []
+    result = run / "result.json"
+    if result.is_file():
+        try:
+            rj = json.loads(result.read_text(encoding="utf-8"))
+            for r in rj.get("peers", []):
+                if r.get("exit_code") not in (0, None) and crash_exit_code(r.get("exit_code")):
+                    crash = crash or f"{r.get('peer')}: exit code {r.get('exit_code')}"
+            if rj.get("stopped_early"):
+                notes.append(rj["stopped_early"])
+            for why in rj.get("reasons", []):
+                notes.append(f"runner: {why}")
+        except (OSError, ValueError):
+            pass
+    notes += lp.counted_fight_notes(plan, texts["S"], texts["H"])
+    notes += lp.level_end_notes(texts["S"], texts)
+    unresolved = lp.unresolved_exit(texts["H"], script)
+    if unresolved:
+        notes.insert(0, f"pass ended at the exit: {unresolved}")
+        findings.append(lp.Finding(severity=lp.TOOL, kind="tool", family="exit", what=lp.EXIT_FATAL_WHAT, obj="",
+                                   step="", lines=[unresolved], peer="H"))
+    findings, artefact_notes = lp.audit_artefacts(findings, texts)
+    findings = lp.exit_not_reached(findings, texts["H"])
+    notes += artefact_notes
+    findings += lp.level_changes(texts["H"], plan.timed)
+    lp.name_ids(findings, lp.names_by_hash(content.objects))
+    if plan.provoke:
+        diverged = lp.provoked(texts["H"])
+        caught = lp.mark_provoked(findings, diverged)
+        notes.append(f"provoked: {plan.provoke} on H alone ({', '.join(e for _k, e in diverged) or 'no row qualified'});"
+                     f" the audit reported it {caught} time(s)" + ("" if caught or not diverged else ": NOT CAUGHT"))
+    skipped = len(re.findall(r"skipped: the sweep's time is up", texts["H"]))
+    if skipped:
+        notes.append(f"{skipped} step(s) skipped at the sweep's deadline (not reached in the budget)")
+    if crash:
+        findings.insert(0, lp.Finding(severity="crash", kind="process", family=crash.split(":")[0], what=crash,
+                                      obj="", step=""))
+    notes.append(f"shader cache: {'warm (from the build snapshot)' if any((run / n / 'cache').rglob('*.xpso') for n in ('H',)) else 'cold'}")
+    settings = "settings: the release defaults a player gets (no online_route_file: every trigger unclassified) plus " \
+        "the test tools " + " ".join(lp.probe_args(lp.H_ARGS, plan.probe, plan.game_args)) + " on H"
+    notes.insert(0, settings)
+    report = lp.report_text(a.level, plan, wall, lp.phase_times(texts["H"]), lp.fold(findings), crash,
+                            {p: lp.summaries(t) for p, t in texts.items()}, str(run), notes,
+                            boot=lp.boot_phases(texts["H"]))
+    # The pass's verdict (R3): PASS, INCOMPLETE with what it did not cover, or FAIL; an incomplete pass is
+    # never a pass, in the report and in result.json (status `incomplete`).
+    rj_now = {}
+    try:
+        rj_now = json.loads(result.read_text(encoding="utf-8")) if result.is_file() else {}
+    except (OSError, ValueError):
+        rj_now = {}
+    # The verdict decided as the case ended (case_verdict), else (a run folder of an older runner) from result.json.
+    verdict, missed = decided.get("verdict") or lp.pass_verdict(
+        str(rj_now.get("status", "fail")), list(rj_now.get("reasons", [])), texts["H"], plan, texts.get("D", ""))
+    if crash:
+        verdict = lp.FAIL
+    head = f"verdict: {verdict}" + (f" (not covered: {'; '.join(missed)})" if missed else "") + \
+        "\n" + lp.clients_line(plan, texts["H"], texts.get("D", ""))
+    report = report.replace("\n", "\n" + head + "\n", 1)
+    if rj_now:
+        rj_now["levelpass"] = {"verdict": verdict, "not_covered": missed}
+        if verdict == lp.INCOMPLETE and rj_now.get("status") == "pass":
+            rj_now["status"] = "incomplete"
+            rj_now.setdefault("reasons", []).append("levelpass: incomplete: " + "; ".join(missed))
+        write_text_replacing(result, json.dumps(rj_now, indent=2))
+    if bugs:
+        import levelpass_predictions as lpp
+        report += "\n" + lpp.verdict_text(lpp.verdicts(bugs, texts))
+    out = folder / f"{a.level}-{'predictions' if a.predictions else 'pass'}-{stamp}.txt"
+    out.write_text(report, encoding="utf-8")
+    if isinstance(getattr(a, "check", None), dict):
+        a.check["report"] = out
+    print(report, flush=True)
+    print(f"levelpass {a.level}: report {out}", flush=True)
+    print(f"levelpass {a.level}: {head}", flush=True)
+    return {lp.PASS: 0, lp.INCOMPLETE: EXIT_INCOMPLETE}.get(verdict, 1)
+
+
+EXIT_INCOMPLETE = 5   # levelpass: the pass did not cover its plan (soft budget, skipped steps, end not reached)
+
+
+def add_levelpass_options(lp_: argparse.ArgumentParser) -> None:
+    """The level pass's options (levelpass, and levelcheck which runs one)."""
+    lp_.add_argument("--full", action="store_true", help="act on every object (default: each action family at"
+                     " most 3 times, every cluster still visited)")
+    lp_.add_argument("--no-late-join", action="store_true", help="no second client D at all (one player)")
+    lp_.add_argument("--d-joins-late", action="store_true", help="D joins late, into the level under test (the"
+                     " parked path); by default both clients join in the lobby, the host picks the slot and the"
+                     " party enters the level together (the owner's order)")
+    lp_.add_argument("--no-gates", action="store_true", help="no required phase: the gates a player opens on the way"
+                     " are not attempted (the page says completable by teleport); the full sweep and the ten-minute"
+                     " budget, for runs about something else")
+    lp_.add_argument("--long-pause", type=int, default=0, metavar="SECONDS", help="one pickup leaves the game's"
+                     " found screen up this long on purpose (the run a pause crash's fix needs); every other step"
+                     " dismisses a pause screen within seconds")
+    lp_.add_argument("--long-pause-at", default="", metavar="NAME", help="the object whose pickup takes the long"
+                     " pause (default: the plan's first pickup of a collectible)")
+    lp_.add_argument("--vulnerable", action="store_true", help="the heroes can be hurt: --dev_hero_invulnerable and "
+                     "--dev_damage_multiplier are left out (the page's row \"enemies hurt players\" is then graded); a "
+                     "knock-out stops the pass's route until the hero is back (no swap at a knock-out yet)")
+    lp_.add_argument("--no-launch-rides", action="store_true", help="the launch pad microgames are only visited, not "
+                     "pressed and ridden (launch_pad), even where the build has the command: for runs that must not "
+                     "depend on a ride rail-launch-tb has not shown yet")
+    lp_.add_argument("--h-figure", default=None, metavar="NAME", help="H's figure from the copied figure folder"
+                     " (default Roller Brawl): `<NAME>.dump`, or a swapper's two halves (`<NAME> Top.dump` in slot 0,"
+                     " `<NAME> Bottom.dump` in slot 1)")
+    lp_.add_argument("--d-figure", default=None, metavar="NAME", help="D's figure, as --h-figure (default Scorp);"
+                     " e.g. --d-figure \"Spy Rise\" puts a swapper on D")
+    lp_.add_argument("--d-stays", action="store_true", help="D stays where it entered the level (the old"
+                     " behaviour); by default D's hero follows H's through the stops (the game's Auto follow,"
+                     " online_auto_follow on) once the game registers that command")
+    lp_.add_argument("--scenes", choices=("skip", "play"), default="skip", help="play: the cutscenes in full,"
+                     " each scene's trigger entered in the sweep, the expected scenes in H's script for the level"
+                     " check's cutscenes row, their lengths (measured in earlier runs, else 60 s at the load and"
+                     " 15 s) in the estimate")
+    lp_.add_argument("--server-hidden", action="store_true", help="the host's server runs hidden with the"
+                     " release's draw skip (real play); by default its window is shown at 640x360, as in every"
+                     " playtest")
+    lp_.add_argument("--new-slot", action="store_true", help="the host starts a new game in the lobby instead of"
+                     " the save's continue")
+    lp_.add_argument("--d-leaves-before-end", action="store_true", help="D ends its session before the exit, as"
+                     " before 19 November (late join and leave without a second client at the end); by default D"
+                     " stays through the level end and must reach the next level itself for a PASS")
+    lp_.add_argument("--no-end", action="store_true", help="stop after the last mid-level step: the level's end is"
+                     " neither acted on nor waited for, the pass is judged on the mid-level steps, the report says"
+                     " the end was not attempted (its own case, levelpass-<level>-no-end): for evidence from the"
+                     " middle of a level")
+    lp_.add_argument("--folder", default=None, help="the levelpass folder (default: tests/skytest.toml's"
+                     " [levelpass] folder)")
+    lp_.add_argument("--provoke", default=None, metavar="KIND", help="the audit's proof: after the first visit H"
+                     " makes one object of KIND (breakable) differ on its own (dev_audit_diverge); the report must"
+                     " show it as a provoked difference")
+    lp_.add_argument("--predictions", action="store_true", help="the predictions run: each predicted co-op bug of"
+                     " the level (<levelpass>/predictions.toml) as steps, snapshots and a check, a verdict per bug")
+    lp_.add_argument("--no-probe", action="store_true", help="the authored probe off in every game: objects only by"
+                     " the names the probe saw live (no auth: ids); to tell a crash of the probe from the game's")
+    lp_.add_argument("--game-arg", action="append", default=None, metavar="--NAME=VALUE", help="one more game"
+                     " setting for H and D (repeatable; a setting Host forwards reaches the hosted S too), e.g."
+                     " --game-arg=--online_authored_ids=2")
+    lp_.add_argument("--plan-only", action="store_true", help="write the generated case and print the plan; start"
+                     " no game")
+    lp_.add_argument("--build-wait-min", type=float, default=None, metavar="MIN", help="as `test`'s")
+    lp_.add_argument("--ignore-build", default=None, metavar="WHY", help="as `test`'s: start beside a build, WHY"
+                     " written into the result")
+    lp_.add_argument("--ignore-preflight", default=None, metavar="WHY", help="as `test`'s: start the generated case"
+                     " although its preflight found an error, WHY written into the result")
+    lp_.add_argument("--rerun-known-failure", default=None, metavar="WHY", help="as `test`'s: run the pass although"
+                     " its last two results on this build with the same generated case failed with the same first"
+                     " reason; WHY is written into the result")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="The Skylanders online forks' test runner.")
     p.add_argument("--repo", default=".", help="the game checkout (default: the current folder)")
@@ -7763,8 +10571,18 @@ def main(argv: list[str] | None = None) -> int:
                    " out and counts each met when its newest result on the same build snapshot is a pass")
     t.add_argument("--allow-restricted", action="store_true", help="start the games even when this runner has a"
                    " restricted token (an agent sandbox): their shader caches are unusable, timings not comparable")
-    t.add_argument("--jobs", type=int, default=1, help="most cases at once (default 1: one after another); their"
-                   " games count against --max-games, and a spec with exclusive = true runs alone")
+    t.add_argument("--jobs", type=int, default=None, help="most cases at once (default 1: one after another; with"
+                   " --bulk half the bulk budget); their games count against --max-games, and a spec with exclusive"
+                   " = true runs alone")
+    t.add_argument("--session-settings", action="store_true", help="every session case (layout server+N) runs with"
+                   " the owner's session settings (tests/session_settings.toml) on every game, unless its spec says"
+                   " session_settings = false; a spec's own value for a name wins")
+    t.add_argument("--bulk", action="store_true", help="bulk mode: every game hidden with the draw skip, waitfor"
+                   " timeouts scaled ([defaults] bulk_wait_factor), the budget [defaults] bulk_machine_games;"
+                   " specs that cannot run hidden are reported `not in bulk` (docs/testing-guide.md, bulk mode)")
+    t.add_argument("--bulk-pacing", default=None, choices=sorted(BULK_PACINGS), help="with --bulk: the games'"
+                   " pacing (default: the game's own; vblank240: --guest_vblank_rate=240; fps30:"
+                   " --frame_rate_limit=30, the session tick stays 60); part of the run's label")
     t.add_argument("--run-not-ready", action="store_true", help="run the cases that are not ready (ready = false,"
                    " a PLACEHOLDER) anyway, e.g. for the legs that exist; their result is graded as usual")
     t.add_argument("--no-breaker", action="store_true", help="start cases even when the circuit breaker of this"
@@ -7778,6 +10596,16 @@ def main(argv: list[str] | None = None) -> int:
                    " record (package_check.py), which the agent verifies its install against")
     t.add_argument("--remote-token-file", default=None, metavar="FILE", help="with --remote: a file with the"
                    " agent's token (else it is asked for: the agent shows it on its console)")
+    t.add_argument("--rerun-known-failure", default=None, metavar="WHY", help="start a case even when its last two"
+                   " results on this build with the same case content failed with the same first reason (known"
+                   " failure); WHY (required) says what can end otherwise and is written into the result")
+    t.add_argument("--build-wait-min", type=float, default=None, metavar="MIN", help="how long a case waits for a"
+                   f" build that holds its slot (tools/build_low.py) before it is not started (default"
+                   f" {build_guard.BUILD_WAIT_MIN:.0f})")
+    t.add_argument("--ignore-build", default=None, metavar="WHY", help="start cases even while a build holds its"
+                   " slot; WHY (required) is written into the result")
+    t.add_argument("--ignore-preflight", default=None, metavar="WHY", help="start a case although its preflight"
+                   " (preflight.py) found an error; WHY (required) is written into the result")
     t.set_defaults(fn=cmd_test)
     ls = sub.add_parser("list")
     ls.add_argument("--gate", action="store_true", help="the gate cases and their expected minutes (from each"
@@ -7808,8 +10636,58 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--noise", type=int, default=0, help="how many of the runs make the A/A (default: all but the"
                    " last of three or more, else all)")
     c.set_defaults(fn=cmd_compare)
+    add_live_parser(sub)
+    lp_ = sub.add_parser("levelpass", help="the automatic level pass: one session, a sweep generated from the"
+                         " level's data, the audit's verdict, a report in the levelpass folder")
+    lp_.add_argument("level", help="the level's short name (tutorial_a, tutorial_b, ww1)")
+    add_levelpass_options(lp_)
+    lp_.set_defaults(fn=cmd_levelpass)
+    lc_ = sub.add_parser("levelcheck", help="the level check: a level pass, then its run graded against the owner's"
+                         " definition of working on one page (levelcheck.py); or --grade an existing run")
+    lc_.add_argument("level", nargs="?", default=None, help="the level's short name (runs `levelpass <level>` first)")
+    lc_.add_argument("--grade", metavar="RUN", default=None, help="grade this run folder instead (no game)")
+    lc_.add_argument("--static", action="store_true", help="every level's end and mechanics from the levelpass"
+                     " folder's data, one table (no game)")
+    lc_.add_argument("--out", default=None, metavar="FILE", help="with --static: also write the table here")
+    add_levelpass_options(lc_)
+    lc_.set_defaults(fn=cmd_levelcheck)
+    pr = sub.add_parser("prune", help="remove the store's run folders older than some hours (through the janitor)")
+    pr.add_argument("--older-than", type=float, required=True, metavar="HOURS",
+                    help="a run or session folder whose newest file is older than this many hours goes")
+    pr.add_argument("--dry-run", action="store_true", help="say what would go, remove nothing")
+    pr.set_defaults(fn=cmd_prune)
+    ac = sub.add_parser("acceptance", help="the acceptance list on one build: each case once, one session at a time,"
+                        " then the level checks with two players, one page (acceptance.py)")
+    ac.add_argument("--cases", default=None, help="comma-separated case names instead of the list")
+    ac.add_argument("--levels", default=None, help="comma-separated levels instead of tutorial_a,tutorial_b,ww1;"
+                    " an empty value (--levels=) runs no level check")
+    ac.add_argument("--run-not-ready", action="store_true", help="pass --run-not-ready to every case")
+    ac.add_argument("--dry-run", action="store_true", help="print the list and its estimate only, start no game"
+                    " (and whether it would wait for the owner's own game)")
+    ac.add_argument("--while-owner-plays", action="store_true", help="start the cases even while one of the owner's"
+                    " own games (*recompiled.exe) runs (by default the list waits, a line a minute)")
+    ac.add_argument("--history", action="append", default=None, metavar="DIR", help="one more store's runs folder whose"
+                    " earlier runs count for the estimate (repeatable)")
+    ac.set_defaults(fn=cmd_acceptance)
+    pf = sub.add_parser("preflight", help="a spec's mistakes before any game runs (preflight.py)")
+    pf.add_argument("cases", nargs="*", help="case names (tests/runtime/<case>.toml)")
+    pf.add_argument("--all-ready", action="store_true", help="every spec that is ready")
+    pf.add_argument("--runs", action="append", default=None, metavar="DIR", help="one more folder of recorded runs"
+                    " (repeatable; default: this worktree's store)")
+    pf.add_argument("--strict", action="store_true", help="exit non-zero on warnings too")
+    pf.add_argument("--wording", action="store_true", help="also check each pattern's wording against the log"
+                    " statements (warnings; noisy for lines composed from fragments)")
+    pf.add_argument("--file", action="append", default=None, metavar="PATH", help="a spec file outside tests/runtime"
+                    " (an older text of a case, e.g. from git show), checked under its file name's case")
+    pf.add_argument("--folder", default=None, help="the levelpass folder (default: tests/skytest.toml's)")
+    pf.set_defaults(fn=cmd_preflight)
     a = p.parse_args(argv)
     cfg = load_config(repo_root(Path(a.repo)))
+    if a.fn in (cmd_test, cmd_acceptance, cmd_levelcheck, cmd_levelpass):
+        missing = data_drive_missing(cfg.store)
+        if missing:
+            print(missing, flush=True)
+            return 2
     return a.fn(cfg, a)
 
 

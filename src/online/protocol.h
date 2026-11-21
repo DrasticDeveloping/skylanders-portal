@@ -372,6 +372,36 @@ struct CurrentFigure {
 // after `elements` (a pose without it reads as 0). The owning client moves it at a teleport, a
 // bounce pad or a fall reset, so S's rate check lets that pose through.
 
+// Stage 4, the other player's moves (the game's online_remote_moves): the hero's own command as its ActorInput held
+// it at the pose, so another game's body of that hero runs the same jumps, specials and blocks itself. A block
+// after `teleports`: a version byte (kPlayerCommandVersion), the sender's peer epoch (u32: its `player` row's key, so a
+// receiver never feeds an old player's command to the body of a new one behind the same peer id: S reuses ids), the
+// held word (u32: the game's 27 logical buttons, bit
+// n = button n, the three attack slots left out: they go as PlayerAction), one wrapping press counter (u8) per
+// button in kPlayerCommandPressButtons (a press between two poses is never lost with a pose that is), the move
+// magnitude and the move vector (f32, finite): version 2, 28 bytes (kPlayerCommandVersion, kPlayerCommandBytes).
+// Version 1 was the first layout, the same without the peer epoch (24 bytes): its own version number, so neither
+// reader takes the other's fields as its own; a version 1 block of exactly 24 bytes is read as no command (it
+// cannot be bound to a player), the pose kept. A pose without a block has has_command false; a block of a version
+// this reader does not know is skipped (has_command false, the pose kept). A block of a known version cut short or
+// longer than its exact size, or one with a float not finite, makes the message invalid. A reader that does not
+// know blocks at all stops after `teleports` and ignores the bytes past it (the rule above); the protocol version
+// stays 3.
+constexpr uint8_t kPlayerCommandVersion = 2;
+constexpr size_t kPlayerCommandBytes = 28;    // the version 2 block, its version byte included
+constexpr uint8_t kPlayerCommandVersion1 = 1;
+constexpr size_t kPlayerCommandV1Bytes = 24;  // the version 1 block (no peer epoch), its version byte included
+constexpr size_t kPlayerCommandPresses = 3;  // JUMP (logical button 4), POWER (7), BLOCK (11)
+inline constexpr std::array<uint8_t, kPlayerCommandPresses> kPlayerCommandPressButtons = {4, 7, 11};
+struct PlayerCommand {
+  uint32_t peer_epoch = 0;
+  uint32_t held = 0;
+  std::array<uint8_t, kPlayerCommandPresses> presses{};
+  float magnitude = 0;
+  std::array<float, 3> move{};
+  bool operator==(const PlayerCommand&) const = default;
+};
+
 // Client to server, fast lane, about 20 Hz (tests/thresholds.toml players_hz): the hero's pose.
 // `pose_sequence` counts the peer's poses from 1 (0 is never sent: only a scene skip's request
 // carries pose sequence 0, for "needs no pose"). The server drops a pose not newer than the last one it has from that peer in
@@ -384,6 +414,8 @@ struct PlayerPose {
   std::array<float, 4> rotation{0, 0, 0, 1};
   CurrentFigure figure;
   uint16_t teleports = 0;  // stage 4: the teleport counter (above)
+  bool has_command = false;  // the moves' command block (above); false: none on the wire
+  PlayerCommand command;     // read only when has_command
   bool operator==(const PlayerPose&) const = default;
 };
 
@@ -563,11 +595,30 @@ struct SessionClosed {
 // itself). Each client that plays a matching occurrence of its own (the same kind, name hash and
 // recipient in that generation) answers kAck. S's scene end goes to every client as kEnd.
 // Directions: kOpen, kRelease and kEnd server to client; kAck client to server. Gameplay lane.
+// The shared skip and hold (the game repository's online/6-scene-skip-shared; its docs/online-6.md):
+// kSkip, kHold and kUnhold server to client, each naming one play of an occurrence by its generation,
+// kind, name hash and recipient, the scene sequence carrying the play (the game's scene_share_rules.h:
+// the play in its low 16 bits, a conversation skip's turn in its high 16). kSkip: every client that plays
+// that play skips its own copy through the game's own skip (one decision of S's per play). kHold: a
+// client still plays it, so every client holds its player (repeated while held); kUnhold: no client plays
+// it any more (or a peer left, a silent copy left, the level changed), the hold is released. kShare
+// server to client: the session's switches for the shared skip and the hold (the scene sequence's bit 0
+// and bit 1; no recipient), sent at each join so every client follows S's one value. kStart server to
+// client: S's world sent a cutscene's Play telegram natively (not a request's step), named by its
+// telegram key (recipient: the messenger's world ref; name_hash: the list owner's hash; the scene
+// sequence: the list index << 16 | S's count of that telegram in the generation); every client sends
+// the same telegram from its own copy unless its own game sent it (the game's scene_share_rules.h
+// ScenePairing). Like kOpen and kRelease they carry no end reason and no skips.
 enum class ScenePhase : uint8_t {
   kOpen = 1,
   kAck = 2,
   kRelease = 3,
   kEnd = 4,
+  kSkip = 5,
+  kHold = 6,
+  kUnhold = 7,
+  kShare = 8,
+  kStart = 9,
 };
 enum class SceneKind : uint8_t {
   kCutscene = 1,      // a CCutsceneManager play
@@ -589,7 +640,10 @@ struct SceneBarrier {
   SceneKey scene;
   SceneKind kind = SceneKind::kCutscene;
   SceneEndReason end = SceneEndReason::kNone;
-  uint8_t skips = 0;  // kEnd: skips S applied to it (saturates at 255)
+  // kEnd: skips S applied to it (saturates at 255). kStart: what the start carries, the game's mark (its
+  // scene_share_rules.h: 0 a scene Play, else a scripted step, a join baseline or a level look state);
+  // the session never reads it. Every other phase: 0.
+  uint8_t skips = 0;
   bool operator==(const SceneBarrier&) const = default;
 };
 
@@ -617,9 +671,15 @@ struct PlayerActionShown {
 };
 
 // Stage 4 (docs/online-4.md section 4.3, D6): server to the other clients, fast lane: another
-// player's pose as S accepted it (newest only, no distance filter).
+// player's pose as S accepted it (newest only, no distance filter). Moves final F5: `peer_epoch`, the peer's
+// `player` row epoch S knows when it relays (0: none known), after the peer id, so a receiver binds EVERY relayed
+// pose (with or without a command block) to the player it came from: S reuses peer ids, and a delayed pose must
+// not move the next player's body. Wire: peer u16, peer epoch u32, then the pose. The layout changed in place:
+// within one session every game runs the same build (S refuses another build's Hello: session.cpp, kDigest), so
+// no reader of the old layout meets it.
 struct PlayerPoseShown {
   uint16_t peer = 0;
+  uint32_t peer_epoch = 0;
   PlayerPose pose;
   bool operator==(const PlayerPoseShown&) const = default;
 };

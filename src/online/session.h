@@ -285,6 +285,10 @@ class ServerSession {
   // To every client: a scene occurrence's open, release or end (the scene barrier, item 12). false
   // for a kAck (the clients' phase), or if it cannot be encoded, or the session is not running.
   bool SendSceneBarrier(const SceneBarrier& scene, TimePoint now = Clock::now());
+  // To one client: a scene phase that names that client's own play (the shared skip's kSkip carries the
+  // client's own play number of the occurrence; the game's scene_share_rules.h PlayBinding). false for a
+  // kAck, if `peer` is not a welcomed client, or if it cannot be encoded.
+  bool SendSceneBarrierTo(uint16_t peer, const SceneBarrier& scene, TimePoint now = Clock::now());
   // Version 3 (stage 3 section 3.2; stage 2 section 3.7): one backend frame to a welcomed client
   // on `lane` (state or gameplay). kFull when the lane's window is full (nothing queued: the
   // caller keeps the frame at its ring's head and retries), kTooBig for an empty frame or one over

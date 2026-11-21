@@ -1,0 +1,4521 @@
+"""The level check's graders: a run folder's logs against the owner's definition of working (two players
+in a lobby, the host's save slot, cutscenes synced, enemies shared, pickups and loot shared, the level
+completable). Every grader reads only lines the games already write; none is written for one level.
+
+Every verdict says what it rests on: its counts and one example line with its file and line number. A
+grader with nothing to grade says NOT TESTED (no data, not reached, switched off in this run), never PASS.
+A finding is a difference between two games with the lines that show it (S's and the client's), or a
+line on one game and the absence on the other, said so.
+
+The run folder's games: S is H/data/Online/session/game.log (a hosted server) or S/game.log; every other
+top-level folder with a game.log is a client (H, D). A client's peer number is its `connected as peer
+<n>` line; its time in a level generation runs from its `level <g> ...: load` line (or its connect into
+<g>) to its next load, its `online_end` or its last line (client_windows).
+
+    python -I tools/skytest/skytest.py levelcheck --grade <run folder>
+Standard library only.
+"""
+from __future__ import annotations
+
+import importlib.util
+import sys
+import json
+import math
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+
+PASS, FAIL, NOT_TESTED = "PASS", "FAIL", "NOT TESTED"
+INCOMPLETE = "INCOMPLETE"   # completable only: the level pass did not cover its plan (never a pass)
+# completable only: the pass reached the end, but by teleport, past steps a player must do on the level's way
+# (levelpass_holds.required_gates: a Spark Lock, a battle gate, a key gate) that no line shows done. Never a
+# bare pass: the page names each step.
+BY_TELEPORT = "BY TELEPORT"
+
+STAMP = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})\]")
+# An enemy row's key: placed `a<id>.<hash>.<hash>@<gen>`, a run-time spawn `s<hash>.<hash>#<n>/<m>@<gen>`.
+KEY = r"([as][0-9a-f]+\.[0-9a-f]+(?:\.[0-9a-f]+|#\d+/\d+)@(\d+))"
+CONNECTED = re.compile(r"Online: connected as peer (\d+) \(server tick \d+, level (\d+) (\S+)\)")
+LEVEL_LOAD = re.compile(r"Online: level (\d+) (\S+): load")
+SESSION_END = re.compile(r"Input script: online_end|online_end: ")
+# The level's end as the client plays it (the results screen or the level-complete message): from here the
+# level is over for the player, the game pauses, and nothing S does in that level is graded any more
+# (ww1 20261119-001659: S woke the final wave 4.9 s before the results screen paused both clients).
+LEVEL_END_HERE = re.compile(r"Online: level end \S+ (?:from the server |to \S+ )?played here")
+
+# How long a client may take to attach an enemy row (the bind's own grace is a few seconds), and to show a
+# death S sent: an S event closer than this to the end of the client's time in the level is not graded.
+BIND_GRACE = timedelta(seconds=10)
+DEATH_GRACE = timedelta(seconds=5)
+
+
+# --- the logs ------------------------------------------------------------------------------------------
+
+
+@dataclass
+class Line:
+    log: str          # the file, relative to the run folder
+    no: int           # 1-based
+    text: str         # from `Online:` / `Input script:` on (the stamp and thread cut)
+    t: datetime | None
+
+    def cite(self) -> str:
+        return f"{self.log}:{self.no}: {self.text[:220]}"
+
+
+@dataclass
+class Log:
+    who: str
+    path: str
+    lines: list[str]
+    # A log the game rotated (`game.<n>.log` older, `game.log` the newest: S's log in a long run, batch 12 case 7,
+    # ww1 20261119-124636, rotated at 12:51:56): its files' lines in time order, each file's (path, first index)
+    # here, so a line is cited in its own file. Empty: one file, `path`.
+    parts: list[tuple[str, int]] = field(default_factory=list)
+
+    def find(self, rx: re.Pattern) -> list[tuple[Line, re.Match]]:
+        out = []
+        for i, raw in enumerate(self.lines):
+            m = rx.search(raw)
+            if m:
+                out.append((self.line(i), m))
+        return out
+
+    def line(self, i: int) -> Line:
+        raw = self.lines[i]
+        k = raw.find("Online: ")
+        if k < 0:
+            k = raw.find("Input script: ")
+        if k < 0:
+            k = raw.find("] ", 26) + 2 if raw.startswith("[") else 0
+        path, first = self.path, 0
+        for part, start in self.parts:
+            if start <= i:
+                path, first = part, start
+        return Line(path, i - first + 1, raw[k:].rstrip(), stamp(raw))
+
+    def last_time(self) -> datetime | None:
+        for raw in reversed(self.lines):
+            t = stamp(raw)
+            if t is not None:
+                return t
+        return None
+
+
+def stamp(raw: str) -> datetime | None:
+    m = STAMP.match(raw)
+    return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f") if m else None
+
+
+def read_log(run: Path, rel: str, who: str) -> Log | None:
+    """A game's log with the files the game rotated before it (`game.<n>.log`, the highest n the oldest), in time
+    order (Log.parts)."""
+    p = run / rel
+    if not p.is_file():
+        return None
+    older = sorted((q for q in p.parent.glob(f"{p.stem}.*{p.suffix}") if q.stem[len(p.stem) + 1:].isdigit()),
+                   key=lambda q: -int(q.stem[len(p.stem) + 1:]))
+    lines: list[str] = []
+    parts: list[tuple[str, int]] = []
+    base = rel.replace("\\", "/").rsplit("/", 1)[0] + "/" if "/" in rel.replace("\\", "/") else ""
+    for q in older + [p]:
+        parts.append((base + q.name, len(lines)))
+        lines += q.read_text(encoding="utf-8", errors="replace").splitlines()
+    return Log(who, rel.replace("\\", "/"), lines, parts if older else [])
+
+
+@dataclass
+class Run:
+    folder: Path
+    server: Log | None
+    clients: dict[str, Log]           # H, D, ... by folder name
+    result: dict = field(default_factory=dict)
+
+
+# W35: a play session's folder (play.py: host\ and second\, the server under host\data\Online\session\) is read as a
+# run: host is H, second is D.
+PLAY_NAMES = {"host": "H", "second": "D"}
+
+
+def load_run(folder: Path) -> Run:
+    server = (read_log(folder, "H/data/Online/session/game.log", "S") or read_log(folder, "S/game.log", "S")
+              or read_log(folder, "host/data/Online/session/game.log", "S"))
+    clients = {}
+    for d in sorted(p for p in folder.iterdir() if p.is_dir() and p.name != "S"):
+        log = read_log(folder, f"{d.name}/game.log", PLAY_NAMES.get(d.name, d.name))
+        if log is not None:
+            clients[PLAY_NAMES.get(d.name, d.name)] = log
+    try:
+        result = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        result = {}
+    return Run(folder, server, clients, result if isinstance(result, dict) else {})
+
+
+# --- a client's time in each level ---------------------------------------------------------------------
+
+
+@dataclass
+class Window:
+    gen: int
+    level: str
+    start: datetime
+    end: datetime
+    joined: Line            # the line its time in the level starts at
+
+
+def client_windows(log: Log) -> dict[int, Window]:
+    """The client's time in each level generation (see the module's text)."""
+    marks: list[tuple[datetime, int, str, Line]] = []
+    end: datetime | None = None
+    level_ends: list[datetime] = []
+    for i, raw in enumerate(log.lines):
+        t = stamp(raw)
+        if t is None:
+            continue
+        if LEVEL_END_HERE.search(raw):
+            level_ends.append(t)
+            continue
+        m = CONNECTED.search(raw)
+        if m and int(m.group(2)) > 0:
+            marks.append((t, int(m.group(2)), m.group(3), log.line(i)))
+            continue
+        m = LEVEL_LOAD.search(raw)
+        if m:
+            marks.append((t, int(m.group(1)), m.group(2), log.line(i)))
+            continue
+        if end is None and SESSION_END.search(raw) and marks:
+            end = t
+    last = end or log.last_time()
+    out: dict[int, Window] = {}
+    for n, (t, gen, level, line) in enumerate(marks):
+        stop = marks[n + 1][0] if n + 1 < len(marks) else last
+        if stop is not None:
+            stop = min([stop] + [e for e in level_ends if t <= e <= stop])
+        if gen not in out and stop is not None:
+            out[gen] = Window(gen, level, t, min(stop, last) if last else stop, line)
+    return out
+
+
+def peer_numbers(run: Run) -> dict[int, str]:
+    """Peer number -> client folder, from each client's `connected as peer <n>` line."""
+    out = {}
+    for who, log in run.clients.items():
+        for line, m in log.find(CONNECTED):
+            out[int(m.group(1))] = who
+            break
+    return out
+
+
+# --- a verdict -----------------------------------------------------------------------------------------
+
+
+@dataclass
+class Finding:
+    what: str
+    lines: list[str]           # cited lines (file:line: text) or a said absence
+
+
+@dataclass
+class Verdict:
+    name: str
+    status: str
+    counts: str
+    example: str = ""          # one cited line the verdict rests on
+    findings: list[Finding] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    def page_lines(self) -> list[str]:
+        out = [f"  {self.name:<12} {self.status:<10} {self.counts}"]
+        if self.findings:
+            f = self.findings[0]
+            out.append(f"  {'':<12} {'':<10} e.g. {f.what}")
+            out += [f"  {'':<23}   {x}" for x in f.lines]
+        elif self.example:
+            out.append(f"  {'':<12} {'':<10} e.g. {self.example}")
+        out += [f"  {'':<23} {n}" for n in self.notes]
+        return out
+
+
+def absent(log: Log, what: str) -> str:
+    return f"{log.path}: no line {what} ({len(log.lines)} lines read)"
+
+
+# --- lobby and save slot -------------------------------------------------------------------------------
+
+HOST_SLOT = re.compile(r"Online: host: the server (?:continues|started) .*?slot (\d+)")
+OWNER_PICK = re.compile(r"Online: host: the server follows the owner's pick \((.+)\)")
+TITLE_ENTRY = re.compile(r"Online: title entry: (.+)$")
+HUB = re.compile(r"^(town|hub)", re.I)
+
+
+def grade_slot(run: Run) -> Verdict:
+    hits = []
+    for log in [run.server, *run.clients.values()]:
+        if log is None:
+            continue
+        hits += [(line, m.group(0)) for line, m in log.find(TITLE_ENTRY)]
+        hits += [(line, m.group(0)) for line, m in log.find(HOST_SLOT)]
+        hits += [(line, m.group(0)) for line, m in log.find(OWNER_PICK)]
+    if not hits:
+        return Verdict("save slot", NOT_TESTED, "no `title entry:` or `host: the server ... slot` line in any log")
+    slot = next((line for line, _ in hits if "follows the owner's pick" in line.text),
+                next((line for line, _ in hits if "title entry" in line.text and "slot" in line.text), hits[0][0]))
+    what = slot.text.split(": ", 1)[1] if ": " in slot.text else slot.text
+    return Verdict("save slot", PASS, f"{what} ({len(hits)} line(s) on the slot in the run's logs)", slot.cite())
+
+
+def grade_lobby(run: Run) -> Verdict:
+    joins = {}
+    for who, log in run.clients.items():
+        found = log.find(CONNECTED)
+        if found:
+            joins[who] = found[0]
+    if not joins:
+        return Verdict("lobby", NOT_TESTED, "no client logged `connected as peer`")
+    late = {w: (line, m) for w, (line, m) in joins.items() if int(m.group(2)) > 0 and not any(
+        HUB.match(part) for part in m.group(3).split("/"))}
+    counts = ", ".join(f"{w} peer {m.group(1)} at level {m.group(2)} {m.group(3).split('/')[-1]}"
+                       for w, (_, m) in joins.items())
+    if len(joins) < 2:
+        return Verdict("lobby", NOT_TESTED, f"one client in this run ({counts})", next(iter(joins.values()))[0].cite())
+    if late:
+        w, (line, m) = next(iter(late.items()))
+        return Verdict("lobby", NOT_TESTED, f"{w} joined late, in {m.group(3).split('/')[-1]} (the lobby join is not "
+                       f"tested in this run): {counts}", line.cite())
+    return Verdict("lobby", PASS, f"both joined before a level: {counts}", next(iter(joins.values()))[0].cite())
+
+
+# --- enemies shared ------------------------------------------------------------------------------------
+
+# S's enemies, every kind it logs (`enemy placed`, `enemy run-time spawn`, and the encounter path's `enemy spawn
+# <key> as <Name> ... (S)`: tutorial_a's 28 ECI_Manager actors and its Feeder were missing from this row before,
+# 20261119-033102), and each one's death: `dead by <peer|none> (S[, placed; attacker <Name#id|->])`. The attacker is
+# S's actor name: `-` is no attacker at all; no field (the encounter path) is an attacker not recorded, and a
+# player's kill there reads `dead by none (S)` too (tutorial_a: a death 4 ms after H's press started on S). The
+# puppet name is no player number (S's puppet slots swap at a level change: tutorial_b 20261119-033620, `puppet 2
+# for peer 1` in generation 2), so a kill is the player of `dead by <peer>`.
+S_PLACED = re.compile(r"Online: enemy (placed|run-time spawn|spawn) " + KEY + r" as (\S+)")
+S_DEAD = re.compile(r"Online: enemy " + KEY + r" dead by (\S+) \((.*)\)")
+S_NO_ATTACKER = re.compile(r"Online: enemy " + KEY + r" died with no attacker at ")
+S_STREAMED = re.compile(r"Online: enemy " + KEY + r" streamed out on the server")
+S_ATTACKER = re.compile(r"attacker (\S+)")
+C_ENEMY = re.compile(r"Online: enemy (spawn|replica|skipped|life|dead|retired alive|retired|bind) " + KEY + r"(.*)")
+# An enemy that dies on S with no attacker this soon after S made it never got to the players: the tutorial_a
+# ship greebles fell and died 0.87 to 2.8 s after their spawn, two of them before either client bound them.
+DIED_SOON = timedelta(seconds=10)
+KINDS = {"placed": "placed", "run-time spawn": "run-time", "spawn": "encounter"}
+
+
+@dataclass
+class EnemyKey:
+    key: str
+    gen: int
+    name: str
+    placed: Line
+    kind: str = "placed"
+    dead: Line | None = None
+    by: str = ""                   # dead by <peer|none>
+    attacker: str | None = None    # S's attacker field: a name, "-" (none), None (not recorded)
+    no_attacker: Line | None = None
+    streamed: Line | None = None
+
+
+def server_enemies(log: Log) -> dict[str, EnemyKey]:
+    keys: dict[str, EnemyKey] = {}
+    for line, m in log.find(S_PLACED):
+        if m.group(1) == "spawn" and not line.text.endswith("(S)"):
+            continue  # the encounter path's line is S's own only with its (S)
+        if m.group(2) not in keys:
+            keys[m.group(2)] = EnemyKey(m.group(2), int(m.group(3)), m.group(4), line, KINDS[m.group(1)])
+    for line, m in log.find(S_DEAD):
+        k = keys.get(m.group(1))
+        if k and k.dead is None:
+            k.dead, k.by = line, m.group(3)
+            a = S_ATTACKER.search(m.group(4))
+            k.attacker = a.group(1) if a else None
+    for line, m in log.find(S_NO_ATTACKER):
+        k = keys.get(m.group(1))
+        if k and k.no_attacker is None:
+            k.no_attacker = line
+    for line, m in log.find(S_STREAMED):
+        k = keys.get(m.group(1))
+        if k and k.streamed is None:
+            k.streamed = line
+    return keys
+
+
+@dataclass
+class ClientEnemy:
+    bound: Line | None = None      # `spawn <key>` or `bind <key> (resolved)`: a copy here tied to S's row
+    waits: Line | None = None      # `bind <key> by authored id ... waits (asleep here ...)`
+    pending: Line | None = None    # `bind <key> (pending past grace: missing)`
+    seen_dead: Line | None = None  # `life <key> alive -> dead` / `dead <key> by`: the death shown on its copy
+    skipped: Line | None = None    # `skipped <key> (dead before bind)`: S's death came before any bind here
+    retired_alive: Line | None = None
+    retired_streamed: Line | None = None  # `retired <key> (streamed out on the server)`: S slept it, its row went
+    last: Line | None = None
+
+    def status(self) -> str:
+        if self.bound:
+            return "bound" + (", saw it die" if self.seen_dead else "")
+        if self.waits:
+            return "waiting asleep" + (", then dead before bind" if self.skipped else "")
+        if self.pending:
+            return "looked for, never found"
+        return "dead before bind (never existed here)" if self.skipped else "no line"
+
+
+def client_enemies(log: Log) -> dict[str, ClientEnemy]:
+    out: dict[str, ClientEnemy] = {}
+    for line, m in log.find(C_ENEMY):
+        kind, key, rest = m.group(1), m.group(2), m.group(4)
+        c = out.setdefault(key, ClientEnemy())
+        c.last = line
+        if kind == "spawn" or (kind == "bind" and "(resolved)" in rest):
+            c.bound = c.bound or line
+        elif kind == "bind" and "pending past grace" in rest:
+            c.pending = c.pending or line
+        elif kind == "bind" and " waits (asleep here" in rest:
+            c.waits = c.waits or line
+        elif kind == "skipped" and "dead before bind" in rest:
+            c.skipped = c.skipped or line
+        elif (kind == "life" and "-> dead" in rest) or kind == "dead":
+            c.seen_dead = c.seen_dead or line
+        elif kind == "retired alive":
+            c.retired_alive = c.retired_alive or line
+        elif kind == "retired" and "streamed out on the server" in rest:
+            c.retired_streamed = c.retired_streamed or line
+    return out
+
+
+def slept_before_made(k: "EnemyKey", c: "ClientEnemy | None") -> bool:
+    """A run-time spawn S put to sleep (streamed out, its row retired) before this client made a copy: it never
+    died, and the client's only line for it is that retirement (never bound, waited for, looked for or killed
+    here). Nobody could see it (batch 11 tutorial_b 20261119-061110: CrashSP_04_Spawned1 slept on S 3.04 s after
+    its spawn, far from both players, and both clients dropped it before their 3 s wait for a copy ran out)."""
+    return (k.kind == "run-time" and k.dead is None and k.streamed is not None and c is not None
+            and c.retired_streamed is not None and not (c.bound or c.waits or c.pending or c.skipped or c.seen_dead))
+
+
+# W34: S's enemy writer refused to publish spawns (server/enemy_writer.cpp): `enemy spawn of <id> not published: the
+# new entry is "<name>", not "<expected>"` (tutorial_b's arena: the nested manager's name cut at 96 characters, so its
+# nine spawns were never shared and each client fought its own) and `enemy <Name>#<id> not published as placed: a
+# run-time spawn`. Any of them fails the enemies row in any run, with the managers named (the author's coming [error]
+# line per manager is read the same way: it names `not published`).
+UNPUBLISHED_SPAWN = re.compile(r'Online: enemy spawn of \S+ not published: the new entry is "([^"]*)", not "([^"]*)"')
+UNPUBLISHED_PLACED = re.compile(r"Online: enemy (\S+?)#\d+ not published as placed: a run-time spawn")
+UNPUBLISHED_ANY = re.compile(r"Online: .*\bnot published\b")
+
+
+def unpublished_finding(run: Run) -> "Finding | None":
+    """One finding for every enemy spawn S did not publish, the managers or names it names; None when there is none."""
+    if run.server is None:
+        return None
+    lines = run.server.find(UNPUBLISHED_ANY)
+    if not lines:
+        return None
+    names: list[str] = []
+    for _l, m in run.server.find(UNPUBLISHED_SPAWN):
+        expected = re.sub(r"_actor_\d+$", "", m.group(2)) or m.group(1)
+        if expected not in names:
+            names.append(expected)
+    for _l, m in run.server.find(UNPUBLISHED_PLACED):
+        if m.group(1) not in names:
+            names.append(m.group(1))
+    return Finding(f"S did not publish {len(lines)} enemy spawn line(s) (each client then fights its own copy and S's "
+                   f"stay alive): {', '.join(n[:80] for n in names[:6]) or 'names not read'}",
+                   [line.cite() for line, _m in lines[:6]])
+
+
+def grade_enemies(run: Run, data: LevelData | None = None) -> Verdict:
+    """Every enemy S had, per client: bound there, waiting asleep (its copy asleep far from that player: no
+    fault by itself), or never there; and each death S logged: seen on a bound copy, or dead before bind. PASS
+    only when every enemy a client was near enough to see (not asleep there) was bound there, every death of a
+    bound enemy arrived, no enemy existed on no client, and none died on S with no attacker right after its
+    spawn."""
+    if run.server is None:
+        return Verdict("enemies", NOT_TESTED, "no server log in this run folder")
+    keys = server_enemies(run.server)
+    if not keys:
+        return Verdict("enemies", NOT_TESTED, "S logged no `enemy placed`, `enemy run-time spawn` or `enemy spawn ... "
+                       "(S)` line")
+    peers = peer_numbers(run)
+    order = sorted(run.clients, key=lambda w: (w != "H", w))  # H first, as the page names the players
+    # The level's holds (levelpass_holds, the generator's data): scenery and holds not released here are set
+    # apart, listed, never graded.
+    scenery: list[str] = []
+    unreleased: list[str] = []
+    for key, k in list(keys.items()):
+        hold = hold_of(data, key, k.name) if k.kind == "placed" else None
+        if hold is None:
+            continue
+        if hold.ambient:
+            scenery.append(k.name.split("#")[0])
+            del keys[key]
+        elif released_here(run, hold, bool(k.dead and k.by.isdigit())) is None:
+            unreleased.append(f"{k.name.split('#')[0]} ({hold.how}; " + "; or ".join(r.words() for r in hold.releases)
+                              + ")")
+            del keys[key]
+    held_notes = ([f"scenery, not counted (the level never releases them): {', '.join(sorted(set(scenery)))}"]
+                  if scenery else []) + [f"held, not released in this run: {u}" for u in unreleased]
+    if not keys:
+        return Verdict("enemies", NOT_TESTED, "every enemy S had is scenery or held and not released in this run",
+                       notes=held_notes)
+    kinds = {kd: sum(1 for k in keys.values() if k.kind == kd) for kd in ("placed", "encounter", "run-time")}
+    dead = [k for k in keys.values() if k.dead]
+    by_player = {who: sum(1 for k in dead if k.by.isdigit() and peers.get(int(k.by)) == who)
+                 for who in order}
+    no_attacker = [k for k in dead if k.attacker == "-"]
+    unrecorded = [k for k in dead if k.attacker is None and not k.by.isdigit()]
+    # Killed by an entity that is no player (`dead by none (S, placed; attacker (null)#3457)`: ww1 20261119-051557,
+    # the seventh death the counts missed): named, so the totals add up.
+    by_other = [k for k in dead if k.attacker not in (None, "-") and not k.by.isdigit()]
+    counts = [f"S {len(keys)} ({', '.join(f'{n} {kd}' for kd, n in kinds.items())}), {len(dead)} died on S (by a "
+              f"player: {', '.join(f'{w} {n}' for w, n in by_player.items()) or '-'}; by another entity "
+              f"{len(by_other)}{' (' + ', '.join(sorted({k.attacker for k in by_other})[:4]) + ')' if by_other else ''}; "
+              f"no attacker {len(no_attacker)}; attacker not recorded {len(unrecorded)})"]
+    findings: list[Finding] = []
+    expected: dict[str, list[str]] = {}       # key -> the clients that should have had it
+    slept: dict[str, list[str]] = {}          # key -> the clients it went to sleep on S before they made it
+    there: dict[str, dict[str, ClientEnemy | None]] = {}
+    for who in order:
+        log = run.clients[who]
+        wins = client_windows(log)
+        seen = client_enemies(log)
+        n_exp = n_bound = n_wait = n_none = 0
+        n_deaths = n_seen = n_before = n_asleep_quiet = 0
+        for k in keys.values():
+            w = wins.get(k.gen)
+            if w is None:
+                continue
+            gone = k.dead or k.streamed
+            if k.placed.t is None or k.placed.t > w.end - BIND_GRACE or (gone and gone.t and gone.t < w.start):
+                continue  # made too late for this client, or gone before it came
+            c = seen.get(k.key)
+            if slept_before_made(k, c):
+                slept.setdefault(k.key, []).append(who)
+                continue  # listed apart, never graded (slept_before_made)
+            n_exp += 1
+            expected.setdefault(k.key, []).append(who)
+            there.setdefault(k.key, {})[who] = c
+            died_here = bool(k.dead and k.dead.t and w.start <= k.dead.t <= w.end - DEATH_GRACE)
+            n_deaths += died_here
+            if c is not None and c.bound:
+                n_bound += 1
+                if died_here:
+                    if c.seen_dead:
+                        n_seen += 1
+                    else:
+                        findings.append(Finding(f"{who} never saw {k.key} ({k.name}) die: dead on S, alive on its "
+                                                f"bound copy here", [k.dead.cite(), (c.retired_alive or c.last).cite()]))
+                elif c.seen_dead and k.dead is None and k.streamed is None:
+                    findings.append(Finding(f"{who}: {k.key} ({k.name}) dead here only, S never logged its death", [
+                        c.seen_dead.cite(), absent(run.server, f"`enemy {k.key} dead by`")]))
+                continue
+            if c is not None and c.waits:
+                n_wait += 1
+                if died_here:
+                    if c.skipped:
+                        n_before += 1
+                    else:
+                        n_asleep_quiet += 1
+                continue
+            if c is not None and c.pending:
+                findings.append(Finding(f"{who} never found {k.key} ({k.name}): S had it, {who} looked for it "
+                                        f"and never bound it", [k.placed.cite(), c.pending.cite()]))
+                continue
+            if c is not None and c.skipped:
+                n_none += 1
+                n_before += died_here
+                continue
+            findings.append(Finding(f"{who} never attached {k.key} ({k.name})", [
+                k.placed.cite(), absent(log, f"for {k.key}")]))
+        if wins:
+            counts.append(f"{who}: bound {n_bound} of {n_exp}, waiting asleep {n_wait} (its copy asleep, far from "
+                          f"this player: not a fault by itself), never existed here {n_none}; deaths {n_deaths}: "
+                          f"{n_seen} seen on a bound copy, {n_before} dead before bind"
+                          + (f", {n_asleep_quiet} with no word on its asleep copy" if n_asleep_quiet else ""))
+        else:
+            counts.append(f"{who}: in no level")
+
+    def where(key: str) -> str:
+        return ", ".join(f"{w} {c.status() if c else 'no line'}" for w, c in there.get(key, {}).items()) or \
+            "no client was in its level"
+
+    soon = [k for k in no_attacker if k.placed.t and k.dead.t and k.dead.t - k.placed.t <= DIED_SOON]
+    if soon:
+        lines = []
+        for k in soon:
+            lines += [k.dead.cite() + f" ({(k.dead.t - k.placed.t).total_seconds():.2f} s after its spawn)",
+                      *([k.no_attacker.cite()] if k.no_attacker else []), f"    on the clients: {where(k.key)}"]
+        nowhere = sum(1 for k in soon if all(c is None or not (c.bound or c.waits) for c in there.get(k.key, {}).values()))
+        findings.insert(0, Finding(f"{len(soon)} enem{'y' if len(soon) == 1 else 'ies'} died on S with no attacker "
+                                   f"within {DIED_SOON.seconds} s of {'its' if len(soon) == 1 else 'their'} spawn "
+                                   f"({nowhere} reached no client)", lines))
+    soon_keys = {k.key for k in soon}
+    # Every client that should have had it logged it and none had a copy (a key with no line on a client is that
+    # client's `never attached` above).
+    nowhere_keys = [key for key, ws in expected.items() if key not in soon_keys and
+                    all(there[key].get(w) is not None and not (there[key][w].bound or there[key][w].waits or
+                                                               there[key][w].pending) for w in ws)]
+    if nowhere_keys:
+        lines = []
+        for key in nowhere_keys:
+            k = keys[key]
+            lines += [k.placed.cite(), *([k.dead.cite()] if k.dead else []), f"    on the clients: {where(key)}"]
+        findings.insert(0, Finding(f"existed on no client: {', '.join(f'{key} ({keys[key].name})' for key in nowhere_keys)}",
+                                   lines))
+    first = next(iter(keys.values())).placed.cite()
+    fights, fight_findings = fight_findings_of(run, by_player, len(unrecorded), data)
+    counts.append(fights)
+    # W32 (c): the fight by D (D's own fight_area lines): its kills on S, and a fight that killed nothing by D.
+    d_log = run.clients.get("D")
+    d_fights = d_log.find(FIGHT_START) if d_log is not None else []
+    if d_fights:
+        counts.append(f"killed by D: {by_player.get('D', 0)} (D fought {len(d_fights)} time(s))")
+        if not by_player.get("D"):
+            fight_findings.append(Finding(
+                f"D fought {len(d_fights)} time(s) and no enemy died by D on S: the second player's hits never landed "
+                "on the server", [d_fights[0][0].cite(),
+                                  absent(run.server, "`enemy ... dead by <D's peer>`") if run.server else "no S log"]))
+    if scenery or unreleased:
+        counts.append(f"set apart: {len(scenery)} scenery, {len(unreleased)} held and not released in this run")
+    gone_early = [k for k in slept if k not in expected]
+    if gone_early:
+        counts.append(f"gone to sleep on the server before any player's game made it: {len(gone_early)}")
+        held_notes.append("gone to sleep on the server before any player's game made it (not graded): " + "; ".join(
+            f"{keys[k].name} ({k}): {keys[k].streamed.cite()}" for k in gone_early[:6]))
+    findings = fight_findings + findings  # the fights first: the most telling
+    if (unpub := unpublished_finding(run)) is not None:
+        findings.insert(0, unpub)
+    if not expected and not findings:
+        # Nothing a client should have had (every key set apart, made too late or gone before it came): not a pass.
+        return Verdict("enemies", NOT_TESTED, "; ".join(counts) + "; no enemy any client should have had", first,
+                       notes=held_notes)
+    return Verdict("enemies", FAIL if findings else PASS, "; ".join(counts), first, findings, held_notes)
+
+
+# The fights a run's steps made (H's route helpers, route_actions.cpp fight_area: `start`, one `try <k>: x at
+# <Name#id> d <d>: hp <a> -> <b|gone>` per burst, then `done (...)` or `failed (...)`) and S's deaths by a player
+# (`enemy <key> dead by <peer> (S, ...; attacker PeerPuppet_<n>#..)`; `dead by none` is no player's kill). A
+# fight step that failed with no hit point taken, and a route that fought where no enemy died by a player, are
+# findings of the enemies row, never a pass (ww1 20261119-035316: 16 bursts, hp 96 -> 96 each, "enemies
+# PASS"). With S's damage trace on, its `puppet <n> damage check on ... result 0 reason ...` lines say why.
+FIGHT_START = re.compile(r"Dev: fight_area (\S+) start: ")
+FIGHT_TRY = re.compile(r"Dev: fight_area (\S+) try \d+: x at (\S+) d [\d.]+: hp (-?\d+) -> (\S+)")
+FIGHT_END = re.compile(r"Dev: fight_area (\S+) (done|failed) \((.*)\) after ([\d.]+) s")
+PLAYER_KILL = re.compile(r"Online: enemy " + KEY + r" dead by (\d+) ")
+DAMAGE_REFUSED = re.compile(r"Online: puppet \d+ damage check on .*result 0 reason .*")
+
+
+def fight_findings_of(run: Run, by_player: dict[str, int] | None = None,
+                      unrecorded: int = 0, data: LevelData | None = None) -> tuple[str, list[Finding]]:
+    """H's fights against S's deaths: `by_player` the kills S credits to each client (`dead by <peer>`),
+    `unrecorded` the deaths whose attacker S does not name (the encounter path: a player's kill may hide there)."""
+    by_player = by_player or {}
+    h = run.clients.get("H")
+    if h is None:
+        return "fights: no H log", []
+    fights: list[dict] = []
+    cur: dict | None = None
+    for i, raw in enumerate(h.lines):
+        m = FIGHT_START.search(raw)
+        if m:
+            cur = {"area": m.group(1), "start": h.line(i), "tries": [], "hit": False, "end": None}
+            fights.append(cur)
+            continue
+        m = FIGHT_TRY.search(raw)
+        if m and cur is not None and m.group(1) == cur["area"]:
+            cur["tries"].append(h.line(i))
+            after = m.group(4)
+            if after == "gone" or (after.lstrip("-").isdigit() and int(after) < int(m.group(3))):
+                cur["hit"] = True
+            continue
+        m = FIGHT_END.search(raw)
+        if m and cur is not None and m.group(1) == cur["area"]:
+            cur["end"] = (h.line(i), m.group(2), m.group(3))
+            cur = None
+    kills = run.server.find(PLAYER_KILL) if run.server is not None else []
+    tally = ", ".join(f"{w} {n}" for w, n in by_player.items())
+    refused = run.server.find(DAMAGE_REFUSED) if run.server is not None else []
+    findings: list[Finding] = []
+    on_held = [fg for fg in fights if fg["tries"] and not fg["hit"] and held_victims(run, fg, data)]
+    for fg in fights:
+        if fg["end"] is None or fg["end"][1] != "failed" or fg["hit"] or not fg["tries"]:
+            continue  # a fight that failed before any burst is the tool's (a hold, out of reach): counted below
+        if fg in on_held:
+            continue  # every victim held: the level's script, not the game (counted below)
+        lines = [fg["end"][0].cite()] + ([fg["tries"][0].cite()] if fg["tries"] else [])
+        lines.append(refused[0][0].cite() + f" (and {len(refused) - 1} more)" if refused else
+                     "S logged no damage check line (its damage trace is off in this run): the hits are not "
+                     "explained, only that none took a hit point")
+        if tally:
+            lines.append(f"S's kills by player (`dead by <peer>`): {tally}")
+        lines += held_lines(run, fg, data)
+        findings.append(Finding(f"a fight step failed with no damage done: {len(fg['tries'])} burst(s) at "
+                                f"{fg['area']}, no hit took a hit point", lines))
+    with_bursts = [fg for fg in fights if fg["tries"] and fg not in on_held]
+    others = {w: n for w, n in by_player.items() if w != "H" and n}
+    if with_bursts and not any(fg["hit"] for fg in with_bursts) and not by_player.get("H") and others:
+        # One player's hits take nothing while the other's kill (the player S credits: `dead by <peer>`).
+        findings.append(Finding(
+            f"H's hits took no hit point in {len(with_bursts)} fight(s) ({sum(len(fg['tries']) for fg in with_bursts)} "
+            f"burst(s)) while {', '.join(f'{w} killed {n}' for w, n in others.items())} on S: one player cannot "
+            "hurt enemies the other can",
+            [with_bursts[0]["tries"][0].cite(), next(l.cite() for l, m in kills if peer_of(run, m) in others)]))
+    if with_bursts and not kills and not unrecorded:
+        findings.append(Finding(
+            f"the route fought {len(fights)} time(s) ({sum(len(fg['tries']) for fg in fights)} burst(s)) and no "
+            "enemy died by a player on S",
+            [fights[0]["start"].cite(),
+             absent(run.server, "`enemy ... dead by <peer>` (a player's kill)") if run.server else "no S log"]))
+    no_burst = [fg for fg in fights if fg["end"] is not None and fg["end"][1] == "failed" and not fg["tries"]]
+    text = (f"fights: {len(fights)} step(s), {len(with_bursts)} with bursts, "
+            f"{sum(1 for fg in fights if fg['hit'])} took hit points"
+            + (f", {len(no_burst)} failed before any burst ({no_burst[0]['end'][2][:60]})" if no_burst else "")
+            + f"; {len(kills)} enemy death(s) by a player on S"
+            + "".join(f"; the fight at {fg['area']} hit only held enemies ({held_victims(run, fg, data)}): the level's "
+                      "script, not a finding" for fg in on_held))
+    return text, findings
+
+
+def held_victims(run: Run, fg: dict, data: LevelData | None) -> str:
+    """When every victim of the fight's bursts is scenery or held and not released in this run: their names and
+    holds in words; else "" (the fight is graded)."""
+    if data is None or not fg["tries"]:
+        return ""
+    try:
+        at = tuple(float(v) for v in fg["area"].split(","))
+    except ValueError:
+        return ""
+    out = []
+    for name in dict.fromkeys(m.group(1) for line in fg["tries"] for m in [VICTIM.search(line.text)] if m):
+        cands = [x for x in data.holds.values() if x.name == name and x.pos is not None]
+        if not cands:
+            return ""
+        hold = min(cands, key=lambda x: math.dist(x.pos, at))
+        if hold.ambient:
+            out.append(f"{name} scenery")
+        elif released_here(run, hold, False) is None:
+            out.append(f"{name} held, not released in this run")
+        else:
+            return ""
+    return ", ".join(out)
+
+
+VICTIM = re.compile(r" try \d+: x at ([^#\s]+)#")
+
+
+def held_lines(run: Run, fg: dict, data: LevelData | None) -> list[str]:
+    """For a fight that took nothing: each victim's hold and release from the level's data (levelpass_holds),
+    and whether this run fired it (the pass's own act line on H, a lock's opening line), so the next reader
+    sees a held enemy instead of suspecting the game."""
+    if data is None:
+        return ["the level's data (logic.json, manifest.json) is not at hand: its holds are not shown"]
+    try:
+        at = tuple(float(v) for v in fg["area"].split(","))
+    except ValueError:
+        at = None
+    out = []
+    h = run.clients.get("H")
+    for name in dict.fromkeys(m.group(1) for line in fg["tries"] for m in [VICTIM.search(line.text)] if m):
+        cands = [x for x in data.holds.values() if x.name == name]
+        if at is not None and len(cands) > 1:
+            cands.sort(key=lambda x: sum((a - b) ** 2 for a, b in zip(x.pos, at)) if x.pos else float("inf"))
+        if not cands:
+            out.append(f"{name}: not held in the level's data (no job state, its AI not disabled)")
+            continue
+        hold = cands[0]
+        out.append(f"{name}: {hold.words()}")
+        for r in hold.releases:
+            if not r.act or not r.path:
+                continue
+            root = r.path[0]
+            if r.act == "lock":
+                line = gate_opened(run, root)
+                out.append(f"    {root} opened: {line.cite()}" if line else
+                           f"    {root}: no line shows it opened: not fired in this run")
+            else:
+                acted = h.find(re.compile(r"Input script: LEVELPASS act \S+ \S+ " + re.escape(root) + r" ")) if h else []
+                out.append(f"    the pass acted on {root}: {acted[0][0].cite()}" if acted else
+                           f"    the pass never acted on {root} (no `LEVELPASS act ... {root}` on H): not fired by "
+                           "this run")
+    return out
+
+
+def peer_of(run: Run, m: re.Match) -> str:
+    """The client a `dead by <peer>` match names (PLAYER_KILL's peer group), or ''."""
+    return peer_numbers(run).get(int(m.group(3)), "")
+
+
+# --- pickups (and the coins slot) ----------------------------------------------------------------------
+
+S_APPLIED = re.compile(r"Online: collect applied ([0-9a-f]{8}) for peer (\d+)")
+COLLECT_NATIVE = r"Online: collect native {id} "
+PARTNER_GOT = r"Online: (?:collect from S {id} |pickup copy not found {id} )"
+OWN_DROP = re.compile(r"Online: collect native ffffffff \(not reported: no source\)")
+COINS = "coins: their own row (coins)"
+
+
+def grade_pickups(run: Run) -> Verdict:
+    if run.server is None:
+        return Verdict("pickups", NOT_TESTED, "no server log in this run folder", notes=[COINS])
+    applied = run.server.find(S_APPLIED)
+    if not applied:
+        return Verdict("pickups", NOT_TESTED, "S applied no collect (`collect applied <id> for peer <n>`): no pickup "
+                       "was taken in this run", notes=[COINS])
+    peers = peer_numbers(run)
+    findings: list[Finding] = []
+    ok = 0
+    graded = 0
+    for line, m in applied:
+        pid, peer = m.group(1), int(m.group(2))
+        collector = peers.get(peer)
+        for who, log in run.clients.items():
+            w = next((w for w in client_windows(log).values() if line.t and w.start <= line.t <= w.end), None)
+            if w is None:
+                continue
+            if who == collector:
+                if not log.find(re.compile(COLLECT_NATIVE.format(id=pid))):
+                    findings.append(Finding(f"{who} (the collector) logged no collect of {pid}", [
+                        line.cite(), absent(log, f"`collect native {pid}`")]))
+                continue
+            graded += 1
+            got = log.find(re.compile(PARTNER_GOT.format(id=pid)))
+            if got:
+                ok += 1
+            else:
+                findings.append(Finding(f"{who} kept pickup {pid} that peer {peer} collected on S", [
+                    line.cite(), absent(log, f"`collect from S {pid}` or `pickup copy not found {pid}`")]))
+    counts = f"S applied {len(applied)} collect(s); the partner's copy went {ok} of {graded}"
+    if graded == 0 and not findings:
+        return Verdict("pickups", NOT_TESTED, counts + " (no partner in the level at the time)", applied[0][0].cite(),
+                       notes=[COINS])
+    return Verdict("pickups", FAIL if findings else PASS, counts, applied[0][0].cite(), findings, [COINS])
+
+
+# --- coins (the shared placed money coins: game/coins.cpp, docs/online-7.md) -----------------------------------
+#
+# On when S says so (`coins on for the session (S's online_shared_coins on)`); off: not tested. Each game walks
+# its zones' placed money coins (`coins walked <zone> <n> placed money coins mapped`) and keeps an account per
+# level: a client's `coins <g>: <m> placed money coins mapped, <t> taken here, <r> taken by others and paid here,
+# <p> pending, <u> unpaid, <w> collected without pay, ...`, S's `coins <g>: <c> claims granted, <x> refused, <m>
+# placed money coins mapped here (<t> this level), ...`. A coin a client takes (`coin taken here ... gold <a> ->
+# <b>`) is granted by S and paid on the others (`coin paid here ... gold ...`). A run with coins on where no game
+# mapped a single coin fails ("0 coins mapped on every game": batch 8 runs 7 and 8, the walk never handed the
+# coin code the level's coins), never "not tested".
+COINS_SWITCH = re.compile(r"Online: coins (on|off) for the session \(S's online_shared_coins (on|off)\)")
+COINS_WALKED = re.compile(r"Online: coins walked (\S+) (\d+) placed money coins mapped")
+C_COINS = re.compile(r"Online: coins (\d+): (\d+) placed money coins mapped, (\d+) taken here, (\d+) taken by others and "
+                     r"paid here, (\d+) pending, (\d+) unpaid, (\d+) collected without pay, (\d+) claims not sent yet")
+S_COINS = re.compile(r"Online: coins (\d+): (\d+) claims granted, (\d+) refused, (\d+) placed money coins mapped here "
+                     r"\((\d+) this level\)")
+COIN_TAKEN = re.compile(r"Online: coin taken here (\S+) \(player \S+, (?:base [^;]*; )?gold (\d+) -> (\d+)")
+COIN_PAID = re.compile(r"Online: coin paid here (\S+) \(taken by another player; player \S+(?: slot \d+, S's amount "
+                       r"[\d.]+:)?,? gold (\d+) -> (\d+)")
+COIN_HANDLED = re.compile(r"Online: coin claim (\S+) peer (\d+) (granted|refused)")
+COIN_BAD = re.compile(r"Online: coin (?:unpaid|collected without pay) \S+ .*|Online: coin claim \S+ peer \d+ refused .*")
+
+
+def grade_coins(run: Run) -> Verdict:
+    """The shared coins: every game's mapped coins, each coin taken on one client and paid on the others, and
+    nothing unpaid, collected without pay or refused; 0 mapped on every game with coins on is a failure."""
+    if run.server is None:
+        return Verdict("coins", NOT_TESTED, "no server log in this run folder")
+    sw = run.server.find(COINS_SWITCH)
+    if not sw:
+        return Verdict("coins", NOT_TESTED, "S logged no `coins on|off for the session` line (a build before shared "
+                       "coins)")
+    if sw[0][1].group(1) == "off":
+        return Verdict("coins", NOT_TESTED, "shared coins are off in this run (S's online_shared_coins off)",
+                       sw[0][0].cite())
+    games = [("S", run.server)] + sorted(run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    mapped: dict[str, int] = {}
+    parts: list[str] = []
+    for who, log in games:
+        walked = sum(int(m.group(2)) for _l, m in log.find(COINS_WALKED))
+        if who == "S":
+            accts = log.find(S_COINS)
+            acct_mapped = max([int(m.group(4)) for _l, m in accts] or [0])
+            granted = sum(int(m.group(2)) for _l, m in accts)
+            refused = sum(int(m.group(3)) for _l, m in accts)
+            parts.append(f"S: walked {walked}, accounts {len(accts)} (mapped {acct_mapped}, claims granted {granted}, "
+                         f"refused {refused})")
+        else:
+            accts = log.find(C_COINS)
+            acct_mapped = max([int(m.group(2)) for _l, m in accts] or [0])
+            sums = [sum(int(m.group(i)) for _l, m in accts) for i in (3, 4, 5, 6, 7)]
+            parts.append(f"{who}: walked {walked}, accounts {len(accts)} (mapped {acct_mapped}, taken here {sums[0]}, "
+                         f"paid here {sums[1]}, pending {sums[2]}, unpaid {sums[3]}, collected without pay {sums[4]})")
+        mapped[who] = max(walked, acct_mapped)
+    counts = "; ".join(parts)
+    if not any(mapped.values()):
+        accts = [l.cite() for who, log in games for l, _m in (log.find(S_COINS if who == "S" else C_COINS))[:1]]
+        return Verdict("coins", FAIL, "0 coins mapped on every game: " + counts, sw[0][0].cite(), [Finding(
+            "0 coins mapped on every game: no game's coin code saw the level's placed money coins (no `coins "
+            "walked` line, every level's account 0 mapped), so no coin a player picks up is shared",
+            accts + [absent(log, "`coins walked`") for _w, log in games])])
+    findings: list[Finding] = []
+    unmapped = [w for w, n in mapped.items() if n == 0]
+    if unmapped:
+        findings.append(Finding(f"0 coins mapped on {', '.join(unmapped)} while others mapped some", [
+            absent(dict(games)[w], "`coins walked`") for w in unmapped]))
+    bad = [(who, l) for who, log in games for l, _m in log.find(COIN_BAD)]
+    if bad:
+        findings.append(Finding(f"{len(bad)} coin(s) unpaid, collected without pay or refused",
+                                [f"{who}: {l.cite()}" for who, l in bad[:12]]))
+    # Each client's own takes (`coin taken here <place> (player <hero>, gold a -> b, +d; S is told)`): batch 11's
+    # second round (ww1 20261119-111305) took 3 coins on H and 7 on D, and S handled no claim; the row had said
+    # "no coin was taken" (the player field is a hex hero, which the old pattern refused).
+    order = sorted(run.clients, key=lambda w: (w != "H", w))
+    takes = {who: {m.group(1): line for line, m in run.clients[who].find(COIN_TAKEN)} for who in order}
+    paid = [(who, l) for who, log in run.clients.items() for l, _m in log.find(COIN_PAID)]
+    handled = run.server.find(COIN_HANDLED)
+    n_taken = sum(len(v) for v in takes.values())
+    counts += (f"; coins taken: {', '.join(f'{w} {len(takes[w])}' for w in order)}; S handled {len(handled)} claim(s); "
+               f"paid on another game {len(paid)}")
+    if not n_taken:
+        return Verdict("coins", FAIL if findings else NOT_TESTED, counts + " (no game logged a take)",
+                       sw[0][0].cite(), findings)
+    first = next(line for who in order for line in takes[who].values())
+    if not handled:
+        findings.insert(0, Finding(
+            f"{', '.join(f'{len(takes[w])} coin(s) taken on {w}' for w in order)}; S handled 0 claim(s): shared coins "
+            "did nothing", [first.cite(), absent(run.server, "`coin claim <place> peer <p> granted|refused`")]))
+    twice = sorted(p for p in set().union(*[set(v) for v in takes.values()]) if sum(p in v for v in takes.values()) > 1)
+    if twice:
+        findings.append(Finding(f"taken twice: {len(twice)} coin(s) taken on more than one game ({', '.join(twice[:6])})",
+                                [f"{w}: {takes[w][p].cite()}" for p in twice[:3] for w in order if p in takes[w]]))
+    return Verdict("coins", FAIL if findings else PASS, counts, first.cite(), findings)
+
+
+# --- world events (W39 item 7) --------------------------------------------------------------------------------
+#
+# The owner's third session ("Map changes are bugged", in his words: "events inside the map, like i dropped crates down
+# with an interaction and on one client they werent interactible"): H used the hanging gong post (tutorial_b's
+# Hanging_Base, about 00:02:08-25) and the cage step it lets down (A2_CageStep_Hanging) could not be used by D from
+# 00:02:56 to 00:03:14 (D's log has only `unclassified trigger A2_CageStep_Hanging_RespawnTrigger#2653` and its echoes).
+# The world rows' author's lines (online/6-owner-session3-world): on the game where it changes `world event
+# <Name#id> <what> by <who> (state <before> -> <after>)`, on each other game `world event <Name#id> <what> applied here
+# (state <after>)`. Every event is applied on every other game (S and the clients) within WORLD_EVENT_S with the same
+# state; ids differ per game, so events pair by name, what and time. From the level's logic, the objects such an event
+# can change (WORLD_EVENT_MSGS sent to them, or by them to themselves): each run counts how many it changed, the rest
+# are listed as untested, never passed.
+WORLD_EVENT_MSGS = ("CSplineMoverMessage", "Scripts.SetHideShowEntityMessage", "Scripts.AnimateEntityComponentMessage",
+                    "CEnableDisableComponentMessage", "CInteractionComponentMessage", "Scripts.BoltEntityUnboltMessage",
+                    "Scripts.DestructibleComponentMessage", "Scripts.RemoveEntitiesMessage")
+# b9266c32: S logs each change (`moves`: still at (x, y, z) -> moving, `moved`: moving -> still at (...), `gate`,
+# `component <i>`, `messenger <i>`, `clip wall`, `hide/show`, `removed`), <who> the player whose chain reached it or
+# `the level`; a client applies every one but `moves` (its copy reaches S's still place: `moved applied here`), at its
+# copy's wake when the copy was asleep (later than WORLD_EVENT_S: counted, not failed). `place draw <Name#id> <method>
+# component <i> draw <n>: <v> of <lo>..<hi> (the game drew <g>)`: the same <v> on every game for the same name,
+# method, component and draw.
+WORLD_EVENT = re.compile(r"Online: world event (\S+?)(?:#\d+)? (.+?) by (.+?) \(state (.*?) -> (.*?)\)\s*$")
+WORLD_EVENT_NO_APPLY = ("moves",)
+PLACE_DRAW = re.compile(r"Online: place draw (\S+?)#\S* (\S+) component (\d+) draw (\d+): (\S+) of ")
+WORLD_EVENT_APPLIED = re.compile(r"Online: world event (\S+?)(?:#\d+)? (.+?) applied here \(state (.*?)\)\s*$")
+WORLD_EVENT_S = 1.0
+# Batch 18d (run 20261120-064438 world-event-cage-tb): ten of S's events were "not applied" on H and D. A client logs
+# `applied here` only when it changes its copy to S's row: a copy that already reads S's state converges with nothing
+# to do and logs nothing (src/online/world/availability.cpp, after PlanRow: `row.converged`, no line). So a missing
+# line is no fault, only "cannot decide":
+# - a change S made while a client was still loading the level (before that client's `level <g>: loaded here`):
+#   the client's own load makes the level's start state (four level-start events at 06:45:53.399, H loaded .423,
+#   D .435): cannot decide, said as the level start;
+# - a removal by death shows on a client as `world breakable <Name#id> killed (live)` (S's row's kill applied there):
+#   read as its apply;
+# - any other change with no line on a client: cannot decide (its copy may have made the change itself: the player
+#   whose chain made it, or the level's own script).
+# Only lines that disagree are faults: a client's apply of another state.
+WORLD_BREAKABLE_KILLED = re.compile(r"Online: world breakable (\S+?)(?:#\d+)? killed \(live\)")
+LEVEL_LOAD_START = re.compile(r"Online: level (\d+) \S+: load$")
+LEVEL_LOADED_HERE = re.compile(r"Online: level (\d+): loaded here")
+
+
+def loading_spans(log: Log) -> list[tuple[datetime, datetime]]:
+    """This game's level loads: from `level <g> <path>: load` to its `level <g>: loaded here`."""
+    starts = {m.group(1): l.t for l, m in log.find(LEVEL_LOAD_START) if l.t is not None}
+    return [(starts[m.group(1)], l.t) for l, m in log.find(LEVEL_LOADED_HERE)
+            if l.t is not None and m.group(1) in starts and starts[m.group(1)] <= l.t]
+
+
+def world_event_objects(logic: dict | None) -> list[tuple[str, str, list[str]]]:
+    """The objects the level's logic drops, lowers, opens, switches or makes usable: (name, unit, message kinds)."""
+    if not logic:
+        return []
+    nodes = {str(n.get("key")): n for n in logic.get("nodes", []) or [] if isinstance(n, dict)}
+    kinds: dict[str, set[str]] = {}
+    for e in logic.get("edges", []) or []:
+        if not isinstance(e, dict):
+            continue
+        msg = str(e.get("message") or "").split(" {")[0]
+        if msg not in WORLD_EVENT_MSGS:
+            continue
+        to = list(e.get("to") or [])
+        if not to and "1" in str(e.get("roles") or ""):
+            to = [str(e.get("from"))]
+        for k in to:
+            if k in nodes and nodes[k].get("group") not in ("enemy", "encounter"):
+                kinds.setdefault(k, set()).add(msg.split(".")[-1])
+    return sorted((str(nodes[k].get("name")), str(nodes[k].get("unit")), sorted(v)) for k, v in kinds.items())
+
+
+def grade_world_events(run: Run, data: "LevelData | None") -> Verdict:
+    name = "world events"
+    games = ([("S", run.server)] if run.server is not None else []) + sorted(
+        run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    objs = data.world_objects if data is not None else []
+    listed = f"{len(objs)} object(s) in {data.level}'s logic an interaction or a script changes" if data else \
+        "no level data"
+    origins = [(w, l, m) for w, lg in games for l, m in lg.find(WORLD_EVENT)]
+    if not origins:
+        return Verdict(name, NOT_TESTED, f"no `world event ... by` line on any game (a build before "
+                       f"online/6-owner-session3-world); {listed}, 0 changed in this run")
+    applied = {w: [(l, m) for l, m in lg.find(WORLD_EVENT_APPLIED)] for w, lg in games}
+    killed = {w: [(l, m) for l, m in lg.find(WORLD_BREAKABLE_KILLED)] for w, lg in games}
+    loads = {w: loading_spans(lg) for w, lg in games}
+    used: dict[str, set[int]] = {w: set() for w, _lg in games}
+    findings: list[Finding] = []
+    ok = 0
+    late_n = 0
+    undecided: list[str] = []
+    level_start_n = 0
+    for w, l, m in origins:
+        nm, what, after = m.group(1), m.group(2), m.group(5)
+        bad = []
+        blind: list[str] = []
+        cites = [f"{w}: {l.cite()}"]
+        for o, _lg in games:
+            if o == w or what in WORLD_EVENT_NO_APPLY:
+                continue
+            pick = None
+            for i, (al, am) in enumerate(applied[o]):
+                if i in used[o] or am.group(1) != nm or am.group(2) != what or al.t is None or l.t is None:
+                    continue
+                d = (al.t - l.t).total_seconds()
+                if -0.5 <= d <= WORLD_EVENT_S:
+                    pick = (i, al, am, d)
+                    break
+            if pick is None:
+                late = [(i, al, am) for i, (al, am) in enumerate(applied[o]) if i not in used[o] and am.group(1) == nm
+                        and am.group(2) == what and al.t is not None and l.t is not None and al.t > l.t]
+                if late:  # at the copy's wake (asleep at the change): later, counted
+                    used[o].add(late[0][0])
+                    late_n += 1
+                    if late[0][2].group(3) != after:
+                        bad.append(f"{o} applied state {late[0][2].group(3)}, not {after}")
+                        cites.append(f"{o}: {late[0][1].cite()}")
+                    continue
+                if what == "removed" and l.t is not None and any(
+                        km.group(1) == nm and kl.t is not None and -0.5 <= (kl.t - l.t).total_seconds() <= WORLD_EVENT_S
+                        for kl, km in killed[o]):
+                    continue  # S's row's kill applied there: `world breakable <Name#id> killed (live)`
+                if l.t is not None and any(a <= l.t <= b for a, b in loads[o]):
+                    blind.append(f"{o} (still loading the level: its load makes the level's start state)")
+                    continue
+                blind.append(f"{o} (no line: its copy may have made the change itself)")
+                continue
+            used[o].add(pick[0])
+            if pick[2].group(3) != after:
+                bad.append(f"{o} applied state {pick[2].group(3)}, not {after}")
+                cites.append(f"{o}: {pick[1].cite()}")
+        if bad:
+            findings.append(Finding(f"{nm} {what} by {m.group(3)} on {w} at {when(l)}: " + "; ".join(bad), cites[:5]))
+        elif blind:
+            if all("still loading" in b for b in blind):
+                level_start_n += 1
+            undecided.append(f"{nm} {what} at {when(l)}: cannot decide on " + ", ".join(blind))
+        else:
+            ok += 1
+    changed = {m.group(1) for _w, _l, m in origins}
+    names = {n for n, _u, _k in objs}
+    untested = sorted(names - changed)
+    draws: dict[tuple[str, str, str, str], dict[str, tuple[str, Line]]] = {}
+    for w, lg in games:
+        for l, m in lg.find(PLACE_DRAW):
+            draws.setdefault((m.group(1), m.group(2), m.group(3), m.group(4)), {})[w] = (m.group(5), l)
+    for k, by in draws.items():
+        if len({x[0] for x in by.values()}) > 1:
+            findings.append(Finding(f"place draw {k[0]} {k[1]} component {k[2]} draw {k[3]} differs: " + ", ".join(
+                f"{w} {x[0]}" for w, x in by.items()), [x[1].cite() for x in list(by.values())[:3]]))
+    counts = (f"{len(origins)} world event(s), {ok} applied on every game ({late_n} later, at a copy's wake)"
+              + (f", {len(undecided)} cannot decide ({level_start_n} at a client's level load)" if undecided else "")
+              + f"; {listed}, {len(names & changed)} changed in this run"
+              + (f"; place draws {len(draws)}" if draws else ""))
+    if undecided:
+        counts += "; cannot decide: " + "; ".join(undecided[:6]) + (f" and {len(undecided) - 6} more"
+                                                                   if len(undecided) > 6 else "")
+    if untested:
+        counts += f"; untested: {', '.join(untested[:12])}" + (f" and {len(untested) - 12} more" if len(untested) > 12 else "")
+    status = FAIL if findings else (PASS if ok else NOT_TESTED)
+    return Verdict(name, status, counts, origins[0][1].cite(), findings)
+
+
+# --- reward gold and placed food (W39 item 3) -------------------------------------------------------------------
+#
+# The coins branch (online/8-all-coins-shared e2011447; being reworked after its review: the patterns follow it).
+# Reward gold (a collectible's script gold, Flynn's Missing Stuff: 50): per tracker T, S settles it once (`reward T
+# settled (...): <a> gold to each hero ...`) and every client is paid once: its own run (`reward T: this game's run of
+# its script gave <a> gold to each hero` / `... this game's own script gave its gold`) or another's pick-up (`reward T
+# paid here (another player's pick-up; ... <a> gold: gold x -> y, +d)`); `reward T received: not paid here (this game's
+# own run of its script paid it)` is no second pay. Twice on one game (two players touching at once), none, a pay
+# other than S's amount, or `ended unanswered` with no later `completed` fails. Placed food: every game walks the same
+# food (`food walked <zone> <n> placed food mapped ... keys <digest>`: n and the digest equal on S and every client,
+# the item drawn by its place: the review's place 0629f659.15667 among them); per food K one game eats it (`food taken
+# here K`) and every other game removes it once (`food removed here K (taken by another player...`, on S `food
+# removed on S K (granted to a client...`); a removal whose
+# game healed its own hero (`... this game's collect healed its hero`), `food not removed`, `food touched without
+# taking` and `food moved without a heal` fail.
+REWARD_SETTLED = re.compile(r"Online: reward ([0-9a-f]{8}) settled \(.*?\): ([\d.]+) gold to each hero")
+# 6864569c: the own pay is `this game's script gives <a> gold to each hero ...; S is told` (the earlier `run of its
+# script gave` and `own script gave its gold` are read too); S owes by player identity (`reward T obliged to player
+# <id> at peer <p> (obligation <n>: ...)`) and counts it paid on that game's message (`reward T paid to player <id>
+# (its game wrote its wallets)`); a client that receives it says `reward T owed here (...)`.
+REWARD_OWN = re.compile(r"Online: reward ([0-9a-f]{8}): this game's (?:script gives ([\d.]+) gold|run of its script gave "
+                        r"([\d.]+) gold|own script gave its gold)")
+REWARD_OBLIGED = re.compile(r"Online: reward ([0-9a-f]{8}) obliged to player ([0-9a-f]+) at peer (\d+)")
+REWARD_PAID_TO = re.compile(r"Online: reward ([0-9a-f]{8}) paid to player ([0-9a-f]+) ")
+REWARD_PAID = re.compile(r"Online: reward ([0-9a-f]{8}) paid here \(another player's pick-up; .*?, ([\d.]+) gold: ")
+REWARD_UNANSWERED = re.compile(r"Online: reward obligation (\d+) to peer (\d+) ended unanswered")
+REWARD_COMPLETED = re.compile(r"Online: reward obligation (\d+) to peer (\d+) completed")
+FOOD_WALKED = re.compile(r"Online: food walked ([0-9a-f]{8}) (\d+) placed food mapped.*?keys ([0-9a-f]{8})")
+FOOD_TAKEN = re.compile(r"Online: food taken here (\S+) \(player")
+FOOD_REMOVED = re.compile(r"Online: food removed (?:here|on S) (\S+) \((?:taken by another player|granted to a client)(.*)")
+FOOD_BAD = re.compile(r"Online: food (?:not removed|touched without taking|moved without a heal) (\S+)")
+
+
+def grade_rewards_food(run: Run) -> Verdict:
+    name = "reward gold and food"
+    games = ([("S", run.server)] if run.server is not None else []) + sorted(
+        run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    clients = [w for w, _l in games if w != "S"]
+    findings: list[Finding] = []
+    counts: list[str] = []
+    settled = {m.group(1): (l, float(m.group(2))) for l, m in (run.server.find(REWARD_SETTLED) if run.server else [])}
+    pays: dict[str, dict[str, list[tuple[Line, float | None]]]] = {}
+    for w in clients:
+        lg = run.clients[w]
+        for l, m in lg.find(REWARD_OWN):
+            amt = m.group(2) or m.group(3)
+            pays.setdefault(m.group(1), {}).setdefault(w, []).append((l, float(amt) if amt else None))
+        for l, m in lg.find(REWARD_PAID):
+            pays.setdefault(m.group(1), {}).setdefault(w, []).append((l, float(m.group(2))))
+    tested = bool(settled or pays)
+    for tr in sorted(set(settled) | set(pays)):
+        bad, cites = [], []
+        s = settled.get(tr)
+        if s is None:
+            bad.append("S never settled it")
+            cites.append(absent(run.server, f"`reward {tr} settled`") if run.server else "no S log")
+        else:
+            cites.append(s[0].cite())
+        for w in clients:
+            mine = pays.get(tr, {}).get(w, [])
+            if len(mine) != 1:
+                bad.append(f"paid {len(mine)} time(s) on {w}")
+                cites += [f"{w}: {l.cite()}" for l, _a in mine[:2]] or [absent(run.clients[w], f"`reward {tr} ... gold`")]
+            elif s is not None and mine[0][1] is not None and abs(mine[0][1] - s[1]) > 0.01:
+                bad.append(f"{w} paid {mine[0][1]:g}, S settled {s[1]:g}")
+                cites.append(f"{w}: {mine[0][0].cite()}")
+        if bad:
+            findings.append(Finding(f"reward {tr}: " + "; ".join(bad), cites[:5]))
+    if run.server is not None:
+        paid_to = {(m.group(1), m.group(2)) for _l, m in run.server.find(REWARD_PAID_TO)}
+        owed = [(l, m) for l, m in run.server.find(REWARD_OBLIGED) if (m.group(1), m.group(2)) not in paid_to]
+        if owed:
+            findings.append(Finding(f"{len(owed)} reward obligation(s) S never counted paid (`reward <t> paid to "
+                                    "player <id>`)", [l.cite() for l, _m in owed[:3]]))
+        elif not paid_to:
+            done = {(m.group(1), m.group(2)) for _l, m in run.server.find(REWARD_COMPLETED)}
+            lost = [(l, m) for l, m in run.server.find(REWARD_UNANSWERED) if (m.group(1), m.group(2)) not in done]
+            if lost and done:  # an older build's `completed` lines
+                findings.append(Finding(f"{len(lost)} reward obligation(s) ended unanswered and never completed",
+                                        [l.cite() for l, _m in lost[:3]]))
+    counts.append(f"rewards settled on S {len(settled)}, paid on the clients "
+                  + ", ".join(f"{w} {sum(len(p.get(w, [])) for p in pays.values())}" for w in clients)
+                  + ("" if settled or pays else " (rewards NOT TESTED: no `reward` line)"))
+    # placed food: the same walk on every game
+    walks = {w: {m.group(1): (int(m.group(2)), m.group(3), l) for l, m in lg.find(FOOD_WALKED)} for w, lg in games}
+    zones = sorted({z for v in walks.values() for z in v})
+    for z in zones:
+        seen = {w: walks[w].get(z) for w, _l in games}
+        vals = {(x[0], x[1]) for x in seen.values() if x is not None}
+        if len(vals) > 1 or any(x is None for x in seen.values()):
+            tested = True
+            findings.append(Finding(f"food of zone {z} differs between the games: " + ", ".join(
+                f"{w} " + (f"{x[0]} mapped, keys {x[1]}" if x else "not walked") for w, x in seen.items()),
+                [x[2].cite() for x in seen.values() if x is not None][:3]))
+        elif vals:
+            tested = True
+    taken = {w: {m.group(1): l for l, m in lg.find(FOOD_TAKEN)} for w, lg in games}
+    removed = {w: [(m.group(1), m.group(2), l) for l, m in lg.find(FOOD_REMOVED)] for w, lg in games}
+    eaten = sorted({k for v in taken.values() for k in v})
+    for k in eaten:
+        tested = True
+        eaters = [w for w in taken if k in taken[w]]
+        bad, cites = [], [f"{w}: {taken[w][k].cite()}" for w in eaters[:2]]
+        if len(eaters) > 1:
+            bad.append(f"eaten on {', '.join(eaters)}")
+        for w, _l in games:
+            if w in eaters:
+                continue
+            mine = [(rest, l) for kk, rest, l in removed[w] if kk == k]
+            if len(mine) != 1:
+                bad.append(f"removed {len(mine)} time(s) on {w}")
+                cites.append(absent(dict(games)[w], f"`food removed here {k}`") if not mine else f"{w}: {mine[1][1].cite()}")
+            elif "collect healed its hero" in mine[0][0] or " healed its hero" in mine[0][0]:
+                bad.append(f"{w} healed its own hero for another player's bite")
+                cites.append(f"{w}: {mine[0][1].cite()}")
+        if bad:
+            findings.append(Finding(f"food {k}: " + "; ".join(bad), cites[:5]))
+    for w, lg in games:
+        for l, m in lg.find(FOOD_BAD)[:3]:
+            findings.append(Finding(f"{w}: food {m.group(1)}: {l.text.split('Online: food ')[1][:80]}", [l.cite()]))
+    counts.append(f"food zones walked {len(zones)}, bites {len(eaten)}"
+                  + ("; place 0629f659.15667 eaten" if "0629f659.15667" in eaten else ""))
+    if not tested and not findings:
+        return Verdict(name, NOT_TESTED, "; ".join(counts) + " (no reward or food line: a build before "
+                       "online/8-all-coins-shared, or none picked up)")
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), "", findings)
+
+
+# --- the server's world advances (W41) ---------------------------------------------------------------------------
+#
+# A client's own watch of S's world (online/5-server-silent-notice 2b14fc0d, client/server_silence.cpp): `[error]
+# Online: the server's world has not advanced for <n> s (last shared tick <t>)` when S's shared tick stood still while
+# this client expected it to move (its level loaded and its barrier released, no join held, S on its level), and
+# `the server's world advances again after <s> s` when it moved again. Any such [error] on any client fails. The watch
+# exists when the source tree the grade runs from has it (src/online/client/server_silence.cpp): without it, a run
+# with no such line is NOT TESTED, not passed.
+SERVER_NOT_ADVANCED = re.compile(r"\[error\] .*Online: the server's world has not advanced for ([\d.]+) s")
+SERVER_ADVANCES_AGAIN = re.compile(r"Online: the server's world advances again after ([\d.]+) s")
+SERVER_WATCH_SOURCE = Path("src") / "online" / "client" / "server_silence.cpp"
+
+
+def grade_server_world(run: Run, repo: Path | None = None) -> Verdict:
+    name = "the server's world advances"
+    stops = [(w, l, m) for w, lg in sorted(run.clients.items()) for l, m in lg.find(SERVER_NOT_ADVANCED)]
+    again = sum(len(lg.find(SERVER_ADVANCES_AGAIN)) for lg in run.clients.values())
+    if stops:
+        return Verdict(name, FAIL, f"{len(stops)} stop(s) of S's world seen by a client, {again} advance(s) again",
+                       stops[0][1].cite(), [Finding(
+                           f"{w}: S's world had not advanced for {m.group(1)} s at {when(l)}", [l.cite()])
+                           for w, l, m in stops[:6]])
+    built = repo is not None and (Path(repo) / SERVER_WATCH_SOURCE).is_file()
+    if not built:
+        return Verdict(name, NOT_TESTED, "the clients' watch of S's world is not in this source tree "
+                       "(online/5-server-silent-notice not merged): no stop line is no proof")
+    return Verdict(name, PASS, f"no client saw S's world stand still ({len(run.clients)} client(s) watched)")
+
+
+# --- level events in step (W39 item 8) ---------------------------------------------------------------------------
+#
+# The owner's third session ("tutorial_a is like completely chopped", in his words: "map visuals didnt line up with the
+# cutscenes"): H's picture went to the fly-through's white look at 23:55:24.6, about 6 s before the shared
+# TA_CoreFlyThrough started (23:55:30.4), while D's stayed normal. The scenes' author's line (online/6-owner-session3-
+# scenes), on each game: `level event <Name#id> step <n> <what> at shared tick <t> (S's step at <ts>)`. Each scripted
+# step of a level's event script happens on every game S logged it on (S and every client), as many times as on S,
+# within LEVEL_EVENT_TICKS shared ticks of S's step; a step twice on a game where S had it once, late or missing
+# fails. Steps pair by name (without the id: ids differ per game), step number and what; a client's `level event
+# <key> step <n> not played here (<why>)` counts as missing, with its why.
+# The same author's states S carries (2e901d2d; logs/sceneskip-notes.txt 8b, 8c, 9): look boxes (S `level look box
+# <key> #<i> at (x, y, z) state <a> -> <b> at shared tick <t> (S's look...)` or `state <s> (this level's first look)`,
+# a client `... state <a> -> <b> here (S's at shared tick <t>)`) and looping effects (S `level effect <Name#id>
+# component <i> on|off at shared tick <t> (S's effect)`, a client `level effect <Name#id> component <i> on|off here
+# (S's at shared tick <t>)`): a paused or late game gets the newest state, never a replay, so each box's and effect's
+# last state on every client must be S's last. Conversations S paces (`conversation <Name#id> ... ended on S at shared
+# tick <t> (S's line)`): each client ends a conversation of that speaker (its `scene local ... start conversation ...
+# recipient <Name#id>` and that play's end) within CONV_END_S of S's end.
+LEVEL_EVENT = re.compile(r"Online: level event (\S+?)(?:#\d+)? step (\d+) (.+?) at shared tick (-?\d+) \(S's step at "
+                         r"(-?\d+)\)")
+LEVEL_EVENT_TICKS = 30
+LEVEL_EVENT_NOT_PLAYED = re.compile(r"Online: level event (\S+?)(?:#\d+)? step (\d+) not played here \((.*)\) \(S's step")
+LOOK_S = re.compile(r"Online: level look box ([0-9a-f]{8}) #(\d+) at \([^)]*\) state (?:\S+ -> )?(\S+) (?:\(this level's "
+                    r"first look\) )?at shared tick")
+LOOK_C = re.compile(r"Online: level look box ([0-9a-f]{8}) #(\d+) at \([^)]*\) state \S+ -> (\S+) here \(S's at shared tick")
+EFFECT_S = re.compile(r"Online: level effect (\S+?)(?:#\d+)? component (\d+) (on|off) at shared tick -?\d+ \(S's effect\)")
+EFFECT_C = re.compile(r"Online: level effect (\S+?)(?:#\d+)? component (\d+) (on|off) here \(S's at shared tick")
+CONV_ENDED_S = re.compile(r"Online: conversation (\S+?)(?:#\d+)? ended on S at shared tick")
+CONV_END_S = 1.0
+# W41: the scenes author puts the conversation-lines sync (his item 9) behind its own setting, off by default:
+# online_scene_lines (online/6-owner-session3-scenes af0864a4; forwarded from Host to S like online_scene_hold and
+# needing it on). The conversations-in-step part is checked only in a run that passes it (a peer's command holds
+# `--online_scene_lines=true`), else said "not tested": each S line `conversation <Name#id> turn <t> line <l> of <n> at
+# shared tick <k> (S's line)` (l >= 1) wants on every client `conversation <Name#id> turn <t> line <l-1> -> next here at
+# shared tick <k'> (<why>)` with |k' - k| <= CONV_LINE_TICKS (300 ms), never `(behind S, at <pos>: jumped)`; and each
+# conversation S ends ends on every client within CONV_END_S. A turn's line 0 is the turn's start (no client line to
+# pair): not checked.
+CONV_SYNC_SETTING: str | None = "online_scene_lines"
+CONV_LINE_TICKS = 18
+CONV_LINE_S = re.compile(r"Online: conversation (\S+?)(?:#\d+)? turn (\d+) line (\d+) of \d+ at shared tick (\d+) \(S's line\)")
+CONV_LINE_C = re.compile(r"Online: conversation (\S+?)(?:#\d+)? turn (\d+) line (\d+) -> next here at shared tick (\d+) \((.*)\)")
+
+
+def grade_level_events(run: Run) -> Verdict:
+    name = "level events in step"
+    games = ([("S", run.server)] if run.server is not None else []) + sorted(
+        run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    per: dict[str, dict[tuple[str, str, str], list[tuple[Line, int, int]]]] = {}
+    for w, lg in games:
+        for l, m in lg.find(LEVEL_EVENT):
+            per.setdefault(w, {}).setdefault((m.group(1), m.group(2), m.group(3)), []).append(
+                (l, int(m.group(4)), int(m.group(5))))
+    states = level_states_findings(run, games)
+    if not per and states is None:
+        return Verdict(name, NOT_TESTED, "no `level event ... step`, `level look box`, `level effect` or `conversation "
+                       "... ended on S` line on any game (a build before online/6-owner-session3-scenes)")
+    s_counts, s_findings = states if states is not None else ([], [])
+    if not per:
+        return Verdict(name, FAIL if s_findings else PASS, "; ".join(s_counts), "", s_findings)
+    ref = per.get("S") or {}
+    if not ref:  # no S log or S logged none: every step any client logged
+        ref = {k: v for w in per for k, v in per[w].items()}
+    findings: list[Finding] = []
+    ok = 0
+    for key, s_steps in sorted(ref.items()):
+        bad, cites = [], []
+        for w, _lg in games:
+            if w == "S":
+                continue
+            mine = per.get(w, {}).get(key, [])
+            skipped = [m for _l, m in dict(games)[w].find(LEVEL_EVENT_NOT_PLAYED)
+                       if (m.group(1), m.group(2)) == key[:2]]
+            if skipped and len(mine) < len(s_steps):
+                bad.append(f"not played on {w} ({skipped[0].group(3)[:60]})")
+                continue
+            if len(mine) > len(s_steps):
+                bad.append(f"{len(mine)} times on {w} (S {len(s_steps)})")
+                cites += [f"{w}: {l.cite()}" for l, _t, _s in mine[:2]]
+            elif len(mine) < len(s_steps):
+                bad.append(f"missing on {w} ({len(mine)} of {len(s_steps)})")
+                cites.append(absent(dict(games)[w], f"`level event {key[0]}#.. step {key[1]} {key[2]}`"))
+            late = [(l, t, ts) for l, t, ts in mine if abs(t - ts) > LEVEL_EVENT_TICKS]
+            if late:
+                l, t, ts = late[0]
+                bad.append(f"{w} {t - ts:+d} shared ticks from S's step")
+                cites.append(f"{w}: {l.cite()}")
+        if bad:
+            findings.append(Finding(f"{key[0]} step {key[1]} {key[2]}: " + "; ".join(bad), cites[:5]))
+        else:
+            ok += 1
+    counts = (f"{len(ref)} event step(s) on S, {ok} on every game within {LEVEL_EVENT_TICKS} shared ticks, once; "
+              + ", ".join(f"{w} {sum(len(x) for x in per.get(w, {}).values())}" for w, _lg in games))
+    findings += s_findings
+    counts = "; ".join([counts] + s_counts)
+    return Verdict(name, FAIL if findings else PASS, counts, "", findings)
+
+
+def level_states_findings(run: Run, games: list) -> "tuple[list[str], list[Finding]] | None":
+    """S's look boxes, effects and conversation ends against every client (the comment above); None: none logged."""
+    if run.server is None:
+        return None
+    s_look = {(m.group(1), m.group(2)): (l, m.group(3)) for l, m in run.server.find(LOOK_S)}
+    s_fx = {(m.group(1), m.group(2)): (l, m.group(3)) for l, m in run.server.find(EFFECT_S)}
+    s_conv = run.server.find(CONV_ENDED_S)
+    if not s_look and not s_fx and not s_conv:
+        return None
+    counts, findings = [], []
+    clients = [(w, lg) for w, lg in games if w != "S"]
+    for what, ref, rx in (("look box", s_look, LOOK_C), ("effect", s_fx, EFFECT_C)):
+        if not ref:
+            continue
+        differ = []
+        for w, lg in clients:
+            mine = {(m.group(1), m.group(2)): (l, m.group(3)) for l, m in lg.find(rx)}
+            for k, (sl, state) in ref.items():
+                got = mine.get(k)
+                if got is not None and got[1] != state:
+                    differ.append((w, k, state, got))
+        counts.append(f"{what}es on S {len(ref)}" if what == "look box" else f"{what}s on S {len(ref)}")
+        if differ:
+            findings.append(Finding(f"{len(differ)} {what}(es) end in another state than S's: " + ", ".join(
+                f"{w} {k[0]} #{k[1]} {g[1]} (S {s})" for w, k, s, g in differ[:4]),
+                [f"{w}: {g[0].cite()}" for w, _k, _s, g in differ[:3]]))
+    conv_on = CONV_SYNC_SETTING is not None and any(
+        f"--{CONV_SYNC_SETTING}=true" in (p.get("command") or []) for p in run.result.get("peers", []) or []
+        if isinstance(p, dict))
+    if s_conv and not conv_on:
+        counts.append(f"conversations ended on S {len(s_conv)}: in step NOT TESTED (the conversation-lines sync's "
+                      f"setting {CONV_SYNC_SETTING or '(not named yet)'} not passed in this run)")
+    elif s_conv:
+        late = []
+        for w, lg in clients:
+            ends = conversation_ends(lg)
+            for sl, m in s_conv:
+                nm = m.group(1)
+                near = [l for n, l in ends if n == nm and l.t and sl.t and abs((l.t - sl.t).total_seconds()) <= CONV_END_S]
+                if not near:
+                    later = [l for n, l in ends if n == nm and l.t and sl.t and l.t > sl.t]
+                    late.append((w, nm, sl, later[0] if later else None))
+        counts.append(f"conversations ended on S {len(s_conv)}")
+        s_lines = [(l, m) for l, m in run.server.find(CONV_LINE_S) if int(m.group(3)) >= 1]
+        bad_lines = []
+        for w, lg in clients:
+            mine: dict[tuple[str, str, int], list[tuple[Line, int, str]]] = {}
+            for l, m in lg.find(CONV_LINE_C):
+                mine.setdefault((m.group(1), m.group(2), int(m.group(3))), []).append((l, int(m.group(4)), m.group(5)))
+            for sl, m in s_lines:
+                key = (m.group(1), m.group(2), int(m.group(3)) - 1)
+                got = mine.get(key, [])
+                ok = [g for g in got if abs(g[1] - int(m.group(4))) <= CONV_LINE_TICKS and "jumped" not in g[2]]
+                if not ok:
+                    why = (f"{got[0][1] - int(m.group(4)):+d} ticks" + (" (jumped)" if "jumped" in got[0][2] else "")
+                           if got else "no line")
+                    bad_lines.append((w, m.group(1), m.group(2), m.group(3), why, sl))
+        counts.append(f"conversation lines on S {len(s_lines)} (each wanted on every client within "
+                      f"{CONV_LINE_TICKS} shared ticks)")
+        if bad_lines:
+            findings.append(Finding(f"{len(bad_lines)} conversation line(s) not started in step with S's: " + ", ".join(
+                f"{w} {nm} turn {t} line {ln}: {why}" for w, nm, t, ln, why, _sl in bad_lines[:5]),
+                [sl.cite() for *_x, sl in bad_lines[:3]]))
+        if late:
+            findings.append(Finding(f"{len(late)} conversation end(s) not within {CONV_END_S:.0f} s of S's: " + ", ".join(
+                f"{w} {nm}" + (f" {(x.t - sl.t).total_seconds():+.1f} s" if x is not None and x.t else " never")
+                for w, nm, sl, x in late[:4]), [sl.cite() for _w, _n, sl, _x in late[:2]]))
+    return counts, findings
+
+
+def conversation_ends(log: "Log") -> list[tuple[str, "Line"]]:
+    """(speaker name without its id, end line) of each conversation this game played."""
+    names: dict[str, str] = {}
+    out = []
+    for i, raw in enumerate(log.lines):
+        m = CONV_START.search(raw)
+        if m:
+            names[m.group(1)] = m.group(2).split("#")[0]
+            continue
+        m = CONV_END.search(raw)
+        if m and m.group(1) in names:
+            out.append((names.pop(m.group(1)), log.line(i)))
+    return out
+
+
+# --- enemy states and damage from S (W39) ---------------------------------------------------------------------
+#
+# The enemies author's lines (online/5-replica-attacks-land-2 4b9ae45d, S's online_enemy_state_convergence; his list
+# may still change: the patterns follow his branch). States: a client's `enemy state <row> converged <machine> <copy's
+# state|none> -> <S's state> lag <n> ticks (within 1 s|late)`; a convergence out of a spawn state (a state whose name
+# starts `Spawn`) later than STATE_LAG_TICKS shared ticks, any `(late)` and any `given up on this copy` fail. Damage
+# from S: each S `enemy hit <row> on peer <p> #<i> damage <d> occurrence <o> tick <t> (S's hit, sent)` wants exactly
+# one `enemy hit <row> #<i> damage <d> ... applied here: ...` on peer <p>'s game (none twice, none lost; `not applied
+# (<why>)` is lost); and while damage is S's (any such S line in the run), a client's `hero hit by ... (S's attack,
+# played here)` that its damage check let through is a copy's own hit hurting a hero: FAIL. A run with none of these
+# lines is NOT TESTED (a build before that branch).
+STATE_CONVERGED = re.compile(r"Online: enemy state (\S+) converged (\S+) (\S+) -> (\S+) lag (-?\d+) ticks \((within 1 s|late)\)")
+STATE_GIVEN_UP = re.compile(r"Online: enemy state (\S+) (\S+) given up on this copy")
+# The final texts (2756bb27): S's sent hit carries `obligation <id>`, the applied line has no `force` (an older
+# build's forms are read too), and a hit a client cannot take ends `refused here (<why>)`.
+S_HIT_SENT = re.compile(r"Online: enemy hit (\S+) on peer (\d+) #(\d+) (?:obligation \S+ )?damage (\S+) .*\(S's hit, sent\)")
+C_HIT_APPLIED = re.compile(r"Online: enemy hit (\S+) #(\d+) damage (\S+) (?:force \S+ )?occurrence \S+ applied here: (.*?) hp")
+C_HIT_NOT = re.compile(r"Online: enemy hit (\S+) #(\d+) damage (\S+) (?:not applied|refused here) \((.*)\)")
+DAMAGE_FROM_S = re.compile(r"Online: hit session \S+ \(S's announcement: .*enemy damage to this player comes from S\)")
+OWN_COPY_HIT = re.compile(r"Online: hero hit by (\S+) (\S+) \(([a-z]+), ([^)]*)\) \(S's attack, played here\)")
+STATE_LAG_TICKS = 60
+
+
+def grade_enemy_server_damage(run: Run) -> Verdict:
+    name = "enemy states and damage from S"
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    sent = run.server.find(S_HIT_SENT)
+    conv = {w: lg.find(STATE_CONVERGED) for w, lg in run.clients.items()}
+    if not sent and not any(conv.values()):
+        return Verdict(name, NOT_TESTED, "no `enemy state ... converged` and no `enemy hit ... (S's hit, sent)` line "
+                       "(a build before online/5-replica-attacks-land-2, or S's online_enemy_state_convergence off)")
+    findings: list[Finding] = []
+    counts: list[str] = []
+    for w, lg in sorted(run.clients.items()):
+        rows = conv[w]
+        bad = [(l, m) for l, m in rows if m.group(6) == "late" or
+               (m.group(3).startswith("Spawn") and int(m.group(5)) > STATE_LAG_TICKS)]
+        spawn = [(l, m) for l, m in rows if m.group(3).startswith("Spawn")]
+        given = lg.find(STATE_GIVEN_UP)
+        counts.append(f"{w}: {len(rows)} convergence(s), {len(spawn)} out of a spawn state "
+                      f"(lag at most {max([int(m.group(5)) for _l, m in spawn] or [0])} ticks), {len(given)} given up")
+        if bad:
+            findings.append(Finding(f"{w}: {len(bad)} copy state(s) converged late (over {STATE_LAG_TICKS} shared ticks "
+                                    "after S, or `late`)", [l.cite() for l, _m in bad[:4]]))
+        if given:
+            findings.append(Finding(f"{w}: {len(given)} state(s) given up on a copy (the game's read-back missed)",
+                                    [l.cite() for l, _m in given[:4]]))
+    peers = peer_numbers(run)
+    if sent:
+        applied: dict[str, dict[tuple[str, str], list[Line]]] = {}
+        lost: dict[str, dict[tuple[str, str], tuple[Line, str]]] = {}
+        for w, lg in run.clients.items():
+            for l, m in lg.find(C_HIT_APPLIED):
+                applied.setdefault(w, {}).setdefault((m.group(1), m.group(2)), []).append(l)
+            for l, m in lg.find(C_HIT_NOT):
+                lost.setdefault(w, {})[(m.group(1), m.group(2))] = (l, m.group(4))
+        missing, twice, refused = [], [], []
+        for l, m in sent:
+            who = peers.get(int(m.group(2)))
+            key = (m.group(1), m.group(3))
+            if who is None:
+                continue
+            got = applied.get(who, {}).get(key, [])
+            if len(got) > 1:
+                twice.append((who, key, got))
+            elif not got:
+                nl = lost.get(who, {}).get(key)
+                (refused if nl else missing).append((who, key, l, nl))
+        counts.append(f"S's hits on players {len(sent)}: applied once "
+                      f"{len(sent) - len(missing) - len(twice) - len(refused)}, twice {len(twice)}, not applied "
+                      f"{len(refused)}, no line {len(missing)}")
+        if twice:
+            findings.append(Finding(f"{len(twice)} S hit(s) applied more than once on the player's game",
+                                    [f"{w}: {g[0].cite()}" for w, _k, g in twice[:3]]))
+        if refused:
+            findings.append(Finding(f"{len(refused)} S hit(s) not applied on the player's game ("
+                                    + ", ".join(sorted({nl[1][:40] for *_x, nl in refused})) + ")",
+                                    [f"{w}: {nl[0].cite()}" for w, _k, _l, nl in refused[:3]]))
+        if missing:
+            findings.append(Finding(f"{len(missing)} S hit(s) lost: no applied or refused line on the player's game",
+                                    [l.cite() for _w, _k, l, _n in missing[:3]]
+                                    + [absent(run.clients[w], f"`enemy hit {k[0]} #{k[1]} ... applied here`")
+                                       for w, k, _l, _n in missing[:1]]))
+        # A client says when its enemy damage comes from S (its `hit session ...` line); without that line, any S hit
+        # sent in the run says so for every client (an older build).
+        from_s = {w for w, lg in run.clients.items() if lg.find(DAMAGE_FROM_S)} or set(run.clients)
+        own = [(w, l) for w, lg in run.clients.items() if w in from_s for l, _m in lg.find(OWN_COPY_HIT)
+               if "refused by this game's damage check" not in l.text]
+        counts.append(f"copies' own hits let through while damage is S's: {len(own)}")
+        if own:
+            findings.append(Finding(f"{len(own)} hero hit(s) by a copy's own hit while the damage is S's",
+                                    [f"{w}: {l.cite()}" for w, l in own[:4]]))
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), "", findings)
+
+
+# --- dialogs skipped (W39) ---------------------------------------------------------------------------------------
+#
+# The owner's third session: both clients ran with the automatic dialog skip (`Dev: skip scenes on (test-only): dialogs
+# only: ...`) and the conversations played on. Every conversation ends `by natural`, skipped or not (the game's own end
+# after its last line: no run in the store has another end for a conversation), so the row reads the skips and their
+# times. On a client with the skip on (dialogs only, or cutscenes, conversations and ...), each conversation with a
+# skippable line (a `Dev: skip conversation <who> line <i> of <n> ...` that is not `is unskippable`) must be skipped
+# here (this game's `handed to the server's skip request`, or the server's skip `scene skip conversation (...) turn <k>
+# echoed here`), its first skip no later than CONV_UNSKIPPABLE_S + DIALOG_SKIP_S after its start (every hand-over in
+# the store came 3.0 s in: the game's own unskippable start), and its end no later than DIALOG_SKIP_S after its last
+# skip. A conversation whose lines are all unskippable is left out. With trace_scenes, `skips 0` fails too.
+SKIP_ON = re.compile(r"Dev: skip scenes on \(test-only\): (?:dialogs only|.*conversations)")
+CONV_START = re.compile(r"Online: scene local (\d+/L\d+) start conversation \S+ recipient (\S+)")
+CONV_END = re.compile(r"Online: scene local (\d+/L\d+) end by (.+?) after ([\d.]+) s")
+CONV_SKIP = re.compile(r"Dev: skip conversation (\S+) line (\d+) of (\d+)(.*)")
+CONV_ECHO = re.compile(r"Online: scene skip conversation \(.*\) turn \d+ echoed here")
+CONV_TRACE_END = re.compile(r"Dev: conversation end key \S+ after [\d.]+ s .* skips (\d+)")
+DIALOG_SKIP_S = 2.0
+CONV_UNSKIPPABLE_S = 3.0
+
+
+def grade_dialog_skip(run: Run) -> Verdict:
+    name = "dialogs skipped"
+    on = [w for w, log in sorted(run.clients.items()) if log.find(SKIP_ON)]
+    if not on:
+        return Verdict(name, NOT_TESTED, "no client ran with the dialog skip (no `Dev: skip scenes on ... dialogs` or "
+                       "`... conversations` line)")
+    findings: list[Finding] = []
+    counts: list[str] = []
+    n_skippable = 0
+    for w in on:
+        log = run.clients[w]
+        open_by_key: dict[str, dict] = {}
+        current: dict | None = None
+        convs: list[dict] = []
+        for i, raw in enumerate(log.lines):
+            m = CONV_START.search(raw)
+            if m:
+                current = {"key": m.group(1), "who": m.group(2), "start": log.line(i), "skips": [], "acts": [],
+                           "end": None, "how": "", "secs": 0.0, "trace_skips": None}
+                open_by_key[m.group(1)] = current
+                convs.append(current)
+                continue
+            if current is None:
+                continue
+            m = CONV_SKIP.search(raw)
+            if m and m.group(1) == current["who"]:
+                current["skips"].append((m.group(4), log.line(i)))
+                if "handed to the server's skip request" in m.group(4):
+                    current["acts"].append(log.line(i))
+                continue
+            if CONV_ECHO.search(raw):
+                current["acts"].append(log.line(i))
+                continue
+            m = CONV_TRACE_END.search(raw)
+            if m and current["end"] is not None and current["trace_skips"] is None:
+                current["trace_skips"] = int(m.group(1))
+                continue
+            m = CONV_END.search(raw)
+            if m and m.group(1) in open_by_key:
+                cv = open_by_key.pop(m.group(1))
+                cv["end"], cv["how"], cv["secs"] = log.line(i), m.group(2), float(m.group(3))
+        skippable = [cv for cv in convs if any("is unskippable" not in s[0] for s in cv["skips"])]
+        n_skippable += len(skippable)
+        late = 0
+        for cv in skippable:
+            why = []
+            st = cv["start"].t
+            acts = [a for a in cv["acts"] if a.t is not None]
+            if not acts:
+                why.append("never skipped here")
+            else:
+                first = (acts[0].t - st).total_seconds() if st else 0.0
+                if first > CONV_UNSKIPPABLE_S + DIALOG_SKIP_S:
+                    why.append(f"its first skip came {first:.1f} s after its start")
+                if cv["end"] is not None and cv["end"].t is not None:
+                    after = (cv["end"].t - acts[-1].t).total_seconds()
+                    if after > DIALOG_SKIP_S:
+                        why.append(f"it ended {after:.1f} s after its last skip ({cv['secs']:.1f} s in all)")
+            if cv["end"] is None:
+                why.append("never ended")
+            if cv["trace_skips"] == 0:
+                why.append("its trace says skips 0")
+            if why:
+                late += 1
+                outcomes = sorted({s[0].strip(": ").split(" (")[0][:60] for s in cv["skips"]})
+                findings.append(Finding(f"{w}: {cv['who']} ({cv['key']}): " + "; ".join(why) + " (the skip said: "
+                                        + "; ".join(outcomes) + ")",
+                                        [cv["start"].cite()] + [a.cite() for a in acts[:1]]
+                                        + ([cv["end"].cite()] if cv["end"] else [])))
+        counts.append(f"{w}: {len(convs)} conversation(s), {len(skippable)} skippable, {len(skippable) - late} "
+                      "skipped in time")
+    if not n_skippable:
+        return Verdict(name, NOT_TESTED, "; ".join(counts) + " (no skippable conversation)")
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), "", findings)
+
+
+# --- elemental gates and Swap Zones by play (W38) -------------------------------------------------------------
+#
+# The owner's third session: "elemental gates dont work", "swap force gates dont work". The level's own elemental
+# gates (a Scripts.LockedObjectComponent whose LockDatas is ElementalLockSingleElementData or ...DualElementData:
+# tutorial_b 3, ww1 3, tutorial_a none) and Swap Zone pads (a TurboZone component: tutorial_b 3, ww1 2) are their
+# own kind here. An elemental gate opens in the game's script (common.cs Scripts.ElementalLock) when a hero whose
+# primary or secondary element is the lock's (each side's, for a dual gate) is within its UnlockRadius (300 in these
+# levels) and an actor touches that sphere: no button. Per gate: opened on S and every client (the gate lines
+# gate_open_ids reads), on some only (FAIL), or NOT TESTED by name (no step walks a figure of its element up to it
+# yet). Swap Zones: with the feature on (online_swap_zones in a peer's command, or a zone's lines in the run), a
+# refusal `swap zone <Name#id> refused: Swap Zones are not available in online play yet` FAILs (with it off it is
+# the off state, said); a zone that ran (`swap zone lease <n> running here`, S's `swap zone <n> won|failed`) is
+# counted; none: NOT TESTED by name. While a zone runs the other players are parked (couch co-op's off player, the
+# owner's choice): every `swap zone <label> parked at ...` on a game wants a later `swap zone <label> released (...)`
+# there, else that player was left parked: FAIL.
+SWAP_REFUSED = re.compile(r"Online: swap zone (\S+) refused: (.*)")
+ELEMENTAL_UNLOCK_R = 300.0
+# ab3f6776 (the gates author): on every game `elemental gate <Name#id> <single|dual> lock: element(s) <e1>[/<e2>], unlock
+# radius <r>`, `elemental gate <Name#id> side <left|right> <state> (nearest hero of its element <who> at <d>)`, a
+# touch `elemental gate <Name#id> touched by <hero>: sides <a>/<b>: unlocks|no unlock` and `hero <Name> elements
+# <p>/<s>`. A touch with `no unlock` by a hero of a lock element fails (the game would open it).
+GATE_LOCK = re.compile(r"Online: elemental gate (\S+) (single|dual) lock: element\(s\) (\S+), unlock radius")
+GATE_TOUCH = re.compile(r"Online: elemental gate (\S+) touched by (\S+): sides (\S+)/(\S+): (unlocks|no unlock)")
+HERO_ELEMENTS = re.compile(r"Online: hero (\S+) elements (\S+)/(\S+)")
+# Doors (the gates author, 380b3362): a follower's game takes its hero through a door another player entered
+# (`door <Name#id>: this game's hero goes through with peer <p> (<d> from it): its entry replayed here, at once|queued`)
+# or keeps it (`door <Name#id>: this game's hero stays for peer <p>'s entry (<d> from it|busy: <why>)` and the other
+# stay reasons). Counted on the page; a partner left behind going through alone afterwards has no line of its own (its
+# own entry is an ordinary request): the specs that use a door check it.
+DOOR_GOES = re.compile(r"Online: door (\S+): this game's hero goes through with peer (\d+) .*its entry replayed here, "
+                       r"(at once|queued)")
+DOOR_STAYS = re.compile(r"Online: door (\S+): this game's hero stays for peer (\d+)'s entry")  # the UnlockRadius of every elemental gate of tutorial_b and ww1 (their LockDatas)
+SWAP_RAN = re.compile(r"Online: swap zone lease \d+ running here")
+SWAP_ENDED_S = re.compile(r"Online: swap zone (\d+) (won|failed)\b")
+SWAP_PARKED = re.compile(r"Online: swap zone (\S+) parked at ")
+SWAP_RELEASED = re.compile(r"Online: swap zone (\S+) released \(")
+SWAP_ON_ARG = "--online_swap_zones=true"
+
+
+# Batch 18d (runs 20261120-064619 element-gate-tb and 20261120-065348 element-gate-dual-tb): the gates opened on all
+# three games, and the row said "opened on no game". It read openings by the name `LockedElementalGate#<id>`, which no
+# game prints: the gate has no run-time name, so S's and H's lines named its lock by address (`elemental gate
+# b82aa6f0 ...`, `backend gate.open applied b82aa6f0 key ...`) and D's world gate line `?#2107` (2429afb4 makes the
+# element gate lines say `?#<id>` too, as the world gate line does). With online_world_authored_keys (the owner's
+# session settings) a gate's row is `a00000000.<zone hash>.<0001xxxx>`: its low 16 bits are the gate's authored index
+# (0x10663 -> 1635, the probe manifest's [tutorial_b#1635] at tutorial_b_zone_elemental_02's place). So a gate is
+# found by its authored index (the probe manifest's object at the gate's data position) and read, per game, by:
+#   S: its row written again after the level start (`world 2 <row>@<g> written`), `backend gate.open applied <address>
+#      key`, or `world event <label> gate by ... -> open)` (label `Name#id` or `?#id`, id this game's own: the
+#      authored probe's `authored obj <zone> <k> <index> ... mid <id hex>`);
+#   a client: `backend key gate <row>@<g> watched <address> (unlocked ...)` or `world gate <label> open apply`;
+#   either: watched while locked, its elemental gate lines (address or label) or S's first write: a game that knows
+#   the gate (closed there unless an opening line follows).
+# The address is the one the clients' `watched <address>` lines give for that row. A game with none of these lines
+# cannot be judged: the row says "cannot decide" (and NOT TESTED), never "opened on no game". A touch is judged by its
+# latest line per gate and hero (`no unlock` while approaching, then `unlocks`, is one opening).
+AUTHORED_ANY = re.compile(r"Online: authored obj \S+ \d+ (\d+) class \S+ entity \S+ name \S+ name0 \S+ mid ([0-9a-f]+) ")
+ROW_KEY = re.compile(r"\ba0{8}\.([0-9a-f]{8})\.([0-9a-f]{8})@\d+")
+KEY_GATE_ANY = re.compile(r"Online: backend key gate (a0{8}\.[0-9a-f]{8}\.[0-9a-f]{8})@\d+ watched (\S+) "
+                          r"\((locked|unlocked) ")
+ROW_WRITTEN_ANY = re.compile(r"Online: world 2 (a0{8}\.[0-9a-f]{8}\.[0-9a-f]{8})@\d+ written")
+GATE_APPLIED_S = re.compile(r"Online: backend gate\.open applied (\S+) key")
+WORLD_GATE_OPEN = re.compile(r"Online: world gate (\S*)#(\d+) open apply")
+WORLD_EVENT_GATE_OPEN = re.compile(r"Online: world event (\S*)#(\d+) gate by .* -> open\)")
+GATE_LINE_LABEL = re.compile(r"Online: elemental gate (\S+) ")
+GATE_PLACE_R = 60.0   # the gate's data position and the probe's place of its object: the same object within this
+
+
+def row_index(ref: str) -> int:
+    """An authored row key's authored index (its last part's low 16 bits)."""
+    return int(ref.split(".")[-1].split("@")[0], 16) & 0xFFFF
+
+
+def gate_index(data: "LevelData", g) -> int | None:
+    """The authored index of a gate: the probe manifest's object nearest its data position (within GATE_PLACE_R)."""
+    if g.pos is None or not data.places:
+        return None
+    best = min(((math.dist(pos, g.pos), i) for i, (_n, pos) in data.places.items() if pos is not None), default=None)
+    return best[1] if best is not None and best[0] <= GATE_PLACE_R else None
+
+
+def own_ids(log: Log) -> dict[int, int]:
+    """This game's own id of each authored index (the authored probe's lines; the last walk's)."""
+    return {int(m.group(1)): int(m.group(2), 16) for _l, m in log.find(AUTHORED_ANY)}
+
+
+def gate_addresses(games: list, idx: int) -> set[str]:
+    """The lock's address the clients' `watched <address>` lines give for the gate's row."""
+    return {m.group(2) for _w, lg in games for _l, m in lg.find(KEY_GATE_ANY) if row_index(m.group(1)) == idx}
+
+
+def gate_state(w: str, lg: Log, idx: int, addrs: set[str]) -> tuple[str, "Line | None"]:
+    """("open", line), ("closed", line) or ("unknown", None): what this game's own lines say of the gate."""
+    gid = own_ids(lg).get(idx)
+    known: Line | None = None
+    opened: list[Line] = []
+    if w == "S":
+        writes = [l for l, m in lg.find(ROW_WRITTEN_ANY) if row_index(m.group(1)) == idx]
+        if writes:
+            known = writes[0]
+        if len(writes) >= 2:
+            opened.append(writes[1])
+        opened += [l for l, m in lg.find(GATE_APPLIED_S) if m.group(1) in addrs]
+        if gid is not None:
+            opened += [l for l, m in lg.find(WORLD_EVENT_GATE_OPEN) if int(m.group(2)) == gid]
+    else:
+        for l, m in lg.find(KEY_GATE_ANY):
+            if row_index(m.group(1)) == idx:
+                known = known or l
+                if m.group(3) == "unlocked":
+                    opened.append(l)
+        if gid is not None:
+            opened += [l for l, m in lg.find(WORLD_GATE_OPEN) if int(m.group(2)) == gid]
+    if known is None:
+        for l, m in lg.find(GATE_LINE_LABEL):
+            lab = m.group(1)
+            if lab in addrs or (gid is not None and lab.endswith(f"#{gid}")):
+                known = l
+                break
+    if opened:
+        return "open", min(opened, key=lambda l: (l.t or datetime.min, l.no))
+    return ("closed", known) if known is not None else ("unknown", None)
+
+
+def grade_gate_kinds(run: Run, data: "LevelData | None") -> Verdict:
+    name = "elemental gates and Swap Zones"
+    if data is None:
+        return Verdict(name, NOT_TESTED, "no level data for this run's level")
+    games = [("S", run.server)] if run.server is not None else []
+    games += sorted(run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    elemental = [g for g in data.gates if getattr(g, "lock", "")]
+    counts: list[str] = []
+    findings: list[Finding] = []
+    untested: list[str] = []
+    undecided: list[str] = []
+    tested = opened_n = 0
+    if elemental:
+        # By name first (a build or a level whose gates have one), then by the gate's authored index (batch 18d).
+        opened = {w: gate_open_ids(lg, elemental[0].name, run=run) for w, lg in games}
+        n_open = {w: len(ids) for w, ids in opened.items()}
+        poses = peer_poses(run.server) if run.server is not None else {}
+        for i, g in enumerate(elemental):
+            label = f"{g.name} {g.unit} ({g.lock} element)"
+            idx = gate_index(data, g)
+            addrs = gate_addresses(games, idx) if idx is not None else set()
+            state: dict[str, tuple[str, "Line | None"]] = {}
+            for w, lg in games:
+                if n_open[w] > i:
+                    state[w] = ("open", opened[w][i])
+                else:
+                    state[w] = gate_state(w, lg, idx, addrs) if idx is not None else ("unknown", None)
+            where = [w for w, _lg in games if state[w][0] == "open"]
+            shut = [w for w, _lg in games if state[w][0] == "closed"]
+            blind = [w for w, _lg in games if state[w][0] == "unknown"]
+            if idx is not None:
+                label += f" [authored {idx}]"
+            near = []
+            if g.pos is not None:
+                for peer, ps in sorted(poses.items()):
+                    hit = next(((tt, line) for tt, pos, line in ps if math.dist(pos, g.pos) <= ELEMENTAL_UNLOCK_R), None)
+                    if hit is not None:
+                        near.append((peer, hit))
+            if where:
+                opened_n += 1
+            stood = ", ".join(f"peer {p}'s hero stood within {ELEMENTAL_UNLOCK_R:.0f} of it at "
+                              f"{hit[0].strftime('%H:%M:%S')}" for p, hit in near)
+            if not where and near and shut and "S" in shut:
+                findings.append(Finding(
+                    f"{label}: {stood}, and it opened on no game (closed on {', '.join(shut)}"
+                    + (f"; no line for it on {', '.join(blind)}" if blind else "") + ")",
+                    [hit[1].cite() for _p, hit in near[:2]] + [state[w][1].cite() for w in shut[:1] if state[w][1]]))
+                tested += 1
+            elif not where and near:
+                undecided.append(f"{label}: {stood}; cannot decide whether it opened (no line names this gate on "
+                                 + ", ".join(blind or shut) + ")")
+            elif not where:
+                untested.append(label)
+            elif shut:
+                findings.append(Finding(f"{label}: opened on {', '.join(where)}, not on {', '.join(shut)}"
+                                        + (f" (cannot decide on {', '.join(blind)})" if blind else ""),
+                                        [state[w][1].cite() for w in where if state[w][1]]))
+                tested += 1
+            elif blind:
+                undecided.append(f"{label}: opened on {', '.join(where)}; cannot decide on {', '.join(blind)} (no line "
+                                 "names this gate there)")
+                tested += 1
+            else:
+                tested += 1
+        locks: dict[str, str] = {}
+        last_touch: dict[tuple[str, str, str], tuple] = {}
+        for w, lg in games:
+            elems: dict[str, set[str]] = {}
+            for i, raw in enumerate(lg.lines):
+                m = GATE_LOCK.search(raw)
+                if m:
+                    locks[m.group(1) + " " + m.group(2)] = m.group(3)
+                    continue
+                m = HERO_ELEMENTS.search(raw)
+                if m:
+                    elems[m.group(1)] = {m.group(2).lower(), m.group(3).lower()}
+                    continue
+                m = GATE_TOUCH.search(raw)
+                if m:
+                    # The latest touch per gate and hero decides (batch 18d: `approach/approach: no unlock`, then
+                    # `completed/completed: unlocks` is one opening).
+                    lock = next((v_ for k_, v_ in locks.items() if k_.split(" ")[0] == m.group(1)), "")
+                    last_touch[(w, m.group(1), m.group(2))] = (m, lg.line(i), set(elems.get(m.group(2), set())), lock)
+        for (w, _gate, _hero), (m, line, his, lock) in last_touch.items():
+            need = {x.lower() for x in lock.split("/") if x}
+            if m.group(5) == "no unlock" and need and his & need:
+                findings.append(Finding(f"{w}: {m.group(1)} touched by {m.group(2)} (elements {'/'.join(sorted(his))}, "
+                                        f"the lock wants {lock}): sides {m.group(3)}/{m.group(4)}, no unlock (its latest "
+                                        "touch)", [line.cite()]))
+        if locks:
+            # A named gate by its name (`LockedElementalGate single`), an unnamed one by its label (`?#2107 single`,
+            # or its lock's address in a build before 2429afb4).
+            shown = {}
+            for k, e in locks.items():
+                lab, _sp, kind = k.rpartition(" ")
+                shown[(lab.split("#")[0] if "#" in lab and not lab.startswith("?") else lab) + " " + kind] = e
+            counts.append("gate elements read: " + ", ".join(f"{k} {e}" for k, e in sorted(shown.items())))
+        counts.append(f"elemental gates: {len(elemental)} ({sum(g.lock == 'dual' for g in elemental)} dual), "
+                      f"{tested} tried by play, {opened_n} opened")
+    refusals = [(w, l, m) for w, lg in games for l, m in lg.find(SWAP_REFUSED)
+                if "not available in online play" in m.group(2)]
+    ran = sum(len(lg.find(SWAP_RAN)) for _w, lg in games if _w != "S")
+    ended = len(run.server.find(SWAP_ENDED_S)) if run.server is not None else 0
+    parked_n = released_n = 0
+    for w, lg in games:
+        open_park: dict[str, Line] = {}
+        for i, raw in enumerate(lg.lines):
+            m = SWAP_PARKED.search(raw)
+            if m:
+                open_park[m.group(1)] = lg.line(i)
+                parked_n += 1
+                continue
+            m = SWAP_RELEASED.search(raw)
+            if m and m.group(1) in open_park:
+                open_park.pop(m.group(1))
+                released_n += 1
+        for label, line in open_park.items():
+            findings.append(Finding(f"{w}: left parked by Swap Zone {label} (no `swap zone {label} released` after "
+                                    f"{when(line)})", [line.cite()]))
+    on = ran or ended or parked_n or any(SWAP_ON_ARG in (p.get("command") or []) for p in
+                                         run.result.get("peers", []) or [] if isinstance(p, dict))
+    if data.swap_zones:
+        counts.append(f"Swap Zone pads: {len(data.swap_zones)}; zones run here {ran}, ended on S {ended}, refused "
+                      f"{len(refusals)}" + ("" if on else " (Swap Zones off in this run: online_swap_zones; the "
+                                                           "refusal is the off state)")
+                      + (f"; other players parked {parked_n}, released {released_n}" if parked_n else ""))
+        for w, l, m in (refusals[:4] if on else []):
+            findings.append(Finding(f"{w}: Swap Zone {m.group(1)} refused with the feature on: {m.group(2)[:120]}",
+                                    [l.cite()]))
+        if not ran and not ended:
+            untested += [f"Swap Zone {n} ({u})" for n, u in data.swap_zones]
+    goes = [(w, m) for w, lg in games for _l, m in lg.find(DOOR_GOES)]
+    stays = [(w, m) for w, lg in games for _l, m in lg.find(DOOR_STAYS)]
+    if goes or stays:
+        counts.append(f"doors: went through with another player {len(goes)} ("
+                      f"{sum(m.group(3) == 'at once' for _w, m in goes)} at once, "
+                      f"{sum(m.group(3) == 'queued' for _w, m in goes)} queued), stayed {len(stays)}")
+    if not counts:
+        return Verdict(name, NOT_TESTED, f"{data.level} has no elemental gate and no Swap Zone pad")
+    if undecided:
+        counts.append("CANNOT DECIDE: " + "; ".join(undecided))
+    if untested:
+        counts.append("NOT TESTED: " + ", ".join(untested))
+    status = FAIL if findings else (PASS if not untested and not undecided else NOT_TESTED)
+    return Verdict(name, status, "; ".join(counts), "", findings)
+
+
+# --- enemies can be killed (W38) -----------------------------------------------------------------------------
+#
+# The owner's third session: "immortal enemies". Per enemy row K (S's key: `a<...>@<g>` placed, `s<...>` spawned):
+# the hits the players landed on their own games (a client's `enemy local health held K (<a> -> <b>, ...)` with b < a:
+# its hit took health off its copy, which S's row holds; and `enemy kill K failed (pending, the replica stays bound)`:
+# its copy's death S did not take) against S's own health of K (S's `hit <p>:<n> <attacker> -> <Name#id> hp <a> ->
+# <b> ...`, the victim tied to K by S's `enemy placed K as <Name#id>`, `enemy K awake on the server as <Name#id>` or
+# `enemy run-time spawn K as <Name#id>`; and `enemy K dead by`). An enemy a client landed hits on that lost no health on
+# S and never died there is a FAIL ("immortal"), and so is each client kill S did not take (with when S's death came,
+# if it did). The page's `attacks started on the server` stays beside it.
+ENEMY_NAMED = re.compile(r"Online: enemy (?:placed (\S+) as (\S+#\d+)|(\S+) awake on the server as (\S+#\d+)|run-time "
+                         r"spawn (\S+) as (\S+#\d+))")
+S_HIT = re.compile(r"Online: hit (\d+):(\d+) \S+ -> (\S+#\d+) hp (-?[\d.]+) -> (-?[\d.]+)")
+S_ENEMY_DEAD = re.compile(r"Online: enemy (\S+) dead by (\S+)")
+LOCAL_HELD = re.compile(r"Online: enemy local health held (\S+) \((-?[\d.]+) -> (-?[\d.]+),")
+KILL_FAILED = re.compile(r"Online: enemy kill (\S+) failed \(pending")
+CLIENT_LIFE_DEAD = re.compile(r"Online: enemy life (\S+) alive -> dead")
+# The players' own hits on S (online/5-hits-that-count dd01982d, kept in the enemies branch's merge): S's `enemy hit
+# report <K> from peer <p>: applied hp <a> -> <b>` or `refused (<why>)`, and a lethal one `enemy kill report <K> from
+# peer <p>: taken (hp <a> -> <b>)`.
+HIT_REPORT = re.compile(r"Online: enemy hit report (\S+) from peer (\d+): (?:applied hp (-?[\d.]+) -> (-?[\d.]+)|refused \((.*)\))")
+KILL_REPORT_TAKEN = re.compile(r"Online: enemy kill report (\S+) from peer (\d+): taken \(hp")
+
+
+def grade_enemy_kills(run: Run) -> Verdict:
+    name = "enemies can be killed"
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    # S: each victim's key at the time of its hit, its health drops and its death
+    named: dict[str, str] = {}
+    lost: dict[str, int] = {}
+    s_hits: dict[str, int] = {}
+    for i, raw in enumerate(run.server.lines):
+        m = ENEMY_NAMED.search(raw)
+        if m:
+            k, nm = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4)) if m.group(3) else \
+                (m.group(5), m.group(6))
+            named[nm] = k
+            continue
+        m = S_HIT.search(raw)
+        if m and m.group(3) in named:
+            k = named[m.group(3)]
+            s_hits[k] = s_hits.get(k, 0) + 1
+            if float(m.group(5)) < float(m.group(4)):
+                lost[k] = lost.get(k, 0) + 1
+    refused_reports: dict[str, list[str]] = {}
+    for line, m in run.server.find(HIT_REPORT):
+        k = m.group(1)
+        if m.group(3) is not None:
+            s_hits[k] = s_hits.get(k, 0) + 1
+            if float(m.group(4)) < float(m.group(3)):
+                lost[k] = lost.get(k, 0) + 1
+        else:
+            refused_reports.setdefault(k, []).append(m.group(5)[:60])
+    dead = {}
+    for line, m in run.server.find(S_ENEMY_DEAD):
+        dead.setdefault(m.group(1), line)
+    for line, m in run.server.find(KILL_REPORT_TAKEN):
+        dead.setdefault(m.group(1), line)
+    order = sorted(run.clients, key=lambda w: (w != "H", w))
+    findings: list[Finding] = []
+    hit_keys: set[str] = set()
+    landed_total = 0
+    for w in order:
+        log = run.clients[w]
+        landed: dict[str, list[Line]] = {}
+        for line, m in log.find(LOCAL_HELD):
+            if float(m.group(3)) < float(m.group(2)):
+                landed.setdefault(m.group(1), []).append(line)
+        here_dead = {}
+        for line, m in log.find(CLIENT_LIFE_DEAD):
+            here_dead.setdefault(m.group(1), []).append(line)
+        for line, m in log.find(KILL_FAILED):
+            k = m.group(1)
+            d = dead.get(k)
+            if d is None or d.t is None or line.t is None:
+                s_part = "S never logged its death"
+            else:
+                s_part = f"S's death of it {(d.t - line.t).total_seconds():+.1f} s from it"
+            after = [l for l in here_dead.get(k, []) if l.t and line.t and l.t >= line.t]
+            h_part = (f"its copy here died {(after[0].t - line.t).total_seconds():.0f} s later" if after
+                      else "its copy here never died")
+            findings.append(Finding(f"{w}: its kill of {k} was not taken (pending, the replica stays bound): {s_part}; "
+                                    f"{h_part}", [line.cite()] + ([d.cite()] if d is not None else [])
+                                    + ([after[0].cite()] if after else [])))
+        for k, lines in landed.items():
+            hit_keys.add(k)
+            landed_total += len(lines)
+            if not lost.get(k) and k not in dead:
+                why = refused_reports.get(k)
+                findings.append(Finding(f"{w}: {k} took {len(lines)} landed hit(s) here and lost no health on S "
+                                        f"(S applied {s_hits.get(k, 0)} hit(s) to it"
+                                        + (f"; S refused {len(why)} report(s): {why[0]}" if why else "") + "): immortal",
+                                        [l.cite() for l in lines[:3]] + [absent(run.server, f"`enemy {k} dead by`")]))
+    counts = (f"{len(hit_keys)} enemy row(s) hit by the players ({landed_total} landed hit(s) on their own games); "
+              f"S took health off {len(lost)} row(s), {len(dead)} died on S")
+    started = attacks_started_line(run)
+    if started:
+        counts += "; " + started
+    if not hit_keys and not findings:
+        return Verdict(name, NOT_TESTED, counts + " (no landed hit on any client's copy of an enemy)")
+    return Verdict(name, FAIL if findings else PASS, counts, "", findings)
+
+
+# --- level changes (W38) ------------------------------------------------------------------------------------
+#
+# The owner's third session: "Map changes are bugged". Per level S opens (`level <g> <path>: open[ (<cause>)]`): who
+# announced it (S's own change from the level's script: `the server's own level change`; else the owner's request,
+# H's `level request ... requested <zone> (...)` before it), each client's load (`level <g> <path>: load`) and its
+# time against S's open, each game's barrier (`barrier <g> released`), a joiner's arrival (`arrival: ...`), both
+# heroes present (on each client the other player's body, `puppet <n> spawned <character> at ... (epoch <e> gen <g>`;
+# on S each peer's puppet, `puppet <n> for peer <p> spawned ... (generation <g>)`) within LEVEL_PRESENT_S of the
+# barrier, each client's hero standing on ground (two `Where: <zone> at x y z` lines in a row within LEVEL_PRESENT_S
+# of the barrier, LEVEL_STAND_DZ apart in height or less; a hero that only falls is named) and no `[error]` line on any
+# game from its load to LEVEL_ERROR_S after its barrier (the hub, `town/...`, is left out). FAIL names what is
+# missing; a part with no line to read (no Where line) is said, not failed.
+LEVEL_OPEN = re.compile(r"Online: level (\d+) (\S+): open(?: \((.*))?")
+LEVEL_REQ = re.compile(r"Online: level request 0x[0-9A-Fa-f]+ requested (\S+) \((.*)")
+LEVEL_BARRIER = re.compile(r"Online: barrier (\d+) released")
+ARRIVAL_LINE = re.compile(r"Online: arrival: (?!armed)(.*)")
+BODY_SPAWNED_GEN = re.compile(r"Online: puppet (\d+) spawned (\S+) at .*\((?:epoch \d+ )?gen (\d+)")
+WHERE_LINE = re.compile(r"(?:Where:|Online: where) (\S+) at (-?[\d.]+)[ ,](-?[\d.]+)[ ,](-?[\d.]+)")
+ERROR_LINE = re.compile(r"\] \[error\] ")
+LEVEL_PRESENT_S = 60.0
+LEVEL_ERROR_S = 30.0
+LEVEL_STAND_DZ = 10.0
+LEVEL_BARRIER_S = 300.0
+
+
+FRAMES_RESUMED = re.compile(r"Online: frames resumed here after ([\d.]+) s stopped")
+
+
+def level_change_numbers(run: Run, oline: Line, g: int, level: str, req: "Line | None") -> str:
+    """W39 item 4, numbers only: seconds from the level request (H's request line, else S's open) to each game's
+    barrier release, and each client's longest stretch with frames stopped (`frames resumed here after <s> s
+    stopped`) between the request and LEVEL_ERROR_S after its barrier."""
+    start = req if req is not None and req.t is not None else oline
+    games = ([("S", run.server)] if run.server is not None else []) + sorted(
+        run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    to_bar, stopped = [], []
+    for w, lg in games:
+        bar = next((l for l, m in lg.find(LEVEL_BARRIER) if int(m.group(1)) == g), None)
+        if bar is not None and bar.t is not None and start.t is not None:
+            to_bar.append(f"{w} {(bar.t - start.t).total_seconds():.1f} s")
+        else:
+            to_bar.append(f"{w} -")
+        if w == "S" or start.t is None:
+            continue
+        end = (bar.t if bar is not None and bar.t is not None else start.t) + timedelta(seconds=LEVEL_ERROR_S)
+        stops = [float(m.group(1)) for l, m in lg.find(FRAMES_RESUMED) if l.t is not None and start.t <= l.t <= end]
+        stopped.append(f"{w} {max(stops):.1f} s" if stops else f"{w} 0 s")
+    return (f"request to in play: {', '.join(to_bar)}; longest frames stopped: {', '.join(stopped) or '-'}")
+
+
+def _secs(a: Line, b: Line) -> float | None:
+    return (b.t - a.t).total_seconds() if a.t is not None and b.t is not None else None
+
+
+def grade_level_changes(run: Run) -> Verdict:
+    name = "level changes"
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    opens = run.server.find(LEVEL_OPEN)
+    if not opens:
+        return Verdict(name, NOT_TESTED, "S opened no level (no `level <g> <path>: open` line)")
+    order = sorted(run.clients, key=lambda w: (w != "H", w))
+    peers = peer_numbers(run)
+    h = run.clients.get("H")
+    counts: list[str] = []
+    findings: list[Finding] = []
+    for k, (oline, om) in enumerate(opens):
+        g, path = int(om.group(1)), om.group(2)
+        level = path.split("/")[-1]
+        if path.startswith("town/"):
+            continue  # the hub before the party's first level: a joiner never loads it, it has no barrier
+        cause = (om.group(3) or "").rstrip(")")
+        nxt = opens[k + 1][0] if k + 1 < len(opens) else None
+        if "the server's own level change" in cause:
+            who = "S's own change (the level's script)"
+        else:
+            reqs = [l for l, m in (h.find(LEVEL_REQ) if h is not None else [])
+                    if m.group(1) == level and oline.t is not None and l.t is not None and
+                    timedelta(seconds=-60) <= oline.t - l.t <= timedelta(seconds=60)]
+            who = "H's request" if reqs else (f"S ({cause[:60]})" if cause else "S")
+        req_line = None
+        if h is not None:
+            near = [l for l, m in h.find(LEVEL_REQ) if m.group(1) == level and oline.t is not None and l.t is not None
+                    and timedelta(0) <= oline.t - l.t <= timedelta(seconds=60)]
+            req_line = near[-1] if near else None
+        parts = [f"{level} (g{g}) by {who} [{level_change_numbers(run, oline, g, level, req_line)}]"]
+        bad: list[str] = []
+        cites: list[str] = [oline.cite()]
+        s_bar = next((l for l, m in run.server.find(LEVEL_BARRIER) if int(m.group(1)) == g), None)
+
+        def errors(log: Log, since: Line, bar: Line | None) -> list[Line]:
+            # [error] lines from the load to LEVEL_ERROR_S after the barrier (or after the load without one)
+            last = (bar.t if bar is not None and bar.t is not None else since.t)
+            if since.t is None or last is None:
+                return []
+            stop = last + timedelta(seconds=LEVEL_ERROR_S)
+            if nxt is not None and nxt.t is not None:
+                stop = min(stop, nxt.t)
+            out = []
+            for i, raw in enumerate(log.lines):
+                if ERROR_LINE.search(raw):
+                    e = log.line(i)
+                    if e.t is not None and since.t <= e.t <= stop:
+                        out.append(e)
+            return out
+        s_errs = errors(run.server, oline, s_bar)
+        if s_errs:
+            bad.append(f"S: {len(s_errs)} [error] line(s) between its open and {LEVEL_ERROR_S:.0f} s after the barrier")
+            cites += [e.cite() for e in s_errs[:3]]
+        for w in order:
+            log = run.clients[w]
+            load = next((l for l, m in log.find(LEVEL_LOAD) if int(m.group(1)) == g), None)
+            if load is None:
+                bad.append(f"{w}: no load of {level}")
+                cites.append(absent(log, f"`level {g} {path}: load`"))
+                continue
+            d = _secs(oline, load)
+            bar = next((l for l, m in log.find(LEVEL_BARRIER) if int(m.group(1)) == g), None)
+            bs = _secs(load, bar) if bar is not None else None
+            part = f"{w} loaded {d:+.1f} s" if d is not None else f"{w} loaded"
+            part += f", in play after {bs:.0f} s" if bs is not None else ", no barrier"
+            if bar is None or (bs is not None and bs > LEVEL_BARRIER_S):
+                bad.append(f"{w}: not in play (no `barrier {g} released`" + (f" within {LEVEL_BARRIER_S:.0f} s)" if bar else ")"))
+                cites.append(bar.cite() if bar else absent(log, f"`barrier {g} released`"))
+            arr = [l for l, m in log.find(ARRIVAL_LINE) if l.t and load.t and l.t >= load.t and
+                   (nxt is None or nxt.t is None or l.t < nxt.t)]
+            if arr:
+                part += f", arrival `{ARRIVAL_LINE.search(arr[0].text).group(1)[:40]}`"
+            errs = errors(log, load, bar)
+            if errs:
+                bad.append(f"{w}: {len(errs)} [error] line(s) between its load and {LEVEL_ERROR_S:.0f} s after the barrier")
+                cites += [e.cite() for e in errs[:3]]
+            if bar is None or bar.t is None:
+                parts.append(part)
+                continue
+            end = bar.t + timedelta(seconds=LEVEL_PRESENT_S)
+            # the other player's body here
+            if len(order) > 1:
+                bodies = [l for l, m in log.find(BODY_SPAWNED_GEN) if int(m.group(3)) == g and l.t and l.t <= end]
+                if not bodies:
+                    bad.append(f"{w}: the other player's body not shown within {LEVEL_PRESENT_S:.0f} s of the barrier")
+                    cites.append(absent(log, f"`puppet <n> spawned <character> ... gen {g}`"))
+            # standing on ground
+            wh = [(l, m) for l, m in log.find(WHERE_LINE) if l.t and bar.t <= l.t <= end]
+            if not wh:
+                part += ", ground not read (no Where line)"
+            else:
+                zs = [float(m.group(4)) for _l, m in wh]
+                stood = any(abs(zs[i + 1] - zs[i]) <= LEVEL_STAND_DZ for i in range(len(zs) - 1))
+                if stood:
+                    part += f", standing at z {zs[-1]:.0f}"
+                elif len(zs) > 1:
+                    bad.append(f"{w}: its hero never stood within {LEVEL_PRESENT_S:.0f} s of the barrier (z "
+                               + " -> ".join(f"{z:.0f}" for z in zs[:5]) + ")")
+                    cites.append(wh[0][0].cite())
+                else:
+                    part += ", ground not read (one Where line)"
+            parts.append(part)
+        # S: each peer's puppet in this generation
+        spawned = {int(m.group(2)) for l, m in run.server.find(PUPPET_FOR) if int(m.group(3)) == g}
+        missing = [p for p in sorted(peers) if p not in spawned]
+        if missing and s_bar is not None:
+            bad.append("S: no puppet for peer " + ", ".join(map(str, missing)) + f" in generation {g}")
+            cites.append(absent(run.server, f"`puppet <n> for peer <p> spawned ... (generation {g})`"))
+        counts.append("; ".join(parts))
+        if bad:
+            findings.append(Finding(f"{level} (g{g}): " + "; ".join(bad), cites[:8]))
+    return Verdict(name, FAIL if findings else PASS, " | ".join(counts), opens[0][0].cite(), findings)
+
+
+# --- cutscenes: each scene played once per game (W38) -----------------------------------------------------
+#
+# The owner's third session: "cutscenes play multiple times". Each game's own scene lines (`scene local <g>/L<n>
+# start cutscene <name> recipient <who> from <how>`: <g> the level's generation, L<n> this game's play number) and S's
+# reports (`scene report cutscene run start from peer <p> (generation <g>, name <id>, play <k>)`): a cutscene that
+# starts more than once on one game within one level generation (a level loaded again is a new generation) is a
+# FAIL naming the scene, the game and each start's time. Conversations are left out: their scene name is always
+# `conversation`, and a player may talk to the same character again. A hard rule on every case (skytest).
+SCENE_START = re.compile(r"Online: scene local (\d+)/L(\d+) start cutscene (\S+)")
+SCENE_REPORT = re.compile(r"Online: scene report cutscene run start from peer (\d+) \(generation (\d+), name (\S+), "
+                          r"play (\d+)\)")
+
+
+def scene_repeats(run: Run) -> tuple[list[str], list["Finding"]]:
+    """Per game, its cutscene starts (counts) and the cutscenes started more than once in one generation."""
+    counts: list[str] = []
+    findings: list[Finding] = []
+    games = ([("S", run.server)] if run.server is not None else []) + sorted(
+        run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    for who, log in games:
+        starts: dict[tuple[str, str], list[Line]] = {}
+        for line, m in log.find(SCENE_START):
+            starts.setdefault((m.group(1), m.group(3)), []).append(line)
+        if who == "S":
+            for line, m in log.find(SCENE_REPORT):
+                starts.setdefault((m.group(2), f"peer {m.group(1)}'s {m.group(3)} play {m.group(4)}"), []).append(line)
+        if not starts:
+            continue
+        n = sum(len(x) for x in starts.values())
+        counts.append(f"{who}: {n} cutscene start(s), {len(starts)} distinct")
+        for (gen, name), lines in sorted(starts.items(), key=lambda kv: kv[1][0].no):
+            if len(lines) > 1:
+                findings.append(Finding(
+                    f"{who}: {name} started {len(lines)} times in level generation {gen} (at "
+                    + ", ".join(when(l) for l in lines) + ")", [l.cite() for l in lines[:4]]))
+    return counts, findings
+
+
+def grade_scenes_once(run: Run) -> Verdict:
+    name = "cutscenes once"
+    counts, findings = scene_repeats(run)
+    if not counts:
+        return Verdict(name, NOT_TESTED, "no game logged a cutscene start (`scene local <g>/L<n> start cutscene`)")
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), "", findings)
+
+
+# --- coins shared: every coin paid once to every player (W38) --------------------------------------------
+#
+# The owner's third session: "coins from broken stuff still doesnt collect for both players". Per coin key K (its
+# place's key, or a drop's `s<source>.<spill>#<slot>`): exactly one game takes it (`coin taken here K (... gold a ->
+# b, +A ...)`), S grants exactly one claim for it (`coin claim K peer <p> granted`, <p> the taker), every other client
+# pays it once (`coin paid here K (... gold a' -> b', +A')`) with A' == A and removes its own copy (`coin removed here
+# K (taken by another player and paid here: ...)`), and over all K the money each client gained from coins is the same.
+# Not tested with one client, or when no coin was taken; a K taken on two games, paid twice or not at all, paid a
+# different amount, not removed, or granted other than once fails, naming the coin and its lines.
+COIN_GOLD = re.compile(r"gold (\d+) -> (\d+), ([+-]\d+)")
+COIN_REMOVED_PAID = re.compile(r"Online: coin removed here (\S+) \(taken by another player and paid here")
+COIN_GRANTED = re.compile(r"Online: coin claim (\S+) peer (\d+) granted")
+
+
+def coin_amount(line: Line) -> int | None:
+    m = COIN_GOLD.search(line.text)
+    return int(m.group(3)) if m else None
+
+
+def grade_coins_shared(run: Run) -> Verdict:
+    """Every coin taken once, granted once by S, paid once on every other client with the same amount and removed
+    there; each client's coin money the same."""
+    name = "coins shared"
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    order = sorted(run.clients, key=lambda w: (w != "H", w))
+    if len(order) < 2:
+        return Verdict(name, NOT_TESTED, "one client in this run: no other player to pay")
+    takes: dict[str, list[tuple[str, Line]]] = {}
+    pays: dict[str, list[tuple[str, Line]]] = {}
+    removed: dict[str, set[str]] = {w: set() for w in order}
+    for w in order:
+        log = run.clients[w]
+        for line, m in log.find(COIN_TAKEN):
+            takes.setdefault(m.group(1), []).append((w, line))
+        for line, m in log.find(COIN_PAID):
+            pays.setdefault(m.group(1), []).append((w, line))
+        removed[w] = {m.group(1) for _l, m in log.find(COIN_REMOVED_PAID)}
+    grants: dict[str, list[tuple[int, Line]]] = {}
+    for line, m in run.server.find(COIN_GRANTED):
+        grants.setdefault(m.group(1), []).append((int(m.group(2)), line))
+    if not takes:
+        return Verdict(name, NOT_TESTED, f"no coin was taken on any client (S granted {len(grants)} claim(s))")
+    peer_of = {w: p for p, w in peer_numbers(run).items()}
+    money = {w: 0 for w in order}
+    findings: list[Finding] = []
+    ok = 0
+    for k in sorted(takes):
+        t = takes[k]
+        bad: list[str] = []
+        cites: list[str] = []
+        if len(t) > 1:
+            bad.append(f"taken on {len(t)} games ({', '.join(w for w, _l in t)})")
+        taker, tline = t[0]
+        cites.append(f"{taker}: {tline.cite()}")
+        a = coin_amount(tline)
+        if a is None:
+            bad.append(f"its take on {taker} has no gold change")
+        else:
+            money[taker] += a
+        g = grants.get(k, [])
+        if len(g) != 1:
+            bad.append(f"S granted it {len(g)} time(s)")
+            cites += [l.cite() for _p, l in g[:2]] or [absent(run.server, f"`coin claim {k} peer <p> granted`")]
+        elif peer_of.get(taker) is not None and g[0][0] != peer_of[taker]:
+            bad.append(f"S granted it to peer {g[0][0]}, not to its taker {taker} (peer {peer_of[taker]})")
+        for w in order:
+            if w == taker:
+                continue
+            mine = [l for who, l in pays.get(k, []) if who == w]
+            if len(mine) != 1:
+                bad.append(f"paid {len(mine)} time(s) on {w}")
+                cites += [f"{w}: {l.cite()}" for l in mine[:2]] or [absent(run.clients[w], f"`coin paid here {k}`")]
+                continue
+            pa = coin_amount(mine[0])
+            if pa is None:
+                bad.append(f"its pay on {w} has no gold change")
+            else:
+                money[w] += pa
+                if a is not None and pa != a:
+                    bad.append(f"paid {pa:+d} on {w}, taken {a:+d} on {taker}")
+                    cites.append(f"{w}: {mine[0].cite()}")
+            if k not in removed[w]:
+                bad.append(f"its copy on {w} not removed")
+                cites.append(absent(run.clients[w], f"`coin removed here {k} (taken by another player and paid here`"))
+        if bad:
+            findings.append(Finding(f"coin {k}: " + "; ".join(bad), cites))
+        else:
+            ok += 1
+    counts = (f"{len(takes)} coin(s) taken ({', '.join(f'{w} {sum(1 for t in takes.values() if t[0][0] == w)}' for w in order)}); "
+              f"{ok} paid once to every player with the same amount; coin money: "
+              + ", ".join(f"{w} {money[w]:+d}" for w in order))
+    if len(set(money.values())) > 1:
+        findings.append(Finding("the players' coin money differs: " + ", ".join(f"{w} {money[w]:+d}" for w in order),
+                                [f"{w}: {takes[k][0][1].cite()}" for k in list(takes)[:1] for w in order[:1]]))
+    first = next(iter(takes.values()))[0][1]
+    return Verdict(name, FAIL if findings else PASS, counts, first.cite(), findings)
+
+
+# --- together: D near H where H acted (the second player follows the first) ------------------------------
+#
+# With the follow on (D's `Online: auto follow the host (peer 1) (script)`: `online_auto_follow on` after the
+# party is in), the game moves D's hero next to H's whenever it is farther than FOLLOW_NEAR. Per stop where H
+# acted (H's first `LEVELPASS act v<n>_<k>` line), S's puppet poses (`puppet <n> pose <seq> at <x,y,z>`, every
+# 2 s; the puppet of each peer from `puppet <n> for peer <p> spawned ... (generation <g>)`: the slots swap at a
+# level change) say whether D stood within FOLLOW_NEAR of H within FOLLOW_WINDOW after it, so the enemies and
+# the loot rows are read where both players stand. Without the follow: not tested (D stayed where it entered).
+FOLLOW_NEAR = 400.0           # the follow moves the hero when it is farther than this (client/auto_follow.h)
+FOLLOW_WINDOW = timedelta(seconds=5)   # a move a second at most, poses every 2 s
+POSE_PAIR = timedelta(seconds=1.5)     # two puppets' poses this close in time are compared
+FOLLOW_ON = re.compile(r"Online: auto follow the host \(peer (\d+)\) \(script\)")
+PUPPET_FOR = re.compile(r"Online: puppet (\d+) for peer (\d+) spawned at .*\(generation (\d+)\)")
+PUPPET_POSE = re.compile(r"Online: puppet (\d+) pose \d+ at (-?[\d.]+),(-?[\d.]+),(-?[\d.]+) ")
+H_ACT = re.compile(r"Input script: LEVELPASS act (v\d+)_\d+ ")
+# A sweep step its deadline skipped (`Dev: <command> <target> ... skipped: the sweep's time is up`), and the act it
+# belongs to (H's `LEVELPASS act <v>_<i> <kind> <name> ...` before it).
+ACT_LINE = re.compile(r"Input script: LEVELPASS act (v\d+_\d+) (\S+) (\S+)")
+STEP_SKIPPED = re.compile(r"Dev: \S+ .* skipped: the sweep's time is up")
+# The rows an act's kind would have tested (W13): a pickup's collect and coins, a chest's or a crate's spill, a
+# fight's enemies, a trigger's or a talk's scene and the enemies it releases.
+KIND_ROWS = {"pickup": ("pickups", "coins"), "interact": ("loot", "pickups"), "attack": ("loot", "enemies"),
+             "fight": ("enemies",), "enter": ("cutscenes", "enemies"), "talk": ("cutscenes",)}
+
+
+def skipped_acts(h: Log | None) -> list[tuple[str, str, str, Line]]:
+    """Each act of H's sweep whose step its deadline skipped: (label, kind, name, the skip line), once per act."""
+    out: list[tuple[str, str, str, Line]] = []
+    if h is None:
+        return out
+    current = None
+    for i, raw in enumerate(h.lines):
+        m = ACT_LINE.search(raw)
+        if m:
+            current = (m.group(1), m.group(2), m.group(3))
+            continue
+        if "LEVELPASS visit" in raw or "LEVELPASS phase" in raw:
+            current = None
+            continue
+        if current is not None and STEP_SKIPPED.search(raw) and (not out or out[-1][0] != current[0]):
+            out.append((*current, h.line(i)))
+    return out
+
+
+def peer_poses(server: Log) -> dict[int, list[tuple[datetime, tuple[float, float, float], Line]]]:
+    """Each peer's poses on S, by the puppet each pose names and that puppet's peer at the time."""
+    owner: dict[int, int] = {}
+    out: dict[int, list] = {}
+    for i, raw in enumerate(server.lines):
+        m = PUPPET_FOR.search(raw)
+        if m:
+            owner[int(m.group(1))] = int(m.group(2))
+            continue
+        m = PUPPET_POSE.search(raw)
+        if m and int(m.group(1)) in owner:
+            line = server.line(i)
+            if line.t is not None:
+                out.setdefault(owner[int(m.group(1))], []).append(
+                    (line.t, (float(m.group(2)), float(m.group(3)), float(m.group(4))), line))
+    return out
+
+
+def grade_together(run: Run) -> Verdict:
+    """Per stop where H acted: was D within FOLLOW_NEAR of H (S's poses) in the seconds after?"""
+    d, h = run.clients.get("D"), run.clients.get("H")
+    if d is None or h is None:
+        return Verdict("together", NOT_TESTED, "one client in this run (no second player to follow)")
+    on = d.find(FOLLOW_ON)
+    if not on:
+        return Verdict("together", NOT_TESTED, "D did not follow H (no `auto follow the host ... (script)` on D: "
+                       "--d-stays, or a build without online_auto_follow): D stayed where it entered")
+    if run.server is None:
+        return Verdict("together", NOT_TESTED, "no server log: no poses", on[0][0].cite())
+    peers = {w: p for p, w in peer_numbers(run).items()}
+    poses = peer_poses(run.server)
+    hp, dp = poses.get(peers.get("H", -1), []), poses.get(peers.get("D", -1), [])
+    stops: dict[str, Line] = {}
+    # A step the sweep's deadline skipped is no stop where H acted (W14: ww1 20261119-124636's v19, v22, v24).
+    skipped = {label for label, _k, _n, _l in skipped_acts(h)}
+    for line, m in h.find(H_ACT):
+        full = ACT_LINE.search(line.text)
+        if full is not None and full.group(1) in skipped:
+            continue
+        if line.t is not None and (on[0][0].t is None or line.t >= on[0][0].t):
+            stops.setdefault(m.group(1), line)
+    if not stops:
+        return Verdict("together", NOT_TESTED, "H acted at no stop after D's follow began", on[0][0].cite())
+    near, apart, unknown = [], [], []
+    findings: list[Finding] = []
+    for label, act in stops.items():
+        win_h = [p for p in hp if act.t <= p[0] <= act.t + FOLLOW_WINDOW]
+        win_d = [p for p in dp if act.t <= p[0] <= act.t + FOLLOW_WINDOW]
+        pairs = [(math.dist(a[1][:2], b[1][:2]), a, b) for a in win_h for b in win_d if abs(a[0] - b[0]) <= POSE_PAIR]
+        if not pairs:
+            unknown.append(label)
+            continue
+        dist, a, b = min(pairs, key=lambda x: x[0])
+        if dist <= FOLLOW_NEAR:
+            near.append(f"{label} ({dist:.0f})")
+        else:
+            apart.append(f"{label} ({dist:.0f})")
+            findings.append(Finding(f"{label}: D was {dist:.0f} from H while H acted (the follow keeps it within "
+                                    f"{FOLLOW_NEAR:.0f})", [act.cite(), a[2].cite(), b[2].cite()]))
+    counts = (f"D near H (within {FOLLOW_NEAR:.0f} on S's poses) at {len(near)} of {len(stops)} stop(s) where H acted"
+              + (f"; apart at {len(apart)}" if apart else "") + (f"; no poses at {len(unknown)}" if unknown else ""))
+    notes = [f"near: {', '.join(near)}"] if near else []
+    notes += [f"no pose pair within {POSE_PAIR.seconds + 0.5:.1f} s: {', '.join(unknown)}"] if unknown else []
+    status = FAIL if findings else (PASS if near else NOT_TESTED)
+    return Verdict("together", status, counts, on[0][0].cite(), findings, notes)
+
+
+# --- objectives: S's objective rows against each client's applies (online/6-progress-apply, the objectives' author's
+# grading, logs/progress-apply-notes.txt) ----------------------------------------------------------------------------
+# With online_shared_objectives on (each client's `objectives shared for the session (S's online_shared_objectives`),
+# per generation (each log's `objective list <n> tracker <t> gen <g>`, the level's list) and objective id: S's
+# sequence of `objective <id> <n>/<m> (S)[ active]` equals each client's `objective applied <id> <n>/<m>[ (active)]`,
+# each within OBJECTIVE_APPLY_S of S's; none of `objective <id> at ... after its apply, S has`, `objective apply
+# refused` or `objective <id> own <action> run here` for an id S has a row for in that generation; each S row going
+# inactive after it was active has an `objective cancelled <id>` on every client. Off: not tested.
+OBJECTIVE_APPLY_S = timedelta(seconds=10)
+OBJ_LIST = re.compile(r"Online: objective list \d+ tracker \S+ gen (\d+)")
+OBJ_S_ROW = re.compile(r"Online: objective ([0-9a-f]{8}) (\d+)/(\d+) \(S\)( active)?")
+OBJ_APPLIED = re.compile(r"Online: objective applied ([0-9a-f]{8}) (\d+)/(\d+)( \(active\))?")
+OBJ_SHARED = re.compile(r"Online: objectives shared for the session \(S's online_shared_objectives")
+OBJ_AFTER = re.compile(r"Online: objective ([0-9a-f]{8}) at .* after its apply, S has")
+OBJ_REFUSED = re.compile(r"Online: objective apply refused ([0-9a-f]{8})")
+OBJ_OWN_RUN = re.compile(r"Online: objective ([0-9a-f]{8}) own (\S+) run here")
+OBJ_CANCELLED = re.compile(r"Online: objective cancelled ([0-9a-f]{8})")
+
+
+def objective_lines(log: Log, rx: re.Pattern) -> list[tuple[int, Line, re.Match]]:
+    """Each line of `rx` with the generation of the objective list this game had then (0 before any)."""
+    gen, out = 0, []
+    for i, raw in enumerate(log.lines):
+        m = OBJ_LIST.search(raw)
+        if m:
+            gen = int(m.group(1))
+            continue
+        m = rx.search(raw)
+        if m:
+            out.append((gen, log.line(i), m))
+    return out
+
+
+def grade_objectives(run: Run) -> Verdict:
+    """S's objective rows against each client's applies, per generation and objective (the objectives' author's
+    grading)."""
+    if run.server is None:
+        return Verdict("objectives", NOT_TESTED, "no server log in this run folder")
+    shared = {who: log.find(OBJ_SHARED) for who, log in run.clients.items()}
+    if not any(shared.values()):
+        return Verdict("objectives", NOT_TESTED, "online_shared_objectives is off in this run (no client logged "
+                       "`objectives shared for the session`): each game runs its own objectives")
+    rows: dict[tuple[int, str], list[tuple[str, Line]]] = {}
+    for gen, line, m in objective_lines(run.server, OBJ_S_ROW):
+        rows.setdefault((gen, m.group(1)), []).append((f"{m.group(2)}/{m.group(3)}{' active' if m.group(4) else ''}",
+                                                      line))
+    findings: list[Finding] = []
+    order = sorted(run.clients, key=lambda w: (w != "H", w))
+    counts = [f"S rows {sum(len(v) for v in rows.values())} for {len(rows)} objective(s) in "
+              f"{len({g for g, _i in rows})} level(s)"]
+    for who in order:
+        log = run.clients[who]
+        applied: dict[tuple[int, str], list[tuple[str, Line]]] = {}
+        for gen, line, m in objective_lines(log, OBJ_APPLIED):
+            applied.setdefault((gen, m.group(1)), []).append(
+                (f"{m.group(2)}/{m.group(3)}{' active' if m.group(4) else ''}", line))
+        counts.append(f"{who} applied {sum(len(v) for v in applied.values())}")
+        for key in sorted(set(rows) | set(applied)):
+            s_seq, c_seq = rows.get(key, []), applied.get(key, [])
+            words = (f"generation {key[0]} objective {key[1]}: S {[v for v, _l in s_seq]}, {who} "
+                     f"{[v for v, _l in c_seq]}")
+            if [v for v, _l in s_seq] != [v for v, _l in c_seq]:
+                cite = [l.cite() for _v, l in s_seq[:3]] + [l.cite() for _v, l in c_seq[:3]]
+                findings.append(Finding(f"{who}'s applies differ from S's rows: {words}",
+                                        cite or [absent(log, "`objective applied`")]))
+                continue
+            late = [(s, c) for (_v, s), (_w, c) in zip(s_seq, c_seq)
+                    if s.t is not None and c.t is not None and c.t - s.t > OBJECTIVE_APPLY_S]
+            if late:
+                s, c = late[0]
+                findings.append(Finding(f"{who} applied S's row more than {OBJECTIVE_APPLY_S.seconds} s late "
+                                        f"({(c.t - s.t).total_seconds():.1f} s): {words}", [s.cite(), c.cite()]))
+        for gen, line, m in objective_lines(log, OBJ_AFTER):
+            findings.append(Finding(f"{who}: objective {m.group(1)} differs from S's after its apply", [line.cite()]))
+        for gen, line, m in objective_lines(log, OBJ_REFUSED):
+            findings.append(Finding(f"{who}: S's objective row {m.group(1)} was refused here", [line.cite()]))
+        for gen, line, m in objective_lines(log, OBJ_OWN_RUN):
+            if (gen, m.group(1)) in rows:
+                first = rows[(gen, m.group(1))][0][1]
+                findings.append(Finding(f"{who} ran its own {m.group(2)} of objective {m.group(1)}, for which S has a "
+                                        f"row in generation {gen}", [line.cite(), first.cite()]))
+        cancelled = {(gen, m.group(1)) for gen, _l, m in objective_lines(log, OBJ_CANCELLED)}
+        for key, seq in rows.items():
+            went = next((l for (a, _la), (b, l) in zip(seq, seq[1:]) if a.endswith(" active")
+                         and not b.endswith(" active")), None)
+            if went is not None and key not in cancelled:
+                findings.append(Finding(f"{who}: S's objective {key[1]} went inactive (generation {key[0]}) and "
+                                        "nothing cancelled it here", [went.cite(), absent(log, "`objective cancelled`")]))
+    example = next((l.cite() for seq in rows.values() for _v, l in seq), "")
+    # Each objective's sequences on S and each client (the row's evidence, PASS or FAIL).
+    notes = []
+    for key in sorted(rows):
+        per = [f"S {[v for v, _l in rows[key]]}"]
+        for who in order:
+            seq = [f"{m.group(2)}/{m.group(3)}{' active' if m.group(4) else ''}"
+                   for gen, _l, m in objective_lines(run.clients[who], OBJ_APPLIED) if (gen, m.group(1)) == key]
+            per.append(f"{who} {seq}")
+        notes.append(f"generation {key[0]} objective {key[1]}: " + ", ".join(per))
+    return Verdict("objectives", FAIL if findings else PASS, "; ".join(counts), example, findings, notes)
+
+
+# --- level pieces: run-time movers (ww1's travelling islands; docs/online-6.md "Spawned movers") ---------------
+#
+# With online_island_spawns on, S tracks each island spawner (`world tracked spawner_fires <Name#id> (...)`) and
+# fires its islands (`world island spawner <Name#id> fired <n> (tick <t>): <island>`); each client with the area
+# loaded (its own `world tracked spawner_fires` of that spawner) makes S's n-th island (`made <n> here (S's <m>,
+# <a> ticks after S)`) or adopts it (`adopted <k> of S's <m>`). Each island's place once a second
+# (`world island <spawner> #<n> at <x,y,z>`) and its end (`... #<n> gone (lived <ms> ms)`) on S and the client.
+# Graded (the movers agent's rule, logs/pieces-notes.txt; calibrated on islands-probe-ww1 20261119-042921: S fired
+# 18, H made the same 18, places 1.6 apart typically): every fire has its island on each such client within
+# PIECE_MADE_S, matched places (within PIECE_PAIR_S of each other) within PIECE_NEAR, each S `gone` followed on the
+# client within PIECE_MADE_S, none of the client's warnings. Off (S tracked no island spawner on a level whose
+# data has them): not tested, each game runs its own islands.
+PIECE_MADE_S = timedelta(seconds=1)
+PIECE_PAIR_S = timedelta(seconds=0.5)
+PIECE_NEAR = 12.0           # W31: about 10 (the probe run: 1.6 typically, 10.1 at most); was 64
+PIECE_TRACKED = re.compile(r"Online: world tracked spawner_fires ([^#\s]+)#")
+PIECE_FIRED = re.compile(r"Online: world island spawner ([^#\s]+)#\S* fired (\d+) \(tick")
+PIECE_MADE = re.compile(r"Online: world island spawner ([^#\s]+)#\S* made (\d+) here")
+PIECE_ADOPTED = re.compile(r"Online: world island spawner ([^#\s]+)#\S* adopted (\d+) of S's (\d+)")
+PIECE_AT = re.compile(r"Online: world island ([^#\s]+)#\S* #(\d+) at (-?[\d.]+),(-?[\d.]+),(-?[\d.]+)")
+PIECE_GONE = re.compile(r"Online: world island ([^#\s]+)#\S* #(\d+) gone")
+PIECE_BAD = re.compile(r"Online: world island spawner \S+ (?:fire made no island here|has no spawn message of its own|"
+                       r"spawn for S's \d+ not delivered inside the send).*")
+
+
+def grade_pieces(run: Run, data: "LevelData | None" = None) -> Verdict:
+    """S's island fires against each client's islands: made in time, in the same place, gone together."""
+    if run.server is None:
+        return Verdict("level pieces", NOT_TESTED, "no server log in this run folder")
+    tracked = {m.group(1) for _l, m in run.server.find(PIECE_TRACKED)}
+    if not tracked:
+        movers = data.movers if data is not None else []
+        if movers:
+            return Verdict("level pieces", NOT_TESTED, f"not tested: each game runs its own islands (S tracked no island "
+                           f"spawner, online_island_spawns off; the level's data has {len(movers)}: "
+                           f"{', '.join(movers[:5])})")
+        return Verdict("level pieces", NOT_TESTED, "S tracked no island spawner (the level has no run-time movers, or "
+                       "online_island_spawns is off)")
+    fires = [(line, m.group(1), int(m.group(2))) for line, m in run.server.find(PIECE_FIRED)]
+    if not fires:
+        return Verdict("level pieces", NOT_TESTED, f"S tracked {len(tracked)} island spawner(s) and fired none in this "
+                       "run (their start trigger was not entered)", run.server.find(PIECE_TRACKED)[0][0].cite())
+    s_at = [(line, m) for line, m in run.server.find(PIECE_AT)]
+    s_gone = [(line, m) for line, m in run.server.find(PIECE_GONE)]
+    counts = [f"S fired {len(fires)} island(s) of {len({sp for _l, sp, _n in fires})} spawner(s)"]
+    findings: list[Finding] = []
+    for who in sorted(run.clients, key=lambda w: (w != "H", w)):
+        log = run.clients[who]
+        here = {m.group(1) for _l, m in log.find(PIECE_TRACKED)}
+        made = {(m.group(1), int(m.group(2))): line for line, m in log.find(PIECE_MADE)}
+        adopted = [(m.group(1), int(m.group(3)), line) for line, m in log.find(PIECE_ADOPTED)]
+        mine = [(line, sp, n) for line, sp, n in fires if sp in here]
+        late, missing, ok = [], [], 0
+        for line, sp, n in mine:
+            got = made.get((sp, n))
+            if got is None:
+                cover = next((a for a in adopted if a[0] == sp and a[1] >= n), None)
+                if cover is None:
+                    missing.append(f"{line.cite()}; {absent(log, f'`{sp} made {n} here` or an adoption')}")
+                else:
+                    ok += 1
+            elif got.t and line.t and abs(got.t - line.t) > PIECE_MADE_S:
+                late.append(f"{line.cite()}; {got.cite()} ({abs((got.t - line.t).total_seconds()):.2f} s)")
+            else:
+                ok += 1
+        c_at = log.find(PIECE_AT)
+        dists, far = [], []
+        # Each client place against S's nearest line of the same island in time (within PIECE_PAIR_S). Interpolating
+        # between S's once-a-second lines was tried (W31) and is worse on the probe run (median 6.5, max 13.9 against
+        # 1.6 and 10.1): an island bobs and curves between two lines, and S's and the client's lines are written at
+        # nearly the same moment anyway.
+        for sl, sm in s_at:
+            pair = [(cl, cm) for cl, cm in c_at if cm.group(1) == sm.group(1) and cm.group(2) == sm.group(2) and
+                    cl.t and sl.t and abs(cl.t - sl.t) <= PIECE_PAIR_S]
+            if not pair:
+                continue
+            cl, cm = min(pair, key=lambda p: abs(p[0].t - sl.t))
+            d = math.dist(tuple(float(sm.group(i)) for i in (3, 4, 5)), tuple(float(cm.group(i)) for i in (3, 4, 5)))
+            dists.append(d)
+            if d > PIECE_NEAR:
+                far.append(f"{sl.cite()}; {cl.cite()} ({d:.1f} apart)")
+        c_gone = log.find(PIECE_GONE)
+        gone_missing = []
+        for sl, sm in s_gone:
+            if sm.group(1) not in here:
+                continue
+            if not any(cm.group(1) == sm.group(1) and cm.group(2) == sm.group(2) and cl.t and sl.t and
+                       abs(cl.t - sl.t) <= PIECE_MADE_S for cl, cm in c_gone):
+                gone_missing.append(f"{sl.cite()}; {absent(log, f'`{sm.group(1)} #{sm.group(2)} gone` within 1 s')}")
+        bad = [l.cite() for l, _m in log.find(PIECE_BAD)]
+        med = sorted(dists)[len(dists) // 2] if dists else None
+        counts.append(f"{who}: tracked {len(here)} spawner(s); made {ok} of {len(mine)} within 1 s; places "
+                      f"{len(dists)} pair(s), {len(far)} over {PIECE_NEAR:.0f}"
+                      + (f" (median {med:.1f}, max {max(dists):.1f})" if dists else "")
+                      + f"; gone {len(s_gone) - len(gone_missing)} of S's {len([1 for _l, m in s_gone if m.group(1) in here])}")
+        for what, lines in ((f"{who}: {len(missing)} of S's island fires never made here", missing),
+                            (f"{who}: {len(late)} island(s) made more than 1 s from S's fire", late),
+                            (f"{who}: {len(far)} island place(s) more than {PIECE_NEAR:.0f} from S's", far),
+                            (f"{who}: {len(gone_missing)} island end(s) of S not followed here within 1 s", gone_missing),
+                            (f"{who}: {len(bad)} island warning(s)", bad)):
+            if lines:
+                findings.append(Finding(what, lines[:8]))
+    status = FAIL if findings else PASS
+    return Verdict("level pieces", status, "; ".join(counts), fires[0][0].cite(), findings)
+
+
+# --- loot (chests and enemy drops: the spill) -----------------------------------------------------------
+
+HOOKS_OFF = re.compile(r"Online: loot hooks off \(online_shared_loot\)")
+# A carrier's key in the loot lines: a world ref `w<mID>` (a client's line adds `.<name hash>`), or a run-time
+# enemy's row `s<spawner digest>.<tag hash>#<ordinal>` (the game names a run-time enemy's drop by its row since
+# batch 11 run 4: sibling spawns of one spawner differ only in the ordinal).
+CARRIER = r"(w[0-9a-f]{8}|s[0-9a-f]{8}\.[0-9a-f]{8}#\d+)"
+W_TAIL = r"(?:\.[0-9a-f]+)?"  # a world ref's name hash in a client's line (none after a run-time row)
+S_OBLIGED = re.compile(r"Online: spill obliged " + CARRIER + r" ([0-9a-f]+) to peer (\d+) \(obligation (\d+)\)")
+S_ENDED = re.compile(r"Online: spill obligation (\d+) " + CARRIER + r" [0-9a-f]+ to peer (\d+) ended (.+)$")
+# S's account per client, at the session's end, and each client's own (the measure of delivery: batch 8 runs 7
+# and 8, the page had counted a client's own run that matched S's selection as lost: "1 of 60", "0 of 16").
+S_SUMMARY = re.compile(r"Online: spill obligations to peer (\d+): (\d+) made, (\d+) completed, (\d+) ended otherwise, "
+                       r"(\d+) open")
+DELIVERY = re.compile(r"Online: loot delivery: (\d+) obligations, (\d+) delivered in full, (\d+) differ, (\d+) short, "
+                      r"(\d+) unfinished, (\d+) own runs without S's obligation \(S's selections give (\d+) items, "
+                      r"here spawned (\d+)\)")
+# The carrier S's selection names (its spill line: `spill <Name> w<key>.<hash> <n>#<k> selected ...`).
+S_SELECTED = re.compile(r"Online: spill (\S+) " + CARRIER + W_TAIL + r" \S+ selected (\d+) items")
+# A client's end of one obligation: run in full or matched by its own run, short, differing, or expired.
+C_FULFILLED = re.compile(r"Online: spill fulfilled (?:\S+ )?" + CARRIER + W_TAIL + r" \S+ \(S selected (\d+) items, "
+                         r"(?:here spawned (\d+)|this game's own run matched)")
+C_DIFFERS = re.compile(r"Online: spill differs (?:\S+ )?" + CARRIER + W_TAIL + r" \S+ \((.*)\)$")
+C_EXPIRED = re.compile(r"Online: spill expired (?:\S+ )?" + CARRIER + W_TAIL + r" \S+ \((.*?) after \d+ s")
+C_SPILL = r"Online: spill \S+ (?:\S+ )?{key}[.\s]"
+# The client's copies asleep there, by name: a replica or a bind waiting for its wake, an authored sleep.
+C_ASLEEP_KEY = re.compile(r"Online: enemy (?:replica " + KEY + r" at \S+ asleep|bind " + KEY + r" .*waits \(asleep here)")
+C_SPAWN_NAME = re.compile(r"Online: enemy spawn " + KEY + r" as ([^#\s]+)")
+C_SLEPT = re.compile(r"Online: authored sleep \S+ ([^#\s]+)#\S* .*slept")
+ASLEEP, NO_ROW, OTHER = "asleep here", "no row here", "other"
+UNNAMED = ("(null)", "?", "-")
+
+
+def asleep_names(run: Run, log: Log) -> set[str]:
+    """The names of the enemies whose copy slept on this client at some time (by name: S's enemy lines and the
+    client's own spawn lines give each key's name)."""
+    names: dict[str, str] = {}
+    if run.server is not None:
+        for _line, m in run.server.find(S_PLACED):
+            names.setdefault(m.group(2), m.group(4).split("#")[0])
+    for _line, m in log.find(C_SPAWN_NAME):
+        names.setdefault(m.group(1), m.group(3))
+    out = {m.group(1) for _line, m in log.find(C_SLEPT)}
+    for _line, m in log.find(C_ASLEEP_KEY):
+        key = m.group(1) or m.group(3)
+        if key in names:
+            out.add(names[key])
+    return out
+
+
+def grade_loot(run: Run) -> Verdict:
+    """Per client: its own `loot delivery` account and S's `spill obligations to peer` (the measure: a client's
+    own run that matched S's selection is a full delivery, as both say); every obligation not delivered in
+    full names its carrier and why: asleep here (its copy slept on that client), no row here (S's entity not
+    bound there), or other (a differing own run, a short spawn, no line)."""
+    own = {who: log.find(OWN_DROP) for who, log in run.clients.items()}
+    own_note = ", ".join(f"{who} {len(v)}" for who, v in own.items() if v)
+    notes = [f"own drops collected with no S key (this game's own selection): {own_note}"] if own_note else []
+    if run.server is None:
+        return Verdict("loot", NOT_TESTED, "no server log in this run folder", notes=notes)
+    off = run.server.find(HOOKS_OFF)
+    if off:
+        return Verdict("loot", NOT_TESTED, "shared loot is off in this run (each game drops its own)", off[0][0].cite(),
+                       notes=notes)
+    obliged = run.server.find(S_OBLIGED)
+    if not obliged:
+        return Verdict("loot", NOT_TESTED, "S obliged no spill to a client (no chest or drop shared in this run)",
+                       notes=notes)
+    peers = peer_numbers(run)
+    summary = {int(m.group(1)): (line, m) for line, m in run.server.find(S_SUMMARY)}
+    carrier = {m.group(2): m.group(1) for _line, m in run.server.find(S_SELECTED)}
+    counts: list[str] = []
+    findings: list[Finding] = []
+    whole = True
+    for who in sorted(run.clients, key=lambda w: (w != "H", w)):
+        log = run.clients[who]
+        peer = next((p for p, w in peers.items() if w == who), None)
+        mine = [(line, m) for line, m in obliged if peer is not None and int(m.group(3)) == peer]
+        if not mine:
+            continue
+        acct = log.find(DELIVERY)
+        s_sum = summary.get(peer)
+        if acct:
+            d = acct[-1][1]
+            text = (f"{who}: {d.group(1)} obligations, {d.group(2)} delivered in full, {d.group(3)} differ, {d.group(4)} "
+                    f"short, {d.group(5)} unfinished (its `loot delivery`; S's selections {d.group(7)} items, spawned "
+                    f"there {d.group(8)})")
+            whole = whole and d.group(1) == d.group(2)
+        else:
+            text = f"{who}: no `loot delivery` line (its session did not end there); {len(mine)} obligations on S"
+            whole = False
+        if s_sum:
+            m = s_sum[1]
+            text += f"; S to peer {peer}: {m.group(2)} made, {m.group(3)} completed, {m.group(4)} ended otherwise"
+            whole = whole and m.group(2) == m.group(3)
+        else:
+            text += f"; S logged no `spill obligations to peer {peer}` line"
+            whole = False
+        counts.append(text)
+        full = {m.group(1) for _l, m in log.find(C_FULFILLED) if m.group(3) is None or int(m.group(3)) >= int(m.group(2))}
+        short = {m.group(1): (line, m) for line, m in log.find(C_FULFILLED)
+                 if m.group(3) is not None and int(m.group(3)) < int(m.group(2))}
+        differs = {m.group(1): (line, m) for line, m in log.find(C_DIFFERS)}
+        expired = {m.group(1): (line, m) for line, m in log.find(C_EXPIRED)}
+        sleepers = asleep_names(run, log)
+        groups: dict[str, list[str]] = {}
+        for line, m in mine:
+            key = m.group(1)
+            if key in full:
+                continue
+            name = carrier.get(key, "?")
+            label = f"{key} (obligation {m.group(4)}) carrier {name}"
+            if key in expired:
+                eline, em = expired[key]
+                why = em.group(2)
+                # An unnamed carrier ((null), ?) is never matched by name: its sleep is not known here.
+                if "not resolved" in why and name in sleepers and name not in UNNAMED:
+                    kind = ASLEEP
+                    detail = f"its copy slept here; {eline.cite()}"
+                elif "not resolved" in why:
+                    kind = NO_ROW
+                    detail = f"S's entity is not bound here; {eline.cite()}"
+                else:
+                    kind = OTHER
+                    detail = f"{why}; {eline.cite()}"
+            elif key in differs:
+                kind, detail = OTHER, f"this game's own run stood against S's selection; {differs[key][0].cite()}"
+            elif key in short:
+                sl, sm = short[key]
+                kind, detail = OTHER, f"spawned {sm.group(3)} of {sm.group(2)}; {sl.cite()}"
+            else:
+                tried = log.find(re.compile(C_SPILL.format(key=re.escape(key))))
+                kind, detail = OTHER, (tried[-1][0].cite() if tried else absent(log, f"`spill ... {key}`"))
+            groups.setdefault(kind, []).append(f"{label}: {detail}")
+        for kind in (ASLEEP, NO_ROW, OTHER):
+            if kind in groups:
+                why = {ASLEEP: "its carrier's copy is asleep here (a far player: no orb where it died)",
+                       NO_ROW: "its carrier has no row here (S's entity is not bound here: nobody there sees the drop)",
+                       OTHER: "other"}[kind]
+                findings.append(Finding(f"{who}: {len(groups[kind])} obligation(s) not delivered in full, {why}",
+                                        groups[kind]))
+    spills = {m.group(1) for _, m in obliged}
+    head = f"S obliged {len(spills)} spill(s), {len(obliged)} deliveries to the clients"
+    status = PASS if whole and not findings else FAIL
+    return Verdict("loot", status, "; ".join([head] + counts), obliged[0][0].cite(), findings, notes)
+
+
+# --- cutscenes synced (the game repository's tools/scene_sync_check.py) ---------------------------------
+
+SKIP_SCENES = re.compile(r"--dev_skip_scenes=(true|movies)")
+
+
+def scene_tool(repo: Path | None):
+    p = (repo / "tools" / "scene_sync_check.py") if repo else None
+    if p is None or not p.is_file():
+        return None
+    name = "levelcheck_scene_sync_check"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, p)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod  # its dataclasses look their module up while it loads
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        del sys.modules[name]
+        raise
+    return mod
+
+
+def scene_line(log: Log, name: str, t: datetime | None) -> str:
+    """The client's line a scene of scene_sync_check starts at (its `run@`/`conversation@` names unfolded)."""
+    if name.startswith("run@"):
+        want, kind = name[4:] + "#", "cutscene run"
+    elif name.startswith("conversation@"):
+        want, kind = "recipient " + name[len("conversation@"):], "scene local"
+    else:
+        want, kind = name, "Online: scene"
+    for i, raw in enumerate(log.lines):
+        if want in raw and kind in raw and (t is None or stamp(raw) == t):
+            return log.line(i).cite()
+    return absent(log, f"naming {name}" + (f" at {t.time()}" if t else ""))
+
+
+def grade_scenes(run: Run, repo: Path | None, start_tol: float = 1.0, end_tol: float = 2.0) -> Verdict:
+    tool = scene_tool(repo)
+    if tool is None:
+        return Verdict("cutscenes", NOT_TESTED, "no tools/scene_sync_check.py in the game repository")
+    if "H" not in run.clients or "D" not in run.clients:
+        return Verdict("cutscenes", NOT_TESTED, "the run has not both clients H and D")
+    h, d = run.clients["H"], run.clients["D"]
+    wh, wd = client_windows(h), client_windows(d)
+    rows = tool.pair(tool.read_scenes(h.lines), tool.read_scenes(d.lines))
+    both = []
+    for r in rows:
+        g = r.key[0]
+        if g not in wh or g not in wd:
+            continue
+        s = r.h or r.d
+        start = s.start
+        lo = max(wh[g].start, wd[g].start)
+        hi = min(wh[g].end, wd[g].end)
+        if start is None or not (lo <= start <= hi):
+            continue  # before the other client came, or after it left
+        both.append(r)
+    out, ok = tool.judge(both, start_tol, end_tol, None)
+    findings = []
+    poses = peer_poses(run.server) if run.server is not None else {}
+    peers = {w: p for p, w in peer_numbers(run).items()}
+    away = there = 0
+    for r, text in zip(both, out):
+        if text.startswith("FAIL"):
+            g, name, n = r.key
+            lines = [scene_line(h, name, r.h.start if r.h else None), scene_line(d, name, r.d.start if r.d else None)]
+            what = text[5:]
+            if (r.h is None) != (r.d is None):
+                # Missing on one client: how far it stood from the other when the scene started there decides
+                # whose the finding is (the test's placement or the game's sharing).
+                missing = "D" if r.d is None else "H"
+                start = (r.h or r.d).start
+                where = players_apart(poses, peers, start)
+                if where is None:
+                    what += f"; where {missing} stood is not known (no pose of both on S within {POSE_AT_S.seconds} s)"
+                else:
+                    dist_, la, lb = where
+                    if dist_ > SCENE_THERE:
+                        away += 1
+                        what = (f"{missing} was not there (test): {dist_:.0f} from the other player when the scene "
+                                f"started ({name}); {what}")
+                    else:
+                        there += 1
+                        what = (f"{missing} was there and did not get the scene (game): {dist_:.0f} from the other "
+                                f"player when it started ({name}); {what}")
+                    lines += [la.cite(), lb.cite()]
+            findings.append(Finding(what, lines))
+    counts = (f"{len(both) - len(findings)} of {len(both)} scene(s) both clients were in played together "
+              f"(start within {start_tol} s, end within {end_tol} s); {len(rows) - len(both)} outside the time both "
+              "were in the level"
+              + (f"; missing on one client: {there} with both players there (game), {away} with the other player "
+                 f"farther than {SCENE_THERE:.0f} (test)" if there or away else ""))
+    notes = expected_scene_notes(h, rows)
+    skipped = [p for p in run.result.get("peers", []) if isinstance(p, dict) and SKIP_SCENES.search(str(p.get("command", "")))]
+    example = scene_line(h, both[0].key[1], (both[0].h or both[0].d).start) if both else ""
+    if skipped:
+        return Verdict("cutscenes", NOT_TESTED, "scenes are skipped in this run (--dev_skip_scenes): " + counts, example,
+                       notes=([f"FAIL-shaped differences while skipping: {len(findings)}"] if findings else []) + notes)
+    if not both:
+        return Verdict("cutscenes", NOT_TESTED, counts, notes=notes)
+    return Verdict("cutscenes", FAIL if findings else PASS, counts, example, findings, notes)
+
+
+# A scene played on one client only: the other stood within SCENE_THERE of it on S's poses when the scene started
+# (it was there: the game's sharing), or farther (it was not there: the test's placement; batch 10's tutorial_b,
+# D at the level start 35 km from the end arena, failed every scene that only starts where a player stands).
+SCENE_THERE = 1500.0
+POSE_AT_S = timedelta(seconds=3)
+
+
+def players_apart(poses: dict, peers: dict, at) -> tuple[float, Line, Line] | None:
+    """H's and D's distance on S's poses nearest `at` (each within POSE_AT_S), with the two pose lines."""
+    if at is None:
+        return None
+    near = []
+    for who in ("H", "D"):
+        ps = [p for p in poses.get(peers.get(who, -1), []) if abs(p[0] - at) <= POSE_AT_S]
+        if not ps:
+            return None
+        near.append(min(ps, key=lambda p: abs(p[0] - at)))
+    return math.dist(near[0][1], near[1][1]), near[0][2], near[1][2]
+
+
+EXPECTED_SCENES = re.compile(r"Input script: LEVELPASS scenes expected: (.*)$")
+
+
+def expected_scene_notes(h: Log, rows) -> list[str]:
+    """The level pass's expected scenes (`LEVELPASS scenes expected: <name>@<how>[+entered], ...`, written from
+    the level's data, levelpass.scenes_expected_line) against the scenes the clients played: how many were
+    played on both, and the ones on neither, named (not reached: a scene whose start the run never came to
+    is no failure by itself; one the sweep entered and that neither client played is said so)."""
+    found = h.find(EXPECTED_SCENES)
+    if not found:
+        return []
+    line, m = found[0]
+    expected = []
+    for part in m.group(1).split(", "):
+        if "@" in part:
+            name, how = part.rsplit("@", 1)
+            expected.append((name, how))
+    played = {}
+    for r in rows:
+        name = r.key[1][4:] if r.key[1].startswith("run@") else r.key[1]
+        played[name] = played.get(name, 0) | (1 if r.h else 0) | (2 if r.d else 0)
+    both = [n for n, _ in expected if played.get(n) == 3]
+    one_side = [n for n, _ in expected if played.get(n) in (1, 2)]
+    entered_none = [n for n, how in expected if how.endswith("+entered") and not played.get(n)]
+    neither = [f"{n} ({how})" for n, how in expected if not played.get(n) and not how.endswith("+entered")]
+    out = [f"expected from the level data: {len(expected)} ({line.cite()}); played on both clients {len(both)}, "
+           f"on one {len(one_side)}, on neither {len(entered_none) + len(neither)}"]
+    if entered_none:
+        out.append("entered by the sweep but played on neither client: " + ", ".join(entered_none))
+    if neither:
+        out.append("not reached (on neither client): " + ", ".join(neither))
+    return out
+
+
+# --- the other player is the right skylander ---------------------------------------------------------------
+#
+# What a player sees of the other player: each client's puppet of each remote player, from the lines the
+# games write: `Online: puppet <n> spawned <character> at ... (epoch e gen g, stand-in from Hero_<own>)` and
+# `Online: puppet <n> epoch e gen g body <character> (stand-in) swap k tick t`, until `puppet <n> despawned`.
+# A body is right when it is a real body (online/4-remote-bodies, setting online_remote_bodies: its line reads
+# `body <character> (real)`; BODY takes it as soon as it is written so) of the character that player plays at
+# that moment (its own `Online: own player row <Character> figure ...` line, the newest before the moment): a
+# figure change or a swap is followed. A stand-in shown longer than STANDIN_MAX_S is a failure, as is a body of
+# another character. Puppet <n> is peer <n>'s (each client's `connected as peer <n>`).
+STANDIN_MAX_S = 5.0
+PUPPET_SPAWNED = re.compile(r"Online: puppet (\d+) spawned (\S+) at .*\((?:epoch \d+ gen \d+, )?(stand-in|real)\b")
+PUPPET_BODY = re.compile(r"Online: puppet (\d+) epoch \d+ gen \d+ body (\S+) \((stand-in|real)\b")
+PUPPET_GONE = re.compile(r"Online: puppet (\d+) despawned")
+OWN_ROW = re.compile(r"Online: own player row (\S+) figure ")
+
+
+@dataclass
+class BodySpan:
+    character: str
+    kind: str              # stand-in or real
+    start: datetime
+    end: datetime
+    line: Line
+
+
+def body_spans(log: Log) -> dict[int, list[BodySpan]]:
+    """Each puppet's bodies on this client, one span per body line (the newest body until the next line,
+    its despawn or the log's end)."""
+    events: list[tuple[datetime, int, str, str, Line]] = []
+    for rx, kind in ((PUPPET_SPAWNED, "body"), (PUPPET_BODY, "body"), (PUPPET_GONE, "gone")):
+        for line, m in log.find(rx):
+            if line.t is None:
+                continue
+            if kind == "gone":
+                events.append((line.t, int(m.group(1)), "", "gone", line))
+            else:
+                events.append((line.t, int(m.group(1)), m.group(2), m.group(3), line))
+    events.sort(key=lambda e: (e[0], e[4].no))
+    last = log.last_time()
+    out: dict[int, list[BodySpan]] = {}
+    for t_, puppet, character, kind, line in events:
+        spans = out.setdefault(puppet, [])
+        if spans and spans[-1].end == datetime.max:
+            spans[-1].end = t_
+        if kind != "gone":
+            spans.append(BodySpan(character, kind, t_, datetime.max, line))
+    for spans in out.values():
+        if spans and spans[-1].end == datetime.max:
+            spans[-1].end = last or spans[-1].start
+    return out
+
+
+def own_characters(log: Log) -> list[tuple[datetime, str, Line]]:
+    return [(line.t, m.group(1).lower(), line) for line, m in log.find(OWN_ROW) if line.t is not None]
+
+
+def grade_bodies(run: Run) -> Verdict:
+    peers = peer_numbers(run)
+    findings: list[Finding] = []
+    counts: list[str] = []
+    example = ""
+    standins = total = 0
+    for who, log in run.clients.items():
+        for puppet, spans in sorted(body_spans(log).items()):
+            other = peers.get(puppet)
+            plays = own_characters(run.clients[other]) if other in run.clients else []
+            shown = standin = 0.0
+            for sp in spans:
+                secs = max(0.0, (sp.end - sp.start).total_seconds())
+                shown += secs
+                total += 1
+                example = example or sp.line.cite()
+                playing = next((c for t_, c, _l in reversed(plays) if t_ <= sp.start), plays[0][1] if plays else "")
+                if sp.kind == "stand-in":
+                    standin += secs
+                    if secs > STANDIN_MAX_S:
+                        standins += 1
+                        findings.append(Finding(
+                            f"{who} shows {other or 'peer ' + str(puppet)} as a stand-in {sp.character} for {secs:.0f} s "
+                            f"(more than {STANDIN_MAX_S:.0f} s): a copy of {who}'s own skylander",
+                            [sp.line.cite()]))
+                if playing and sp.character.lower() != playing:
+                    findings.append(Finding(
+                        f"{who} shows {other or 'peer ' + str(puppet)} as {sp.character}, but that player plays {playing}",
+                        [sp.line.cite(), next(l.cite() for t_, c, l in reversed(plays) if c == playing)]))
+            counts.append(f"{who} sees {other or 'peer ' + str(puppet)}: {len(spans)} body line(s), "
+                          f"{shown:.0f} s shown, {standin:.0f} s of it a stand-in")
+    if total == 0:
+        return Verdict("other player", NOT_TESTED, "no client showed another player (no `puppet <n> spawned` line)")
+    return Verdict("other player", FAIL if findings else PASS,
+                   "; ".join(counts) + f"; stand-ins over {STANDIN_MAX_S:.0f} s: {standins}", example, findings)
+
+
+# --- the other player's moves (online_remote_moves; online/4-other-moves) -----------------------------------
+#
+# W32 (b). With online_remote_moves each client sends its hero's command with its poses (`moves: capture on`) and the
+# other clients feed it to that player's real body: attacks (`puppet <p> attack <seq> taken at pose <s> (waited
+# <ms>[, its pose not reached])` against the sender's presses `press <p>:<seq> slot <k> tick <t> (announced)`),
+# jumps, the special and the block (`puppet <p> input <jump|power|block> at pose <s>`, `puppet <p> held 0x<a> ->
+# 0x<b>`), the walk (the body steers itself; `puppet <p> drift <d> corrected (#<n>, pose <s>)` when it strays), the
+# behaviour states (`puppet <p> states entered 0x..` against the sender's `hero states entered 0x..` near the same
+# pose), shots (`puppet shot made`, their effects dropped: `puppet shot drop <what>`) and the knock-out (`puppet <p>
+# down (ko, pose <s>)`, `back as <character> after <ms>`). Off (no `moves: capture on`): not tested.
+MOVES_ON = re.compile(r"Online: moves: capture on ")
+SENDER_PRESS = re.compile(r"Online: press (\d+):(\d+) slot \d+ tick \d+ \(announced\)")
+BODY_ATTACK = re.compile(r"Online: puppet (\d+) attack (\d+) taken at pose (\d+) \(waited (\d+) ms(, its pose not reached)?")
+HERO_STATES = re.compile(r"Online: hero states entered (0x[0-9A-F,x]+) \(pose (\d+)\)")
+BODY_STATES = re.compile(r"Online: puppet (\d+) states entered (0x[0-9A-F,x]+) \(pose (\d+)\)")
+BODY_DRIFT = re.compile(r"Online: puppet (\d+) drift (\d+) corrected \(#(\d+), pose (\d+)\)")
+BODY_HELD = re.compile(r"Online: puppet (\d+) held 0x([0-9A-F]+) -> 0x([0-9A-F]+)")
+BODY_EXPIRED = re.compile(r"Online: puppet (\d+) input expired")
+BODY_INPUT = re.compile(r"Online: puppet (\d+) input (jump|power|block) at pose (\d+)")
+SHOT_MADE = re.compile(r"Online: puppet shot made ")
+SHOT_DROP = re.compile(r"Online: puppet shot drop (\S+)")
+BODY_DOWN = re.compile(r"Online: puppet (\d+) down \(ko, pose (\d+)\)(?!:)")
+BODY_BACK = re.compile(r"Online: puppet (\d+) back as (\S+) after (\d+) ms")
+# W40: no test presses BLOCK (logical button 11, held bit 0x800): the controller fills its logical buttons from raw
+# channels by a table it holds (sub_82B07630), and which pad button feeds 11 is not read yet; LT does not (batch 17's
+# moves-jump-block-tb: `hold lt` fed no 0x800). A run whose bodies show no block says so on the page.
+BLOCK_NOT_TESTED = ("NOT TESTED: block (logical button 11, 0x800: which pad button sets it is the controller's own "
+                    "table, sub_82B07630, not read yet; LT does not)")
+MOVES_STATE_POSES = 20      # a body's state set matches the sender's within this many poses (1 s at 20 Hz)
+MOVES_DRIFT_PER_S = 1.0     # walking: under one correction a second (in any 10 s)
+
+
+def grade_moves(run: Run) -> Verdict:
+    """Each client's view of the other player's moves against what that player sent."""
+    if not any(log.find(MOVES_ON) for log in run.clients.values()):
+        return Verdict("other player's moves", NOT_TESTED, "online_remote_moves off: no client sent its moves (no "
+                       "`moves: capture on`); the other player's body only slides to its poses")
+    peers = peer_numbers(run)
+    counts: list[str] = []
+    findings: list[Finding] = []
+    example = ""
+    blocked = False
+    for who, log in sorted(run.clients.items()):
+        for peer, sender in sorted(peers.items()):
+            if sender == who or sender not in run.clients:
+                continue
+            slog = run.clients[sender]
+            pressed = {int(m.group(2)): line for line, m in slog.find(SENDER_PRESS) if int(m.group(1)) == peer}
+            taken = {int(m.group(2)): (line, m) for line, m in log.find(BODY_ATTACK) if int(m.group(1)) == peer}
+            not_reached = [line for line, m in taken.values() if m.group(5)]
+            missing = sorted(set(pressed) - set(taken))
+            sent = [(int(m.group(2)), set(m.group(1).split(","))) for _l, m in slog.find(HERO_STATES)]
+            shown = [(line, int(m.group(3)), set(m.group(2).split(","))) for line, m in log.find(BODY_STATES)
+                     if int(m.group(1)) == peer]
+            matched = sum(1 for _l, pose, hs in shown
+                          if any(abs(pose - sp) <= MOVES_STATE_POSES and hs & shs for sp, shs in sent))
+            drifts = [line for line, m in log.find(BODY_DRIFT) if int(m.group(1)) == peer]
+            worst = 0
+            for i, line in enumerate(drifts):
+                if line.t is None:
+                    continue
+                n = sum(1 for other in drifts[i:] if other.t is not None and (other.t - line.t).total_seconds() < 10)
+                worst = max(worst, n)
+            inputs = [m.group(2) for _l, m in log.find(BODY_INPUT) if int(m.group(1)) == peer]
+            blocked = blocked or "block" in inputs or any(
+                int(m.group(1)) == peer and int(m.group(3), 16) & 0x800 for _l, m in log.find(BODY_HELD))
+            # an `input expired` while a held button (non-zero held bits) was fed
+            held_now, expired_held = False, []
+            for i, raw in enumerate(log.lines):
+                m = BODY_HELD.search(raw)
+                if m and int(m.group(1)) == peer:
+                    held_now = m.group(3) != "0"
+                    continue
+                m = BODY_EXPIRED.search(raw)
+                if m and int(m.group(1)) == peer and held_now:
+                    expired_held.append(log.line(i))
+            downs = [line for line, m in log.find(BODY_DOWN) if int(m.group(1)) == peer]
+            backs = [(line, m) for line, m in log.find(BODY_BACK) if int(m.group(1)) == peer]
+            shots = log.find(SHOT_MADE)
+            drops: dict[str, int] = {}
+            for _l, m in log.find(SHOT_DROP):
+                drops[m.group(1)] = drops.get(m.group(1), 0) + 1
+            counts.append(
+                f"{who} shows {sender}: attacks taken {len(taken)} of {len(pressed)} pressed"
+                + (f" ({len(not_reached)} before their pose)" if not_reached else "")
+                + f"; states {matched} of {len(shown)} matching {sender}'s within {MOVES_STATE_POSES} poses"
+                + f"; inputs {', '.join(f'{k} {inputs.count(k)}' for k in ('jump', 'power', 'block') if k in inputs) or '0'}"
+                + f"; drift corrections {len(drifts)} (at most {worst} in 10 s)"
+                + f"; shots made {len(shots)}, drops {', '.join(f'{k} {n}' for k, n in sorted(drops.items())) or '0'}"
+                + (f"; knock-outs {len(downs)}, back {len(backs)}" if downs or backs else ""))
+            if not example and (taken or shown):
+                example = (next(iter(taken.values()))[0] if taken else shown[0][0]).cite()
+            if missing:
+                findings.append(Finding(f"{who}: {len(missing)} of {sender}'s attack presses never taken by its body",
+                                        [pressed[s].cite() for s in missing[:4]] +
+                                        [absent(log, f"`puppet {peer} attack {missing[0]} taken`")]))
+            if shown and sent and not matched:
+                findings.append(Finding(f"{who}: none of {sender}'s body's {len(shown)} state sets matches a state "
+                                        f"{sender} entered within {MOVES_STATE_POSES} poses",
+                                        [shown[0][0].cite()]))
+            if worst > MOVES_DRIFT_PER_S * 10:
+                findings.append(Finding(f"{who}: {sender}'s body corrected {worst} times in 10 s (over one a second)",
+                                        [drifts[0].cite()]))
+            if expired_held:
+                findings.append(Finding(f"{who}: {len(expired_held)} `input expired` while {sender}'s button was held",
+                                        [x.cite() for x in expired_held[:4]]))
+            if downs and len(backs) < len(downs):
+                findings.append(Finding(f"{who}: {sender}'s body went down {len(downs)} time(s), back {len(backs)}",
+                                        [downs[-1].cite(), absent(log, f"`puppet {peer} back as` after it")]))
+    if not counts:
+        return Verdict("other player's moves", NOT_TESTED, "no two clients with peer numbers to compare")
+    if not blocked:
+        counts.append(BLOCK_NOT_TESTED)
+    return Verdict("other player's moves", FAIL if findings else PASS, "; ".join(counts), example, findings)
+
+
+# --- enemies hurt players (W33) ------------------------------------------------------------------------------
+#
+# The level pass starts both heroes invulnerable (--dev_hero_invulnerable; its job is the level), so there the row is
+# not tested and the page's head says so; enemy-damage-tb and enemy-knockout-tb run without it. Graded from the
+# player-damage lines (online/5-player-damage-lines): on a client, its copy of S's enemy hitting its own hero (`hero hit
+# by <Name#mID> <row> (<sweep|shot|other>, <dmg>)[ refused by this game's damage check] (S's attack, played here)`)
+# and its health's drop (`own vitals <h>/<max> (was <h0>; hit by ...)`); on S, the same hit on that player's puppet
+# (`sentinel guard refused a hit on sentinel/puppet entry <i> PeerPuppet_<n>#.. ... by <Name#mID> <row> (<kind>)`; puppet
+# <n>'s peer from S's `puppet <n> for peer <p> spawned` line) and
+# the health it reads back (`peer <p> vitals <h>/<max>`). Every hit S counted on a puppet wants one hit on that
+# player's hero by the same enemy row within PAIR_HIT_S (one to one: a client hit is used once), and every drop of
+# the own health wants S's `peer <p> vitals` with the same health within PAIR_VITALS_S.
+INVULNERABLE_ARG = "--dev_hero_invulnerable=true"
+HERO_HIT = re.compile(r"Online: hero hit by (\S+) (\S+) \((sweep|shot|other), ([^)]*)\)( refused by this game.s damage check)?")
+PUPPET_HIT = re.compile(r"Online: sentinel guard refused a hit on sentinel/puppet entry \d+ PeerPuppet_(\d+)\S* .* by (\S+) "
+                        r"(\S+) \((sweep|shot|other)\)")
+OWN_VITALS = re.compile(r"Online: own vitals (-?[\d.]+)/(-?[\d.]+) \(was (-?[\d.]+); hit by ")
+PEER_VITALS = re.compile(r"Online: peer (\d+) vitals (-?[\d.]+)/(-?[\d.]+)")
+PAIR_HIT_S = 1.0
+PAIR_VITALS_S = 1.5
+ANY_VITALS = re.compile(r"Online: own vitals (-?[\d.]+)/(-?[\d.]+) \(was ([^;]+); hit by (\S+)")
+KO_SCREEN = re.compile(r"Online: swap placement none reason \d+ \(KO; player 0")
+DEFERRED_SHOT = re.compile(r"its deferred projectile made here")
+
+
+def invulnerable_clients(folder: Path) -> list[str]:
+    """The clients the runner started with --dev_hero_invulnerable=true (result.json's commands)."""
+    try:
+        r = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [str(p.get("peer")) for p in r.get("peers", []) or []
+            if isinstance(p, dict) and INVULNERABLE_ARG in (p.get("command") or [])]
+
+
+def launch_relay_head(folder: Path) -> list[str]:
+    """W36: whether the run relayed a launch pad's ride (--online_launch_relay=true on H, which Host forwards to S)."""
+    try:
+        r = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    h = next((p for p in r.get("peers", []) or [] if isinstance(p, dict) and p.get("peer") == "H"), None)
+    if h is None or not h.get("command"):
+        return []
+    on = "--online_launch_relay=true" in h.get("command")
+    return [f"launch pad relay: {'on' if on else 'off'} (online_launch_relay; off: a ride carries the presser only)"]
+
+
+def invulnerable_head(folder: Path) -> list[str]:
+    who = invulnerable_clients(folder)
+    return [f"heroes invulnerable in this run ({', '.join(who)}): enemy damage not tested"] if who else []
+
+
+def grade_player_damage(run: Run) -> Verdict:
+    """S's hits on each player's puppet against that player's own hits and health."""
+    name = "enemies hurt players"
+    invulnerable = invulnerable_clients(run.folder)
+    if invulnerable:
+        return Verdict(name, NOT_TESTED, f"heroes invulnerable in this run ({', '.join(invulnerable)}): enemy damage "
+                       "not tested; this is what hid it until 19 November (enemy-damage-tb and moves-ko-tb test it, "
+                       "and a level check with --vulnerable)")
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    peers = peer_numbers(run)
+    # W40: PeerPuppet_<n> is puppet <n>, S's spawn order; its peer is the one S's last `puppet <n> for peer <p>
+    # spawned` line before the hit names (the numbers change hands at a level change).
+    owner: dict[int, int] = {}
+    s_hits = []
+    for i, raw in enumerate(run.server.lines):
+        m = PUPPET_FOR.search(raw)
+        if m:
+            owner[int(m.group(1))] = int(m.group(2))
+            continue
+        m = PUPPET_HIT.search(raw)
+        if m and int(m.group(1)) in owner:
+            s_hits.append((owner[int(m.group(1))], run.server.line(i), m))
+    s_vitals = run.server.find(PEER_VITALS)
+    counts, findings, example = [], [], ""
+    any_hit = False
+    for peer, who in sorted(peers.items()):
+        log = run.clients.get(who)
+        if log is None:
+            continue
+        hits = [(line, m) for line, m in log.find(HERO_HIT) if not m.group(5)]
+        refused = [line for line, m in log.find(HERO_HIT) if m.group(5)]
+        mine = [(line, m) for p, line, m in s_hits if p == peer]
+        used: set[int] = set()
+        unmatched = []
+        for sl, sm in mine:
+            best = None
+            for k, (cl, cm) in enumerate(hits):
+                if k in used or cm.group(2) != sm.group(3) or cl.t is None or sl.t is None:
+                    continue
+                d = abs((cl.t - sl.t).total_seconds())
+                if d <= PAIR_HIT_S and (best is None or d < best[0]):
+                    best = (d, k)
+            if best is None:
+                unmatched.append(sl)
+            else:
+                used.add(best[1])
+        extra = [hits[k][0] for k in range(len(hits)) if k not in used]
+        drops = [(line, m) for line, m in log.find(OWN_VITALS) if float(m.group(1)) < float(m.group(3))]
+        late = []
+        for line, m in drops:
+            ok = any(int(sm.group(1)) == peer and abs(float(sm.group(2)) - float(m.group(1))) < 0.5 and sl.t
+                     and line.t and abs((sl.t - line.t).total_seconds()) <= PAIR_VITALS_S for sl, sm in s_vitals)
+            if not ok:
+                late.append(line)
+        kinds = {k: sum(1 for _l, m in hits if m.group(3) == k) for k in ("sweep", "shot", "other")}
+        any_hit = any_hit or bool(hits or mine)
+        vit = log.find(ANY_VITALS)
+        unknown = [line for line, m in vit if m.group(4) == "unknown" and m.group(3) != "-" and
+                   float(m.group(1)) < float(m.group(3))]
+        lowest = min((float(m.group(1)) for _l, m in vit), default=None)
+        top = max((float(m.group(2)) for _l, m in vit), default=None)
+        kos = log.find(KO_SCREEN)
+        counts.append(f"{who}: hit {len(hits)} time(s) ({', '.join(f'{k} {n}' for k, n in kinds.items() if n) or '-'}"
+                      f"{f', {len(refused)} refused here' if refused else ''}); S counted {len(mine)} on its puppet, "
+                      f"{len(mine) - len(unmatched)} matched one to one; health drops {len(drops)}"
+                      + (f", {len(unknown)} by unknown" if unknown else "")
+                      + (f"; lowest health {lowest:.0f}/{top:.0f}" if lowest is not None and top else "")
+                      + (f"; knocked out {len(kos)} time(s), shown the placement screen" if kos else ""))
+        if mine and not hits:
+            findings.append(Finding(f"{who}: S's enemies attacked the stand-in {len(mine)} times, no attack was played "
+                                    f"here (S refused {len(mine)} hit(s) on peer {peer}'s puppet; no `hero hit by` on "
+                                    f"{who})", [mine[0][0].cite(), absent(log, "`hero hit by`")]))
+        if unknown:
+            findings.append(Finding(f"{who}: its health fell {len(unknown)} time(s) with `hit by unknown` (no enemy "
+                                    "hit of S's within 3 s)", [x.cite() for x in unknown[:4]]))
+        if not example and hits:
+            example = hits[0][0].cite()
+        if unmatched:
+            findings.append(Finding(f"{who}: {len(unmatched)} hit(s) S counted on its puppet with no hit on its hero by "
+                                    f"the same enemy within {PAIR_HIT_S:.0f} s", [x.cite() for x in unmatched[:4]]))
+        if extra and mine:
+            findings.append(Finding(f"{who}: {len(extra)} hit(s) on its hero S did not count on its puppet (doubled "
+                                    "or S's copy missed them)", [x.cite() for x in extra[:4]]))
+        if late:
+            findings.append(Finding(f"{who}: {len(late)} health drop(s) S never read back (`peer {peer} vitals` with "
+                                    f"that health within {PAIR_VITALS_S} s)", [x.cite() for x in late[:4]]))
+    # Who was shown the placement screen of a knock-out (only the knocked-out player should be).
+    shown_ko = [who for who, log in run.clients.items() if log.find(KO_SCREEN)]
+    if shown_ko:
+        counts.append(f"the knock-out's placement screen shown on: {', '.join(sorted(shown_ko))}")
+    # Shots: graded only where the deferred-shot fix is in (`its deferred projectile made here`); else not tested.
+    if not any(log.find(DEFERRED_SHOT) for log in run.clients.values()):
+        counts.append("shots not tested: no client made a deferred projectile (the bomb throwers' shots are dropped "
+                      "on the clients without online/5-replica-deferred-shots)")
+    if not any_hit:
+        return Verdict(name, NOT_TESTED, "no enemy attacked: S counted no hit on any stand-in and no attack was played "
+                       "on any client (no `hero hit by`): " + "; ".join(counts))
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), example, findings)
+
+
+# --- the server's game stopped (W37) ------------------------------------------------------------------------
+#
+# The owner's second session (play\20261119-211901): S's game thread logged nothing after 21:46:16 (four seconds after
+# a refused collect and a save), while its frames and traffic lines went on to 22:01; nothing on the page said so.
+# The hard rule: S's game work (every line of the thread that logs `Online: world`, `enemy` and `backend memory`: the
+# game's own thread) must not end more than SERVER_STALL_S before S's last `frames` line while a client was connected
+# (S's `traffic peer <p>` lines). FAIL "the server's game stopped at <time>" with its last three game-work lines. The
+# fixing agent's [error] line on S for the same thing fails it too (SERVER_STALL_ERROR, once its text is known).
+SERVER_STALL_S = 5.0
+GAME_WORK = re.compile(r"\[t(\d+)\] Online: (?:world|enemy|backend memory)\b")
+THREAD_OF = re.compile(r"\[t(\d+)\] ")
+FRAMES_LINE = re.compile(r"\] Online: frames \d+ ")
+TRAFFIC_LINE = re.compile(r"\] Online: traffic peer \d+ ")
+# The fix's lines (online/5-server-never-paused: online.cpp, backend/stage5_hits.cpp): S's own [error] when its world
+# has not run with clients connected, and when a player's presses are refused for a while (its attacks never reach
+# S's hit path). Either fails every grade.
+SERVER_STALL_ERROR = re.compile(r"Online: the server's (?:world has not run for [\d.]+ s|world still has not run: "
+                                r"[\d.]+ s|level entry has made no progress for [\d.]+ s) with \d+ client\(s\) connected")
+PRESSES_REFUSED = re.compile(r"Online: presses of peer (\d+) refused for [\d.]+ s")
+# The world watch's recovery press (online_server_unstick, off by default; no spec passes it): a press of A on S's
+# own screen is a fault in any run that did not ask for it (online/5-server-never-paused 362a3652).
+UNSTICK_PRESS = re.compile(r"Online: the server's world is paused: pressed A ")
+UNSTICK_ARG = "--online_server_unstick=true"
+
+
+def server_stalled(run: Run) -> "Finding | None":
+    """The finding when S's game thread stopped while its frames went on with a client connected; else None."""
+    s = run.server
+    if s is None:
+        return None
+    if SERVER_STALL_ERROR is not None:
+        hit = s.find(SERVER_STALL_ERROR)
+        if hit:
+            return Finding(f"the server's game stopped (its own line) at {when(hit[0][0])}", [hit[0][0].cite()])
+    counts: dict[str, int] = {}
+    for raw in s.lines:
+        m = GAME_WORK.search(raw)
+        if m:
+            counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+    if not counts:
+        return None
+    game = max(counts, key=counts.get)
+    work = [i for i, raw in enumerate(s.lines) if (m := THREAD_OF.search(raw)) and m.group(1) == game]
+    frames = [i for i, raw in enumerate(s.lines) if FRAMES_LINE.search(raw)]
+    traffic = [i for i, raw in enumerate(s.lines) if TRAFFIC_LINE.search(raw)]
+    if not work or not frames or not traffic:
+        return None
+    last_work, last_frames, last_traffic = s.line(work[-1]), s.line(frames[-1]), s.line(traffic[-1])
+    if not (last_work.t and last_frames.t and last_traffic.t):
+        return None
+    end = min(last_frames.t, last_traffic.t)  # S still drawing frames and a client still connected
+    if (end - last_work.t).total_seconds() <= SERVER_STALL_S:
+        return None
+    return Finding(f"the server's game stopped at {when(last_work)} (its frames and a client's traffic went on to "
+                   f"{end.strftime('%H:%M:%S')})", [s.line(i).cite() for i in work[-3:]])
+
+
+def server_hard_findings(run: Run) -> list["Finding"]:
+    """The hard rules on S: its game stopped (server_stalled), and a player's presses refused for a while (S's own
+    [error] line `presses of peer <p> refused for <s> s`)."""
+    out = []
+    f = server_stalled(run)
+    if f is not None:
+        out.append(f)
+    if run.server is not None:
+        pressed = run.server.find(UNSTICK_PRESS)
+        asked = any(UNSTICK_ARG in (p.get("command") or []) for p in run.result.get("peers", []) or []
+                    if isinstance(p, dict))
+        if pressed and not asked:
+            out.append(Finding("the server pressed A on its own screen without --online_server_unstick=true (its "
+                               "world was paused by a screen of its own game)", [line.cite() for line, _m in pressed[:3]]))
+        refused = run.server.find(PRESSES_REFUSED)
+        if refused:
+            peers = sorted({m.group(1) for _l, m in refused})
+            out.append(Finding(f"the server refused the presses of peer {', '.join(peers)} for a while: their attacks "
+                               "never reached its hit path", [line.cite() for line, _m in refused[:3]]))
+    return out
+
+
+def grade_server_alive(run: Run) -> Verdict:
+    """The page's row for the hard rules above."""
+    name = "server game alive"
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    # W41: a case that tested nothing (a peer's `within` rule whose why ends ": nothing tested") is not graded here.
+    nothing = next((f"{p.get('peer')}: {w}" for p in run.result.get("peers", []) or [] if isinstance(p, dict)
+                    for w in p.get("reasons") or [] if ": nothing tested" in str(w)), "")
+    if nothing:
+        return Verdict(name, NOT_TESTED, f"the case tested nothing ({nothing})")
+    fs = server_hard_findings(run)
+    if fs:
+        return Verdict(name, FAIL, "; ".join(f.what for f in fs), fs[0].lines[-1] if fs[0].lines else "", fs)
+    return Verdict(name, PASS, "the server's game thread worked to the end of its frames while a client was connected")
+
+
+# --- what no grader covers yet -------------------------------------------------------------------------------
+#
+# Said at the bottom of every page so the gaps are seen without asking. From the placeholder audit's CLASS 1
+# (logs/placeholder-audit.txt, two players in tutorial_a, tutorial_b and ww1 with the session's defaults) and the
+# owner's own list; a line goes when a grader covers it.
+NOT_COVERED = (
+    "the other player's sounds and effects (the moves row reads its commands, states and shots, not what plays)",
+    "which skylander's attack lands on the server (it replays the presses on its own hero: reach and damage may "
+    "differ), player hits and damage numbers as the other player sees them",
+    "the HUD and party panel: portraits (a number today), health bars, names, level, hat, lives",
+    "food and the wallet beyond the coins' gold lines",
+    "the other player's revive (a resurrection) and its falls as seen on the screen",
+    "enemy movement, animation and attack timing, enemies aiming at the partner, enemy missiles, freezes and "
+    "other victim states",
+    "the save: whether the session's progress reaches the host's real slot",
+    "Spark Lock boards, Swap Zones, shops, turrets, containers and conversations left open, push blocks and "
+    "moving platforms seen in different places, sub-map scenery",
+    "a cutscene one screen keeps playing after the server stopped it, conversation lines skipped on one screen",
+    "co-op difficulty scaling for two players",
+    "levels, modes and paths the pass does not take (swap zones, later levels, rejoining)",
+)
+
+
+def not_covered_lines() -> list[str]:
+    return ["", "what this check does NOT look at (no grader covers it yet):"] + [f"  - {x}" for x in NOT_COVERED]
+
+
+# --- completable (the level pass's own verdict) --------------------------------------------------------
+
+H_NEXT = re.compile(r"Input script: LEVELPASS phase next-level")
+D_NEXT = re.compile(r"Input script: LEVELPASS D next level")
+
+
+@dataclass
+class LevelData:
+    """The level's own data the page reads beside the logs (levelpass_holds): its held enemies by node key and
+    its gates."""
+    level: str
+    holds: dict
+    gates: list
+    authored: dict = field(default_factory=dict)   # authored index -> (name, position): <level>-manifest.txt
+    movers: list = field(default_factory=list)     # the level's re-arming mover spawners' names (levelpass_pieces)
+    swap_zones: list = field(default_factory=list)  # W38: (name, unit) of each Swap Zone pad (a TurboZone component)
+    world_objects: list = field(default_factory=list)  # W39: (name, unit, kinds) the logic drops, lowers, opens, ...
+    places: dict = field(default_factory=dict)     # authored index -> (name or "", position), unnamed objects too
+
+
+def run_level(run: Run) -> str:
+    """The level of a level pass's run: its case `levelpass-<level>[-no-end]` (result.json); W35: for any other run
+    (a spec's, a play session's) the last level H loaded that is not the hub (`level <g> <path>: load`, the path's
+    last part); else ""."""
+    case = str(run.result.get("case") or "")
+    if case.startswith("levelpass-"):
+        level = case[len("levelpass-"):]
+        return level[:-len("-no-end")] if level.endswith("-no-end") else level
+    h = run.clients.get("H")
+    loads = [m.group(2).split("/")[-1] for _l, m in h.find(LEVEL_LOAD)] if h is not None else []
+    loads = [x for x in loads if not x.startswith("town")]
+    return loads[-1] if loads else ""
+
+
+def level_data(levelpass: Path | None, level: str) -> LevelData | None:
+    """<levelpass>/<level>/logic.json and manifest.json read into LevelData; None when either is missing."""
+    import levelpass_holds as lh
+    if levelpass is None or not level:
+        return None
+    try:
+        logic = json.loads((levelpass / level / "logic.json").read_text(encoding="utf-8"))
+        manifest = json.loads((levelpass / level / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    disabled = [(f"{e.get('unit')}.{e.get('name')}", str(e.get("name")), str(e.get("unit")),
+                 tuple(e["position"]) if isinstance(e.get("position"), list) and len(e["position"]) == 3 else None)
+                for e in manifest.get("entities", []) or [] if isinstance(e, dict) and e.get("group") == "enemy"
+                and str((e.get("details") or {}).get("_isEnabled", "")).startswith("false")]
+    authored: dict = {}
+    places: dict = {}
+    probe = levelpass / f"{level}-manifest.txt"
+    if probe.is_file():
+        import levelpass as lp
+        try:
+            for o in lp.parse_probe_manifest(probe.read_text(encoding="utf-8", errors="replace"), level).objects:
+                zone, _, idx = o.ident.partition("#")
+                if zone.lower() == level.lower() and idx.isdigit():
+                    places[int(idx)] = (o.name, o.pos)
+                    if o.name:
+                        authored[int(idx)] = (o.name, o.pos)
+        except (OSError, ValueError):
+            authored, places = {}, {}
+    import levelpass_pieces as lpc
+    movers = sorted(k.split(".")[-1] for k, period in lpc.mover_spawners(logic, level).items() if period > 0)
+    zones = [(str(e.get("name") or ""), str(e.get("unit") or "")) for e in manifest.get("entities", []) or []
+             if isinstance(e, dict) and any("TurboZone" in str(k) for k in (e.get("components") or []))]
+    return LevelData(level, lh.holds_of(logic, disabled), lh.required_gates(manifest, logic, level), authored, movers,
+                     zones, world_event_objects(logic), places)
+
+
+# --- held enemies in a run (levelpass_holds: what the generator reads) -------------------------------------
+#
+# A placed key on S (`a<..>.<zone hash>.<0001xxxx>@<g>`) names its authored index in its low 16 bits (tutorial_b:
+# a00000000.0629f659.00013057@2 is [tutorial_b#12375] Chompy in the probe's manifest); its name and place tie it
+# to the level's node and so to its hold. An ambient hold (nothing in the logic releases it) is scenery: not
+# counted. A hold whose release this run did not fire is listed, not graded. A held enemy whose release fired
+# is graded as any other.
+AUTHORED_KEY = re.compile(r"^a[0-9a-f]+\.[0-9a-f]{8}\.([0-9a-f]+)@\d+$")
+NEAR_NODE = 300.0   # the probe's live place and the static reader's within this: the same object
+
+
+def hold_of(data: LevelData | None, key: str, name: str):
+    """The level's hold of S's enemy `key` (named `name` on S), or None."""
+    if data is None or not data.holds:
+        return None
+    base = name.split("#")[0]
+    m = AUTHORED_KEY.match(key)
+    row = data.authored.get(int(m.group(1), 16) & 0xFFFF) if m else None
+    cands = [h for h in data.holds.values() if h.name == (row[0] if row else base)]
+    if row and cands:
+        near = [h for h in cands if h.pos is not None and math.dist(h.pos, row[1]) <= NEAR_NODE]
+        return min(near, key=lambda h: math.dist(h.pos, row[1])) if near else None
+    return cands[0] if len(cands) == 1 else None
+
+
+def released_here(run: Run, hold, dead_by_player: bool) -> Line | str | None:
+    """Whether this run fired the hold's release: the pass acted on its root (any LEVELPASS line of H naming it),
+    a lock's opening line, or the enemy died by a player (it took damage: released). A cited line, a reason, or
+    None."""
+    if dead_by_player:
+        return "it died by a player on S"
+    h = run.clients.get("H")
+    for r in hold.releases:
+        if not r.path:
+            continue
+        root = r.path[0]
+        if r.act == "lock":
+            line = gate_opened(run, root)
+            if line:
+                return line
+        elif h is not None:
+            hit = h.find(re.compile(r"Input script: LEVELPASS .*\b" + re.escape(root) + r"\b"))
+            if hit:
+                return hit[0][0]
+    return None
+
+
+# The pass's required phase (levelpass.plan_required): H's `LEVELPASS required r<k> <kind> <gate> (...)` before
+# the step, or `... not performed: <why>`. Each gate's opening is read on each game apart: a client's `world gate
+# <Name#id> open apply` (S's open applied there) or `backend key gate <Name#id> ... unlocked`, S's `world gate
+# <Name#id> tombstoned` or `availability <Name#id> removed`, S's `backend gate.open applied <h> key <k>` (its own
+# read of its gate settled open after a client's press: the press's `backend press held <Name#id> key <k>` on that
+# client names the gate), and on H the step's own `wait_moved <Name#id> done`. S writes no `world gate ... open
+# apply` (that is a client applying S's row): the key-gate run tutorial_b 20261119-065111 opened gate 1 on S at
+# 06:54:11.795 and the page said "not on S".
+# Gates of the same name (tutorial_b's two TutorialLockedGate) are told apart by their order along the level and
+# the distinct ids each game opened.
+REQ_LINE = re.compile(r"Input script: LEVELPASS required (r\d+) (\S+) (\S+)(?: not performed: (.*))?")
+GATES_SKIPPED = re.compile(r"Input script: LEVELPASS gates not attempted \(--no-gates\)")
+
+
+def when(line: Line) -> str:
+    """A line's time of day to the millisecond, or ?."""
+    return line.t.strftime("%H:%M:%S.%f")[:-3] if line.t is not None else "?"
+
+
+GATE_APPLIED_S = re.compile(r"Online: backend gate\.open applied \S+ key (\S+)")
+
+
+def server_gate_opens(run: Run, name: str) -> list[tuple[str, Line]]:
+    """S's own opens of a gate of this name: each `backend gate.open applied <h> key <k>` whose request a client's
+    `backend press held <name>#<id> key <k>` sent, as (that client and its <name>#<id>, S's line)."""
+    if run.server is None:
+        return []
+    pressed = {}
+    for who, log in run.clients.items():
+        for _line, m in log.find(re.compile(r"Online: backend press held (" + re.escape(name) + r"#\d+) key (\S+)")):
+            pressed.setdefault(m.group(2), f"{who}:{m.group(1)}")
+    return [(pressed[m.group(1)], line) for line, m in run.server.find(GATE_APPLIED_S) if m.group(1) in pressed]
+
+
+# A gate's lock state (W17: a Scripts.LockedObjectComponent gate opens in place, its origin never moves, so
+# wait_moved never sees it). A gate's row is named by S's reference: `a<S's entity id, 8 hex>.<name hash>.<class>`
+# (S's `authored obj <zone> <i> <index> class <class> entity 1 name <hash> ... mid <id hex> ... text <Name>` line).
+# Every game logs the same authored list with its own entity ids, so S's reference names a gate by its authored
+# index, and each game's own line for that index names its `<Name>#<id>` (ww1: Finale_DemonGate008 is S's and H's
+# 0x93d, D's 0x95a). A client shows the opening as `backend key gate <S's ref>@<g> watched <p> (unlocked
+# Scripts.<Lock>=<n>)`; S writes the gate's row once when the level starts (`world 2 <ref>@<g> written`) and again
+# when the gate opens (batch 12 case 7, ww1: Finale_DemonGate008 S 12:54:21.128, H 12:54:21.454, D 12:54:21.363;
+# PuzzleGateSawtooth001 12:56:09.599, 56:10.041, 56:10.016).
+AUTHORED_GATE = re.compile(r"Online: authored obj (\S+) \d+ (\d+) class ([0-9a-f]{8}) entity \d+ name ([0-9a-f]{8}) "
+                           r"name0 \S+ mid ([0-9a-f]+) .* text (\S+)$")
+KEY_GATE_UNLOCKED = re.compile(r"Online: backend key gate (a[0-9a-f]{8}\.[0-9a-f]{8}\.[0-9a-f]{8})@\d+ watched \S+ "
+                               r"\(unlocked ")
+GATE_ROW_WRITTEN = re.compile(r"Online: world 2 (a[0-9a-f]{8}\.[0-9a-f]{8}\.[0-9a-f]{8})@\d+ written")
+
+
+def authored_gates(log: Log, name: str) -> dict[tuple[str, str], tuple[str, str]]:
+    """This game's gates of this name: (zone, authored index) -> (its reference, its `<name>#<id>`)."""
+    out = {}
+    for _line, m in log.find(AUTHORED_GATE):
+        if m.group(6) == name:
+            ident = int(m.group(5), 16)
+            out[(m.group(1), m.group(2))] = (f"a{ident:08x}.{m.group(4)}.{m.group(3)}", f"{name}#{ident}")
+    return out
+
+
+def gate_refs(log: Log, name: str, server: Log | None = None) -> dict[str, str]:
+    """The row references of the gates of this name (S's, from `server` when given, else this game's own), each to
+    this game's `<name>#<id>` of the same authored gate."""
+    own = authored_gates(log, name)
+    named = authored_gates(server, name) if server is not None else own
+    out = {}
+    for key, (ref, _ident) in named.items():
+        if key in own:
+            out[ref] = own[key][1]
+    return out
+
+
+def lock_state_opens(log: Log, name: str, server: bool, s_log: Log | None = None) -> list[tuple[str, Line]]:
+    """(<name>#<id>, the line) for each opening this game shows by the gate's lock state: on S a gate's row written
+    again after its first write, on a client its `backend key gate <S's ref> ... (unlocked ...)` (`s_log`: S's log,
+    whose references the rows carry; None: this game's own)."""
+    refs = gate_refs(log, name, None if server else s_log)
+    if not refs:
+        return []
+    out: list[tuple[str, Line]] = []
+    if server:
+        written: set[str] = set()
+        for line, m in log.find(GATE_ROW_WRITTEN):
+            ref = m.group(1)
+            if ref in refs:
+                if ref in written:
+                    out.append((refs[ref], line))
+                written.add(ref)
+    else:
+        out = [(refs[m.group(1)], line) for line, m in log.find(KEY_GATE_UNLOCKED) if m.group(1) in refs]
+    return out
+
+
+def gate_open_ids(log: Log, name: str, mover: bool = False, run: Run | None = None) -> list[Line]:
+    """One line per distinct `<name>#<id>` this game shows opened, in time order: S's own and each client's lines,
+    the lock state (lock_state_opens), on S with `run` also S's own applied opens (server_gate_opens: one that
+    follows S's write of a gate's row within 2 s is that gate's)."""
+    n = re.escape(name)
+    rx = re.compile(r"(?:Online: (?:world gate (" + n + r"#\d+) (?:open apply|tombstoned)|availability (" + n +
+                    r"#\d+) removed|backend key gate (" + n + r"#\d+)\S* unlocked)" +
+                    (r"|Dev: wait_moved (" + n + r"#\d+) done \()" if mover else ")"))
+    server = run is not None and log is run.server
+    seen: dict[str, Line] = {}
+    found = [(next(g for g in m.groups() if g), line) for line, m in log.find(rx)]
+    found += lock_state_opens(log, name, server, run.server if run is not None else None)
+    for ident, line in sorted(found, key=lambda x: (x[1].t or datetime.min, x[1].no)):
+        seen.setdefault(ident, line)
+    if server:
+        rows = [(ident, line) for ident, line in lock_state_opens(log, name, True)]
+        for who_ident, line in server_gate_opens(run, name):
+            near = [ident for ident, row in rows if row.t is not None and line.t is not None and
+                    timedelta(0) <= line.t - row.t <= timedelta(seconds=2)]
+            seen.setdefault(near[-1] if near else "pressed " + who_ident, line)
+    return sorted(seen.values(), key=lambda l: (l.t or datetime.min, l.no))
+
+
+def gate_opened(run: Run, name: str) -> Line | None:
+    """A line of any game that shows the gate opened (the first)."""
+    for log in ([run.server] if run.server else []) + list(run.clients.values()):
+        ids = gate_open_ids(log, name, mover=log.who == "H", run=run)
+        if ids:
+            return ids[0]
+    return None
+
+
+def key_gate_trail(run: Run, name: str, k: int) -> list[str]:
+    """A key gate's carried key, in order (the k-th gate of that name): touched and following on H, what S
+    logged for the key, the held press at the lock on H, S's decision, and D's own copy of the key."""
+    h = run.clients.get("H")
+    out: list[str] = []
+    key = re.escape(name) + r"_key#\S+"
+    picked = h.find(re.compile(r"Dev: pickup " + key + r" (done|failed)")) if h else []
+    if len(picked) <= k or picked[k][1].group(1) != "done":
+        out.append("key not carried on H: " + (picked[k][0].cite() if len(picked) > k else
+                                                absent(h, f"`pickup {name}_key ... done`") if h else "no H log"))
+    else:
+        out.append(f"key touched and following on H: {picked[k][0].cite()}")
+    # W25: the key by name, who carried it and when (a client's `carried key <ref> row carried by <p>/<e> here (key
+    # <Name#id>)`), and S's `carried key <ref> row consumed (by <p>)`.
+    if h is not None and len(picked) > k and picked[k][1].group(1) == "done":
+        label = re.search(r"pickup (\S+_key#\d+)", picked[k][0].text)
+        carried = h.find(re.compile(r"Online: carried key (\S+) row carried by (\d+)/\d+ here \(key "
+                                    + re.escape(label.group(1)) + r"\)")) if label else []
+        if carried:
+            line, m = carried[0]
+            who = peer_numbers(run).get(int(m.group(2)), f"peer {m.group(2)}")
+            words = f"its key {label.group(1)}: carried by {who} from {when(line)}"
+            if run.server is not None:
+                gone = run.server.find(re.compile(r"Online: carried key " + re.escape(m.group(1))
+                                                  + r" row consumed \(by (\d+)\)"))
+                if gone:
+                    words += f", consumed at {when(gone[0][0])} (S)"
+            out.append(words + f" ({line.cite()})")
+    if run.server is not None:
+        # What S tracked or did with the key (its row, a carry, a claim), not its level-start volume line.
+        s_key = [l for l, _m in run.server.find(re.compile(r"Online: .*\b" + key + r".*"))
+                 if "single-fire volume" not in l.text]
+        out.append(f"S for the key: {s_key[-1].cite()}" if s_key else
+                   absent(run.server, f"naming {name}_key (other than its level-start volume)"))
+        # One decision per press (`gate.open run` or `refused`), the k-th for the k-th gate of this name.
+        decided = run.server.find(re.compile(r"Online: backend gate\.open (?:run|refused) .*"))
+        if len(decided) > k:
+            out.append(f"S's decision: {decided[k][0].cite()}")
+        elif decided:
+            out.append(f"S's decision: none for this press (S decided {len(decided)}, the last {decided[-1][0].cite()})")
+    if h is not None:
+        held = h.find(re.compile(r"Online: backend press (held|released|cancelled|refused|slow)[^\n]*" + re.escape(name)))
+        out.append("press at the lock on H: " + "; ".join(l.cite() for l, _m in held[:3]) if held else
+                   "no held press at the lock on H (" + absent(h, f"`backend press held ... {name}`") + ")")
+        pressed = h.find(re.compile(r"Dev: interact " + re.escape(name) + r"_keylock#\S+ (done|failed).*"))
+        if len(pressed) > k:
+            out.append(f"interact on H: {pressed[k][0].cite()}")
+        # The gate each press went to (`backend press held <Name#id> key <k>`): a press on a gate an earlier step
+        # pressed is another gate's lock (tutorial_b 20261119-065111: step 2 pressed gate 1's lock by its name).
+        gates = [(line, m.group(1)) for line, m in
+                 h.find(re.compile(r"Online: backend press held (" + re.escape(name) + r"#\d+) key \S+"))]
+        if len(gates) > k and gates[k][1] in [g for _l, g in gates[:k]]:
+            out.append(f"the press went to {gates[k][1]}, the gate an earlier step pressed (another gate's lock, not "
+                       f"this one's): {gates[k][0].cite()}")
+    d = run.clients.get("D")
+    if d is not None:
+        d_key = [l for l, _m in d.find(re.compile(r"Online: .*\b" + key + r".*"))
+                 if "single-fire volume" not in l.text and "unsupported carried_item" not in l.text]
+        out.append(f"D's own key: {d_key[-1].cite()}" if d_key else
+                   "D's own key: no line after its level start (still at home: nothing on D moves or removes it)")
+    return out
+
+
+def battle_gate_left(run: Run, data: "LevelData", gate) -> str:
+    """For a battle gate S did not open: its fight's enemies still alive on S (by name: the openers and the
+    encounters' actors) and whether H had them bound."""
+    if run.server is None:
+        return "no S log"
+    names = [k.split(".")[-1] for k in gate.openers]
+    keys = server_enemies(run.server)
+    seen = client_enemies(run.clients["H"]) if "H" in run.clients else {}
+    alive = []
+    for key, k in keys.items():
+        base = k.name.split("#")[0]
+        if any(base == n or base.startswith(n + "_actor_") for n in names) and k.dead is None:
+            c = seen.get(key)
+            alive.append(f"{k.name} ({'bound on H' if c is not None and c.bound else 'not bound on H'})")
+    return ("still alive on S: " + ", ".join(alive[:8])) if alive else \
+        f"none of its fight's enemies ({', '.join(names[:4])}) alive on S: it never started, or its count is elsewhere"
+
+
+def required_steps(run: Run, data: LevelData | None) -> tuple[list[str], list[str]]:
+    """Each required gate (levelpass_holds.required_gates), in the pass's order: the ones not done (not performed,
+    or not opened on S, H and D, with where it broke) and the ones done, in words; the first of the first list is
+    the step the completable row names."""
+    if data is None:
+        return [], []
+    h = run.clients.get("H")
+    reqs = h.find(REQ_LINE) if h is not None else []
+    games = [("S", run.server)] + sorted(run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    games = [(w, lg) for w, lg in games if lg is not None]
+    opened = {}
+    shut, done = [], []
+    nth: dict[str, int] = {}
+    for g in [g for g in data.gates if g.required]:
+        k = nth.get(g.name, 0)
+        nth[g.name] = k + 1
+        mine = [(line, m) for line, m in reqs if m.group(3) == g.name]
+        req = mine[k] if len(mine) > k else None
+        if req is None:
+            shut.append(f"{g.name} ({g.kind}: {g.opener}): not performed by this pass (no `LEVELPASS required ... "
+                        f"{g.name}` on H)")
+            continue
+        if req[1].group(4):
+            shut.append(f"{g.name} ({g.kind}): not performed: {req[1].group(4)} ({req[0].cite()})")
+            continue
+        where = {}
+        for who, lg in games:
+            ids = opened.setdefault((who, g.name), gate_open_ids(lg, g.name, mover=who == "H", run=run))
+            where[who] = ids[k] if len(ids) > k else None
+        missing = [w for w, line in where.items() if line is None]
+        trail = key_gate_trail(run, g.name, k) if g.kind == "key gate" else []
+        if g.kind in ("battle gate", "arena gate") and where.get("S") is None:
+            trail.append(battle_gate_left(run, data, g))
+        fight_faults = fight_gate_managers(run, g) if g.kind in ("battle gate", "arena gate") else []
+        passed, faults, unchecked = gate_passes(run, g.name, k, where)
+        faults = fight_faults + faults
+        walk = ([f"passed on foot by {', '.join(passed)}"] if passed else []) + unchecked
+        if missing:
+            opened_on = [f"{w} at {when(where[w])}" for w in where if where[w] is not None]
+            shut.append(f"{g.name} ({g.kind}): attempted by the pass ({req[0].cite()}: its own line, no proof of anything the game did); opened on "
+                        f"{', '.join(opened_on) or 'no game'}, not on {', '.join(missing)}"
+                        + ("; " + "; ".join(faults + walk + trail) if faults or walk or trail else ""))
+        elif faults:
+            shut.append(f"{g.name} ({g.kind}): opened on {', '.join(where)} but " + "; ".join(faults)
+                        + ("; " + "; ".join(walk + trail) if walk or trail else ""))
+        else:
+            done.append(f"{g.name} ({g.kind}): opened on {', '.join(where)}: "
+                        + "; ".join(f"{w} at {when(line)} {line.cite()}" for w, line in where.items())
+                        + ("; " + "; ".join(walk + trail) if walk or trail else ""))
+    return shut, done
+
+
+# W34: a fight gate's fight graded on S: each encounter manager that opens it (the data's openers) has its `encounter
+# complete <Name#id>` on S (dev/trigger_tools.cpp; on S with online_sentinel or dev_trigger_commands). One without it
+# is a fault of the gate, named.
+ENCOUNTER_COMPLETE = re.compile(r"Online: encounter complete (\S+)")
+ENCOUNTER_START = re.compile(r"Online: encounter start (\S+)")
+
+
+def fight_gate_managers(run: Run, g) -> list[str]:
+    """The fight's managers with no `encounter complete` on S, in words (empty: every one completed, or no S log)."""
+    if run.server is None:
+        return []
+    done = [m.group(1) for _l, m in run.server.find(ENCOUNTER_COMPLETE)]
+    out = []
+    for k in getattr(g, "openers", []) or []:
+        name = k.split(".")[-1]
+        if "Manager" not in name and "manager" not in name and "_target" not in name:
+            continue  # a placed enemy: its death is in the enemies row
+        if not any(d.split("#")[0][:60] == name[:60] for d in done):
+            out.append(f"its fight's manager {name} never completed on S ({absent(run.server, f'`encounter complete {name[:60]}...`')})")
+    return out
+
+
+# W34: the row "fight gates": each required fight gate's waves (its managers in the data's order, upstream first:
+# tutorial_b's arena: EA_Manager_W1, EA_Manager_W1_B, then W1_B's nested manager, whose end opens the gate), each wave
+# graded on S (`encounter complete <Name#id>`), with how many of its spawns S refused (`enemy spawn of ... not
+# published` naming the manager) and how many H's own copy made (H's `encounter_clear <Name#id> ... spawned a/b`, its
+# last line), then the gate open on S and every client and walked through. A finding names the wave, the manager and
+# the counts. A fight gate the pass did not fight: NOT TESTED by name.
+ENC_CLEAR = re.compile(r"Dev: encounter_clear (\S+?)#\d+ (finished|time|start|started|progress [\d.]+ s): .*?spawned "
+                       r"(\d+)/(\d+)")
+
+
+def wave_lines(run: Run, g) -> list[tuple[str, str, list[str]]]:
+    """Per wave of a fight gate: (manager name, its words, its faults)."""
+    s_done = [(line, m.group(1)) for line, m in run.server.find(ENCOUNTER_COMPLETE)] if run.server else []
+    s_refused = [m.group(2) for _l, m in run.server.find(UNPUBLISHED_SPAWN)] if run.server else []
+    h = run.clients.get("H")
+    clears = h.find(ENC_CLEAR) if h is not None else []
+    out = []
+    for k in getattr(g, "openers", []) or []:
+        name = k.split(".")[-1]
+        if "Manager" not in name and "_target" not in name:
+            continue
+        key = name[:60]
+        done = next((line for line, n in s_done if n.split("#")[0][:60] == key), None)
+        refused = sum(1 for e in s_refused if e[:60] == key)
+        mine = [m for _l, m in clears if m.group(1)[:60] == key]
+        last = mine[-1] if mine else None
+        h_words = (f"H's copy spawned {last.group(3)}/{last.group(4)} ({'finished' if last.group(2) == 'finished' else 'not finished'})"
+                   if last else "H fought no actor of it (no `encounter_clear` line)")
+        words = (f"{'complete on S ' + done.cite() if done else 'never complete on S'}; S refused {refused} of its "
+                 f"spawns; {h_words}")
+        faults = []
+        if done is None:
+            faults.append("never complete on S")
+        if refused:
+            faults.append(f"S refused {refused} of its spawns (`not published`)")
+        out.append((name, words, faults))
+    return out
+
+
+# W35: a fight gate opens by its last wave's encounter act, not by a press: none of gate_open_ids' lines (an applied
+# open, a lock state line) comes for it (batch 16's fight-gate-tb: the gate opened, the row said so). Its opening:
+# S's row of the gate written again after the last wave's `encounter complete` (the row is the one S writes right
+# after the gate's own relay line, `relay ... (relay <gate>#<id>, ...)`: `world 2 <row> written`, kind 2 the gate's), and on each client its watch of that row saying
+# `unlocked` after that moment (`backend key gate <row> watched ... (unlocked ...)`).
+ROW_WRITTEN = re.compile(r"Online: world 2 (\S+) written")  # kind 2: a gate's row (W9)
+ROW_UNLOCKED = re.compile(r"Online: backend key gate (\S+) watched \S+ \(unlocked ")
+
+
+def fight_gate_opened(run: Run, gate: str, after: "Line") -> tuple[list[str], list[str]]:
+    """(the games where the gate opened after `after`, cited; the games where it did not) for a fight gate."""
+    s = run.server
+    if s is None or after.t is None:
+        return [], ["S"]
+    row = ""
+    for i, raw in enumerate(s.lines):
+        if f"(relay {gate}#" in raw:  # the gate's own relay: S writes its row right after (not the tracking lines)
+            for j in range(i + 1, min(i + 4, len(s.lines))):
+                m = ROW_WRITTEN.search(s.lines[j])
+                if m:
+                    row = m.group(1)
+                    break
+        if row:
+            break
+    opened, missing = [], []
+    w = next((line for line, m in s.find(ROW_WRITTEN) if m.group(1) == row and line.t and line.t >= after.t), None)
+    (opened if w else missing).append(f"S at {when(w)}" if w else "S")
+    for who, log in sorted(run.clients.items()):
+        u = next((line for line, m in log.find(ROW_UNLOCKED) if row and m.group(1) == row and line.t and
+                  line.t >= after.t), None)
+        (opened if u else missing).append(f"{who} at {when(u)}" if u else who)
+    return opened, missing
+
+
+def grade_fight_gates(run: Run, data: "LevelData | None" = None) -> Verdict:
+    """Each required fight gate: its waves on S and H, its opening and the walk through."""
+    name = "fight gates"
+    if data is None:
+        return Verdict(name, NOT_TESTED, "no level data (the [levelpass] folder) to name the fight gates")
+    gates = [g for g in data.gates if g.required and g.kind in ("battle gate", "arena gate")]
+    if not gates:
+        return Verdict(name, NOT_TESTED, "the level has no fight gate")
+    if run.server is None:
+        return Verdict(name, NOT_TESTED, "no server log in this run folder")
+    h = run.clients.get("H")
+    reqs = h.find(REQ_LINE) if h is not None else []
+    clears = [m.group(1)[:60] for _l, m in h.find(ENC_CLEAR)] if h is not None else []
+    s_started = [m.group(1) for _l, m in run.server.find(ENCOUNTER_START)]
+    counts, findings, untested = [], [], []
+    for g in gates:
+        managers = [k.split(".")[-1][:60] for k in getattr(g, "openers", []) or []]
+        # Fought: the pass's step, H's encounter_clear of one of its managers, or (W35: a player's own fight, a play
+        # session) S starting one of them.
+        fought = (any(m.group(3) == g.name and not m.group(4) for _l, m in reqs) or any(n in clears for n in managers)
+                  or any(n.split("#")[0][:60] in managers for n in s_started))
+        if not fought:
+            untested.append(g.name)
+            continue
+        waves = wave_lines(run, g)
+        lines = [f"wave {i + 1} ({n}): {w}" for i, (n, w, _f) in enumerate(waves)]
+        counts.append(f"{g.name}: " + "; ".join(lines) if lines else f"{g.name}: no wave in the data")
+        for i, (n, _w, faults) in enumerate(waves):
+            if faults:
+                findings.append(Finding(f"{g.name} wave {i + 1} ({n}): " + "; ".join(faults), [lines[i]]))
+        last = None
+        for n in managers:
+            done = [line for line, m in run.server.find(ENCOUNTER_COMPLETE) if m.group(1).split("#")[0][:60] == n]
+            if done and (last is None or (done[-1].t and last.t and done[-1].t > last.t)):
+                last = done[-1]
+        if last is None or any(f for _n, _w, f in waves if f):
+            findings.append(Finding(f"{g.name}: never opened on S (its last wave never completed there)",
+                                    [absent(run.server, f"the last wave's `encounter complete` of {g.name}")]))
+        else:
+            opened, missing = fight_gate_opened(run, g.name, last)
+            counts.append(f"{g.name} opened on " + (", ".join(opened) or "no game"))
+            if "S" in missing:
+                findings.append(Finding(f"{g.name}: never opened on S after its last wave", [last.cite()]))
+            elif missing:
+                findings.append(Finding(f"{g.name}: opened on S, not on {', '.join(missing)}", [last.cite()]))
+    if untested:
+        counts.append("not fought by this pass (NOT TESTED): " + ", ".join(untested))
+    if not counts or all(c.startswith("not fought") for c in counts):
+        return Verdict(name, NOT_TESTED, "; ".join(counts))
+    return Verdict(name, FAIL if findings else PASS, "; ".join(counts), "", findings)
+
+
+def fight_gates_head(run: Run, data: "LevelData | None") -> list[str]:
+    """The page head's count of the level's fight gates the pass fought (W34), and the ones it did not, by name."""
+    if data is None:
+        return []
+    gates = [g for g in data.gates if g.required and g.kind in ("battle gate", "arena gate")]
+    if not gates:
+        return []
+    h = run.clients.get("H")
+    reqs = h.find(REQ_LINE) if h is not None else []
+    fought = [g for g in gates if any(m.group(3) == g.name and not m.group(4) for _l, m in reqs)]
+    missed = [g.name for g in gates if g not in fought]
+    return [f"fight gates: fought {len(fought)} of {len(gates)}"
+            + (f"; NOT TESTED: {', '.join(missed)}" if missed else "")]
+
+
+# W23: each client's walk through the gate (`Dev: pass_gate <Name#id> done (passed on foot: ...)` / `failed (not
+# passed on foot: ...)` / `failed (not walkable straight: ...)`, the k-th of that name for the k-th gate). A walk
+# that failed after the gate opened on that game is "gate open but not passable" (a finding); one that ended before
+# it opened there, or a line that is no player's way (not walkable straight), is said and not counted either way.
+PASS_GATE = re.compile(r"Dev: pass_gate (\S+#\d+) (done|failed) \((.*)\)")
+
+
+def gate_passes(run: Run, name: str, k: int, where: dict) -> tuple[list[str], list[str], list[str]]:
+    """(passed: "<who> at <t>", faults, not checked) for the k-th gate of this name on each client."""
+    passed, faults, unchecked = [], [], []
+    for who in sorted(run.clients, key=lambda w: (w != "H", w)):
+        log = run.clients[who]
+        mine = [(line, m) for line, m in log.find(PASS_GATE) if m.group(1).split("#")[0] == name]
+        if len(mine) <= k:
+            if log.find(PASS_GATE):
+                unchecked.append(f"no walk through it on {who}")
+            continue
+        line, m = mine[k]
+        if m.group(2) == "done":
+            passed.append(f"{who} at {when(line)}")
+        elif m.group(3).startswith("not walkable straight"):
+            unchecked.append(f"passing not checked on {who}: {m.group(3)} ({line.cite()})")
+        elif where.get(who) is not None and where[who].t is not None and line.t is not None and where[who].t <= line.t:
+            faults.append(f"gate open but not passable on {who}: {m.group(3)} ({line.cite()}; opened there at "
+                          f"{when(where[who])})")
+        else:
+            unchecked.append(f"{who}'s walk ended before the gate opened there ({line.cite()})")
+    return passed, faults, unchecked
+
+
+# "Reached the next level" is the game's own evidence on that client: a level loaded after the level under test
+# (`Online: level <g> <path>: load` with a later generation) and that generation's start released there
+# (`Online: barrier <g> released`: the hero in play). Never the script's own marker (`LEVELPASS phase
+# next-level`, `LEVELPASS D next level`), which runs whatever its wait's outcome: batch 11 run 4 (tutorial_b
+# 20261119-063529) logged it right after `waitfor online_level_after_mark timed out after 150.0 s`, and the page
+# said "H yes". A timed-out wait for the level change is cited as the reason.
+CLIENT_BARRIER = re.compile(r"Online: barrier (\d+) released at tick")
+LEVEL_WAIT_TIMEOUT = re.compile(r"Input script: waitfor online_level_after_mark timed out after [\d.]+ s")
+
+
+def next_level_reached(log: Log, level: str) -> tuple[Line | None, str]:
+    """(the line that shows this client in play in the level after `level`, or None; why not, in words)."""
+    loads = [(line, int(m.group(1)), m.group(2)) for line, m in log.find(LEVEL_LOAD)]
+    # A late joiner comes into the level under test by its Welcome (`connected as peer <n> (..., level <g> <path>)`).
+    joined = [(line, int(m.group(2)), m.group(3)) for line, m in log.find(CONNECTED)]
+    under = [g for _l, g, path in loads + joined if level and path.split("/")[-1].lower() == level.lower()]
+    if not under:
+        return None, (f"no load of {level} on this game" if level else "the level under test is not known (no case name)")
+    after = [(line, g, path) for line, g, path in loads if g > min(under)]
+    timed_out = log.find(LEVEL_WAIT_TIMEOUT)
+    if not after:
+        return None, ("no level loaded after " + level + (f"; {timed_out[-1][0].cite()}" if timed_out else ""))
+    load, g, path = after[0]
+    played = [line for line, m in log.find(CLIENT_BARRIER) if int(m.group(1)) == g]
+    if not played:
+        return None, f"loaded {path.split('/')[-1]} ({load.cite()}) but its start was never released here (not in play)"
+    return played[0], ""
+
+
+def _levelpass():
+    """The level pass module (its log readers), or None when it cannot be loaded beside this one."""
+    try:
+        import levelpass
+        return levelpass
+    except Exception:
+        return None
+
+
+def grade_completable(run: Run, data: LevelData | None = None) -> Verdict:
+    """The level pass's verdict (result.json `levelpass`, written by `levelpass`) and each client's mark of
+    the next level. Two players: a run without D does not show it (NOT TESTED)."""
+    lp = run.result.get("levelpass") if isinstance(run.result.get("levelpass"), dict) else None
+    if lp is None:
+        return Verdict("completable", NOT_TESTED, "not a level pass (result.json has no `levelpass` verdict)")
+    verdict = str(lp.get("verdict", ""))
+    missed = [str(x) for x in lp.get("not_covered", []) or []]
+    reached = {}
+    why_not: dict[str, str] = {}
+    level = run_level(run)
+    for who in ("H", "D"):
+        log = run.clients.get(who)
+        if log is None:
+            reached[who] = None
+            continue
+        reached[who], why_not[who] = next_level_reached(log, level)
+    counts = (f"level pass {verdict or '?'}; next level reached (the level change and play on that game): " +
+              ", ".join(f"{w} {'yes' if line else 'no'}" for w, line in reached.items() if w in run.clients))
+    example = next((line.cite() for line in reached.values() if line), "")
+    notes = [f"not covered: {m}" for m in missed]
+    notes += [f"{w} did not reach the next level: {why}" for w, why in why_not.items() if reached.get(w) is None and why]
+    # A client's mark that landed inside a load (levelpass.late_marks): its script ran a level late; the run's
+    # failure is the test tool's (batch 12 run 2: D's mark 0.02 s after tutorial_b began loading).
+    lpm = _levelpass()
+    for who in ("H", "D"):
+        log = run.clients.get(who)
+        for lm in (lpm.late_marks("\n".join(log.lines)) if log is not None and lpm is not None else [])[:1]:
+            notes.insert(0, f"tool fault: {lm.words(who)} ({log.line(lm.mark_no - 1).cite()})")
+    # The pass teleports: it can reach the end without doing what a player must on the way.
+    shut, done = required_steps(run, data)
+    if data is None:
+        counts += "; required steps on the way not checked (no level data for this run)"
+    notes += [f"required, not done: {s}" for s in shut] + [f"required, done: {s}" for s in done]
+    if verdict == "FAIL":
+        return Verdict("completable", FAIL, counts, example, notes=notes)
+    if verdict == "INCOMPLETE":
+        return Verdict("completable", INCOMPLETE, counts, example, notes=notes)
+    if "D" not in run.clients:
+        return Verdict("completable", NOT_TESTED, counts + " (one client in this run: two players not shown)", example,
+                       notes=notes)
+    gates_skipped = bool(run.clients.get("H") and run.clients["H"].find(GATES_SKIPPED))
+    if verdict == "PASS" and all(reached.values()):
+        if shut and gates_skipped:
+            return Verdict("completable", BY_TELEPORT, f"completable by teleport; gates not attempted (--no-gates); "
+                           f"required steps not performed: {len(shut)}; {counts}", example, notes=notes)
+        if shut:
+            return Verdict("completable", BY_TELEPORT, f"completable by teleport; first step not done: {shut[0]}; "
+                           f"required steps not done: {len(shut)} of {len(shut) + len(done)}; {counts}", example,
+                           notes=notes)
+        if data is not None and done:
+            return Verdict("completable", PASS, f"completable by play: {len(done)} required step(s) performed, every "
+                           f"gate opened on {', '.join(['S'] + sorted(run.clients, key=lambda w: (w != 'H', w)))}; "
+                           f"{counts}", example, notes=notes)
+        return Verdict("completable", PASS, counts, example, notes=notes)
+    missing = [w for w, line in reached.items() if line is None and w in run.clients]
+    return Verdict("completable", FAIL, counts, example, [Finding(
+        f"{', '.join(missing)} did not reach the next level", [f"{w}: {why_not.get(w, '')}" for w in missing])], notes)
+
+
+# --- the page ------------------------------------------------------------------------------------------
+
+
+def grade(folder: Path, repo: Path | None, levelpass: Path | None = None) -> list[Verdict]:
+    """Every row of the page; `levelpass` (the [levelpass] folder) gives the level's own data: its required
+    gates (completable) and its held enemies (a fight that lands nothing)."""
+    run = load_run(folder)
+    data = level_data(levelpass, run_level(run))
+    together = grade_together(run)
+    rows = [grade_server_alive(run), grade_completable(run, data), grade_lobby(run), grade_slot(run), grade_bodies(run), together,
+            grade_scenes(run, repo), grade_enemies(run, data), grade_pickups(run), grade_coins(run),
+            grade_coins_shared(run), grade_scenes_once(run), grade_level_changes(run), grade_enemy_kills(run),
+            grade_gate_kinds(run, data), grade_dialog_skip(run), grade_enemy_server_damage(run),
+            grade_world_events(run, data), grade_level_events(run), grade_rewards_food(run),
+            grade_server_world(run, repo),
+            grade_loot(run),
+            grade_objectives(run), grade_pieces(run, data), grade_moves(run), grade_player_damage(run),
+            grade_fight_gates(run, data)]
+    # The enemies and the loot are read where both players stand only when D followed H: each says which.
+    followed = bool(run.clients.get("D") and run.clients["D"].find(FOLLOW_ON))
+    if together.status in (PASS, FAIL):
+        where = f"read with D following H: {together.counts}"
+    elif followed:
+        # D's follow ran, but the together row had nothing to read (batch 11 run 3: H hung before any stop).
+        where = f"D followed H (its `auto follow ... (script)` line), but where both stood was not read: {together.counts}"
+    else:
+        where = ("read with D where it entered the level (no follow in this run): D's enemies and loot far from H "
+                 "are asleep there")
+    for v in rows:
+        if v.name in ("enemies", "loot"):
+            v.notes.append(where)
+    # A sweep that skipped steps for time: each NOT TESTED row those steps would have tested says so (W13).
+    skipped = skipped_acts(run.clients.get("H"))
+    for v in rows:
+        mine = [s for s in skipped if v.name in KIND_ROWS.get(s[1], ())]
+        # Not for a row the run turned off (shared coins or loot off, scenes skipped): time made no difference there.
+        off = re.search(r"\boff\b|--dev_skip_scenes", v.counts)
+        if v.status == NOT_TESTED and mine and not off:
+            v.notes.insert(0, f"not tested partly for time: the sweep's deadline skipped {len(mine)} step(s) that "
+                              f"test it: " + ", ".join(f"{label} {kind} {name}" for label, kind, name, _l in mine[:6])
+                           + f" ({mine[0][3].cite()})")
+    return rows
+
+
+def skipped_head(h: Log | None) -> list[str]:
+    """The page's head line for a sweep that skipped steps for time, with the NOT TESTED rows they would test."""
+    skipped = skipped_acts(h)
+    if not skipped:
+        return []
+    rows = sorted({r for _l, kind, _n, _x in skipped for r in KIND_ROWS.get(kind, ())})
+    return [f"the sweep skipped {len(skipped)} act(s) for time ({skipped[0][3].cite()}); rows they would test: "
+            f"{', '.join(rows)} (a NOT TESTED row among them says so)"]
+
+
+# W40: how many of each player's attack presses S's puppet started (S's own `press <p>:<n> done: <a> landed, <b>
+# without damage, <k> kills, started yes|no (<why>)`, server/attacks.cpp): batch 17's moves-shot-tb started 1 of 8.
+# On every page's head and every case's result (skytest's notes).
+PRESS_DONE = re.compile(r"Online: press (\d+):(\d+) done: .*, started (yes|no) ")
+
+
+def attacks_started_line(run: Run) -> str | None:
+    """`attacks started on the server: H 4 of 9, D 0 of 2` (by S's done lines, one per press); None with no S log."""
+    if run.server is None:
+        return None
+    done: dict[tuple[int, int], bool] = {}
+    for _line, m in run.server.find(PRESS_DONE):
+        done[(int(m.group(1)), int(m.group(2)))] = m.group(3) == "yes"
+    if not done:
+        return "attacks started on the server: no press done (no `press <p>:<n> done` line)"
+    names = peer_numbers(run)
+    parts = []
+    for peer in sorted({p for p, _n in done}):
+        mine = [ok for (p, _n), ok in done.items() if p == peer]
+        who = names.get(peer)
+        parts.append(f"{who + ' (peer ' + str(peer) + ')' if who else 'peer ' + str(peer)} {sum(mine)} of {len(mine)}")
+    return "attacks started on the server: " + ", ".join(parts)
+
+
+# W39 item 5: the frame rate as numbers on the page head (no verdict): per game, from its first `barrier <g> released`
+# on (in play), the mean of its `frames <n> fps <f> ...` windows (frames over time) and the lowest per-minute rate
+# (whole minutes of consecutive windows), with the resolution scale and frame size the game drew at (`FXAA: frame
+# <w>x<h> scaled by <a>x<b>`) and its window (the command's --window_width/--window_height, else its settings.toml
+# `resolution = "<w>x<h>"`). The owner's sessions: 19 to 20 on both clients at scale 2.
+FPS_WINDOW = re.compile(r"Online: frames (\d+) fps ([\d.]+) ")
+FXAA_FRAME = re.compile(r"FXAA: frame (\d+x\d+) scaled by (\d+)x(\d+)")
+SETTINGS_RESOLUTION = re.compile(r'^\s*resolution\s*=\s*"(\d+x\d+)"', re.M)
+
+
+def frame_rate_parts(run: Run) -> list[str]:
+    games = ([("S", run.server)] if run.server is not None else []) + sorted(
+        run.clients.items(), key=lambda kv: (kv[0] != "H", kv[0]))
+    commands: dict[str, list[str]] = {}
+    for p in run.result.get("peers", []) or []:
+        if isinstance(p, dict) and p.get("command"):
+            commands[str(p.get("peer"))] = [str(a) for a in p["command"]]
+    out = []
+    for w, lg in games:
+        bar = next((l for l, _m in lg.find(LEVEL_BARRIER)), None)
+        wins = [(l, int(m.group(1)), float(m.group(2))) for l, m in lg.find(FPS_WINDOW)
+                if bar is None or (l.t is not None and bar.t is not None and l.t >= bar.t)]
+        if not wins:
+            continue
+        frames = sum(n for _l, n, _f in wins)
+        secs = sum(n / f for _l, n, f in wins if f > 0)
+        mean = frames / secs if secs else 0.0
+        lowest = None
+        for i in range(0, len(wins) - 5):
+            chunk = wins[i:i + 6]
+            if chunk[0][0].t is None or chunk[-1][0].t is None or (chunk[-1][0].t - chunk[0][0].t).total_seconds() > 65:
+                continue  # not six consecutive 10 s windows
+            f = sum(n for _l, n, _x in chunk) / sum(n / x for _l, n, x in chunk if x > 0)
+            lowest = f if lowest is None else min(lowest, f)
+        fx = lg.find(FXAA_FRAME)
+        draw = f"scale {fx[0][1].group(2)}, frame {fx[0][1].group(1)}" if fx else "scale not logged"
+        cmd = commands.get(w, [])
+        ww = next((a.split("=", 1)[1] for a in cmd if a.startswith("--window_width=")), None)
+        wh = next((a.split("=", 1)[1] for a in cmd if a.startswith("--window_height=")), None)
+        window = f"window {ww}x{wh}" if ww and wh else ""
+        if not window:
+            for cand in [run.folder / d / "settings.toml" for d, n in PLAY_NAMES.items() if n == w] + [run.folder / w / "settings.toml"]:
+                try:
+                    m = SETTINGS_RESOLUTION.search(cand.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    continue
+                if m:
+                    window = f"window {m.group(1)} (settings)"
+                    break
+        out.append(f"{w} mean {mean:.1f}, lowest minute " + (f"{lowest:.1f}" if lowest is not None else "-")
+                   + f" ({draw}" + (f", {window}" if window else "") + ")")
+    return out
+
+
+def frame_rate_head(folder: Path) -> list[str]:
+    try:
+        parts = frame_rate_parts(load_run(folder))
+    except (OSError, ValueError):
+        return []
+    return ["frame rate in play: " + "; ".join(parts)] if parts else []
+
+
+def attacks_started_head(folder: Path) -> list[str]:
+    try:
+        line = attacks_started_line(load_run(folder))
+    except (OSError, ValueError):
+        return []
+    return [line] if line else []
+
+
+def run_head(folder: Path, levelpass: Path | None = None) -> list[str]:
+    """The page's head from the run's result.json: the case, its status, minutes, build snapshot, runner; with the
+    [levelpass] folder also the fight gates fought (W34)."""
+    gates_line: list[str] = []
+    if levelpass is not None:
+        try:
+            run = load_run(folder)
+            gates_line = fight_gates_head(run, level_data(levelpass, run_level(run)))
+        except (OSError, ValueError):
+            gates_line = []
+    try:
+        r = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ["run: no result.json"]
+    prov = r.get("provenance") if isinstance(r.get("provenance"), dict) else {}
+    secs = r.get("seconds")
+    return [f"case {r.get('case', '?')}: runner status {r.get('status', '?')}, "
+            f"{(secs / 60):.1f} min" if isinstance(secs, (int, float)) else f"case {r.get('case', '?')}",
+            f"build snapshot {prov.get('build') or '?'}, runner {prov.get('runner') or '?'}",
+            *figures_head(folder),
+            *gates_line,
+            *invulnerable_head(folder),
+            *launch_relay_head(folder),
+            *attacks_started_head(folder),
+            *frame_rate_head(folder),
+            *skipped_head(read_log(folder, "H/game.log", "H")),
+            *route_head(folder)]
+
+
+# W24: a sweep target with no floor a player can stand on near it (a trigger in the air: tutorial_b's rail-ride end
+# trigger, auth:tutorial_b:8394) is not visited: the route teleport says `failed (no floor: ...)`; and a hero held too
+# long at the same spot twice is taken out to the last ground it stood on. The page names both.
+NO_FLOOR = re.compile(r"Dev: route teleport \S+ failed \((no floor: .*)\) \(target (.+)\)$")
+TAKEN_OUT = re.compile(r"Dev: route held too long at the same spot twice \(([^)]*)\): (taken out to the last ground it "
+                       r"stood on \S+|no ground it stood on is known, left there)")
+VISIT_OR_ACT = re.compile(r"Input script: LEVELPASS (?:visit (v\d+)|act (v\d+_\d+) \S+) .*?(?:ref (\S+))?$")
+
+
+# W27b: a target in the air the level reaches by a launch pad's ride: its scripted run (`cutscene run <Name#id> starts
+# here`) begins on that client between a `launch pad <pad>: launched` and that ride's end (`launch_pad <pad> done|
+# failed`).
+LAUNCHED = re.compile(r"Dev: launch pad (\S+): launched")
+RIDE_END = re.compile(r"Dev: launch_pad (\S+) (?:done|failed)")
+RUN_START = re.compile(r"Online: cutscene run (\S+?)#\d+ starts here")
+
+
+def ride_reached(log: Log | None) -> dict[str, tuple[str, Line]]:
+    """The names whose scripted run began during a launch ride on this client: name -> (the pad, the run's line)."""
+    out: dict[str, tuple[str, Line]] = {}
+    if log is None:
+        return out
+    riding = ""
+    for i, raw in enumerate(log.lines):
+        m = LAUNCHED.search(raw)
+        if m:
+            riding = m.group(1)
+            continue
+        if RIDE_END.search(raw):
+            riding = ""
+            continue
+        m = RUN_START.search(raw)
+        if m and riding and m.group(1) not in out:
+            out[m.group(1)] = (riding, log.line(i))
+    return out
+
+
+# W31: the follow's rescue (client/auto_follow.cpp): a follower the game put back twice after a move, taken back to
+# its own last ground; and the game's own put-backs (`Stuck falling: player put back`) on that client.
+FOLLOW_RESCUED = re.compile(r"Online: auto follow \d+: rescued: put back \d+ times since the move to (\S+); back to "
+                            r"its own last ground (\S+)")
+PUT_BACK = re.compile(r"Stuck falling: player put back after")
+
+
+def route_head(folder: Path) -> list[str]:
+    """The page's lines for targets not visited (no floor) and heroes taken out of a stuck spot, per client."""
+    out = []
+    for who in ("H", "D"):
+        log = read_log(folder, f"{who}/game.log", who)
+        if log is None:
+            continue
+        label, missed, taken, rescued, put_backs, first_put = "", [], [], [], 0, None
+        for i, raw in enumerate(log.lines):
+            m = FOLLOW_RESCUED.search(raw)
+            if m:
+                rescued.append(f"from {m.group(1)} to {m.group(2)} ({log.line(i).cite()})")
+                continue
+            if PUT_BACK.search(raw):
+                put_backs += 1
+                first_put = first_put or log.line(i)
+                continue
+            m = VISIT_OR_ACT.search(raw)
+            if m:
+                label = m.group(1) or m.group(2)
+                continue
+            m = NO_FLOOR.search(raw)
+            if m:
+                missed.append(f"{label + ' ' if label else ''}{m.group(2)} ({m.group(1)}; {log.line(i).cite()})")
+                continue
+            m = TAKEN_OUT.search(raw)
+            if m:
+                taken.append(f"at {m.group(1)}: {m.group(2)} ({log.line(i).cite()})")
+        rode = ride_reached(log)
+        for name, (pad, line) in rode.items():
+            out.append(f"reached by the launch ride on {who}: {name} (the ride of {pad}; {line.cite()})")
+        missed = [m for m in missed if not any(m.split(" ", 1)[-1].startswith(n + "#") for n in rode)]
+        if missed:
+            out.append(f"not visited on {who}: no floor (a trigger in the air): " + "; ".join(missed[:4])
+                       + (f"; and {len(missed) - 4} more" if len(missed) > 4 else ""))
+        if taken:
+            out.append(f"{who} held too long at the same spot twice, {len(taken)} time(s): " + "; ".join(taken[:3]))
+        if rescued:
+            out.append(f"{who} rescued by the follow (put back twice after a move, taken to its own last ground), "
+                       f"{len(rescued)} time(s): " + "; ".join(rescued[:3]))
+        if put_backs >= 2:
+            out.append(f"{who} put back by the game {put_backs} times (`Stuck falling: player put back`; the first "
+                       f"{first_put.cite()})")
+    return out
+
+
+PLACE_LINE = re.compile(r"^\s*place (\d+) .*?([^/\\]+)\.dump\s*$")
+
+
+def figures_head(folder: Path) -> list[str]:
+    """The page's line naming each player's figures (W21), from its script's `place` lines; a Top and a Bottom of
+    one name are a swapper."""
+    out = []
+    for who in ("H", "D"):
+        script = folder / who / "script.txt"
+        if not script.is_file():
+            continue
+        names = [m.group(2) for m in map(PLACE_LINE.match, script.read_text(encoding="utf-8", errors="replace")
+                                         .splitlines()) if m]
+        if not names:
+            continue
+        if len(names) == 2 and names[0].endswith(" Top") and names[1].endswith(" Bottom") and \
+                names[0][:-4] == names[1][:-7]:
+            out.append(f"{who} {names[0][:-4]} (a swapper: {names[0]} + {names[1]})")
+        else:
+            out.append(f"{who} {' + '.join(names)}")
+    return [f"figures: {'; '.join(out)}"] if out else []
+
+
+def overall(verdicts: list[Verdict]) -> str:
+    """The page's one line: FAIL (and which rows) when a grader failed, INCOMPLETE when the pass did not cover
+    its plan, PASS only when every row passed; with every row NOT TESTED named next to it, so nobody reads the
+    rest as passed."""
+    untested = [v.name for v in verdicts if v.status == NOT_TESTED]
+    teleport = [v.name for v in verdicts if v.status == BY_TELEPORT]
+    tail = (f"; NOT TESTED: {', '.join(untested)}" if untested else "") + \
+        (f"; BY TELEPORT: {', '.join(teleport)}" if teleport else "")
+    if any(v.status == FAIL for v in verdicts):
+        return "FAIL: " + ", ".join(v.name for v in verdicts if v.status == FAIL) + \
+            ("; INCOMPLETE" if any(v.status == INCOMPLETE for v in verdicts) else "") + tail
+    if any(v.status == INCOMPLETE for v in verdicts):
+        return "INCOMPLETE" + tail
+    if untested:
+        return "NOT ALL TESTED: " + ", ".join(untested) + (f"; BY TELEPORT: {', '.join(teleport)}" if teleport else "")
+    return "PASS" if not teleport else "BY TELEPORT: " + ", ".join(teleport)
+
+
+def page(folder: Path, verdicts: list[Verdict], head: list[str] | None = None) -> str:
+    out = [f"level check: {folder}", *(head or []), f"overall: {overall(verdicts)}", ""]
+    for v in verdicts:
+        out += v.page_lines()
+    more = [(v, f) for v in verdicts for f in v.findings[1:]]
+    if more:
+        out += ["", f"every other finding ({len(more)}):"]
+        for v, f in more:
+            out.append(f"  {v.name}: {f.what}")
+            out += [f"      {x}" for x in f.lines]
+    out += not_covered_lines()
+    out += [f"  - {name}: no ground a player can stand on near it (a target in the air): the level reaches it "
+            "another way (a ride, a launch, a script that moves it) the pass does not take; not covered by the pass"
+            for name in no_floor_targets(folder)]
+    return "\n".join(out)
+
+
+def no_floor_targets(folder: Path) -> list[str]:
+    """W27: the targets the route refused for having no floor near them (`route teleport ... failed (no floor: ...)
+    (target <Name#id>)`) on any client, each once, by name without its id."""
+    seen: list[str] = []
+    rode: set[str] = set()
+    for who in ("H", "D"):
+        rode |= set(ride_reached(read_log(folder, f"{who}/game.log", who)))
+    for who in ("H", "D"):
+        log = read_log(folder, f"{who}/game.log", who)
+        for _line, m in (log.find(NO_FLOOR) if log is not None else []):
+            if not re.fullmatch(r"\S+#\d+", m.group(2)):
+                continue  # a fight's area or an asleep target's stored position: no entity of the level by name
+            name = m.group(2).split("#")[0]
+            if name not in seen and name not in rode:
+                seen.append(name)
+    return seen
+
+
+# --- the static table: every level's end and mechanics from its data, no game ----------------------------
+
+LEVEL_TYPES = (  # by the level's name (the game's own naming)
+    (re.compile(r"^town_state"), "hub"),
+    (re.compile(r"^town_"), "hub side game"),
+    (re.compile(r"^(pvp|ringout)_"), "versus arena"),
+    (re.compile(r"^(survival|sv)_"), "survival arena"),
+    (re.compile(r"^hc_"), "heroic challenge"),
+    (re.compile(r"^lp_puzzle"), "lock puzzle"),
+    (re.compile(r"_speedster$"), "swap zone"),
+    (re.compile(r"^ap_"), "adventure pack"),
+)
+TYPE_ORDER = ["story", "adventure pack", "hub", "swap zone", "heroic challenge", "lock puzzle", "hub side game",
+              "survival arena", "versus arena"]
+STATIC_COLUMNS = [("switches/mini-games", "A"), ("fetch hand-ins", "B"), ("thrown objects", "C"),
+                  ("turrets/vehicles", "D"), ("bosses", "F"), ("rides", "G")]
+SPAWNERS = re.compile(r"SpawnerComponentData$|CEncounterManagerComponentData$")
+
+
+def level_type(level: str) -> str:
+    return next((name for rx, name in LEVEL_TYPES if rx.search(level)), "story")
+
+
+@dataclass
+class StaticRow:
+    level: str
+    kind: str
+    ends: str          # how the level ends, in words
+    needs: str         # what the pass cannot do at the end ('' when it can)
+    on_way: str        # families on the end's path
+    counts: dict[str, int]
+    spawners: int
+    probe: bool
+    detail: str        # the full reason for an end the pass cannot carry out
+
+
+def static_row(folder: Path, level: str) -> StaticRow:
+    import levelpass_end as le
+    logic = json.loads((folder / level / "logic.json").read_text(encoding="utf-8"))
+    nodes, _ = le.read_logic(logic)
+    counts = {fam: 0 for _, fam in STATIC_COLUMNS}
+    spawners = 0
+    for n in nodes.values():
+        fam = le.family_of(n.components)
+        if fam in counts:
+            counts[fam] += 1
+        spawners += any(SPAWNERS.search(c) for c in n.components)
+    chains = logic.get("level_end") or []
+    end = le.derive_end(chains, logic, level) if chains else None
+
+    def name(k: str) -> str:
+        return nodes[k].name if k in nodes else k.split(".")[-1]
+    needs = detail = ""
+    if end is None:
+        ends = "no level end in the data"
+    elif end.kind == le.TRIGGER:
+        ends = f"enter a trigger: {name(end.trigger)}"
+    elif end.kind == le.FIGHT:
+        ends = (f"win a fight: {name(end.counter)} ({end.count} deaths)" if end.counter else "kill one enemy: "
+                + ", ".join(name(k) for k in end.counted[:2]))
+    elif end.kind == le.TIMED:
+        ends = "on its own (no player act found)"
+    else:
+        fam, key, _when = end.blockers[0]
+        ends = "the pass cannot end it"
+        needs = (f"{le.FAMILIES[fam]}: {name(key)}" if fam in le.FAMILIES else f"unknown: {name(key)}")
+        others = sorted({f for f, _k, _w in end.blockers[1:] if f != fam})
+        if others:
+            needs += " (also " + ", ".join(le.FAMILIES.get(f, "unknown") for f in others) + ")"
+        detail = end.why
+    on_way = ", ".join(sorted({le.FAMILIES[f] for f, _k in end.on_path})) if end and end.on_path else ""
+    return StaticRow(level, level_type(level), ends, needs, on_way, counts, spawners,
+                     (folder / f"{level}-manifest.txt").is_file(), detail)
+
+
+def summary_line(rows: list[StaticRow]) -> str:
+    """The table's one line for the owner: the levels with an end in their data that the pass can end today,
+    those it cannot (per reason), those whose end is unknown (with the node)."""
+    with_end = [r for r in rows if r.ends != "no level end in the data"]
+    can = [r for r in with_end if not r.needs]
+    unknown = [r for r in with_end if r.needs.startswith("unknown")]
+    cannot: dict[str, list[str]] = {}
+    for r in with_end:
+        if r.needs and not r.needs.startswith("unknown"):
+            cannot.setdefault(r.needs.split(":")[0], []).append(r.level)
+    own = [r.level for r in can if r.ends.startswith("on its own")]
+    return ("Today: of the " + str(len(with_end)) + " levels with an end in their data, the pass can end "
+            + str(len(can)) + " (" + ", ".join(r.level for r in can)
+            + (f"; {', '.join(own)} by waiting, it ends on its own" if own else "") + "); it cannot end "
+            + str(sum(len(v) for v in cannot.values())) + " ("
+            + "; ".join(f"{k} {len(v)}: {', '.join(v)}" for k, v in sorted(cannot.items(), key=lambda x: (-len(x[1]), x[0])))
+            + "); unknown " + str(len(unknown)) + " ("
+            + ", ".join(f"{r.level} at {r.needs.split(': ', 1)[1]}" for r in unknown) + ").")
+
+
+def static_table(folder: Path) -> str:
+    levels = sorted(p.parent.name for p in folder.glob("*/logic.json"))
+    rows = [static_row(folder, lv) for lv in levels]
+    rows.sort(key=lambda r: (TYPE_ORDER.index(r.kind) if r.kind in TYPE_ORDER else 99, r.level))
+    heads = ["level", "type", "how the level ends", "what the pass cannot do at the end", "on the way to the end",
+             *(h for h, _ in STATIC_COLUMNS), "enemy spawners", "probe data"]
+    cells = [[r.level, r.kind, r.ends, r.needs or "-", r.on_way or "-", *(str(r.counts[f]) for _, f in STATIC_COLUMNS),
+              str(r.spawners), "yes" if r.probe else "no"] for r in rows]
+    width = [max(len(h), *(len(c[i]) for c in cells)) for i, h in enumerate(heads)]
+    line = lambda c: " | ".join(x.ljust(width[i]) for i, x in enumerate(c)).rstrip()  # noqa: E731
+    by_end = {}
+    for r in rows:
+        k = ("cannot end it" if r.needs else r.ends.split(":")[0])
+        by_end[k] = by_end.get(k, 0) + 1
+    out = [
+        f"Every level's end and mechanics, read from the level data in {folder} (no game). {len(rows)} levels.",
+        "How the level ends: what the level pass would do at the end (enter a trigger, win a fight, wait), found by",
+        "  walking the level's own telegrams back from its map load. 'The pass cannot end it': the end needs what the",
+        "  next column says (a mini-game's result, a turret, a boss, a ride, a menu choice), or 'unknown' at the node",
+        "  where the reader stopped. Counts: objects of that kind in the level. Probe data: the pass can run (yes/no).",
+        summary_line(rows),
+        "",
+        line(heads),
+        line(["-" * w for w in width]),
+        *(line(c) for c in cells),
+        "",
+        "Totals by how the level ends: " + ", ".join(f"{k} {v}" for k, v in sorted(by_end.items(), key=lambda x: -x[1])),
+        "",
+        "Why the pass cannot end these levels (the node and the telegram the reader stopped at):",
+    ]
+    out += [f"  {r.level}: {r.detail}" for r in rows if r.detail]
+    return "\n".join(out)

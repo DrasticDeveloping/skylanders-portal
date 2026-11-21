@@ -677,10 +677,38 @@ void OwnerFlagsMessage() {
 void Version2Scenes() {
   // Every phase and kind survives a round trip; a level-load scene has no recipient (kNone).
   const SceneKey loaded{1, EntityRef{RefKind::kNone, 2}, NameHash("Tutorial_B_Intro")};
-  for (ScenePhase p : {ScenePhase::kOpen, ScenePhase::kAck, ScenePhase::kRelease}) {
+  for (ScenePhase p : {ScenePhase::kOpen, ScenePhase::kAck, ScenePhase::kRelease, ScenePhase::kSkip,
+                       ScenePhase::kHold, ScenePhase::kUnhold, ScenePhase::kShare, ScenePhase::kStart}) {
     CHECK(RoundTrip(SceneBarrier{p, 2, loaded, SceneKind::kCutscene}));
     CHECK(RoundTrip(SceneBarrier{p, 2, Scene(), SceneKind::kConversation}));
   }
+  // kStart's mark rides in the skips byte (the game's scene_share_rules.h); no other phase but kEnd has one.
+  for (uint8_t mark : {uint8_t(1), uint8_t(2), uint8_t(3), uint8_t(255)}) {
+    SceneBarrier m{ScenePhase::kStart, 2, Scene(), SceneKind::kCutscene};
+    m.skips = mark;
+    CHECK(RoundTrip(m));
+    CHECK(EncodeMessage(m).back() == mark);
+  }
+  {
+    SceneBarrier m{ScenePhase::kHold, 2, loaded, SceneKind::kCutscene};
+    m.skips = 1;
+    CHECK(EncodeMessage(m).empty());
+  }
+  // The shared skip's and the hold's phases: their numbers on the wire, and no end reason or skips.
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase::kSkip, 2, loaded, SceneKind::kCutscene})[4] == 5);
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase::kHold, 2, loaded, SceneKind::kCutscene})[4] == 6);
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase::kUnhold, 2, loaded, SceneKind::kCutscene})[4] == 7);
+  // kShare: the session's switches in the scene sequence, no recipient.
+  {
+    const SceneKey share{3, EntityRef{RefKind::kNone, 0}, 0};
+    const auto b = EncodeMessage(SceneBarrier{ScenePhase::kShare, 0, share, SceneKind::kCutscene});
+    REQUIRE_OR_RETURN_VOID(!b.empty());
+    CHECK(b[4] == 8 && b[9] == 3);
+    CHECK(RoundTrip(SceneBarrier{ScenePhase::kShare, 0, share, SceneKind::kCutscene}));
+    CHECK(EncodeMessage(SceneBarrier{ScenePhase::kShare, 0, share, SceneKind::kCutscene, SceneEndReason::kNone, 1}).empty());
+  }
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase::kSkip, 2, loaded, SceneKind::kCutscene, SceneEndReason::kStop}).empty());
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase::kHold, 2, loaded, SceneKind::kCutscene, SceneEndReason::kNone, 1}).empty());
   for (SceneEndReason e : {SceneEndReason::kNatural, SceneEndReason::kStop, SceneEndReason::kLevelChange,
                            SceneEndReason::kOther}) {
     CHECK(RoundTrip(SceneBarrier{ScenePhase::kEnd, 2, loaded, SceneKind::kCutscene, e, 0}));
@@ -706,7 +734,8 @@ void Version2Scenes() {
   // Not encoded: an unknown phase or kind, an end reason outside kEnd (or none in it), skips
   // outside kEnd, a recipient ref with stray fields.
   CHECK(EncodeMessage(SceneBarrier{ScenePhase(0), 2, loaded, SceneKind::kCutscene}).empty());
-  CHECK(EncodeMessage(SceneBarrier{ScenePhase(5), 2, loaded, SceneKind::kCutscene}).empty());
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase(10), 2, loaded, SceneKind::kCutscene}).empty());
+  CHECK(EncodeMessage(SceneBarrier{ScenePhase::kStart, 2, Scene(), SceneKind::kCutscene})[4] == 9);
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kOpen, 2, loaded, SceneKind(3)}).empty());
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kOpen, 2, loaded, SceneKind::kCutscene, SceneEndReason::kStop}).empty());
   CHECK(EncodeMessage(SceneBarrier{ScenePhase::kEnd, 2, loaded, SceneKind::kCutscene, SceneEndReason::kNone}).empty());
@@ -721,7 +750,9 @@ void Version2Scenes() {
     REQUIRE_OR_RETURN_VOID(b.size() == kMessageHeaderSize + 33);
     const size_t phase = kMessageHeaderSize, kind = kMessageHeaderSize + 30, end = kind + 1;
     CHECK(DecodeMessages(b).has_value());
-    b[phase] = 6;
+    b[phase] = 10;  // past kStart
+    CHECK(!DecodeMessages(b).has_value());
+    b[phase] = uint8_t(ScenePhase::kHold);  // a hold with an end reason
     CHECK(!DecodeMessages(b).has_value());
     b[phase] = uint8_t(ScenePhase::kEnd);
     b[kind] = 0;
@@ -907,6 +938,7 @@ void Stage4() {
     CHECK(RoundTrip(PlayerActionShown{3, 2, 7, 41, 0x80000002u, 900}));
     PlayerPoseShown s;
     s.peer = 4;
+    s.peer_epoch = 0x0A0B0C0Du;  // moves final F5: every relayed pose names its player's epoch
     s.pose.pose_sequence = 12;
     s.pose.generation = 7;
     s.pose.position = {1.5f, -2.0f, 3.0f};
@@ -917,6 +949,108 @@ void Stage4() {
     b.pop_back();
     b[2] = uint8_t(b.size() - kMessageHeaderSize);
     CHECK(!DecodeMessages(b).has_value());
+  }
+}
+
+// Stage 4, the other player's moves: the pose's command block. The bytes of a pose with a block begin with the
+// bytes of the same pose without one (an older reader reads exactly its fields there and ignores the rest), a pose
+// without one reads has_command false, another version's block is skipped, a cut or non-finite one is invalid,
+// and the shown pose carries it.
+void Moves() {
+  PlayerPose p;
+  p.pose_sequence = 31;
+  p.generation = 4;
+  p.position = {10.f, -20.f, 30.f};
+  p.figure.elements = uint16_t(kElementsKnown | (1u << 3));
+  p.teleports = 2;
+  const std::vector<uint8_t> plain = EncodeMessage(p);
+  CHECK(RoundTrip(p));
+  PlayerPose c = p;
+  c.has_command = true;
+  c.command.peer_epoch = 0x01020304u;
+  c.command.held = 0x00000810u;  // JUMP and BLOCK held
+  c.command.presses = {7, 0, 255};
+  c.command.magnitude = 0.75f;
+  c.command.move = {0.6f, -0.8f, 0.f};
+  CHECK(RoundTrip(c));
+  const std::vector<uint8_t> with = EncodeMessage(c);
+  REQUIRE_OR_RETURN_VOID(with.size() == plain.size() + kPlayerCommandBytes);
+  // Past the header (whose length differs) the plain pose's fields are the first bytes of the new one.
+  CHECK(std::equal(plain.begin() + kMessageHeaderSize, plain.end(), with.begin() + kMessageHeaderSize));
+  {
+    auto back = DecodeMessages(plain);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<PlayerPose>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    CHECK(!got->has_command && got->teleports == 2);
+  }
+  // Another version's block: skipped, the pose itself read.
+  {
+    std::vector<uint8_t> b = with;
+    b[plain.size()] = uint8_t(kPlayerCommandVersion + 1);  // version 3: unknown
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<PlayerPose>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    CHECK(!got->has_command && got->pose_sequence == 31 && got->teleports == 2);
+  }
+  // A version 1 block cut short: invalid.
+  {
+    std::vector<uint8_t> b = with;
+    b.resize(b.size() - 3);
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);
+    b[3] = 0;
+    CHECK(!DecodeMessages(b).has_value());
+  }
+  // Version 1, the first layout (24 bytes, no epoch): read as no command, the pose kept; one byte more or less:
+  // invalid. Version 2 is not read as version 1 nor the other way round.
+  {
+    std::vector<uint8_t> b = plain;
+    b.push_back(kPlayerCommandVersion1);
+    for (size_t i = 1; i < kPlayerCommandV1Bytes; ++i) b.push_back(0);
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);
+    b[3] = 0;
+    auto back = DecodeMessages(b);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<PlayerPose>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    CHECK(!got->has_command && got->pose_sequence == 31);
+    std::vector<uint8_t> longer = b;
+    longer.push_back(0);
+    longer[2] = uint8_t(longer.size() - kMessageHeaderSize);
+    CHECK(!DecodeMessages(longer).has_value());
+    std::vector<uint8_t> shorter = b;
+    shorter.pop_back();
+    shorter[2] = uint8_t(shorter.size() - kMessageHeaderSize);
+    CHECK(!DecodeMessages(shorter).has_value());
+    std::vector<uint8_t> v2_as_v1 = with;  // a version 2 block's bytes under version 1: 28 bytes, not 24
+    v2_as_v1[plain.size()] = kPlayerCommandVersion1;
+    CHECK(!DecodeMessages(v2_as_v1).has_value());
+  }
+  // A version 2 block one byte longer than its size: invalid (never read as a version 2 block).
+  {
+    std::vector<uint8_t> b = with;
+    b.push_back(0);
+    b[2] = uint8_t(b.size() - kMessageHeaderSize);
+    b[3] = 0;
+    CHECK(!DecodeMessages(b).has_value());
+  }
+  // A float not finite: not written, and not read.
+  {
+    PlayerPose bad = c;
+    bad.command.move[1] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(EncodeMessage(bad).empty());
+    std::vector<uint8_t> b = with;
+    const uint32_t nan = 0x7FC00000u;
+    for (int i = 0; i < 4; ++i) b[b.size() - 4 + i] = uint8_t(nan >> (8 * i));
+    CHECK(!DecodeMessages(b).has_value());
+  }
+  // The shown pose carries the block (it ends the message).
+  {
+    PlayerPoseShown s;
+    s.peer = 5;
+    s.pose = c;
+    CHECK(RoundTrip(s));
   }
 }
 
@@ -1301,6 +1435,7 @@ int main() {
   Version3();
   OwnerFlagsMessage();
   Stage4();
+  Moves();
   Stage5();
   Stage6();
 

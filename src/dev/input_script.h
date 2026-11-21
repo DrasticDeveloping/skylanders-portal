@@ -60,6 +60,17 @@
 //                            holds, at most that long; what follows starts when it returns (met
 //                            or timed out), not by the clock
 //   quit                     ends the game
+//   follow <file>            live mode: plays every complete line appended to that file (relative
+//                            to the working directory), in order, each on a timeline of its own that
+//                            starts when it is taken, with the same commands and blocking rules;
+//                            what follows `follow` in the script waits until a `follow_end` line.
+//                            Only lines that end in a newline are taken; lines are numbered from 1
+//                            in the file (blank and comment lines count) and logged as
+//                            `Input script: live <n>: <line>` when they start, `Input script: live
+//                            <n> done` when their last command, press and wait are over, or
+//                            `Input script: live <n> refused: <why>` (the session goes on). The
+//                            test runner's `skytest.py live` sessions write the file (dev/live_lines.h)
+//   follow_end               (a live line only) leaves live mode: `Input script: live mode ended`
 //   <name> [<args>]          a command the game registered (RegisterScriptCommand), e.g. a
 //                            developer build's level loading; the timeline waits while it runs,
 //                            presses included
@@ -99,6 +110,11 @@ void RegisterScriptCondition(const std::string& name, std::function<bool()> hold
 // position each frame): while `on`, it replaces the script's `stick` events on the script's virtual
 // pad; x and y in -1..1. Any thread.
 void SetScriptStick(bool on, double x, double y);
+// The right stick the game's own developer code drives (a microgame that wants the camera stick wiggled):
+// while `on` it is the script's virtual pad's right stick (the script itself has no right stick events);
+// centred when off. x and y in -1..1. Any thread.
+#define SKYLANDERS_DEV_SCRIPT_RIGHT_STICK 1
+void SetScriptRightStick(bool on, double x, double y);
 // Buttons the game's own developer code holds (the closed-loop walk's jump): while `on`, they are
 // added to the script's own presses; XInput button bits (A is 0x1000). Any thread.
 #define SKYLANDERS_DEV_SCRIPT_BUTTONS 1
