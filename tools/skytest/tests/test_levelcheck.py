@@ -297,7 +297,7 @@ class Unpublished(unittest.TestCase):
         self.assertIn("EA_Manager_W1_B_componentDataOverrides", f.what)
 
 
-LEVELPASS_FOLDER = Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass")
+LEVELPASS_FOLDER = Path("~/Documents/T3Code/SwapForceOnline-work/levelpass").expanduser()
 
 
 @unittest.skipUnless((LEVELPASS_FOLDER / "tutorial_b").is_dir(), "the levelpass folder is not here")
@@ -870,7 +870,7 @@ class LevelEvents(unittest.TestCase):
 
 class AuthorsFinalLines(unittest.TestCase):
     """W40: the rows read the authors' final texts (their branches' code)."""
-    LP = Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass")
+    LP = LEVELPASS_FOLDER
 
     def test_damage_from_s_final_forms(self) -> None:
         # online/5-replica-attacks-land-2 2756bb27
@@ -1025,7 +1025,7 @@ class AuthorsFinalLines(unittest.TestCase):
 
 class WorldEvents(unittest.TestCase):
     OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
-    LP = Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass")
+    LP = LEVELPASS_FOLDER
 
     @unittest.skipUnless(LP.is_dir(), "the level data is not here")
     def test_the_cage_step_moved_on_s_applied_here_and_at_a_wake(self) -> None:
@@ -1163,7 +1163,7 @@ class DialogSkip(unittest.TestCase):
 
 class GateKinds(unittest.TestCase):
     OWNER_3 = Path(r"D:/SwapForceOnline-data/play/20261119-235225")
-    LP = Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass")
+    LP = LEVELPASS_FOLDER
 
     @unittest.skipUnless(LP.is_dir(), "the level data is not here")
     def test_tutorial_b_has_three_elemental_gates_and_three_swap_zones(self) -> None:
@@ -1614,12 +1614,12 @@ class ScenesWhereCalibration(unittest.TestCase):
 
 
 @unittest.skipUnless((CALIBRATION_RUNS / "20261119-065111-levelpass-tutorial_b").is_dir() and
-                     (Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass/tutorial_b") / "manifest.json").is_file(),
+                     ((LEVELPASS_FOLDER / "tutorial_b") / "manifest.json").is_file(),
                      "the key-gate run or tutorial_b's data is not here")
 class KeyGateCalibration(unittest.TestCase):
     def test_gate_one_opened_on_s_and_gate_two_pressed_gate_ones_lock(self) -> None:
         run = lc.load_run(CALIBRATION_RUNS / "20261119-065111-levelpass-tutorial_b")
-        shut, done = lc.required_steps(run, lc.level_data(Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass"), "tutorial_b"))
+        shut, done = lc.required_steps(run, lc.level_data(LEVELPASS_FOLDER, "tutorial_b"))
         self.assertEqual(len(done), 1, done)
         self.assertIn("opened on S, H, D: S at 06:54:11.743 ", done[0])  # W17: S's own row of the gate, written again
         # W34: the arena gate is a required fight gate now; this pass never fought it: named, never silent.
@@ -1640,12 +1640,12 @@ class GatesRunCalibration(unittest.TestCase):
 
 
 @unittest.skipUnless((CALIBRATION_RUNS / "20261119-124636-levelpass-ww1").is_dir() and
-                     (Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass/ww1") / "manifest.json").is_file(),
+                     ((LEVELPASS_FOLDER / "ww1") / "manifest.json").is_file(),
                      "batch 12's ww1 gates run or ww1's data is not here")
 class FightGatesCalibration(unittest.TestCase):
     def test_two_demon_gates_opened_on_every_game(self) -> None:
         run = lc.load_run(CALIBRATION_RUNS / "20261119-124636-levelpass-ww1")
-        _shut, done = lc.required_steps(run, lc.level_data(Path(r"C:/Users/daz/Documents/T3Code/SwapForceOnline-work/levelpass"),
+        _shut, done = lc.required_steps(run, lc.level_data(LEVELPASS_FOLDER,
                                                            "ww1"))
         names = [d.split(" (")[0] for d in done]
         self.assertEqual(names, ["Finale_DemonGate008", "PuzzleGateSawtooth001"])
