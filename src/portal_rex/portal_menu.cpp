@@ -5799,6 +5799,13 @@ bool PlayerHasFreshSkylander(uint32_t user) {
 std::atomic<uint32_t> g_auto_open_generation{0};
 // How long the game must keep asking although the player's Skylander is on the portal.
 constexpr auto kAutoOpenWithFigureDelay = std::chrono::milliseconds(1500);
+// Swap Force Online's audit (2026-11-21): after a two-part figure change the game can go back to its prompt with both
+// halves on (2 of 12 start checks): the menu then lifted them and the player was stuck in it. Before the menu opens,
+// the player's figures are taken off for kReseatOff and put back on once (the game makes fresh toy objects and reads
+// them again); only if the game still asks after that does the menu open. Once per kReseatAgain per player.
+constexpr auto kReseatOff = std::chrono::milliseconds(500);
+constexpr auto kReseatAgain = std::chrono::seconds(10);
+std::array<Clock::time_point, rex::input::kMaxGuestUsers> g_reseat_at{};  // UI thread only
 
 void OpenAutoMenu(uint32_t user) {
   // The player's controller steers it; without one, the keyboard.
@@ -5832,6 +5839,22 @@ void AutoOpenPortalMenu(uint32_t user) {
           if (g_menu || g_auto_open_generation.load() != generation) return;
           if (!REXCVAR_GET(portal_menu_auto_open) || !GetSoftwarePortal()) return;
           REXLOG_INFO("Portal menu: the game still asks player {} although a Skylander is on", user + 1);
+          const auto now = Clock::now();
+          if (g_reseat_at[user] == Clock::time_point{} || now - g_reseat_at[user] >= kReseatAgain) {
+            g_reseat_at[user] = now;
+            std::vector<LiftedFigure> lifted = LiftPlayer(user);
+            if (!lifted.empty()) {
+              REXLOG_INFO("Portal menu: player {}'s figure taken off and put back on once ({} part(s)): the game reads "
+                          "it fresh",
+                          user + 1, lifted.size());
+              std::thread([user, lifted] {
+                std::this_thread::sleep_for(kReseatOff);
+                if (!g_app_context) return;
+                g_app_context->CallInUIThread([user, lifted] { RestoreLifted(user, lifted); });
+              }).detach();
+              return;
+            }
+          }
           OpenAutoMenu(user);
         });
       }).detach();
