@@ -297,6 +297,53 @@ std::string FrameName(uintptr_t address);
 LPTOP_LEVEL_EXCEPTION_FILTER g_previous_filter = nullptr;
 std::atomic<bool> g_crash_logged{false};
 
+// The crash report's other threads (a crash in a game's sound mixer, 2026-11-21: the mixer read memory another thread
+// had freed that instant, and the report could not say which thread): each other thread's call chain, taken once,
+// each thread suspended only while its context is read (the room is taken before any is suspended: a suspended thread
+// may hold the heap lock), then written as urgent lines. At most kCrashThreads threads, kCrashFrames frames each; a
+// thread with no frame is left out.
+void LogOtherThreadsAtCrash() {
+  constexpr size_t kCrashThreads = 96;
+  constexpr int kCrashFrames = 12;
+  struct Taken {
+    DWORD id = 0;
+    uintptr_t frames[kCrashFrames] = {};
+  };
+  std::vector<Taken> taken(kCrashThreads);
+  size_t count = 0;
+  const DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) return;
+  THREADENTRY32 entry{};
+  entry.dwSize = sizeof(entry);
+  for (BOOL ok = Thread32First(snapshot, &entry); ok && count < taken.size(); ok = Thread32Next(snapshot, &entry)) {
+    if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) continue;
+    HANDLE thread =
+        OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+    if (!thread) continue;
+    Taken& one = taken[count];
+    one.id = entry.th32ThreadID;
+    const StackRange stack = ThreadStackRange(thread);
+    if (SuspendThread(thread) != DWORD(-1)) {
+      CONTEXT ctx{};
+      ctx.ContextFlags = CONTEXT_FULL;
+      if (GetThreadContext(thread, &ctx)) UnwindSafe(ctx, one.frames, kCrashFrames, stack);
+      ResumeThread(thread);
+      ++count;
+    }
+    CloseHandle(thread);
+  }
+  CloseHandle(snapshot);
+  for (size_t i = 0; i < count; ++i) {
+    std::string chain;
+    for (uintptr_t frame : taken[i].frames) {
+      if (!frame) break;
+      chain += (chain.empty() ? "" : " <- ") + FrameName(frame);
+    }
+    if (!chain.empty()) REXLOG_URGENT_ERROR("Crash: thread {} at the crash: {}", taken[i].id, chain);
+  }
+}
+
 // The unhandled-exception filter of InstallCrashReport: logs once, then lets the crash go on.
 LONG WINAPI OnCrash(PEXCEPTION_POINTERS info) {
   if (!g_crash_logged.exchange(true)) {
@@ -337,6 +384,7 @@ LONG WINAPI OnCrash(PEXCEPTION_POINTERS info) {
       REXLOG_URGENT_ERROR("Crash: guest registers{}", text);
     }
     LogPlace("crash", true);
+    LogOtherThreadsAtCrash();
     rex::FlushLogging();
   }
   return g_previous_filter ? g_previous_filter(info) : EXCEPTION_CONTINUE_SEARCH;
