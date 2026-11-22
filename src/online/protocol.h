@@ -404,6 +404,21 @@ struct PlayerCommand {
   bool operator==(const PlayerCommand&) const = default;
 };
 
+// 2026-11-22 (the owner's spectating, the game's decision 37): the sender's rendered view, so another player can
+// watch it. A block after the command block (or after `teleports` when the pose has none): the tag byte
+// kPlayerViewTag, then the eye position (3 f32), three angles in radians (3 f32) and the field of view in radians
+// (f32), all finite: kPlayerViewBytes in all. Only a block of exactly that size reads; a cut or longer one, or any
+// byte after a command block that does not begin a view block, makes the message invalid. A pose without it has
+// has_view false. The protocol version stays 3.
+constexpr uint8_t kPlayerViewTag = 0x56;
+constexpr size_t kPlayerViewBytes = 29;  // the tag included
+struct PlayerView {
+  std::array<float, 3> position{};
+  std::array<float, 3> angles{};
+  float fov = 0;
+  bool operator==(const PlayerView&) const = default;
+};
+
 // Client to server, fast lane, about 20 Hz (tests/thresholds.toml players_hz): the hero's pose.
 // `pose_sequence` counts the peer's poses from 1 (0 is never sent: only a scene skip's request
 // carries pose sequence 0, for "needs no pose"). The server drops a pose not newer than the last one it has from that peer in
@@ -418,6 +433,8 @@ struct PlayerPose {
   uint16_t teleports = 0;  // stage 4: the teleport counter (above)
   bool has_command = false;  // the moves' command block (above); false: none on the wire
   PlayerCommand command;     // read only when has_command
+  bool has_view = false;     // the view block (above); false: none on the wire
+  PlayerView view;           // read only when has_view
   bool operator==(const PlayerPose&) const = default;
 };
 

@@ -1054,6 +1054,88 @@ void Moves() {
   }
 }
 
+// 2026-11-22 (the owner's spectating): the pose's view block. It follows the command block or stands alone after
+// `teleports`; the bytes before it are the pose without it; exactly its size reads, a cut or longer one is invalid, a
+// byte after a command block that is not its tag is invalid, a float not finite is neither written nor read, and the
+// shown pose carries it.
+void View() {
+  PlayerPose p;
+  p.pose_sequence = 7;
+  p.generation = 3;
+  p.position = {1.f, 2.f, 3.f};
+  p.figure.elements = kElementsKnown;
+  p.teleports = 1;
+  PlayerPose v = p;
+  v.has_view = true;
+  v.view.position = {-41142.f, -15205.f, 2455.f};
+  v.view.angles = {0.1f, -0.35f, 3.1f};
+  v.view.fov = 1.0471976f;
+  CHECK(RoundTrip(v));
+  const std::vector<uint8_t> plain = EncodeMessage(p);
+  const std::vector<uint8_t> alone = EncodeMessage(v);
+  REQUIRE_OR_RETURN_VOID(alone.size() == plain.size() + kPlayerViewBytes);
+  CHECK(std::equal(plain.begin() + kMessageHeaderSize, plain.end(), alone.begin() + kMessageHeaderSize));
+  CHECK(alone[plain.size()] == kPlayerViewTag);
+  PlayerPose both = v;
+  both.has_command = true;
+  both.command.peer_epoch = 9;
+  both.command.held = 0x10;
+  both.command.magnitude = 1.f;
+  both.command.move = {1.f, 0.f, 0.f};
+  CHECK(RoundTrip(both));
+  PlayerPose command_only = both;
+  command_only.has_view = false;
+  const std::vector<uint8_t> with_command = EncodeMessage(command_only);
+  const std::vector<uint8_t> with_both = EncodeMessage(both);
+  REQUIRE_OR_RETURN_VOID(with_both.size() == with_command.size() + kPlayerViewBytes);
+  CHECK(std::equal(with_command.begin() + kMessageHeaderSize, with_command.end(), with_both.begin() + kMessageHeaderSize));
+  const auto resized = [](std::vector<uint8_t> b, size_t n) {
+    b.resize(n);
+    b[2] = uint8_t((b.size() - kMessageHeaderSize) & 0xFF);
+    b[3] = uint8_t((b.size() - kMessageHeaderSize) >> 8);
+    return b;
+  };
+  // Cut by one, or one byte longer: invalid, with or without a command block before it.
+  CHECK(!DecodeMessages(resized(alone, alone.size() - 1)).has_value());
+  CHECK(!DecodeMessages(resized(with_both, with_both.size() - 1)).has_value());
+  {
+    std::vector<uint8_t> longer = resized(alone, alone.size() + 1);
+    CHECK(!DecodeMessages(longer).has_value());
+  }
+  // A command block followed by a byte that is not the view's tag: invalid.
+  {
+    std::vector<uint8_t> b = with_both;
+    b[with_command.size()] = uint8_t(kPlayerViewTag + 1);
+    CHECK(!DecodeMessages(b).has_value());
+  }
+  // A float not finite: not written, and not read.
+  {
+    PlayerPose bad = v;
+    bad.view.fov = std::numeric_limits<float>::infinity();
+    CHECK(EncodeMessage(bad).empty());
+    std::vector<uint8_t> b = alone;
+    const uint32_t nan = 0x7FC00000u;
+    for (int i = 0; i < 4; ++i) b[b.size() - 4 + i] = uint8_t(nan >> (8 * i));
+    CHECK(!DecodeMessages(b).has_value());
+  }
+  // A pose without the block reads has_view false.
+  {
+    auto back = DecodeMessages(with_command);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<PlayerPose>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    CHECK(!got->has_view && got->has_command);
+  }
+  // The shown pose carries it (the pose ends the message).
+  {
+    PlayerPoseShown s;
+    s.peer = 2;
+    s.peer_epoch = 11;
+    s.pose = both;
+    CHECK(RoundTrip(s));
+  }
+}
+
 // Stage 5 (future/online-5.md sections 3.4, 3.6, D16, D28): the records_enemies bit, the accepted
 // occurrence keys and the attack press outside replay.
 void Stage5() {
@@ -1473,6 +1555,7 @@ int main() {
   OwnerFlagsMessage();
   Stage4();
   Moves();
+  View();
   Stage5();
   Stage6();
 

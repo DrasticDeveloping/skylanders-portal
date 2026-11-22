@@ -425,15 +425,32 @@ bool ReadPose(ByteReader& r, PlayerPose& m) {
     if (r.Ok() && !ValidElements(m.figure.elements)) return false;
   }
   if (ok && r.Ok() && r.Remaining() > 0) m.teleports = r.U16();  // stage 4 (absent before: 0)
+  // The view block (protocol.h PlayerView), its tag already read: exactly its size, every float finite.
+  const auto read_view = [&]() {
+    if (r.Remaining() != kPlayerViewBytes - 1) return false;
+    std::array<float, 1> fov{};
+    if (!GetFloats(r, m.view.position) || !GetFloats(r, m.view.angles) || !GetFloats(r, fov) || !r.Ok()) return false;
+    m.view.fov = fov[0];
+    m.has_view = true;
+    return true;
+  };
   if (ok && r.Ok() && r.Remaining() > 0) {
     // The moves' command block (protocol.h PlayerCommand): another version's is skipped, a cut one is invalid.
+    // 2026-11-22: a view block may follow it, or stand alone after `teleports`.
     const uint8_t version = r.U8();
+    if (r.Ok() && version == kPlayerViewTag) return read_view();
     if (r.Ok() && version == kPlayerCommandVersion1) {
       // The first layout (no peer epoch): exactly its size, and read as no command (it names no player).
-      if (r.Remaining() != kPlayerCommandV1Bytes - 1) return false;
+      if (r.Remaining() != kPlayerCommandV1Bytes - 1 && r.Remaining() != kPlayerCommandV1Bytes - 1 + kPlayerViewBytes) {
+        return false;
+      }
+      r.Bytes(kPlayerCommandV1Bytes - 1);
     } else if (r.Ok() && version == kPlayerCommandVersion) {
-      // Exactly its size (the 27 bytes after the version byte): a longer version 2 block is not a version 2 one.
-      if (r.Remaining() != kPlayerCommandBytes - 1) return false;
+      // Exactly its size (the 27 bytes after the version byte), or that and a view block: a longer version 2 block is
+      // not a version 2 one.
+      if (r.Remaining() != kPlayerCommandBytes - 1 && r.Remaining() != kPlayerCommandBytes - 1 + kPlayerViewBytes) {
+        return false;
+      }
       m.command.peer_epoch = r.U32();
       m.command.held = r.U32();
       for (uint8_t& p : m.command.presses) p = r.U8();
@@ -442,7 +459,10 @@ bool ReadPose(ByteReader& r, PlayerPose& m) {
       m.command.magnitude = magnitude[0];
       m.has_command = ok && r.Ok();
       if (!m.has_command) return false;
+    } else {
+      return ok && r.Ok();  // another version's block: skipped with what follows it
     }
+    if (r.Ok() && r.Remaining() > 0) return r.U8() == kPlayerViewTag && r.Ok() && read_view();
   }
   return ok && r.Ok();
 }
@@ -537,6 +557,12 @@ bool Fields(ByteWriter& w, const PlayerPose& m) {
     for (const uint8_t p : m.command.presses) w.U8(p);
     const std::array<float, 1> magnitude{m.command.magnitude};
     if (!PutFloats(w, magnitude) || !PutFloats(w, m.command.move)) return false;
+  }
+  if (m.has_view) {
+    // 2026-11-22: the view block, after the command block (protocol.h PlayerView).
+    w.U8(kPlayerViewTag);
+    const std::array<float, 1> fov{m.view.fov};
+    if (!PutFloats(w, m.view.position) || !PutFloats(w, m.view.angles) || !PutFloats(w, fov)) return false;
   }
   return true;
 }
