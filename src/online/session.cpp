@@ -753,6 +753,11 @@ bool ServerSession::SendAppliedStep(const AppliedStep& step, TimePoint now) {
   return true;
 }
 
+bool ServerSession::SendSaveImage(uint16_t peer, const SaveImage& piece, TimePoint now) {
+  Peer* p = FindById(peer);
+  return p && Post(*p, Lane::kState, piece, now);
+}
+
 bool ServerSession::SendLevelEnd(uint16_t peer, const LevelEnd& end, TimePoint now) {
   Peer* p = FindById(peer);
   return p && Post(*p, Lane::kGameplay, end, now);
@@ -1134,6 +1139,11 @@ void ClientSession::HandleMessage(const Message& message, Lane lane, TimePoint n
     ClientEvent e;
     e.type = ClientEvent::Type::kLevelEnd;
     e.level_end = *end;
+    events_.push_back(std::move(e));
+  } else if (const auto* image = std::get_if<SaveImage>(&message)) {  // Swap Force Online's instant join
+    ClientEvent e;
+    e.type = ClientEvent::Type::kSaveImage;
+    e.save_image = *image;
     events_.push_back(std::move(e));
   } else if (const auto* reaction = std::get_if<Reaction>(&message)) {
     ClientEvent e;

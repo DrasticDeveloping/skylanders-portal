@@ -111,6 +111,8 @@ enum class MessageType : uint16_t {
   // Stage 8's block (55-59): the Hello gate's stateless answers (design 3.4, D10).
   kHelloCookie = 55,
   kJoinWait = 56,
+  // Swap Force Online's instant join (2026-11-21): the host's save for a joining game.
+  kSaveImage = 57,
 };
 
 enum class RefuseReason : uint8_t {
@@ -780,15 +782,40 @@ struct JoinWait {
   bool operator==(const JoinWait&) const = default;
 };
 
+// Swap Force Online, 2026-11-21 (the owner: "make players join the hosts save when they select it instantly and
+// automatically"): server to a client, state lane (reliable, in order): one piece of the save the host picked, for a
+// joining game to start from (the game decides what to do with it; the session never reads it). `kind` 0: a continue,
+// the slot's bytes in pieces of at most kMaxSaveImageChunk (`total` the whole's length and `sha256` its hash, the same
+// in every piece; `offset` this piece's place); 1: a new game, no bytes (`difficulty`, 0xFF: none). Wire: slot u8,
+// kind u8, difficulty u8, total u32, offset u32, sha256 32 bytes, then the piece (the rest of the message).
+constexpr size_t kMaxSaveImageChunk = 1024;
+constexpr uint32_t kMaxSaveImageBytes = 256 * 1024;
+struct SaveImage {
+  uint8_t slot = 0;
+  uint8_t kind = 0;
+  uint8_t difficulty = 0xFF;
+  uint32_t total = 0;
+  uint32_t offset = 0;
+  std::array<uint8_t, 32> sha256{};
+  std::vector<uint8_t> bytes;
+  bool operator==(const SaveImage&) const = default;
+};
+// A piece's fields agree with each other (both ends check it).
+inline bool ValidSaveImage(const SaveImage& m) {
+  if (m.kind > 1 || m.total > kMaxSaveImageBytes || m.bytes.size() > kMaxSaveImageChunk) return false;
+  if (m.kind == 1) return m.total == 0 && m.offset == 0 && m.bytes.empty();
+  return m.total != 0 && !m.bytes.empty() && uint64_t(m.offset) + m.bytes.size() <= m.total;
+}
+
 // The variant's order is the type numbering for the contiguous run (Hello = 1 ... AttackPress =
 // 26); the block types after it (OwnerFlags = 50, EnemyPoses = 30, HelloCookie = 55, JoinWait =
-// 56) are mapped by TypeOf.
+// 56, SaveImage = 57) are mapped by TypeOf.
 using Message = std::variant<Hello, Welcome, Refuse, Bye, Ping, Pong, LevelRequest, LevelLoad,
                              LevelLoaded, BarrierGo, PlayerList, PlayerPose, PlayerAction,
                              WorldRequest, WorldDecision, AppliedStep, LevelEnd, Reaction,
                              SessionClosing, SessionClosed, SceneBarrier, BackendFrame,
                              PlayerActionShown, PlayerPoseShown, OccurrenceAccept, AttackPress,
-                             OwnerFlags, EnemyPoses, HelloCookie, JoinWait>;
+                             OwnerFlags, EnemyPoses, HelloCookie, JoinWait, SaveImage>;
 MessageType TypeOf(const Message& message);
 
 // Appends one message to `out`. false (nothing appended) if a string is over its limit or not

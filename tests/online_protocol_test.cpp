@@ -1271,6 +1271,43 @@ int main() {
     CHECK(RoundTrip(JoinWait{3}));
     CHECK((TypeOf(Message{HelloCookie{1}}) == MessageType::kHelloCookie));
     CHECK((TypeOf(Message{JoinWait{}}) == MessageType::kJoinWait));
+    // Swap Force Online's instant join (57): the host's save in pieces, and a new game's notice.
+    SaveImage piece;
+    piece.slot = 1;
+    piece.kind = 0;
+    piece.total = 3000;
+    piece.offset = 2048;
+    for (size_t i = 0; i < piece.sha256.size(); ++i) piece.sha256[i] = uint8_t(i * 7);
+    piece.bytes.assign(952, 0xAB);
+    CHECK(RoundTrip(piece));
+    CHECK((TypeOf(Message{piece}) == MessageType::kSaveImage));
+    const auto wire = EncodeMessage(piece);
+    CHECK(wire.size() == kMessageHeaderSize + 3 + 8 + 32 + 952 && wire[0] == 57 && wire[1] == 0);
+    SaveImage fresh;
+    fresh.slot = 2;
+    fresh.kind = 1;
+    fresh.difficulty = 1;
+    CHECK(RoundTrip(fresh));
+    SaveImage bad = piece;
+    bad.offset = 2049;  // past the whole
+    CHECK(EncodeMessage(bad).empty());
+    bad = piece;
+    bad.bytes.assign(kMaxSaveImageChunk + 1, 1);
+    bad.total = 100000;
+    bad.offset = 0;
+    CHECK(EncodeMessage(bad).empty());
+    bad = fresh;
+    bad.bytes = {1};
+    CHECK(EncodeMessage(bad).empty());
+    bad = piece;
+    bad.kind = 2;
+    CHECK(EncodeMessage(bad).empty());
+    // A piece cut short on the wire is refused.
+    std::vector<uint8_t> cut = wire;
+    cut.resize(kMessageHeaderSize + 3 + 8 + 20);
+    cut[2] = uint8_t((cut.size() - kMessageHeaderSize) & 0xFF);
+    cut[3] = uint8_t((cut.size() - kMessageHeaderSize) >> 8);
+    CHECK(!DecodeMessages(cut).has_value());
     // The gate's refusals keep their reasons; 10 and up still read as "other".
     for (uint8_t r = 6; r <= 9; ++r) {
       const std::vector<uint8_t> refuse = {3, 0, 2, 0, r, 0};

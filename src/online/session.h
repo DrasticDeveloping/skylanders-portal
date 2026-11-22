@@ -304,6 +304,8 @@ class ServerSession {
   // filters by that client's interest radius and keeps the 10 Hz rate). false if `peer` is not a
   // welcomed client or the message cannot be encoded.
   bool SendEnemyPoses(uint16_t peer, const EnemyPoses& poses, TimePoint now = Clock::now());
+  // Swap Force Online's instant join: one piece of the host's save to `peer`, state lane (reliable, in order).
+  bool SendSaveImage(uint16_t peer, const SaveImage& piece, TimePoint now = Clock::now());
   // Datagrams sent to `peer` on `lane` and not yet acked (netplay's Connection::Unacked: every
   // message on that lane counts, the session's own included); 0 for a peer that is not welcomed.
   size_t BackendUnacked(uint16_t peer, netplay::Lane lane) const;
@@ -424,6 +426,8 @@ struct ClientEvent {
     // Stage 8 item 4: S's gate holds this join for the owner's let in (its first JoinWait;
     // pending_id). The client keeps connecting: a Welcome or a Refuse follows.
     kJoinWaiting,
+    // Swap Force Online's instant join: save_image, one piece of the host's save (state lane, in order).
+    kSaveImage,
   };
   Type type = Type::kConnected;
   uint16_t peer_id = 0;
@@ -451,6 +455,7 @@ struct ClientEvent {
   PlayerPoseShown pose_shown;                     // kPlayerPoseShown (stage 4)
   EnemyPoses enemy_poses;                         // kEnemyPoses (stage 5)
   uint32_t pending_id = 0;                        // kJoinWaiting (stage 8)
+  SaveImage save_image;                           // kSaveImage (Swap Force Online's instant join)
 };
 
 // The client side: one server, a ping every kPingInterval for the tick estimate and liveness.

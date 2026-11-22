@@ -15,7 +15,7 @@ using netplay::ByteWriter;
 // contiguous run 1..kLastType; the number-block types after it (stage 1C's OwnerFlags = 50,
 // stage 5's EnemyPoses = 30, stage 8's HelloCookie = 55 and JoinWait = 56) are mapped explicitly
 // (TypeOf, IsKnown).
-static_assert(std::variant_size_v<Message> == 30);
+static_assert(std::variant_size_v<Message> == 31);
 static_assert(std::is_same_v<std::variant_alternative_t<0, Message>, Hello>);
 static_assert(std::is_same_v<std::variant_alternative_t<10, Message>, PlayerList>);
 static_assert(std::is_same_v<std::variant_alternative_t<11, Message>, PlayerPose>);
@@ -31,7 +31,8 @@ static_assert(std::is_same_v<std::variant_alternative_t<26, Message>, OwnerFlags
 static_assert(std::is_same_v<std::variant_alternative_t<27, Message>, EnemyPoses>);
 static_assert(std::is_same_v<std::variant_alternative_t<28, Message>, HelloCookie>);
 static_assert(std::is_same_v<std::variant_alternative_t<29, Message>, JoinWait>);
-constexpr size_t kBlockTypes = 4;  // OwnerFlags, EnemyPoses, HelloCookie, JoinWait
+static_assert(std::is_same_v<std::variant_alternative_t<30, Message>, SaveImage>);
+constexpr size_t kBlockTypes = 5;  // OwnerFlags, EnemyPoses, HelloCookie, JoinWait, SaveImage
 static_assert(kLastType + kBlockTypes == std::variant_size_v<Message>);
 
 bool IsNone(const OwnerToken& token) {
@@ -173,6 +174,7 @@ MessageType TypeOf(const Message& message) {
   if (std::holds_alternative<EnemyPoses>(message)) return MessageType::kEnemyPoses;
   if (std::holds_alternative<HelloCookie>(message)) return MessageType::kHelloCookie;
   if (std::holds_alternative<JoinWait>(message)) return MessageType::kJoinWait;
+  if (std::holds_alternative<SaveImage>(message)) return MessageType::kSaveImage;
   return MessageType(message.index() + 1);
 }
 
@@ -669,6 +671,17 @@ bool Fields(ByteWriter& w, const JoinWait& m) {
   w.U32(m.pending_id);
   return true;
 }
+bool Fields(ByteWriter& w, const SaveImage& m) {
+  if (!ValidSaveImage(m)) return false;
+  w.U8(m.slot);
+  w.U8(m.kind);
+  w.U8(m.difficulty);
+  w.U32(m.total);
+  w.U32(m.offset);
+  w.Bytes(std::span<const uint8_t>(m.sha256.data(), m.sha256.size()));
+  w.Bytes(std::span<const uint8_t>(m.bytes.data(), m.bytes.size()));
+  return true;
+}
 bool Fields(ByteWriter& w, const OwnerFlags& m) {
   if (m.generation == 0 || m.revision == 0) return false;
   w.U32(m.generation);
@@ -1021,6 +1034,21 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
       result = m;
       break;
     }
+    case MessageType::kSaveImage: {
+      SaveImage m;
+      m.slot = r.U8();
+      m.kind = r.U8();
+      m.difficulty = r.U8();
+      m.total = r.U32();
+      m.offset = r.U32();
+      const auto sha = r.Bytes(m.sha256.size());
+      if (r.Ok()) std::copy(sha.begin(), sha.end(), m.sha256.begin());
+      const auto piece = r.Bytes(r.Remaining());
+      m.bytes.assign(piece.begin(), piece.end());
+      ok = r.Ok() && ValidSaveImage(m);
+      result = std::move(m);
+      break;
+    }
     default:
       return std::nullopt;
   }
@@ -1031,7 +1059,8 @@ std::optional<Message> DecodeKnown(MessageType type, std::span<const uint8_t> bo
 bool IsKnown(uint16_t type) {
   return (type >= 1 && type <= kLastType) || type == uint16_t(MessageType::kOwnerFlags) ||
          type == uint16_t(MessageType::kEnemyPoses) ||
-         type == uint16_t(MessageType::kHelloCookie) || type == uint16_t(MessageType::kJoinWait);
+         type == uint16_t(MessageType::kHelloCookie) || type == uint16_t(MessageType::kJoinWait) ||
+         type == uint16_t(MessageType::kSaveImage);
 }
 
 }  // namespace
