@@ -516,6 +516,28 @@ void ServerSession::HandleHello(Peer& peer, const Hello& hello, TimePoint now) {
     }
   }
 
+  // Two players with one profile name (both windows of one PC are "User" by default) are told apart on every
+  // screen: a name an admitted peer has already gets " 2", " 3", ... (cut to kMaxNameBytes). The owner's list of
+  // 2026-11-22 (the windows showed the stand-ins "Owner" and "Player").
+  {
+    const auto taken = [&](const std::string& name) {
+      for (const auto& [from, other] : peers_) {
+        if (other.get() != &peer && other->state == PeerState::kWelcomed && other->hello.name == name) return true;
+      }
+      return false;
+    };
+    if (taken(peer.hello.name)) {
+      const std::string first = peer.hello.name;
+      for (int n = 2; n < 100; ++n) {
+        const std::string suffix = " " + std::to_string(n);
+        const std::string name = TruncateUtf8(first, kMaxNameBytes - suffix.size()) + suffix;
+        if (!taken(name)) {
+          peer.hello.name = name;
+          break;
+        }
+      }
+    }
+  }
   peer.state = PeerState::kWelcomed;
   peer.id = id;
   peer.owner = claims_owner;
@@ -533,7 +555,7 @@ void ServerSession::HandleHello(Peer& peer, const Hello& hello, TimePoint now) {
   ServerEvent e;
   e.type = ServerEvent::Type::kPeerJoined;
   e.peer_id = id;
-  e.name = hello.name;
+  e.name = peer.hello.name;  // the name as told apart above
   e.owner = claims_owner;
   e.figure_id = hello.figure_id;
   e.figure_variant = hello.figure_variant;

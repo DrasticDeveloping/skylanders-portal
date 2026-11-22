@@ -208,7 +208,8 @@ void FakeNetworkSession() {
   CHECK(w.RunUntil([&] { return owner.session->Connected(); }));
   Client& b = w.Connect(MakeHello("Bee"));
   CHECK(w.RunUntil([&] { return b.session->Connected(); }));
-  Client& cc = w.Connect(MakeHello("Cee"));
+  // 2026-11-22: a third player with the second one's name is told apart ("Bee 2").
+  Client& cc = w.Connect(MakeHello("Bee"));
   CHECK(w.RunUntil([&] { return cc.session->Connected(); }));
   CHECK(owner.session->PeerId() == 1 && owner.session->IsOwner());
   CHECK(b.session->PeerId() == 2 && !b.session->IsOwner());
@@ -216,7 +217,7 @@ void FakeNetworkSession() {
   CHECK(owner.session->SessionId() == Settings().session_id);
   CHECK(w.Count(SE::kPeerJoined) == 3);
   const ServerEvent* joined = w.Last(SE::kPeerJoined);
-  CHECK(joined && joined->peer_id == 3 && joined->name == "Cee" && !joined->owner &&
+  CHECK(joined && joined->peer_id == 3 && joined->name == "Bee 2" && !joined->owner &&
         joined->figure_variant == 0x1801);
   CHECK(w.server_events[0].owner && w.server_events[0].peer_id == 1);
   const ClientEvent* connected = owner.Last(CE::kConnected);
@@ -230,6 +231,7 @@ void FakeNetworkSession() {
     return true;
   }));
   CHECK(cc.session->Players()[0].name == "Owner" && cc.session->Players()[2].peer_id == 3);
+  CHECK(cc.session->Players()[1].name == "Bee" && cc.session->Players()[2].name == "Bee 2");
 
   // Refusals: another build, another protocol version, a wrong owner token.
   Client& d = w.Connect(MakeHello("Dee", false, 9));
