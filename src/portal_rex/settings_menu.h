@@ -80,6 +80,15 @@ struct Setting {
   // through the game's own levels, a list no settings file holds). A still runs the action. Nothing
   // is stored or saved; while the row is greyed (`available` false) it does not step either.
   std::function<void(int delta)> step;
+  // With an action: a list the app fills at run time, picked from a drop-down with a search field (F4 > Debug >
+  // Level, the game's own levels). A (or a click on the row) opens it over the rows: what is typed filters it
+  // (every word typed, in any part of an entry, any case; choice_filter.h), up / down (held: repeating) and
+  // LB / RB (Page Up / Page Down) move, A / Enter or a click picks an entry (`pick` gets its index in what
+  // `choices` returned), B / Esc or a click outside closes it unchanged. `picked` gives the current entry's
+  // index (one past the end for none): the list opens on it. Left / right still call `step`. Nothing is stored.
+  std::function<std::vector<std::string>()> choices;
+  std::function<void(size_t index)> pick;
+  std::function<size_t()> picked;
 };
 
 struct SettingsPage {

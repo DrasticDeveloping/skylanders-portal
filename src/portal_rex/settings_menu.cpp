@@ -33,6 +33,7 @@
 #include <rex/ui/keybinds.h>
 #include <rex/ui/windowed_app_context.h>
 
+#include "portal_rex/choice_filter.h"
 #include "portal_rex/input_pictures.h"
 #include "portal_rex/menu_draw.h"
 #include "portal_rex/portal_menu_input.h"
@@ -701,6 +702,8 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
     SetScale(io.DisplaySize.y / 1080.0f);
     if (!listen_cvar_.empty()) {
       ListenForKey();
+    } else if (drop_) {
+      HandleDropInput(ReadActions(/*keys=*/false));  // the search field takes the keyboard
     } else {
       HandleInput(ReadActions());
     }
@@ -729,6 +732,7 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
     DrawRows(dl, {p0.x + S(38), p0.y + S(168)}, {list_right, p1.y - S(86)});
     DrawInfo(dl, {list_right + S(30), p0.y + S(168)}, {p1.x - S(38), p1.y - S(86)});
     DrawFooter(dl, p0, p1);
+    if (drop_) DrawDrop(dl, {p0.x + S(38), p0.y + S(168)}, {list_right, p1.y - S(86)});
     if (confirm_) DrawConfirm(dl, p0, p1);
     if (ask_) DrawAsk(dl, p0, p1);
     FadeVertices(dl, first_vertex,
@@ -748,11 +752,14 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
     return &page->settings[std::min(row_, page->settings.size() - 1)];
   }
 
-  Actions ReadActions() {
+  // `keys` false (a drop-down's search field has the keyboard): the keyboard's own menu keys and its controller
+  // emulation are left out, so typing a letter neither moves nor picks.
+  Actions ReadActions(bool keys = true) {
     Actions actions;
     bool released = true;
     for (const menu_input::ConnectedDevice& device : menu_input::ConnectedDevices()) {
       if (!device.pollable) continue;
+      if (!keys && device.keyboard) continue;
       const auto pad = menu_input::ReadPad(device.id);
       if (!pad) continue;
       released = released && PadReader::Released(*pad);
@@ -769,12 +776,14 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
       if (released && !ImGui::IsKeyDown(ImGuiKey_F4)) waiting_for_release_ = false;
       return {};
     }
-    const Actions keys = ReadKeyboard();
-    if (Any(keys)) {
-      keyboard_view_ = true;
-      menu_draw::UseKeyboardHints(true);
+    if (keys) {
+      const Actions typed = ReadKeyboard();
+      if (Any(typed)) {
+        keyboard_view_ = true;
+        menu_draw::UseKeyboardHints(true);
+      }
+      Merge(actions, typed);
     }
-    Merge(actions, keys);
     if (ImGui::IsKeyPressed(ImGuiKey_F4, false)) actions.back = true;
     return actions;
   }
@@ -903,7 +912,13 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
         s.step(a.left ? -1 : +1);
         return;
       }
-      if (a.accept) RunAction(s);
+      if (a.accept) {
+        if (s.choices) {
+          OpenDrop(s);  // a drop-down row (Setting::choices)
+        } else {
+          RunAction(s);
+        }
+      }
       return;
     }
     if (!Enabled(s)) return;  // greyed: its enabled_by setting is off
@@ -1085,7 +1100,7 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
       if (active) dl->AddRect(t0, t1, Rgba(255, 240, 190), S(23), 0, S(2));
       Label(dl, BoldFont(), S(22), {t0.x + S(20), CapCentredY(t0.y + h / 2, S(22))},
             active ? kInk : kDim, title);
-      if (!confirm_ && !ask_ && ImGui::IsMouseHoveringRect(t0, t1) && ImGui::IsMouseClicked(0)) {
+      if (!confirm_ && !ask_ && !drop_ && ImGui::IsMouseHoveringRect(t0, t1) && ImGui::IsMouseClicked(0)) {
         page_ = i;
         row_ = scroll_ = 0;
         followed_row_ = SIZE_MAX;  // follow the choice again
@@ -1100,12 +1115,12 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
     const float row_h = S(64), gap = S(8);
     const size_t visible = std::max<size_t>(1, size_t((b.y - a.y + gap) / (row_h + gap)));
     ScrollList(scroll_, followed_row_, wheel_, row_, visible, page->settings.size(),
-               !confirm_ && !ask_);
+               !confirm_ && !ask_ && !drop_);
     for (size_t i = scroll_; i < page->settings.size() && i < scroll_ + visible; ++i) {
       const Setting& s = page->settings[i];
       const ImVec2 r0{a.x, a.y + (i - scroll_) * (row_h + gap)}, r1{b.x, r0.y + row_h};
       const bool active = i == row_;
-      if (!confirm_ && !ask_ && ImGui::IsMouseHoveringRect(r0, r1) &&
+      if (!confirm_ && !ask_ && !drop_ && ImGui::IsMouseHoveringRect(r0, r1) &&
           (ImGui::GetIO().MouseDelta.x != 0.0f || ImGui::GetIO().MouseDelta.y != 0.0f)) {
         row_ = i;
       }
@@ -1121,12 +1136,23 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
       }
       if (s.action) {
         std::string value = s.shown ? s.shown() : std::string();  // a read-only value (Setting::shown)
-        if (s.step && !value.empty()) value = "<  " + value + "  >";  // a run-time choice (Setting::step)
+        if (s.step && !s.choices && !value.empty()) value = "<  " + value + "  >";  // a run-time choice (Setting::step)
         const char* go = value.empty() ? Tr("Open", "\xC3\x96" "ffnen") : value.c_str();
         const ImVec2 ts = TextSize(BoldFont(), S(21), go);
-        Label(dl, BoldFont(), S(21), {r1.x - S(24) - ts.x, r0.y + S(19)}, enabled ? kGold : greyed, go);
-        if (enabled && !confirm_ && !ask_ && ImGui::IsMouseHoveringRect(r0, r1) && ImGui::IsMouseClicked(0)) {
-          RunAction(s);
+        // A drop-down row (Setting::choices): its value with the list's arrow at the right.
+        const float arrow_w = s.choices ? S(34) : 0.0f;
+        Label(dl, BoldFont(), S(21), {r1.x - S(24) - arrow_w - ts.x, r0.y + S(19)}, enabled ? kGold : greyed, go);
+        if (s.choices) {
+          const float cx = r1.x - S(24) - S(12), cy = r0.y + row_h / 2 + S(1);
+          dl->AddTriangleFilled({cx - S(9), cy - S(5)}, {cx + S(9), cy - S(5)}, {cx, cy + S(6)},
+                                enabled ? kGold : greyed);
+        }
+        if (enabled && !confirm_ && !ask_ && !drop_ && ImGui::IsMouseHoveringRect(r0, r1) && ImGui::IsMouseClicked(0)) {
+          if (s.choices) {
+            OpenDrop(s);
+          } else {
+            RunAction(s);
+          }
           return;
         }
         continue;
@@ -1157,7 +1183,7 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
       const ImU32 arrow = active ? kGold : Rgba(255, 255, 255, 90);
       Label(dl, BoldFont(), S(24), {v0.x + S(12), v0.y + S(5)}, arrow, "<");
       Label(dl, BoldFont(), S(24), {v1.x - S(26), v0.y + S(5)}, arrow, ">");
-      if (!confirm_ && !ask_ && listen_cvar_.empty() && ImGui::IsMouseHoveringRect(v0, v1) &&
+      if (!confirm_ && !ask_ && !drop_ && listen_cvar_.empty() && ImGui::IsMouseHoveringRect(v0, v1) &&
           ImGui::IsMouseClicked(0)) {
         row_ = i;
         if (s.key_bind) {
@@ -1390,9 +1416,134 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
     }
   }
 
+  // --- a row's drop-down with its search field (Setting::choices) ---
+
+  void OpenDrop(const Setting& s) {
+    std::vector<std::string> items = s.choices();
+    if (items.empty()) return;
+    drop_ = true;
+    drop_items_ = std::move(items);
+    drop_pick_ = s.pick;
+    drop_text_[0] = '\0';
+    drop_query_.clear();
+    drop_shown_ = choice_filter::Match(drop_items_, drop_query_);
+    drop_sel_ = choice_filter::Keep(drop_shown_, s.picked ? s.picked() : drop_items_.size());
+    drop_scroll_ = 0;
+    drop_followed_ = SIZE_MAX;
+    drop_wheel_ = 0.0f;
+    drop_focus_ = true;
+    drop_opened_frame_ = ImGui::GetFrameCount();
+    REXLOG_INFO("Settings menu: {} list opened ({} entries)", s.en, drop_items_.size());
+  }
+
+  void CloseDrop() {
+    drop_ = false;
+    drop_items_.clear();
+    drop_shown_.clear();
+    drop_pick_ = nullptr;
+  }
+
+  void PickDrop(size_t index) {
+    if (index < drop_items_.size()) {
+      REXLOG_INFO("Settings menu: picked {}", drop_items_[index]);
+      if (drop_pick_) drop_pick_(index);
+    }
+    CloseDrop();
+  }
+
+  // The drop-down's keys and pads (the typing goes to the search field, DrawDrop).
+  void HandleDropInput(const Actions& a) {
+    if (a.back || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+      CloseDrop();
+      return;
+    }
+    const size_t n = drop_shown_.size();
+    if (n == 0) return;
+    const auto key = [](ImGuiKey k) { return ImGui::IsKeyPressed(k, true); };
+    const size_t page = std::max<size_t>(1, drop_visible_);
+    if (a.up || key(ImGuiKey_UpArrow)) drop_sel_ = (drop_sel_ + n - 1) % n;
+    if (a.down || key(ImGuiKey_DownArrow)) drop_sel_ = (drop_sel_ + 1) % n;
+    if (a.prev_page || key(ImGuiKey_PageUp)) drop_sel_ = drop_sel_ > page ? drop_sel_ - page : 0;
+    if (a.next_page || key(ImGuiKey_PageDown)) drop_sel_ = std::min(n - 1, drop_sel_ + page);
+    drop_sel_ = std::min(drop_sel_, n - 1);
+    if (a.accept || ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
+      PickDrop(drop_shown_[drop_sel_]);
+    }
+  }
+
+  // Over the rows: the search field (an ImGui text box, as F4 > Online > Join's: typing, Backspace, the cursor
+  // and Ctrl+V work as in any box), how many entries match, and the matching entries.
+  void DrawDrop(ImDrawList* dl, ImVec2 a, ImVec2 b) {
+    DrawPanel(dl, a, b);
+    const float pad = S(24);
+    ImGui::SetCursorScreenPos({a.x + pad, a.y + S(24)});
+    ImGui::PushItemWidth(b.x - a.x - 2 * pad - S(140));
+    if (drop_focus_ || !ImGui::IsAnyItemActive()) {
+      ImGui::SetKeyboardFocusHere();
+      drop_focus_ = false;
+    }
+    ImGui::InputTextWithHint("##drop_search", Tr("Type to search", "Zum Suchen tippen"), drop_text_,
+                             sizeof(drop_text_));
+    ImGui::PopItemWidth();
+    if (drop_query_ != drop_text_) {
+      const size_t keep = drop_sel_ < drop_shown_.size() ? drop_shown_[drop_sel_] : drop_items_.size();
+      drop_query_ = drop_text_;
+      drop_shown_ = choice_filter::Match(drop_items_, drop_query_);
+      drop_sel_ = choice_filter::Keep(drop_shown_, keep);
+    }
+    const std::string count = std::to_string(drop_shown_.size()) + " / " + std::to_string(drop_items_.size());
+    const ImVec2 cs = TextSize(BoldFont(), S(19), count);
+    Label(dl, BoldFont(), S(19), {b.x - pad - cs.x, a.y + S(30)}, kDim, count);
+    const float top = a.y + S(92), row_h = S(46), gap = S(6);
+    const size_t visible = std::max<size_t>(1, size_t((b.y - S(18) - top + gap) / (row_h + gap)));
+    drop_visible_ = visible;
+    // The click that opened the list (on its row, under the list now) picks nothing.
+    const bool mouse = ImGui::GetFrameCount() != drop_opened_frame_;
+    ScrollList(drop_scroll_, drop_followed_, drop_wheel_, drop_sel_, visible, drop_shown_.size(), true);
+    if (drop_shown_.empty()) {
+      Label(dl, BoldFont(), S(22), {a.x + pad + S(18), top + S(10)}, kDim, Tr("Nothing matches", "Nichts passt"));
+    }
+    for (size_t i = drop_scroll_; i < drop_shown_.size() && i < drop_scroll_ + visible; ++i) {
+      const ImVec2 r0{a.x + pad, top + (i - drop_scroll_) * (row_h + gap)}, r1{b.x - pad - S(14), r0.y + row_h};
+      if (mouse && ImGui::IsMouseHoveringRect(r0, r1)) {
+        const ImGuiIO& io = ImGui::GetIO();
+        if (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f) drop_sel_ = i;
+        if (ImGui::IsMouseClicked(0)) {
+          PickDrop(drop_shown_[i]);
+          return;
+        }
+      }
+      const bool active = i == drop_sel_;
+      dl->AddRectFilled(r0, r1, active ? Rgba(255, 255, 255, 52) : Rgba(255, 255, 255, 14), S(12));
+      if (active) dl->AddRect(r0, r1, kGold, S(12), 0, S(3));
+      const std::string& text = drop_items_[drop_shown_[i]];
+      float size = S(22);
+      ImVec2 ts = TextSize(BoldFont(), size, text);
+      while (ts.x > r1.x - r0.x - S(36) && size > S(13)) {
+        size -= S(1);
+        ts = TextSize(BoldFont(), size, text);
+      }
+      Label(dl, BoldFont(), size, {r0.x + S(18), r0.y + (row_h - ts.y) / 2}, active ? kGold : kWhite, text);
+    }
+    const size_t total = drop_shown_.size();
+    if (total > visible) {
+      const float track_h = b.y - S(18) - top;
+      const float thumb_h = track_h * float(visible) / float(total);
+      const float thumb_y = top + track_h * float(drop_scroll_) / float(total);
+      dl->AddRectFilled({b.x - pad - S(6), thumb_y}, {b.x - pad, thumb_y + thumb_h}, Rgba(255, 255, 255, 90), S(3));
+    }
+    if (mouse && ImGui::IsMouseClicked(0) && !ImGui::IsMouseHoveringRect(a, b)) CloseDrop();  // a click outside
+  }
+
   void DrawFooter(ImDrawList* dl, ImVec2 p0, ImVec2 p1) {
     float x = p0.x + S(38);
     const float y = p1.y - S(54);
+    if (drop_) {
+      x += Hint(dl, {x, y}, "A", kAcceptGreen, Tr("Pick", "W\xC3\xA4hlen"), true, "Enter");
+      x += Hint(dl, {x, y}, "LB / RB", kHintGrey, Tr("Page", "Seite"), false, "PgUp / PgDn");
+      Hint(dl, {x, y}, "B", kBackRed, Tr("Close", "Schlie\xC3\x9F" "en"), true, "Esc");
+      return;
+    }
     if (confirm_ || ask_) {
       x += Hint(dl, {x, y}, "A", kAcceptGreen, Tr("Choose", "Ausw\xC3\xA4hlen"), true, "Enter");
       Hint(dl, {x, y}, "B", kBackRed, Tr("Back", "Zur\xC3\xBC" "ck"), true, "Esc");
@@ -1464,6 +1615,20 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
   Clock::time_point open_time_ = Clock::now();
   std::unordered_map<uint64_t, PadReader> pads_;  // by device
   bool keyboard_view_ = false;  // the controls page shows the keyboard (last used) instead of a pad
+  // A row's drop-down (Setting::choices): its entries, the ones the search shows, the selection among those.
+  bool drop_ = false;
+  std::vector<std::string> drop_items_;
+  std::vector<size_t> drop_shown_;
+  std::function<void(size_t)> drop_pick_;
+  char drop_text_[128] = {};
+  std::string drop_query_;
+  size_t drop_sel_ = 0;
+  size_t drop_scroll_ = 0;
+  size_t drop_followed_ = SIZE_MAX;  // ScrollList's
+  size_t drop_visible_ = 1;
+  float drop_wheel_ = 0.0f;
+  bool drop_focus_ = false;
+  int drop_opened_frame_ = -1;
 };
 
 // UI thread only.
