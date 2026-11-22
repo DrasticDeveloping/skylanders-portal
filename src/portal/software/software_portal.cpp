@@ -118,12 +118,33 @@ Report SoftwarePortal::Read() {
 }
 
 Report SoftwarePortal::StatusReportLocked() {
-  uint32_t states = 0;
-  if (active_) {
-    for (int i = 0; i < kMaxFigures; ++i) {
-      states |= static_cast<uint32_t>(slots_[i].state) << (2 * i);
+  const auto word = [this] {
+    uint32_t w = 0;
+    if (active_) {
+      for (int i = 0; i < kMaxFigures; ++i) w |= static_cast<uint32_t>(slots_[i].state) << (2 * i);
     }
+    return w;
+  };
+  uint32_t states = word();
+  // Swap Force Online, 2026-11-21 (the stuck figure prompt; re-20261121 stuck-prompt notes-2): the game processes a
+  // status report only when its slot word differs from the last one it processed (or its counter jumps), and then
+  // takes every slot showing "added" as a new placement, even a figure it already holds (it removes the toy and the
+  // character it belongs to, then reads it again). A slot still showing "added" when the word changed for another
+  // slot (a Swap Force figure's second half placed 9 to 41 ms after the first, the first half's window ending) was
+  // re-announced: the game dropped that half in the middle of its figure change and asked for a Skylander again.
+  // So a slot already shown as "added" shows "ready" in the first report whose word changes: each placement
+  // reaches the game as one processed "added"; identical reports in a row (which the game skips) still repeat it.
+  if (active_ && states != last_states_) {
+    bool settled = false;
+    for (Slot& s : slots_) {
+      if (s.state == SlotState::kAdded && s.reports_left < kAddedReports) {
+        s.state = SlotState::kReady;
+        settled = true;
+      }
+    }
+    if (settled) states = word();
   }
+  last_states_ = states;
   Report r = MakeReport({0x53, static_cast<uint8_t>(states), static_cast<uint8_t>(states >> 8),
                          static_cast<uint8_t>(states >> 16), static_cast<uint8_t>(states >> 24),
                          counter_++, static_cast<uint8_t>(active_ ? 1 : 0)});

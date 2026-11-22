@@ -92,6 +92,8 @@ class SoftwarePortal : public PortalDevice {
   std::array<Slot, kMaxFigures> slots_{};
   bool active_ = false;
   uint8_t counter_ = 0;
+  // The slot word of the last status report (StatusReportLocked's rule: one processed "added" per placement).
+  uint32_t last_states_ = 0;
   std::function<void(int, const FigureData&, const std::optional<std::filesystem::path>&)> on_write_;
   std::function<void(const char*, int, int, const uint8_t*, size_t)> research_log_;
   std::function<bool(int, const FigureData&, std::span<const FigureData>)> place_filter_;

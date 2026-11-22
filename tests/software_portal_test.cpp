@@ -114,6 +114,47 @@ int main() {
     CHECK(slot_state(p.Read(), 0) == 1);
   }
 
+  // Swap Force Online, 2026-11-21 (the stuck figure prompt): two halves placed a few reports apart. When the word
+  // changes for the second, the first (already shown as "added") shows "ready": the game, which processes a
+  // report only when its word changes, sees each placement as one "added", never the first one again.
+  {
+    SoftwarePortal p;
+    p.Write(Cmd({'A', 0x01}));
+    p.Read();
+    CHECK(p.PlaceFigure(0, pattern()));
+    for (int i = 0; i < 3; ++i) CHECK(slot_state(p.Read(), 0) == 3);  // identical reports: still "added"
+    CHECK(p.PlaceFigure(1, pattern()));
+    Report second = p.Read();
+    CHECK(slot_state(second, 0) == 1);  // shown before: "ready" now
+    CHECK(slot_state(second, 1) == 3);
+    for (int i = 0; i < 7; ++i) {
+      Report r = p.Read();
+      CHECK(slot_state(r, 0) == 1 && slot_state(r, 1) == 3);
+    }
+    Report settled = p.Read();  // slot 1's own window over
+    CHECK(slot_state(settled, 0) == 1 && slot_state(settled, 1) == 1);
+    // A removal of slot 0 while slot 1 shows "added" again (re-placed): slot 1 settles with the change.
+    p.RemoveFigure(1);
+    p.Read();
+    p.Read();
+    CHECK(p.PlaceFigure(1, pattern()));
+    CHECK(slot_state(p.Read(), 1) == 3);
+    p.RemoveFigure(0);
+    Report removed = p.Read();
+    CHECK(slot_state(removed, 0) == 2 && slot_state(removed, 1) == 1);
+    // Placed in the same report: both "added" together, each shown once.
+    SoftwarePortal q;
+    q.Write(Cmd({'A', 0x01}));
+    q.Read();
+    CHECK(q.PlaceFigure(0, pattern()) && q.PlaceFigure(1, pattern()));
+    for (int i = 0; i < 8; ++i) {
+      Report r = q.Read();
+      CHECK(slot_state(r, 0) == 3 && slot_state(r, 1) == 3);
+    }
+    Report both = q.Read();
+    CHECK(slot_state(both, 0) == 1 && slot_state(both, 1) == 1);
+  }
+
   // A figure placed after activation goes straight to "added". Other slots stay empty.
   {
     SoftwarePortal p;
