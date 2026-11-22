@@ -1303,11 +1303,11 @@ int main() {
     bad.kind = 2;
     CHECK(EncodeMessage(bad).empty());
     // A piece cut short on the wire is refused.
-    std::vector<uint8_t> cut = wire;
-    cut.resize(kMessageHeaderSize + 3 + 8 + 20);
-    cut[2] = uint8_t((cut.size() - kMessageHeaderSize) & 0xFF);
-    cut[3] = uint8_t((cut.size() - kMessageHeaderSize) >> 8);
-    CHECK(!DecodeMessages(cut).has_value());
+    std::vector<uint8_t> short_piece = wire;
+    short_piece.resize(kMessageHeaderSize + 3 + 8 + 20);
+    short_piece[2] = uint8_t((short_piece.size() - kMessageHeaderSize) & 0xFF);
+    short_piece[3] = uint8_t((short_piece.size() - kMessageHeaderSize) >> 8);
+    CHECK(!DecodeMessages(short_piece).has_value());
     // The gate's refusals keep their reasons; 10 and up still read as "other".
     for (uint8_t r = 6; r <= 9; ++r) {
       const std::vector<uint8_t> refuse = {3, 0, 2, 0, r, 0};
