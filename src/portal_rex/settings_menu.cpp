@@ -752,14 +752,13 @@ class SettingsMenuDialog final : public rex::ui::ImGuiDialog {
     return &page->settings[std::min(row_, page->settings.size() - 1)];
   }
 
-  // `keys` false (a drop-down's search field has the keyboard): the keyboard's own menu keys and its controller
-  // emulation are left out, so typing a letter neither moves nor picks.
+  // `keys` false (a drop-down's search field has the keyboard): the keyboard's own menu keys are left out, so typing a
+  // letter neither moves nor picks (the keyboard device is not polled as a pad: ConnectedDevices marks it so).
   Actions ReadActions(bool keys = true) {
     Actions actions;
     bool released = true;
     for (const menu_input::ConnectedDevice& device : menu_input::ConnectedDevices()) {
       if (!device.pollable) continue;
-      if (!keys && device.keyboard) continue;
       const auto pad = menu_input::ReadPad(device.id);
       if (!pad) continue;
       released = released && PadReader::Released(*pad);

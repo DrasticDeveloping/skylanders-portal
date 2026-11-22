@@ -192,14 +192,25 @@ void ForceStatusPresentToAdded(skylanders::portal::Report& report) {
 // Advances `phase`/`added_reports` and applies the announce transform to `report` in place.
 // Callers own their own phase/counter pair, since TransitioningPortal only ever runs this once
 // while UsbHotPlugPortal resets and re-runs it on every reconnect.
+// Swap Force Online, 2026-11-21 (review S6 of SoftwarePortal's one "added" per placement): once every present slot was
+// forced to "added" in at least one report, a change of the real slot word ends the announce, as SoftwarePortal's
+// StatusReportLocked settles a shown "added": the game takes every "added" in a changed report as a new placement, so
+// forcing on would re-announce the figures it already holds (a figure placed in the window).
 void ApplyAnnounceStep(skylanders::portal::Report& report, AnnouncePhase& phase,
-                       int& added_reports) {
+                       int& added_reports, uint32_t& last_word) {
   if (report[0] != 0x53 || phase == AnnouncePhase::kDone) return;
+  const uint32_t word = uint32_t(report[1]) | (uint32_t(report[2]) << 8) | (uint32_t(report[3]) << 16) |
+                        (uint32_t(report[4]) << 24);
   if (phase == AnnouncePhase::kForceEmpty) {
     ForceStatusEmpty(report);
     phase = AnnouncePhase::kForceAdded;
     return;
   }
+  if (added_reports > 0 && word != last_word) {
+    phase = AnnouncePhase::kDone;
+    return;
+  }
+  last_word = word;
   ForceStatusPresentToAdded(report);
   if (++added_reports >= kAnnounceAddedReports) phase = AnnouncePhase::kDone;
 }
@@ -216,7 +227,7 @@ class TransitioningPortal final : public skylanders::portal::PortalDevice {
 
   skylanders::portal::Report Read() override {
     skylanders::portal::Report report = real_->Read();
-    ApplyAnnounceStep(report, phase_, added_reports_);
+    ApplyAnnounceStep(report, phase_, added_reports_, last_word_);
     return report;
   }
 
@@ -224,6 +235,7 @@ class TransitioningPortal final : public skylanders::portal::PortalDevice {
   skylanders::portal::PortalDevice* real_;
   AnnouncePhase phase_ = AnnouncePhase::kForceEmpty;
   int added_reports_ = 0;
+  uint32_t last_word_ = 0;
 };
 
 // Builds a ready-to-use UsbPortal, or nullptr if no matching device is connected. Never stored
@@ -260,7 +272,7 @@ class UsbHotPlugPortal final : public skylanders::portal::PortalDevice {
     MaybeReconnect();
     skylanders::portal::Report report =
         current_ ? current_->Read() : skylanders::portal::Report{};
-    ApplyAnnounceStep(report, phase_, added_reports_);
+    ApplyAnnounceStep(report, phase_, added_reports_, last_word_);
     return report;
   }
 
@@ -271,6 +283,7 @@ class UsbHotPlugPortal final : public skylanders::portal::PortalDevice {
     if (current_) {
       phase_ = AnnouncePhase::kForceEmpty;
       added_reports_ = 0;
+      last_word_ = 0;
       REXLOG_INFO("Portal: usb device connected");
       return;
     }
@@ -303,6 +316,7 @@ class UsbHotPlugPortal final : public skylanders::portal::PortalDevice {
   skylanders::portal::UsbPortal* current_ = nullptr;  // never freed when replaced, see file comment
   AnnouncePhase phase_ = AnnouncePhase::kForceEmpty;
   int added_reports_ = 0;
+  uint32_t last_word_ = 0;
   std::chrono::steady_clock::time_point last_attempt_{};
 };
 
@@ -328,7 +342,7 @@ class HybridPortal final : public skylanders::portal::PortalDevice {
   void WriteAudio(std::span<const int16_t> pcm) override { software_->WriteAudio(pcm); }
   skylanders::portal::Report Read() override {
     skylanders::portal::Report report = software_->Read();
-    ApplyAnnounceStep(report, phase_, added_reports_);
+    ApplyAnnounceStep(report, phase_, added_reports_, last_word_);
     return report;
   }
 
@@ -337,6 +351,7 @@ class HybridPortal final : public skylanders::portal::PortalDevice {
   skylanders::portal::RealPortalBridge* bridge_;
   AnnouncePhase phase_ = AnnouncePhase::kForceEmpty;
   int added_reports_ = 0;
+  uint32_t last_word_ = 0;
 };
 
 // Drives the bridge every few milliseconds and keeps looking for the USB portal (once a second)
