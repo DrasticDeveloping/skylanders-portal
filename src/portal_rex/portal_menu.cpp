@@ -2732,6 +2732,16 @@ class PortalMenuDialog final : public rex::ui::ImGuiDialog {
 
   uint32_t user() const { return user_; }
   bool auto_opened() const { return auto_opened_; }
+
+  // Swap Force Online's review (2026-11-21, S6): the auto-open's re-seat took this player's figures off and this menu
+  // opened meanwhile with nothing to lift (its button, or a new prompt with the portal empty): it holds them as its own
+  // lifted figures, so a cancel puts them back and a pick prefers their slots. A pick already made stands.
+  void AdoptLifted(const std::vector<LiftedFigure>& figures) {
+    if (state_ == State::kWaiting || state_ == State::kDone || !lifted_.empty()) return;
+    lifted_ = figures;
+    REXLOG_INFO("Portal menu: player {}'s figure taken off for the re-seat is held by the menu ({} part(s))",
+                user_ + 1, figures.size());
+  }
   bool wants_back() const { return wants_back_; }
 
   // hybrid: the player put a figure on the real portal while the menu was open, so that one is
@@ -5847,10 +5857,29 @@ void AutoOpenPortalMenu(uint32_t user) {
               REXLOG_INFO("Portal menu: player {}'s figure taken off and put back on once ({} part(s)): the game reads "
                           "it fresh",
                           user + 1, lifted.size());
-              std::thread([user, lifted] {
+              std::thread([user, lifted, generation] {
                 std::this_thread::sleep_for(kReseatOff);
                 if (!g_app_context) return;
-                g_app_context->CallInUIThread([user, lifted] { RestoreLifted(user, lifted); });
+                g_app_context->CallInUIThread([user, lifted, generation] {
+                  // Review S6: a menu that opened while they were off takes them instead.
+                  if (g_menu && g_menu->user() == user) {
+                    g_menu->AdoptLifted(lifted);
+                    return;
+                  }
+                  RestoreLifted(user, lifted);
+                  // Review S1: the game's prompt is reported once (the watch's edge), so the menu's check runs again:
+                  // if the game still asks after the figure went back on, the menu opens as before.
+                  std::thread([user, generation] {
+                    std::this_thread::sleep_for(kAutoOpenWithFigureDelay);
+                    if (!g_app_context || g_auto_open_generation.load() != generation) return;
+                    g_app_context->CallInUIThread([user, generation] {
+                      if (g_menu || g_auto_open_generation.load() != generation) return;
+                      if (!REXCVAR_GET(portal_menu_auto_open) || !GetSoftwarePortal()) return;
+                      REXLOG_INFO("Portal menu: the game still asks player {} after its figure was put back on", user + 1);
+                      OpenAutoMenu(user);
+                    });
+                  }).detach();
+                });
               }).detach();
               return;
             }
