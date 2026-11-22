@@ -147,8 +147,8 @@ void RelayCases() {
     r.SetEpoch(1, 3);
     r.OnAction(3, 1, 0, false, 0ms, kT0);
     CHECK(r.Think(kT0) == 0x01);
-    CHECK(r.Think(kT0 + 5000ms) == 0x01);
-    CHECK(r.Think(kT0 + 5001ms) == 0x00);
+    CHECK(r.Think(kT0 + Relay::kMaxHold) == 0x01);
+    CHECK(r.Think(kT0 + Relay::kMaxHold + 1ms) == 0x00);
     CHECK(Has(Drain(r), Ev::Type::kReleased, 1, Relay::ReleaseWhy::kTimeout));
   }
   // Teardown at despawn or a body change: every key released, the table kept (a late release is a
@@ -252,7 +252,7 @@ void RelayCases() {
     CHECK(held);
     CHECK(bounded);
     CHECK(q.HeldSlots() == 0x01);
-    CHECK(q.Think(kT0 + 5001ms) == 0x00);  // key 1's timeout
+    CHECK(q.Think(kT0 + Relay::kMaxHold + 1ms) == 0x00);  // key 1's timeout
     CHECK(q.HeldSlots() == 0x00);
     const uint64_t lost = 2 * uint64_t(flood) + 2 - Relay::kMaxEvents;  // starts and releases
     CHECK(q.EventsLost() == lost);
