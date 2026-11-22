@@ -2735,12 +2735,16 @@ class PortalMenuDialog final : public rex::ui::ImGuiDialog {
 
   // Swap Force Online's review (2026-11-21, S6): the auto-open's re-seat took this player's figures off and this menu
   // opened meanwhile with nothing to lift (its button, or a new prompt with the portal empty): it holds them as its own
-  // lifted figures, so a cancel puts them back and a pick prefers their slots. A pick already made stands.
-  void AdoptLifted(const std::vector<LiftedFigure>& figures) {
-    if (state_ == State::kWaiting || state_ == State::kDone || !lifted_.empty()) return;
+  // lifted figures, so a cancel puts them back and a pick prefers their slots. True when it took them, or when a pick
+  // of the player's is being placed (that pick stands); false when they are to go back on now (the menu was cancelled
+  // or holds figures of its own; final review N1).
+  bool AdoptLifted(const std::vector<LiftedFigure>& figures) {
+    if ((state_ == State::kWaiting || state_ == State::kDone) && !restore_) return true;
+    if (state_ == State::kWaiting || state_ == State::kDone || !lifted_.empty()) return false;
     lifted_ = figures;
     REXLOG_INFO("Portal menu: player {}'s figure taken off for the re-seat is held by the menu ({} part(s))",
                 user_ + 1, figures.size());
+    return true;
   }
   bool wants_back() const { return wants_back_; }
 
@@ -5863,8 +5867,9 @@ void AutoOpenPortalMenu(uint32_t user) {
                 g_app_context->CallInUIThread([user, lifted, generation] {
                   // Review S6: a menu that opened while they were off takes them instead.
                   if (g_menu && g_menu->user() == user) {
-                    g_menu->AdoptLifted(lifted);
-                    return;
+                    if (g_menu->AdoptLifted(lifted)) return;
+                    REXLOG_INFO("Portal menu: player {}'s figure put back on after the re-seat (the menu was closing)",
+                                user + 1);
                   }
                   RestoreLifted(user, lifted);
                   // Review S1: the game's prompt is reported once (the watch's edge), so the menu's check runs again:
