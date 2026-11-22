@@ -384,6 +384,7 @@ LONG WINAPI OnCrash(PEXCEPTION_POINTERS info) {
       REXLOG_URGENT_ERROR("Crash: guest registers{}", text);
     }
     LogPlace("crash", true);
+    rex::FlushLogging();  // the crash lines are out before the walk (a walk that hangs loses none of them)
     LogOtherThreadsAtCrash();
     rex::FlushLogging();
   }
