@@ -50,7 +50,9 @@ class PuppetActionRelay {
   static constexpr size_t kMaxKeys = 32;
   static constexpr size_t kMaxEvents = 4 * kMaxKeys;
   static constexpr std::chrono::milliseconds kStale{500};
-  static constexpr std::chrono::milliseconds kMaxHold{5000};
+  // A held press with no release is let go after this long: a safety net for a holder whose game went (the release
+  // travels on a reliable lane). 5 s cut a real 7.9 s hold (2026-11-21); 60 s covers every real one.
+  static constexpr std::chrono::milliseconds kMaxHold{60000};
   static constexpr uint8_t kSlots = 8;  // slot numbers 0..7 (the game uses 0..2)
 
   enum class Drop : uint8_t { kNone, kDuplicatePress, kDuplicateRelease, kStale, kGeneration, kSlot };
