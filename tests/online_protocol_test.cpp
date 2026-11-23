@@ -1055,10 +1055,6 @@ void Moves() {
   }
 }
 
-// 2026-11-22 (the owner's spectating): the pose's view block. It follows the command block or stands alone after
-// `teleports`; the bytes before it are the pose without it; exactly its size reads, a cut or longer one is invalid, a
-// byte after a command block that is not its tag is invalid, a float not finite is neither written nor read, and the
-// shown pose carries it.
 // 2026-11-23 (the crystal entry's shrink): the hero's scale block after the view block, in one ordered walk with the
 // command and view blocks; each exactly its size; the scale finite in (0, 16].
 void Scale() {
@@ -1137,6 +1133,10 @@ void Scale() {
   }
 }
 
+// 2026-11-22 (the owner's spectating): the pose's view block. It follows the command block or stands alone after
+// `teleports`; the bytes before it are the pose without it; exactly its size reads, a cut or longer one is invalid, a
+// byte after a command block that is not its tag is invalid, a float not finite is neither written nor read, and the
+// shown pose carries it.
 void View() {
   PlayerPose p;
   p.pose_sequence = 7;
