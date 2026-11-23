@@ -425,44 +425,50 @@ bool ReadPose(ByteReader& r, PlayerPose& m) {
     if (r.Ok() && !ValidElements(m.figure.elements)) return false;
   }
   if (ok && r.Ok() && r.Remaining() > 0) m.teleports = r.U16();  // stage 4 (absent before: 0)
-  // The view block (protocol.h PlayerView), its tag already read: exactly its size, every float finite.
-  const auto read_view = [&]() {
-    if (r.Remaining() != kPlayerViewBytes - 1) return false;
-    std::array<float, 1> fov{};
-    if (!GetFloats(r, m.view.position) || !GetFloats(r, m.view.angles) || !GetFloats(r, fov) || !r.Ok()) return false;
-    m.view.fov = fov[0];
-    m.has_view = true;
-    return true;
-  };
-  if (ok && r.Ok() && r.Remaining() > 0) {
-    // The moves' command block (protocol.h PlayerCommand): another version's is skipped, a cut one is invalid.
-    // 2026-11-22: a view block may follow it, or stand alone after `teleports`.
-    const uint8_t version = r.U8();
-    if (r.Ok() && version == kPlayerViewTag) return read_view();
-    if (r.Ok() && version == kPlayerCommandVersion1) {
-      // The first layout (no peer epoch): exactly its size, and read as no command (it names no player).
-      if (r.Remaining() != kPlayerCommandV1Bytes - 1 && r.Remaining() != kPlayerCommandV1Bytes - 1 + kPlayerViewBytes) {
-        return false;
+  // The trailing blocks (protocol.h): command, view, scale, each at most once and in that order, each exactly its size.
+  // An unknown leading byte as the first block is another version's (skipped with what follows); anywhere later, or a
+  // block out of order or cut, the message is invalid.
+  int stage = 0;  // 1: a command block read, 2: a view block, 3: a scale block
+  bool first = true;
+  while (ok && r.Ok() && r.Remaining() > 0) {
+    const uint8_t lead = r.U8();
+    if (!r.Ok()) return false;
+    if ((lead == kPlayerCommandVersion1 || lead == kPlayerCommandVersion) && stage < 1) {
+      if (lead == kPlayerCommandVersion1) {
+        // The first layout (no peer epoch): its size, and read as no command (it names no player).
+        if (r.Remaining() < kPlayerCommandV1Bytes - 1) return false;
+        r.Bytes(kPlayerCommandV1Bytes - 1);
+      } else {
+        if (r.Remaining() < kPlayerCommandBytes - 1) return false;
+        m.command.peer_epoch = r.U32();
+        m.command.held = r.U32();
+        for (uint8_t& p : m.command.presses) p = r.U8();
+        std::array<float, 1> magnitude{};
+        ok = GetFloats(r, magnitude) && GetFloats(r, m.command.move);
+        m.command.magnitude = magnitude[0];
+        m.has_command = ok && r.Ok();
+        if (!m.has_command) return false;
       }
-      r.Bytes(kPlayerCommandV1Bytes - 1);
-    } else if (r.Ok() && version == kPlayerCommandVersion) {
-      // Exactly its size (the 27 bytes after the version byte), or that and a view block: a longer version 2 block is
-      // not a version 2 one.
-      if (r.Remaining() != kPlayerCommandBytes - 1 && r.Remaining() != kPlayerCommandBytes - 1 + kPlayerViewBytes) {
-        return false;
-      }
-      m.command.peer_epoch = r.U32();
-      m.command.held = r.U32();
-      for (uint8_t& p : m.command.presses) p = r.U8();
-      std::array<float, 1> magnitude{};
-      ok = GetFloats(r, magnitude) && GetFloats(r, m.command.move);
-      m.command.magnitude = magnitude[0];
-      m.has_command = ok && r.Ok();
-      if (!m.has_command) return false;
+      stage = 1;
+    } else if (lead == kPlayerViewTag && stage < 2) {
+      if (r.Remaining() < kPlayerViewBytes - 1) return false;
+      std::array<float, 1> fov{};
+      if (!GetFloats(r, m.view.position) || !GetFloats(r, m.view.angles) || !GetFloats(r, fov) || !r.Ok()) return false;
+      m.view.fov = fov[0];
+      m.has_view = true;
+      stage = 2;
+    } else if (lead == kPlayerScaleTag && stage < 3) {
+      if (r.Remaining() < kPlayerScaleBytes - 1) return false;
+      std::array<float, 1> scale{};
+      if (!GetFloats(r, scale) || !r.Ok() || !(scale[0] > 0.0f) || scale[0] > kPlayerScaleMax) return false;
+      m.scale = scale[0];
+      m.has_scale = true;
+      stage = 3;
     } else {
-      return ok && r.Ok();  // another version's block: skipped with what follows it
+      if (first) return ok && r.Ok();  // another version's block: skipped with what follows it
+      return false;
     }
-    if (r.Ok() && r.Remaining() > 0) return r.U8() == kPlayerViewTag && r.Ok() && read_view();
+    first = false;
   }
   return ok && r.Ok();
 }
@@ -563,6 +569,13 @@ bool Fields(ByteWriter& w, const PlayerPose& m) {
     w.U8(kPlayerViewTag);
     const std::array<float, 1> fov{m.view.fov};
     if (!PutFloats(w, m.view.position) || !PutFloats(w, m.view.angles) || !PutFloats(w, fov)) return false;
+  }
+  if (m.has_scale) {
+    // 2026-11-23: the scale block, last (protocol.h kPlayerScaleTag).
+    if (!std::isfinite(m.scale) || !(m.scale > 0.0f) || m.scale > kPlayerScaleMax) return false;
+    w.U8(kPlayerScaleTag);
+    const std::array<float, 1> scale{m.scale};
+    if (!PutFloats(w, scale)) return false;
   }
   return true;
 }

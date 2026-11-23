@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -1058,6 +1059,84 @@ void Moves() {
 // `teleports`; the bytes before it are the pose without it; exactly its size reads, a cut or longer one is invalid, a
 // byte after a command block that is not its tag is invalid, a float not finite is neither written nor read, and the
 // shown pose carries it.
+// 2026-11-23 (the crystal entry's shrink): the hero's scale block after the view block, in one ordered walk with the
+// command and view blocks; each exactly its size; the scale finite in (0, 16].
+void Scale() {
+  PlayerPose p;
+  p.pose_sequence = 9;
+  p.generation = 4;
+  p.figure.elements = kElementsKnown;
+  p.teleports = 2;
+  PlayerPose s = p;
+  s.has_scale = true;
+  s.scale = 0.25f;
+  CHECK(RoundTrip(s));
+  PlayerPose cs = s;
+  cs.has_command = true;
+  cs.command.peer_epoch = 3;
+  cs.command.magnitude = 1.f;
+  cs.command.move = {0.f, 1.f, 0.f};
+  CHECK(RoundTrip(cs));
+  PlayerPose vs = s;
+  vs.has_view = true;
+  vs.view.fov = 1.f;
+  CHECK(RoundTrip(vs));
+  PlayerPose all = cs;
+  all.has_view = true;
+  all.view.fov = 1.f;
+  CHECK(RoundTrip(all));
+  const std::vector<uint8_t> plain = EncodeMessage(p);
+  const std::vector<uint8_t> alone = EncodeMessage(s);
+  REQUIRE_OR_RETURN_VOID(alone.size() == plain.size() + kPlayerScaleBytes);
+  CHECK(alone[plain.size()] == kPlayerScaleTag);
+  const auto resized = [](std::vector<uint8_t> b, size_t n) {
+    b.resize(n);
+    b[2] = uint8_t((b.size() - kMessageHeaderSize) & 0xFF);
+    b[3] = uint8_t((b.size() - kMessageHeaderSize) >> 8);
+    return b;
+  };
+  CHECK(!DecodeMessages(resized(alone, alone.size() - 1)).has_value());  // cut
+  CHECK(!DecodeMessages(resized(alone, alone.size() + 1)).has_value());  // a byte more: no block begins with 0
+  // Not written and not read: 0, negative, not finite, past 16.
+  for (const float bad : {0.0f, -1.0f, std::numeric_limits<float>::quiet_NaN(), 17.0f}) {
+    PlayerPose b = s;
+    b.scale = bad;
+    CHECK(EncodeMessage(b).empty());
+    std::vector<uint8_t> bytes = alone;
+    uint32_t bits = 0;
+    std::memcpy(&bits, &bad, 4);
+    for (int i = 0; i < 4; ++i) bytes[bytes.size() - 4 + i] = uint8_t(bits >> (8 * i));
+    CHECK(!DecodeMessages(bytes).has_value());
+  }
+  // Two scale blocks, or a scale block before a view block: invalid.
+  {
+    std::vector<uint8_t> two = alone;
+    two.insert(two.end(), alone.end() - kPlayerScaleBytes, alone.end());
+    two[2] = uint8_t((two.size() - kMessageHeaderSize) & 0xFF);
+    two[3] = uint8_t((two.size() - kMessageHeaderSize) >> 8);
+    CHECK(!DecodeMessages(two).has_value());
+    const std::vector<uint8_t> view_scale = EncodeMessage(vs);
+    PlayerPose v_only = vs;
+    v_only.has_scale = false;
+    const std::vector<uint8_t> view_alone = EncodeMessage(v_only);
+    std::vector<uint8_t> swapped(view_alone.begin(), view_alone.begin() + long(plain.size()));
+    swapped.insert(swapped.end(), alone.end() - kPlayerScaleBytes, alone.end());
+    swapped.insert(swapped.end(), view_alone.begin() + long(plain.size()), view_alone.end());
+    swapped[2] = uint8_t((swapped.size() - kMessageHeaderSize) & 0xFF);
+    swapped[3] = uint8_t((swapped.size() - kMessageHeaderSize) >> 8);
+    CHECK(swapped.size() == view_scale.size());
+    CHECK(!DecodeMessages(swapped).has_value());
+  }
+  // A pose without it reads has_scale false and scale 1.
+  {
+    auto back = DecodeMessages(plain);
+    REQUIRE_OR_RETURN_VOID(back && back->size() == 1);
+    const auto* got = std::get_if<PlayerPose>(&(*back)[0]);
+    REQUIRE_OR_RETURN_VOID(got != nullptr);
+    CHECK(!got->has_scale && got->scale == 1.0f);
+  }
+}
+
 void View() {
   PlayerPose p;
   p.pose_sequence = 7;
@@ -1556,6 +1635,7 @@ int main() {
   Stage4();
   Moves();
   View();
+  Scale();
   Stage5();
   Stage6();
 

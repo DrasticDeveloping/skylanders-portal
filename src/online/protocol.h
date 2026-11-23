@@ -412,6 +412,16 @@ struct PlayerCommand {
 // has_view false. The protocol version stays 3.
 constexpr uint8_t kPlayerViewTag = 0x56;
 constexpr size_t kPlayerViewBytes = 29;  // the tag included
+
+// 2026-11-23 (the game's crystal entry shrinks its heroes; another player saw them full size): the sender's hero scale,
+// sent only while it is not 1. A block after the view block (or after the command block, or after `teleports`): the tag
+// byte kPlayerScaleTag and the scale (f32, finite, above 0 and at most kPlayerScaleMax): kPlayerScaleBytes in all.
+// The trailing blocks read in one ordered walk: command, view, scale, each at most once and in that order, each exactly
+// its size; an unknown leading byte as the first block is another version's (skipped with what follows), anywhere
+// later it makes the message invalid. A pose without it has has_scale false. The protocol version stays 3.
+constexpr uint8_t kPlayerScaleTag = 0x53;
+constexpr size_t kPlayerScaleBytes = 5;  // the tag included
+constexpr float kPlayerScaleMax = 16.0f;
 struct PlayerView {
   std::array<float, 3> position{};
   std::array<float, 3> angles{};
@@ -435,6 +445,8 @@ struct PlayerPose {
   PlayerCommand command;     // read only when has_command
   bool has_view = false;     // the view block (above); false: none on the wire
   PlayerView view;           // read only when has_view
+  bool has_scale = false;    // the scale block (above); false: none on the wire (the hero's scale is 1)
+  float scale = 1.0f;        // read only when has_scale
   bool operator==(const PlayerPose&) const = default;
 };
 
